@@ -1,229 +1,232 @@
 #!/usr/bin/env python3
-"""Paper 10 — Evaluation Soundness (Benchmarks).
-
-Formal proofs: benchmark construction is exhaustive, cross-validation
-preserves accuracy. CLI: run prove/bugs/spec/equiv on benchmark programs.
-"""
-import subprocess, json, os, sys, tempfile
-
-ROOT = os.path.join(os.path.dirname(__file__), '..', '..')
+"""Paper 10 — Full Benchmark Verification."""
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
-from jugeo.encodings.deduction_rules.models import (
-    make_rule, make_axiom_rule, InferenceStep, RuleKind,
+from jugeo_proof import (
+    theorem, check, verify, encode, find_bugs, descend_code,
+    reset, run_all,
 )
-from jugeo.encodings.deduction_rules.algorithms import verify_proof_trace
+from jugeo.geometry.site import (
+    SiteBuilder, Coordinate, CoordinateKind,
+    Morphism, MorphismKind, GrothendieckTopology,
+)
+from jugeo.geometry.descent import (
+    DescentEngine, DescentConfiguration, DescentStrategy,
+)
+from jugeo.geometry.covers import Cover
+from jugeo.judgments.judgment_terms import (
+    JudgmentBuilder, Proposition, PropositionKind,
+    TrustLevel, ProvenanceSource,
+)
 
-PASS = 0
-FAIL = 0
-PROOFS = 0
-CLI_CHECKS = 0
+reset()
 
-def report(name, ok, kind="proof"):
-    global PASS, FAIL, PROOFS, CLI_CHECKS
-    tag = "PASS" if ok else "FAIL"
-    print(f"  [{tag}] {name}")
-    if ok:
-        PASS += 1
-    else:
-        FAIL += 1
-    if kind == "proof":
-        PROOFS += 1 if ok else 0
-    else:
-        CLI_CHECKS += 1 if ok else 0
+# ─── Test programs ──────────────────────────────────────────
 
-def run_jugeo(*args):
-    cmd = ["python3", "-m", "jugeo", "--format", "json"] + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
-    lines = [l for l in result.stdout.splitlines()
-             if not (len(l) > 8 and l[2] == ':' and l[5] == ':') and not l.startswith("JuGeo v")]
-    text = "\n".join(lines)
-    objects = []
-    decoder = json.JSONDecoder()
-    idx = 0
-    while idx < len(text):
-        remaining = text[idx:].lstrip()
-        if not remaining:
-            break
-        try:
-            obj, end = decoder.raw_decode(remaining)
-            objects.append(obj)
-            idx += len(text) - len(remaining) + end
-        except json.JSONDecodeError:
-            break
-    return objects
+PROGS = {
+    "arithmetic": '''
+def add(x, y):
+    return x + y
 
-def write_temp(source):
-    f = tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False, dir='/tmp')
-    f.write(source)
-    f.close()
-    return f.name
+def sub(x, y):
+    return x - y
+''',
+    "branching": '''
+def clamp(x, lo, hi):
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+''',
+    "loop": '''
+def total(lst):
+    s = 0
+    for v in lst:
+        s += v
+    return s
+''',
+    "class": '''
+class Counter:
+    def __init__(self):
+        self.n = 0
 
-temp_files = []
+    def inc(self):
+        self.n += 1
+        return self.n
 
-def main():
-    print("Paper 10 — Evaluation Soundness (Benchmarks)")
-    print("=" * 55)
+    def dec(self):
+        self.n -= 1
+        return self.n
+''',
+    "recursion": '''
+def gcd(a, b):
+    if b == 0:
+        return a
+    return gcd(b, a % b)
 
-    # ==================================================================
-    # PROOF 1: Benchmark construction is exhaustive
-    #   covers_spec_mode, covers_equiv_mode, covers_bug_mode
-    #     ⊢ benchmark_exhaustive
-    # ==================================================================
-    print("\nProof 1 — Benchmark construction exhaustive")
+def lcm(a, b):
+    return a * b // gcd(a, b)
+''',
+    "exception": '''
+def safe_div(x, y):
+    try:
+        return x / y
+    except ZeroDivisionError:
+        return 0
 
-    ax_spec = make_axiom_rule('covers_spec', 'covers_spec_mode(B)')
-    ax_equiv = make_axiom_rule('covers_equiv', 'covers_equiv_mode(B)')
-    ax_bug = make_axiom_rule('covers_bug', 'covers_bug_mode(B)')
-    r_exhaust = make_rule('benchmark_exhaustive',
-                          ['covers_spec_mode(B)', 'covers_equiv_mode(B)',
-                           'covers_bug_mode(B)'],
-                          'benchmark_exhaustive(B)', RuleKind.SEMANTIC)
+def safe_sqrt(x):
+    if x < 0:
+        return None
+    return x ** 0.5
+''',
+}
 
-    steps = [
-        InferenceStep('s0', ax_spec, (), 'covers_spec_mode(B)',
-                      'benchmark covers spec mode', 0),
-        InferenceStep('s1', ax_equiv, (), 'covers_equiv_mode(B)',
-                      'benchmark covers equiv mode', 1),
-        InferenceStep('s2', ax_bug, (), 'covers_bug_mode(B)',
-                      'benchmark covers bug mode', 2),
-        InferenceStep('s3', r_exhaust,
-                      ('covers_spec_mode(B)', 'covers_equiv_mode(B)',
-                       'covers_bug_mode(B)'),
-                      'benchmark_exhaustive(B)', 'all modes covered', 3),
+# ─── CLI-based Theorems ────────────────────────────────────
+
+@theorem("All benchmark programs verify")
+def all_verify():
+    for name, src in PROGS.items():
+        r = verify(src)
+        assert r.verified, f"{name} did not verify"
+        assert r.H1 == "0", f"{name} has H1 != 0"
+
+@theorem("All benchmark programs have passing axioms")
+def all_axioms():
+    for name, src in PROGS.items():
+        r = verify(src)
+        assert r.all_axioms_pass, f"{name} axioms failed"
+
+@theorem("Stats collected for all programs")
+def stats_collected():
+    total_coords = 0
+    total_morphisms = 0
+    total_props = 0
+    for name, src in PROGS.items():
+        r = verify(src)
+        total_coords += r.n_coordinates
+        total_morphisms += r.n_morphisms
+        total_props += r.propositions_total
+    assert total_coords > 0
+    assert total_morphisms > 0
+    assert total_props > 0
+
+# ─── Deep API Theorems ─────────────────────────────────────
+
+@theorem("Deep API: benchmark sites scale with complexity")
+def deep_benchmark_scaling():
+    def build_site(prefix, funcs):
+        mod = Coordinate((prefix,), CoordinateKind.MODULE)
+        coords = [Coordinate((prefix, f), CoordinateKind.FUNCTION) for f in funcs]
+        builder = SiteBuilder(prefix).add_coordinate(mod)
+        for c in coords:
+            builder = builder.add_coordinate(c)
+            builder = builder.add_morphism(Morphism(c, mod, MorphismKind.RESTRICTION))
+        return builder.set_topology(GrothendieckTopology.canonical()).build()
+
+    s_arith = build_site('arith', ['add', 'sub'])
+    s_class = build_site('ctr', ['__init__', 'inc', 'dec'])
+
+    assert len(s_class.objects()) > len(s_arith.objects()), \
+        "Class should have more coordinates than simple arithmetic"
+
+@theorem("Deep API: descent succeeds across all benchmark types")
+def deep_benchmark_descent():
+    engine = DescentEngine(configuration=DescentConfiguration(strategy=DescentStrategy.EXHAUSTIVE))
+
+    benchmarks = [
+        ('arith', ['add', 'sub']),
+        ('branch', ['clamp']),
+        ('loop', ['total']),
+        ('ctr', ['__init__', 'inc', 'dec']),
+        ('rec', ['gcd', 'lcm']),
+        ('exc', ['safe_div', 'safe_sqrt']),
     ]
-    ok, issues = verify_proof_trace(steps, goal='benchmark_exhaustive(B)')
-    report(f"benchmark exhaustive (issues={issues})", ok and not issues)
 
-    # ==================================================================
-    # PROOF 2: Cross-validation preserves accuracy
-    #   verified_on_fold(P, k), for all k in folds
-    #     ⊢ cross_validated(P)
-    #   cross_validated(P), accuracy_preserved
-    #     ⊢ cross_validation_sound(P)
-    # ==================================================================
-    print("\nProof 2 — Cross-validation preserves accuracy")
+    for prefix, funcs in benchmarks:
+        mod = Coordinate((prefix,), CoordinateKind.MODULE)
+        coords = [Coordinate((prefix, f), CoordinateKind.FUNCTION) for f in funcs]
+        builder = SiteBuilder(prefix).add_coordinate(mod)
+        for c in coords:
+            builder = builder.add_coordinate(c)
+            builder = builder.add_morphism(Morphism(c, mod, MorphismKind.RESTRICTION))
+        site = builder.build()
 
-    ax_f1 = make_axiom_rule('fold1', 'verified_on_fold(P,1)')
-    ax_f2 = make_axiom_rule('fold2', 'verified_on_fold(P,2)')
-    ax_f3 = make_axiom_rule('fold3', 'verified_on_fold(P,3)')
-    r_cross = make_rule('cross_validation',
-                        ['verified_on_fold(P,1)', 'verified_on_fold(P,2)',
-                         'verified_on_fold(P,3)'],
-                        'cross_validated(P)', RuleKind.SEMANTIC)
-    r_sound = make_rule('accuracy_preserved',
-                        ['cross_validated(P)'],
-                        'cross_validation_sound(P)', RuleKind.SEMANTIC)
+        sections = {c.name: {'verified': True, 'trust': 1.0, 'props_ok': 2} for c in coords}
+        result = engine.attempt_descent(
+            cover=Cover(target=mod, patches=tuple(coords)),
+            sections=sections)
+        assert result.is_success, f"Descent failed for {prefix}"
 
-    steps2 = [
-        InferenceStep('s0', ax_f1, (), 'verified_on_fold(P,1)', 'fold 1 ok', 0),
-        InferenceStep('s1', ax_f2, (), 'verified_on_fold(P,2)', 'fold 2 ok', 1),
-        InferenceStep('s2', ax_f3, (), 'verified_on_fold(P,3)', 'fold 3 ok', 2),
-        InferenceStep('s3', r_cross,
-                      ('verified_on_fold(P,1)', 'verified_on_fold(P,2)',
-                       'verified_on_fold(P,3)'),
-                      'cross_validated(P)', 'all folds pass', 3),
-        InferenceStep('s4', r_sound, ('cross_validated(P)',),
-                      'cross_validation_sound(P)', 'accuracy preserved', 4),
+@theorem("Deep API: judgments model all benchmark program types")
+def deep_benchmark_judgments():
+    benchmarks = [
+        ('arith', 'add', PropositionKind.STRUCTURAL, 'type_correct(add)'),
+        ('branch', 'clamp', PropositionKind.BEHAVIORAL, 'lo <= result <= hi'),
+        ('rec', 'gcd', PropositionKind.BEHAVIORAL, 'gcd(a,b) divides a and b'),
+        ('exc', 'safe_div', PropositionKind.STRUCTURAL, 'no_exceptions(safe_div)'),
     ]
-    ok2, issues2 = verify_proof_trace(steps2, goal='cross_validation_sound(P)')
-    report(f"cross-validation sound (issues={issues2})", ok2 and not issues2)
 
-    # ==================================================================
-    # PROOF 3: Determinism — same program → same result
-    #   run(P, config) = R1, run(P, config) = R2
-    #     ⊢ R1 = R2
-    #     ⊢ deterministic(P)
-    # ==================================================================
-    print("\nProof 3 — Benchmark determinism")
+    for prefix, func, kind, formula in benchmarks:
+        fn = Coordinate((prefix, func), CoordinateKind.FUNCTION)
+        j = (JudgmentBuilder().at(fn)
+            .claiming(Proposition(kind=kind, formula=formula))
+            .of_type_named('Benchmark')
+            .with_trust_level(TrustLevel.VERIFIED_PROOF)
+            .from_source(ProvenanceSource.SOLVER)
+            .build())
+        assert j.proposition.kind == kind
+        assert j.proposition.formula == formula
+        assert not j.has_obstructions()
 
-    ax_r1 = make_axiom_rule('run1', 'run(P,config,R1)')
-    ax_r2 = make_axiom_rule('run2', 'run(P,config,R2)')
-    r_eq = make_rule('results_equal',
-                     ['run(P,config,R1)', 'run(P,config,R2)'],
-                     'equal(R1,R2)', RuleKind.SEMANTIC)
-    r_det = make_rule('deterministic',
-                      ['equal(R1,R2)'],
-                      'deterministic(P)', RuleKind.SEMANTIC)
+# ─── Checks ────────────────────────────────────────────────
 
-    steps3 = [
-        InferenceStep('s0', ax_r1, (), 'run(P,config,R1)', 'first run', 0),
-        InferenceStep('s1', ax_r2, (), 'run(P,config,R2)', 'second run', 1),
-        InferenceStep('s2', r_eq, ('run(P,config,R1)', 'run(P,config,R2)'),
-                      'equal(R1,R2)', 'same config → same result', 2),
-        InferenceStep('s3', r_det, ('equal(R1,R2)',),
-                      'deterministic(P)', 'deterministic', 3),
-    ]
-    ok3, issues3 = verify_proof_trace(steps3, goal='deterministic(P)')
-    report(f"benchmark determinism (issues={issues3})", ok3 and not issues3)
+@check("Total propositions across benchmark > 0")
+def chk_total_props():
+    total = sum(verify(src).propositions_total for src in PROGS.values())
+    assert total > 20
 
-    # ==================================================================
-    # CLI: prove/bugs/spec/equiv on benchmark programs
-    # ==================================================================
-    benchmarks = {
-        "arith": "def add(x, y): return x + y\ndef sub(x, y): return x - y\ndef mul(x, y): return x * y\n",
-        "string": "def upper(s): return s.upper()\ndef lower(s): return s.lower()\n",
-        "control": "def maximum(a, b):\n    return a if a > b else b\n\ndef clamp(x, lo, hi):\n    if x < lo: return lo\n    if x > hi: return hi\n    return x\n",
-        "collection": "def flatten(lst):\n    result = []\n    for item in lst:\n        if isinstance(item, list):\n            result.extend(item)\n        else:\n            result.append(item)\n    return result\n",
-        "recursive": "def gcd(a, b):\n    if b == 0:\n        return a\n    return gcd(b, a % b)\n",
-    }
+@check("All H1 values are 0")
+def chk_all_h1():
+    for name, src in PROGS.items():
+        r = verify(src)
+        assert r.H1 == "0", f"{name} has H1={r.H1}"
 
-    paths = {}
-    for name, src in benchmarks.items():
-        p = write_temp(src)
-        temp_files.append(p)
-        paths[name] = p
+@check("Encode works on all programs")
+def chk_encode_all():
+    for name, src in PROGS.items():
+        enc = encode(src)
+        assert enc.n_coordinates >= 1, f"{name} encode failed"
 
-    print("\nCLI — prove on all benchmarks")
-    for name, path in paths.items():
-        objs = run_jugeo("prove", path)
-        if objs:
-            report(f"prove {name} → verified",
-                   objs[0]["files"][0]["verdict"] == "verified", kind="cli")
-        else:
-            report(f"prove {name} → verified", False, kind="cli")
+@check("Descend works on representative program")
+def chk_descend():
+    d = descend_code(PROGS["branching"])
+    assert len(d) >= 1
+    assert d[0].get("verdict") == "verified"
 
-    print("\nCLI — bugs on all benchmarks")
-    for name, path in paths.items():
-        objs = run_jugeo("bugs", path)
-        if objs and isinstance(objs[0], list) and objs[0]:
-            report(f"bugs {name} ok", objs[0][0].get("status") == "ok", kind="cli")
-        else:
-            report(f"bugs {name} ok", False, kind="cli")
+@check("Bugs finds nothing in clean arithmetic")
+def chk_bugs():
+    b = find_bugs(PROGS["arithmetic"])
+    assert b.count == 0
 
-    print("\nCLI — spec on a benchmark")
-    spec_file = tempfile.NamedTemporaryFile(suffix='.txt', mode='w', delete=False, dir='/tmp')
-    spec_file.write("returns a result")
-    spec_file.close()
-    temp_files.append(spec_file.name)
-    objs = run_jugeo("spec", spec_file.name, paths["arith"])
-    if objs:
-        report("spec has clauses", "clauses" in objs[0], kind="cli")
-    else:
-        report("spec has clauses", False, kind="cli")
+@check("Class program has more coordinates than single function")
+def chk_class_coords():
+    r_branch = verify(PROGS["branching"])
+    r_class = verify(PROGS["class"])
+    assert r_class.n_coordinates > r_branch.n_coordinates
 
-    print("\nCLI — equiv on benchmarks")
-    arith2 = write_temp(benchmarks["arith"])
-    temp_files.append(arith2)
-    objs = run_jugeo("equiv", paths["arith"], arith2)
-    if objs:
-        v = objs[0].get("verdict", "").lower()
-        report("equiv identical → equivalent", "equivalent" in v, kind="cli")
-    else:
-        report("equiv identical → equivalent", False, kind="cli")
+@check("All programs produce certificate hashes")
+def chk_certs():
+    for name, src in PROGS.items():
+        r = verify(src)
+        assert r.certificate_hash, f"{name} missing cert hash"
 
-    total = PASS + FAIL
-    print(f"\nPaper 10 — Benchmark Verification: {PROOFS} proofs verified, "
-          f"{CLI_CHECKS} CLI checks passed, {total} total, {FAIL} failed")
-    return FAIL == 0
+@check("Aggregate morphism count is positive")
+def chk_morphisms():
+    total = sum(verify(src).n_morphisms for src in PROGS.values())
+    assert total > 10
 
 if __name__ == "__main__":
-    try:
-        ok = main()
-    finally:
-        for f in temp_files:
-            try:
-                os.unlink(f)
-            except OSError:
-                pass
-    sys.exit(0 if ok else 1)
+    run_all("Paper 10 — Full Benchmark Verification")

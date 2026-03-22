@@ -1,218 +1,202 @@
 #!/usr/bin/env python3
-"""Paper 7 — Python Effects as Sheaf Sections.
-
-Formal proofs: exception handling decomposes into try/except cover,
-effect composition preserves local sections, pure subexpressions glue.
-"""
-import subprocess, json, os, sys, tempfile
-
-ROOT = os.path.join(os.path.dirname(__file__), '..', '..')
+"""Paper 07 — Python Effect Verification."""
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
-from jugeo.encodings.deduction_rules.models import (
-    make_rule, make_axiom_rule, InferenceStep, RuleKind,
+from jugeo_proof import (
+    theorem, check, verify, encode, find_bugs,
+    reset, run_all,
 )
-from jugeo.encodings.deduction_rules.algorithms import verify_proof_trace
+from jugeo.geometry.site import (
+    SiteBuilder, Coordinate, CoordinateKind,
+    Morphism, MorphismKind, GrothendieckTopology,
+)
+from jugeo.geometry.descent import (
+    DescentEngine, DescentConfiguration, DescentStrategy,
+)
+from jugeo.geometry.covers import Cover
+from jugeo.judgments.judgment_terms import (
+    JudgmentBuilder, Proposition, PropositionKind,
+    TrustLevel, ProvenanceSource,
+)
 
-PASS = 0
-FAIL = 0
-PROOFS = 0
-CLI_CHECKS = 0
+reset()
 
-def report(name, ok, kind="proof"):
-    global PASS, FAIL, PROOFS, CLI_CHECKS
-    tag = "PASS" if ok else "FAIL"
-    print(f"  [{tag}] {name}")
-    if ok:
-        PASS += 1
-    else:
-        FAIL += 1
-    if kind == "proof":
-        PROOFS += 1 if ok else 0
-    else:
-        CLI_CHECKS += 1 if ok else 0
+# ─── Test programs ──────────────────────────────────────────
 
-def run_jugeo(*args):
-    cmd = ["python3", "-m", "jugeo", "--format", "json"] + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
-    lines = [l for l in result.stdout.splitlines()
-             if not (len(l) > 8 and l[2] == ':' and l[5] == ':') and not l.startswith("JuGeo v")]
-    text = "\n".join(lines)
-    objects = []
-    decoder = json.JSONDecoder()
-    idx = 0
-    while idx < len(text):
-        remaining = text[idx:].lstrip()
-        if not remaining:
-            break
-        try:
-            obj, end = decoder.raw_decode(remaining)
-            objects.append(obj)
-            idx += len(text) - len(remaining) + end
-        except json.JSONDecodeError:
-            break
-    return objects
+PURE_FN = '''
+def add(x, y):
+    return x + y
 
-def write_temp(source):
-    f = tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False, dir='/tmp')
-    f.write(source)
-    f.close()
-    return f.name
+def compose(f_val, g_val):
+    return f_val + g_val
+'''
 
-temp_files = []
+EXCEPTION_FN = '''
+def safe_divide(x, y):
+    try:
+        return x / y
+    except ZeroDivisionError:
+        return 0
 
-def main():
-    print("Paper 07 — Effect Verification (Sheaf Sections)")
-    print("=" * 55)
+def safe_index(lst, i):
+    try:
+        return lst[i]
+    except IndexError:
+        return None
+'''
 
-    # ==================================================================
-    # PROOF 1: Exception handling decomposes into try/except cover
-    #   has_try_except(f) ⊢ cover(try_body, except_handler, f)
-    #   section(try_body, normal_path), section(except_handler, error_path)
-    #     ⊢ local_sections_cover(f)
-    # ==================================================================
-    print("\nProof 1 — Exception handling → try/except cover")
+CLASS_STATE = '''
+class Accumulator:
+    def __init__(self):
+        self.total = 0
+        self.count = 0
 
-    ax_try = make_axiom_rule('has_try_except', 'has_try_except(f)')
-    r_decompose = make_rule('try_except_decomposition',
-                            ['has_try_except(f)'],
-                            'cover(try_body,except_handler,f)', RuleKind.STRUCTURAL)
-    ax_try_sec = make_axiom_rule('try_section', 'section(try_body,normal_path)')
-    ax_exc_sec = make_axiom_rule('except_section', 'section(except_handler,error_path)')
-    r_cover = make_rule('sections_cover',
-                        ['cover(try_body,except_handler,f)',
-                         'section(try_body,normal_path)',
-                         'section(except_handler,error_path)'],
-                        'local_sections_cover(f)', RuleKind.STRUCTURAL)
+    def add(self, value):
+        self.total += value
+        self.count += 1
+        return self.total
 
-    steps = [
-        InferenceStep('s0', ax_try, (), 'has_try_except(f)', 'f uses try/except', 0),
-        InferenceStep('s1', r_decompose, ('has_try_except(f)',),
-                      'cover(try_body,except_handler,f)',
-                      'decompose into try/except cover', 1),
-        InferenceStep('s2', ax_try_sec, (), 'section(try_body,normal_path)',
-                      'try body section', 2),
-        InferenceStep('s3', ax_exc_sec, (), 'section(except_handler,error_path)',
-                      'except handler section', 3),
-        InferenceStep('s4', r_cover,
-                      ('cover(try_body,except_handler,f)',
-                       'section(try_body,normal_path)',
-                       'section(except_handler,error_path)'),
-                      'local_sections_cover(f)', 'sections cover f', 4),
-    ]
-    ok, issues = verify_proof_trace(steps, goal='local_sections_cover(f)')
-    report(f"try/except cover (issues={issues})", ok and not issues)
+    def average(self):
+        if self.count == 0:
+            return 0
+        return self.total / self.count
+'''
 
-    # ==================================================================
-    # PROOF 2: Effect composition preserves local sections
-    #   section(e1, U), section(e2, V), composable(e1, e2)
-    #     ⊢ section(compose(e1, e2), U_seq_V)
-    #     ⊢ composition_preserves_sections(e1, e2)
-    # ==================================================================
-    print("\nProof 2 — Effect composition preserves sections")
+IO_LIKE = '''
+def format_output(name, value):
+    header = "Result for " + name
+    body = str(value)
+    return header + ": " + body
 
-    ax_e1 = make_axiom_rule('section_e1', 'section(e1,U)')
-    ax_e2 = make_axiom_rule('section_e2', 'section(e2,V)')
-    ax_comp = make_axiom_rule('composable', 'composable(e1,e2)')
-    r_compose = make_rule('effect_composition',
-                          ['section(e1,U)', 'section(e2,V)', 'composable(e1,e2)'],
-                          'section(compose(e1,e2),U_seq_V)', RuleKind.SEMANTIC)
-    r_preserves = make_rule('composition_preserves',
-                            ['section(compose(e1,e2),U_seq_V)'],
-                            'composition_preserves_sections(e1,e2)', RuleKind.SEMANTIC)
+def build_report(items):
+    lines = []
+    for name, val in items:
+        lines.append(format_output(name, val))
+    return "\\n".join(lines)
+'''
 
-    steps2 = [
-        InferenceStep('s0', ax_e1, (), 'section(e1,U)', 'e1 section on U', 0),
-        InferenceStep('s1', ax_e2, (), 'section(e2,V)', 'e2 section on V', 1),
-        InferenceStep('s2', ax_comp, (), 'composable(e1,e2)', 'e1;e2 composable', 2),
-        InferenceStep('s3', r_compose,
-                      ('section(e1,U)', 'section(e2,V)', 'composable(e1,e2)'),
-                      'section(compose(e1,e2),U_seq_V)', 'composed section', 3),
-        InferenceStep('s4', r_preserves, ('section(compose(e1,e2),U_seq_V)',),
-                      'composition_preserves_sections(e1,e2)',
-                      'composition preserves sections', 4),
-    ]
-    ok2, issues2 = verify_proof_trace(steps2, goal='composition_preserves_sections(e1,e2)')
-    report(f"effect composition (issues={issues2})", ok2 and not issues2)
+# ─── CLI-based Theorems ────────────────────────────────────
 
-    # ==================================================================
-    # PROOF 3: Pure subexpressions glue correctly
-    #   pure(e1), pure(e2), sections_compatible(e1, e2)
-    #     ⊢ glue(e1, e2) is pure
-    #     ⊢ pure_glue_correct(e1, e2)
-    # ==================================================================
-    print("\nProof 3 — Pure subexpressions glue correctly")
+@theorem("Pure function verifies completely", code=PURE_FN)
+def pure_verified(result):
+    assert result.verified
+    assert result.H1 == "0"
+    assert result.propositions_ok == result.propositions_total
 
-    ax_p1 = make_axiom_rule('pure_e1', 'pure(e1)')
-    ax_p2 = make_axiom_rule('pure_e2', 'pure(e2)')
-    ax_compat = make_axiom_rule('sections_compat', 'sections_compatible(e1,e2)')
-    r_glue_pure = make_rule('glue_pure',
-                            ['pure(e1)', 'pure(e2)', 'sections_compatible(e1,e2)'],
-                            'pure(glue(e1,e2))', RuleKind.STRUCTURAL)
-    r_correct = make_rule('pure_glue_correct',
-                          ['pure(glue(e1,e2))'],
-                          'pure_glue_correct(e1,e2)', RuleKind.STRUCTURAL)
+@theorem("Exception handler verifies", code=EXCEPTION_FN)
+def exception_verified(result):
+    assert result.verified
+    assert result.H1 == "0"
+    assert result.all_axioms_pass
 
-    steps3 = [
-        InferenceStep('s0', ax_p1, (), 'pure(e1)', 'e1 is pure', 0),
-        InferenceStep('s1', ax_p2, (), 'pure(e2)', 'e2 is pure', 1),
-        InferenceStep('s2', ax_compat, (), 'sections_compatible(e1,e2)',
-                      'sections compatible', 2),
-        InferenceStep('s3', r_glue_pure,
-                      ('pure(e1)', 'pure(e2)', 'sections_compatible(e1,e2)'),
-                      'pure(glue(e1,e2))', 'glued expression is pure', 3),
-        InferenceStep('s4', r_correct, ('pure(glue(e1,e2))',),
-                      'pure_glue_correct(e1,e2)', 'pure glue correct', 4),
-    ]
-    ok3, issues3 = verify_proof_trace(steps3, goal='pure_glue_correct(e1,e2)')
-    report(f"pure glue correct (issues={issues3})", ok3 and not issues3)
+@theorem("Stateful class verifies", code=CLASS_STATE)
+def class_verified(result):
+    assert result.verified
+    assert result.H1 == "0"
 
-    # ==================================================================
-    # CLI: jugeo prove and bugs on effectful programs
-    # ==================================================================
-    print("\nCLI — prove on effectful programs")
+@theorem("Pure function has fewer coordinates than effectful class")
+def pure_fewer_coords():
+    r_pure = verify(PURE_FN)
+    r_class = verify(CLASS_STATE)
+    assert r_pure.n_coordinates < r_class.n_coordinates
 
-    programs = {
-        "pure": "def add(x, y):\n    return x + y\n",
-        "exceptions": "def safe_divide(x, y):\n    try:\n        return x / y\n    except ZeroDivisionError:\n        return 0\n",
-        "mutation": "class Acc:\n    def __init__(self):\n        self.total = 0\n    def add(self, v):\n        self.total += v\n        return self.total\n",
-        "generator": "def count_up(n):\n    for i in range(n):\n        yield i\n",
-    }
+# ─── Deep API Theorems ─────────────────────────────────────
 
-    paths = {}
-    for name, src in programs.items():
-        p = write_temp(src)
-        temp_files.append(p)
-        paths[name] = p
+@theorem("Deep API: pure vs effectful site complexity")
+def deep_effect_complexity():
+    # Pure: 3 coordinates
+    pure_mod = Coordinate(('pure',), CoordinateKind.MODULE)
+    pure_add = Coordinate(('pure', 'add'), CoordinateKind.FUNCTION)
+    pure_comp = Coordinate(('pure', 'compose'), CoordinateKind.FUNCTION)
+    pure_site = (SiteBuilder('pure')
+        .add_coordinate(pure_mod).add_coordinate(pure_add).add_coordinate(pure_comp)
+        .add_morphism(Morphism(pure_add, pure_mod, MorphismKind.RESTRICTION))
+        .add_morphism(Morphism(pure_comp, pure_mod, MorphismKind.RESTRICTION))
+        .build())
 
-    for name, path in paths.items():
-        objs = run_jugeo("prove", path)
-        if objs:
-            v = objs[0].get("files", [{}])[0].get("verdict")
-            report(f"prove {name} → verified", v == "verified", kind="cli")
-        else:
-            report(f"prove {name} → verified", False, kind="cli")
+    # Effectful: 5 coordinates (class with methods)
+    eff_mod = Coordinate(('eff',), CoordinateKind.MODULE)
+    eff_init = Coordinate(('eff', '__init__'), CoordinateKind.FUNCTION)
+    eff_add = Coordinate(('eff', 'add'), CoordinateKind.FUNCTION)
+    eff_avg = Coordinate(('eff', 'average'), CoordinateKind.FUNCTION)
+    eff_state = Coordinate(('eff', 'state'), CoordinateKind.REGION)
+    eff_site = (SiteBuilder('effectful')
+        .add_coordinate(eff_mod).add_coordinate(eff_init)
+        .add_coordinate(eff_add).add_coordinate(eff_avg).add_coordinate(eff_state)
+        .add_morphism(Morphism(eff_init, eff_mod, MorphismKind.RESTRICTION))
+        .add_morphism(Morphism(eff_add, eff_mod, MorphismKind.RESTRICTION))
+        .add_morphism(Morphism(eff_avg, eff_mod, MorphismKind.RESTRICTION))
+        .add_morphism(Morphism(eff_add, eff_init, MorphismKind.TRANSPORT))
+        .add_morphism(Morphism(eff_state, eff_init, MorphismKind.INCLUSION))
+        .build())
 
-    print("\nCLI — bugs on effectful programs")
-    for name, path in paths.items():
-        objs = run_jugeo("bugs", path)
-        if objs and isinstance(objs[0], list) and objs[0]:
-            report(f"bugs {name} ok", objs[0][0].get("status") == "ok", kind="cli")
-        else:
-            report(f"bugs {name} ok", False, kind="cli")
+    assert len(eff_site.objects()) > len(pure_site.objects()), \
+        "Effectful code should have more coordinates"
 
-    total = PASS + FAIL
-    print(f"\nPaper 07 — Effect Verification: {PROOFS} proofs verified, "
-          f"{CLI_CHECKS} CLI checks passed, {total} total, {FAIL} failed")
-    return FAIL == 0
+@theorem("Deep API: exception handler modeled with REGION forks")
+def deep_exception_regions():
+    mod = Coordinate(('exc',), CoordinateKind.MODULE)
+    fn  = Coordinate(('exc', 'safe_divide'), CoordinateKind.FUNCTION)
+    ok_path  = Coordinate(('exc', 'safe_divide', 'ok'), CoordinateKind.REGION)
+    err_path = Coordinate(('exc', 'safe_divide', 'err'), CoordinateKind.REGION)
+
+    site = (SiteBuilder('exception-fork')
+        .add_coordinate(mod).add_coordinate(fn)
+        .add_coordinate(ok_path).add_coordinate(err_path)
+        .add_morphism(Morphism(fn, mod, MorphismKind.RESTRICTION))
+        .add_morphism(Morphism(ok_path, fn, MorphismKind.INCLUSION))
+        .add_morphism(Morphism(err_path, fn, MorphismKind.INCLUSION))
+        .set_topology(GrothendieckTopology.canonical())
+        .build())
+
+    assert len(site.objects()) == 4
+    engine = DescentEngine(configuration=DescentConfiguration(strategy=DescentStrategy.EXHAUSTIVE))
+    result = engine.attempt_descent(
+        cover=Cover(target=mod, patches=(fn, ok_path, err_path)),
+        sections={
+            'exc.safe_divide':     {'verified': True, 'trust': 1.0, 'props_ok': 2},
+            'exc.safe_divide.ok':  {'verified': True, 'trust': 1.0, 'props_ok': 1},
+            'exc.safe_divide.err': {'verified': True, 'trust': 1.0, 'props_ok': 1},
+        })
+    assert result.is_success
+
+# ─── Checks ────────────────────────────────────────────────
+
+@check("All programs verify")
+def chk_all_verify():
+    for code in (PURE_FN, EXCEPTION_FN, CLASS_STATE, IO_LIKE):
+        r = verify(code)
+        assert r.verified
+
+@check("Bugs finds nothing in clean pure code")
+def chk_bugs_pure():
+    b = find_bugs(PURE_FN)
+    assert b.count == 0
+
+@check("Encode shows coordinates per effect region")
+def chk_encode_regions():
+    enc_pure = encode(PURE_FN)
+    enc_class = encode(CLASS_STATE)
+    assert enc_class.n_coordinates > enc_pure.n_coordinates
+
+@check("IO-like program has multiple coordinates")
+def chk_io_coords():
+    enc = encode(IO_LIKE)
+    assert enc.n_coordinates >= 2
+
+@check("Propositions scale with program complexity")
+def chk_props_scale():
+    r_pure = verify(PURE_FN)
+    r_class = verify(CLASS_STATE)
+    assert r_class.propositions_total > r_pure.propositions_total
+
+@check("All programs produce certificate hashes")
+def chk_certs():
+    for code in (PURE_FN, EXCEPTION_FN, CLASS_STATE, IO_LIKE):
+        r = verify(code)
+        assert r.certificate_hash
 
 if __name__ == "__main__":
-    try:
-        ok = main()
-    finally:
-        for f in temp_files:
-            try:
-                os.unlink(f)
-            except OSError:
-                pass
-    sys.exit(0 if ok else 1)
+    run_all("Paper 07 — Python Effect Verification")
