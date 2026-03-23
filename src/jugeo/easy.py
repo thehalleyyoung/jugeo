@@ -359,6 +359,101 @@ def equiv(source_a: str, source_b: str) -> EquivResult:
     )
 
 
+def _spec_direct(source: str, payload: dict) -> SpecResult:
+    """Run spec check in-process using benchmarks.semantics primitives.
+
+    This bypasses the CLI subprocess and directly executes the spec function
+    against each cover point, matching the logic in cmd_spec._run_runtime_cover_pipeline.
+    """
+    from jugeo.benchmarks.models import InputPoint
+    from jugeo.benchmarks.semantics import call_fresh, load_function
+
+    spec_program: str = payload["spec_program"]
+    input_cover: list = payload["input_cover"]
+    fn_name: str = payload.get("entrypoint", "solve")
+    spec_fn_name: str = payload.get("spec_function", "spec")
+
+    points = tuple(InputPoint.from_dict(item) for item in input_cover)
+    spec_fn = load_function(spec_program, spec_fn_name)
+
+    clauses: list[dict] = []
+    obstructions: list[str] = []
+    witnesses: list[dict] = []
+    residuals: list[str] = []
+    satisfied_count = 0
+
+    for index, point in enumerate(points):
+        text = f"{fn_name} respects {spec_fn_name} on cover[{index}]"
+        outcome = call_fresh(source, fn_name, point)
+        passed = False
+        detail = ""
+
+        if outcome.tag != "return":
+            detail = (
+                f"{fn_name} produced {outcome.tag}={outcome.value!r} "
+                f"for declared cover[{index}]"
+            )
+        else:
+            try:
+                spec_result = spec_fn(outcome.value, *point.args, **point.kwargs)
+                if isinstance(spec_result, bool):
+                    passed = spec_result
+                    if passed:
+                        detail = (
+                            f"result={outcome.value!r} accepted on cover[{index}]"
+                        )
+                    else:
+                        detail = (
+                            f"{spec_fn_name} returned False for "
+                            f"result={outcome.value!r} on cover[{index}]"
+                        )
+                else:
+                    detail = (
+                        f"{spec_fn_name} returned {type(spec_result).__name__}, "
+                        f"not bool, on cover[{index}]"
+                    )
+            except Exception as exc:
+                detail = (
+                    f"{spec_fn_name} raised {type(exc).__name__}: {exc} "
+                    f"on cover[{index}]"
+                )
+
+        if passed:
+            satisfied_count += 1
+        else:
+            obstructions.append(f"cover[{index}]: {detail}")
+            residuals.append(f"obligation at cover[{index}]: {detail}")
+            witnesses.append({
+                "cover_index": index,
+                "input_point": point.to_dict(),
+                "outcome": {"tag": outcome.tag, "value": outcome.value},
+                "detail": detail,
+            })
+
+        clauses.append({
+            "text": text,
+            "pass": passed,
+            "status": "SETTLED" if passed else "FAIL",
+            "detail": detail,
+            "input_point": point.to_dict(),
+        })
+
+    total = len(points) or 1
+    satisfied = satisfied_count == total
+    trust = round(satisfied_count / total, 4)
+
+    return SpecResult(
+        satisfied=satisfied,
+        trust_level=trust,
+        clauses=clauses,
+        witnesses=witnesses,
+        obstructions=obstructions,
+        residual_obligations=residuals,
+        mode="runtime-declared-cover",
+        raw=[],
+    )
+
+
 def spec(
     source: str,
     specification: str | dict,
@@ -383,6 +478,15 @@ def spec(
     payload.setdefault("spec_function", spec_function)
     if description and "description" not in payload:
         payload["description"] = description
+
+    # Fast path: run directly in-process when spec_program and input_cover
+    # are present. This avoids subprocess import failures that cause the
+    # runtime cover pipeline to silently fall back to AST-only checking.
+    if "spec_program" in payload and "input_cover" in payload:
+        try:
+            return _spec_direct(source, payload)
+        except Exception:
+            pass
 
     source_path = _tmp(source)
     spec_file = tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False)
@@ -478,3 +582,59 @@ def carry(source: str, **kwargs) -> tuple[str, dict]:
         "trust_algebra_ok": result.trust_algebra_ok,
     }
     return source, cert
+
+
+def research(
+    prompt: str,
+    *,
+    max_iterations: int = 30,
+    max_pivots: int = 3,
+    output_dir: str | None = None,
+    no_llm: bool = False,
+    seed: int | None = None,
+    verbose: bool = False,
+):
+    """Run a full directed research loop from a natural-language prompt.
+
+    Given a high-level idea like "build a killer app in finance using
+    advanced math", this function:
+
+    1. Ideates a novel mathematical approach (cross-tradition synthesis)
+    2. Designs a software plan (covering family decomposition)
+    3. Generates code (local sections on each module)
+    4. Establishes benchmarks and baselines (evidence sections)
+    5. Evaluates via workspace descent (consistency check)
+    6. Refines or pivots until competitive and consistent
+    7. Writes README.md and conference_tool_track.tex/.pdf
+
+    Every step is a semantic move on the workspace site (T, R, E, P).
+
+    Example::
+
+        from jugeo.easy import research
+
+        result = research(
+            "Build a Python tool that uses tropical geometry to optimize supply chains",
+            max_iterations=20,
+        )
+        print(result)
+        # DirectedResearchResult(
+        #   status=converged,
+        #   approach='tropical-supply-optimization',
+        #   code_files=7,
+        #   consistency=ConsistencyReport(CONSISTENT, ...),
+        #   iterations=12,
+        # )
+    """
+    from jugeo.directed_research import DirectedResearch
+
+    dr = DirectedResearch(
+        prompt=prompt,
+        max_iterations=max_iterations,
+        max_pivots=max_pivots,
+        output_dir=output_dir,
+        no_llm=no_llm,
+        seed=seed,
+        verbose=verbose,
+    )
+    return dr.run()

@@ -26,9 +26,9 @@ except ImportError:  # pragma: no cover
     solve = None
 
 try:
-    from jugeo.easy import prove, bugs, equiv, ideate, carry, spec  # type: ignore[import-untyped]
+    from jugeo.easy import prove, bugs, equiv, ideate, carry, spec, research  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover
-    prove = bugs = equiv = ideate = carry = spec = None
+    prove = bugs = equiv = ideate = carry = spec = research = None
 
 __all__ = [
     "GeometricSite",
@@ -43,6 +43,7 @@ __all__ = [
     "spec",
     "ideate",
     "carry",
+    "research",
 ]
 
 

@@ -333,6 +333,26 @@ def _cmd_prove(args: argparse.Namespace) -> int:
 
 
 # ===========================================================================
+# Subcommand: research
+# ===========================================================================
+
+def _cmd_research(args: argparse.Namespace) -> int:
+    from jugeo.directed_research import DirectedResearch
+    dr = DirectedResearch(
+        prompt=args.prompt,
+        max_iterations=getattr(args, 'max_iterations', 30),
+        max_pivots=getattr(args, 'max_pivots', 3),
+        output_dir=getattr(args, 'output', None),
+        no_llm=getattr(args, 'no_llm', False),
+        seed=getattr(args, 'seed', None),
+        verbose=getattr(args, 'verbose', False),
+    )
+    result = dr.run()
+    print(result)
+    return 0 if result.success else 1
+
+
+# ===========================================================================
 # Subcommand: descend
 # ===========================================================================
 
@@ -625,6 +645,17 @@ def _build_parser() -> argparse.ArgumentParser:
     from jugeo.cli import cmd_orchestrate
     p_orch = cmd_orchestrate.add_subparser(subs)
     p_orch.set_defaults(func=_cmd_orchestrate)
+
+    # -- research --
+    p_research = subs.add_parser("research",
+        help="Directed research: prompt → ideate → implement → benchmark → refine → paper.")
+    p_research.add_argument("prompt", help="Natural-language research prompt.")
+    p_research.add_argument("--max-iterations", type=int, default=30,
+                            help="Maximum refinement iterations (default: 30).")
+    p_research.add_argument("--max-pivots", type=int, default=3,
+                            help="Maximum theory pivots (default: 3).")
+    p_research.add_argument("--seed", type=int, default=None, help="Random seed.")
+    p_research.set_defaults(func=_cmd_research)
 
     return parser
 
