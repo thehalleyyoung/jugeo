@@ -67,11 +67,104 @@ except ImportError:
     ]
 
 try:
-    from jugeo.ideation.synthesis_frontier.fields import ALL_48_FIELDS
+    from jugeo.ideation.synthesis_frontier.fields import ALL_128_FIELDS
     _FIELDS_AVAILABLE = True
 except ImportError:
-    _FIELDS_AVAILABLE = False
-    ALL_48_FIELDS = []
+    try:
+        from jugeo.ideation.synthesis_frontier.fields import ALL_48_FIELDS as ALL_128_FIELDS
+        _FIELDS_AVAILABLE = True
+    except ImportError:
+        _FIELDS_AVAILABLE = False
+        ALL_128_FIELDS = []
+
+# Mathematical tradition categories — fields within the same tradition
+# are too close to produce genuinely novel syntheses.
+# Covers all 128 fields in the expanded catalog.
+_FIELD_TRADITION: dict[str, str] = {
+    # Logic & Foundations
+    "Type Theory": "logic", "Category Theory": "logic",
+    "Homotopy Type Theory": "logic", "Topos Theory": "logic",
+    "Model Theory": "logic", "Proof Theory": "logic",
+    "Recursion Theory": "logic", "Lambda Calculus": "logic",
+    "Linear Logic": "logic", "Modal Logic": "logic",
+    "Dependent Type Theory": "logic", "Formal Languages": "logic",
+    "Automata Theory": "logic", "Applied Category Theory": "logic",
+    # Algebra (pure)
+    "Representation Theory": "algebra", "Lie Theory": "algebra",
+    "Universal Algebra": "algebra", "Homological Algebra": "algebra",
+    "K-Theory": "algebra", "Commutative Algebra": "algebra",
+    "Ring Theory": "algebra", "Field Theory": "algebra",
+    "Galois Theory": "algebra", "Quadratic Forms": "algebra",
+    # Analysis & PDE
+    "Functional Analysis": "analysis", "Operator Algebras": "analysis",
+    "Harmonic Analysis": "analysis", "PDE Theory": "analysis",
+    "Distribution Theory": "analysis", "Microlocal Analysis": "analysis",
+    "Several Complex Variables": "analysis", "Potential Theory": "analysis",
+    "Banach Space Theory": "analysis", "Spectral Theory": "analysis",
+    "Variational Calculus": "analysis", "Nonlinear Analysis": "analysis",
+    "Measure Theory": "analysis",
+    # Geometry & Topology
+    "Algebraic Topology": "geometry", "Differential Geometry": "geometry",
+    "Algebraic Geometry": "geometry", "Symplectic Geometry": "geometry",
+    "Poisson Geometry": "geometry", "Cobordism Theory": "geometry",
+    "Noncommutative Geometry": "geometry", "Riemannian Geometry": "geometry",
+    "Geometric Analysis": "geometry", "Convex Geometry": "geometry",
+    "Discrete Geometry": "geometry", "Geometric Group Theory": "geometry",
+    "Metric Geometry": "geometry", "Sub-Riemannian Geometry": "geometry",
+    "Geometric Measure Theory": "geometry",
+    # Arithmetic / Number Theory
+    "Number Theory": "arithmetic", "Arithmetic Geometry": "arithmetic",
+    "Etale Cohomology": "arithmetic", "Motivic Cohomology": "arithmetic",
+    "Tropical Geometry": "arithmetic", "Analytic Number Theory": "arithmetic",
+    "Algebraic Number Theory": "arithmetic",
+    "Diophantine Geometry": "arithmetic", "Modular Forms": "arithmetic",
+    # Combinatorics / Discrete
+    "Combinatorics": "discrete", "Graph Theory": "discrete",
+    "Matroid Theory": "discrete", "Order Theory": "discrete",
+    "Lattice Theory": "discrete", "Additive Combinatorics": "discrete",
+    "Extremal Combinatorics": "discrete", "Ramsey Theory": "discrete",
+    "Design Theory": "discrete",
+    # Probability / Statistics
+    "Probability Theory": "probability", "Stochastic Processes": "probability",
+    "Random Matrix Theory": "probability", "Percolation Theory": "probability",
+    "Stochastic PDE": "probability", "Rough Path Theory": "probability",
+    "Malliavin Calculus": "probability", "Extreme Value Theory": "probability",
+    "High-Dimensional Statistics": "probability",
+    "Concentration Inequalities": "probability",
+    # Physics (mathematical)
+    "Statistical Mechanics": "physics", "Quantum Mechanics": "physics",
+    "Quantum Field Theory": "physics", "String Theory": "physics",
+    "General Relativity": "physics", "Higher Gauge Theory": "physics",
+    "Integrable Systems": "physics", "Soliton Theory": "physics",
+    "Kinetic Theory": "physics", "Celestial Mechanics": "physics",
+    "Conformal Field Theory": "physics",
+    "Topological Quantum Computation": "physics",
+    "Mathematical Fluid Mechanics": "physics",
+    # Information / CS / Complexity
+    "Information Theory": "cs", "Complexity Theory": "cs",
+    "Coding Theory": "cs", "Cryptography": "cs",
+    "Computability Theory": "cs", "Descriptive Complexity": "cs",
+    "Circuit Complexity": "cs", "Algorithmic Game Theory": "cs",
+    "Distributed Computing Theory": "cs",
+    # Applied Mathematics
+    "Numerical Analysis": "applied", "Approximation Theory": "applied",
+    "Control Theory": "applied", "Optimization Theory": "applied",
+    "Signal Processing": "applied", "Dynamical Systems": "applied",
+    "Mathematical Biology": "applied", "Operations Research": "applied",
+    "Game Theory": "applied", "Mechanism Design": "applied",
+    "Computational Geometry": "applied", "Finite Element Methods": "applied",
+    "Fluid Dynamics": "applied", "Elasticity Theory": "applied",
+    "Epidemiological Modeling": "applied",
+    # Emerging / Interdisciplinary / Data
+    "Topological Data Analysis": "data", "Persistent Homology": "data",
+    "Geometric Deep Learning": "data", "Quantum Information Theory": "data",
+    "Mathematical Neuroscience": "data",
+    "Computational Algebraic Geometry": "data",
+    "Random Geometry": "data", "Ergodic Theory": "data",
+    # Higher categorical structures
+    "Infinity Categories": "higher_cat", "Derived Categories": "higher_cat",
+    "Perverse Sheaves": "higher_cat",
+}
 
 # FieldNode stub (also imported below from the real module if available)
 try:
@@ -1334,11 +1427,19 @@ class FoundationPipeline:
 
         self._log("  Sampled %d areas from taxonomy (%d available).", len(sampled_areas), len(all_areas))
 
-        # Build initial FieldNode seeds (oversample for novelty filtering)
-        oversample = max(self._n_fields * 3, 6)
+        # Build initial FieldNode seeds (oversample for viability filtering)
+        # Use 6x oversample from 128 fields to ensure cross-tradition diversity
+        oversample = max(self._n_fields * 6, 12)
         seed_fields = self._build_seed_fields(sampled_areas, oversample)
 
-        self._log("  Built %d seed FieldNodes (oversampled for novelty filter).", len(seed_fields))
+        # Ensure seeds span at least 4 different traditions
+        traditions_seen = set()
+        for f in seed_fields:
+            name = getattr(f, "name", "")
+            trad = _FIELD_TRADITION.get(name, "unknown")
+            traditions_seen.add(trad)
+        self._log("  Built %d seed FieldNodes spanning %d traditions.",
+                  len(seed_fields), len(traditions_seen))
 
         # --- Novelty gate: filter to genuinely unexplored pairs ---
         seed_fields = self._novelty_filter(seed_fields, self._n_fields)
@@ -1473,7 +1574,7 @@ class FoundationPipeline:
     def _build_seed_fields(self, areas: list[str], n: int) -> list[Any]:
         """Create FieldNode seeds from sampled taxonomy area names.
 
-        If the pre-built ALL_48_FIELDS list is available and large enough,
+        If the pre-built ALL_128_FIELDS list is available and large enough,
         sample from it; otherwise build stubs from the taxonomy strings.
 
         Parameters
@@ -1488,9 +1589,10 @@ class FoundationPipeline:
         list[FieldNode]
             Seed nodes for the tournament.
         """
-        if _FIELDS_AVAILABLE and len(ALL_48_FIELDS) >= n:
-            self._rng.shuffle(ALL_48_FIELDS)
-            return ALL_48_FIELDS[:n]
+        if _FIELDS_AVAILABLE and len(ALL_128_FIELDS) >= n:
+            pool = list(ALL_128_FIELDS)
+            self._rng.shuffle(pool)
+            return pool[:n]
 
         # Build stubs from taxonomy strings
         fields: list[Any] = []
@@ -1539,12 +1641,11 @@ class FoundationPipeline:
     ) -> list[Any]:
         """Score candidate pairs on novelty, CLI utility, and foundational depth.
 
-        Generates candidate pairs, asks the LLM to rate each on three axes:
-          1. Novelty — has this bridge been studied before?
-          2. CLI utility — could the synthesis power a concrete, useful tool?
-          3. Foundational potential — could this become a real area of mathematics?
+        Enforces that paired fields come from DIFFERENT mathematical traditions
+        (e.g. cannot pair two algebra fields) and requires genuinely empty
+        intersections — the LLM must confirm no named theorems exist at
+        the bridge.
 
-        The composite score determines which fields enter the tournament.
         Falls back to random selection when --no-llm is set.
         """
         import itertools
@@ -1553,51 +1654,74 @@ class FoundationPipeline:
             return candidates
 
         names = [getattr(f, "name", str(f)) for f in candidates]
-        pairs = list(itertools.combinations(range(len(candidates)), 2))
-        self._rng.shuffle(pairs)
-        pairs = pairs[:15]
+
+        # --- Pre-filter: only allow pairs from DIFFERENT traditions ---
+        traditions = [_FIELD_TRADITION.get(n, "unknown") for n in names]
+        all_pairs = list(itertools.combinations(range(len(candidates)), 2))
+        cross_tradition_pairs = [
+            (i, j) for i, j in all_pairs
+            if traditions[i] != traditions[j]
+        ]
+
+        if not cross_tradition_pairs:
+            self._log("  WARNING: no cross-tradition pairs found; allowing all pairs.")
+            cross_tradition_pairs = all_pairs
+
+        self._rng.shuffle(cross_tradition_pairs)
+        pairs = cross_tradition_pairs[:20]
 
         if self._no_llm:
+            # Even without LLM, enforce cross-tradition
+            if cross_tradition_pairs:
+                best_i, best_j = cross_tradition_pairs[0]
+                selected = [candidates[best_i], candidates[best_j]]
+                for c in candidates:
+                    if c not in selected and len(selected) < n_keep:
+                        selected.append(c)
+                return selected
             self._rng.shuffle(candidates)
             return candidates[:n_keep]
 
         pair_lines = []
         for idx, (i, j) in enumerate(pairs, 1):
-            pair_lines.append(f"  {idx}. {names[i]} × {names[j]}")
+            pair_lines.append(
+                f"  {idx}. {names[i]} ({traditions[i]}) × {names[j]} ({traditions[j]})"
+            )
 
         prompt = (
             "You are a research mathematician AND software architect evaluating\n"
             "proposed cross-field syntheses. For each pair, rate THREE dimensions (1-5):\n\n"
-            "NOVELTY — Has this bridge been studied before?\n"
-            "  1 = Well-known subfield (e.g. Algebraic Geometry × Number Theory = Arithmetic Geometry)\n"
-            "  2 = Established connection with active literature\n"
-            "  3 = Some known links, but large unexplored territory\n"
-            "  4 = Sparse/emerging connections, mostly terra incognita\n"
-            "  5 = Essentially no existing literature bridging these\n\n"
+            "NOVELTY — Is this intersection genuinely unexplored?\n"
+            "  1 = Well-known subfield or essentially the same field\n"
+            "      (e.g. Algebraic Geometry × Number Theory = Arithmetic Geometry)\n"
+            "  2 = Established connection with named theorems/papers at the bridge\n"
+            "  3 = Some known links, but large unexplored computational territory\n"
+            "  4 = Very sparse connections; you cannot name more than 1-2 papers\n"
+            "  5 = No existing literature bridging these; genuinely terra incognita\n\n"
+            "  CRITICAL: If you can name ANY theorem, textbook, or well-known\n"
+            "  researcher who worked specifically on this intersection, score ≤ 2.\n"
+            "  If they share a Wikipedia article or named subfield, score 1.\n\n"
             "UTILITY — Could this synthesis power a *concrete, useful* CLI tool?\n"
             "  Think: what data would it take as input, what would it compute,\n"
             "  who would use it? Not 'a tool that does math' but a tool that\n"
             "  solves a real problem no single-field tool can.\n"
             "  1 = No obvious computational application\n"
-            "  2 = Vaguely useful, hard to imagine concrete I/O\n"
             "  3 = Plausible tool with moderate audience\n"
-            "  4 = Clear tool with specific users and concrete I/O\n"
             "  5 = Killer app: solves an important problem, obvious demand\n\n"
             "FOUNDATIONAL — Could this become a genuine new area of mathematics?\n"
-            "  Not just 'apply X to Y' but a real two-way bridge with its own theorems.\n"
-            "  1 = One field trivially subsumes the other, or connection is superficial\n"
-            "  2 = One-directional application (X applied to Y, no feedback)\n"
-            "  3 = Some bidirectional structure, a few non-trivial bridge theorems\n"
-            "  4 = Rich bidirectional structure, multiple deep theorems possible\n"
+            "  1 = Superficial connection, one field trivially subsumes the other\n"
+            "  3 = Bidirectional structure, a few deep bridge theorems possible\n"
             "  5 = Clearly a new field: own objects, own questions, own methods\n\n"
-            "BE STRICT. Most pairs should score ≤2 on novelty. 'Arithmetic Geometry ×\n"
-            "Etale Cohomology' is novelty=1 (that IS algebraic number theory). 'Order\n"
-            "Theory × Algebraic Topology' is novelty=2 (Alexandroff spaces are classical).\n\n"
+            "BE VERY STRICT on novelty. We want pairs where there are NO NAMED\n"
+            "THEOREMS in the intersection. Most well-known pairs should score 1-2.\n"
+            "Only score ≥4 if you genuinely cannot think of prior work connecting them.\n\n"
             "Pairs to evaluate:\n"
             + "\n".join(pair_lines) + "\n\n"
             "Return ONLY a JSON array:\n"
             '[{"pair": 1, "novelty": 4, "utility": 5, "foundational": 4,\n'
-            '  "tool_idea": "one-line tool concept", "reason": "why novel+useful+deep"}, ...]\n'
+            '  "tool_idea": "one-line tool concept",\n'
+            '  "known_work": "name any known theorems/papers at this intersection, or NONE",\n'
+            '  "reason": "why novel+useful+deep"}, ...]\n'
             "One object per pair. Return ONLY valid JSON.\n"
         )
 
@@ -1607,11 +1731,18 @@ class FoundationPipeline:
             raw = re.sub(r"\n?```\s*$", "", raw.strip())
             ratings = json.loads(raw)
         except Exception as exc:
-            self._log("  Viability check failed (%s); using random selection.", exc)
+            self._log("  Viability check failed (%s); using random cross-tradition pair.", exc)
+            if cross_tradition_pairs:
+                best_i, best_j = cross_tradition_pairs[0]
+                selected = [candidates[best_i], candidates[best_j]]
+                for c in candidates:
+                    if c not in selected and len(selected) < n_keep:
+                        selected.append(c)
+                return selected
             self._rng.shuffle(candidates)
             return candidates[:n_keep]
 
-        # Score each pair: composite = novelty + utility + foundational
+        # Score each pair: REQUIRE novelty ≥ 3, strongly prefer ≥ 4
         scored: list[tuple[int, int, float, dict]] = []
         for entry in ratings:
             try:
@@ -1621,34 +1752,49 @@ class FoundationPipeline:
                 found = int(entry.get("foundational", 1))
                 if 0 <= pair_idx < len(pairs):
                     i, j = pairs[pair_idx]
-                    # Composite: all three matter, but penalize hard if any is ≤1
+                    # Composite scoring with novelty floor
                     composite = (nov + util + found) / 3.0
+                    # Hard penalty: if novelty ≤ 2, this pair is not novel enough
+                    if nov <= 2:
+                        composite *= 0.4
+                    # Penalty if any dimension is terrible
                     if min(nov, util, found) <= 1:
-                        composite *= 0.5  # harsh penalty for any dimension being terrible
+                        composite *= 0.5
+                    # Bonus for genuinely empty intersections
+                    known = entry.get("known_work", "")
+                    if known.upper().strip() in ("NONE", "NONE.", "N/A", ""):
+                        composite *= 1.2
                     scored.append((i, j, composite, entry))
             except (ValueError, TypeError):
                 continue
 
         scored.sort(key=lambda x: x[2], reverse=True)
 
-        # Always print viability scores (important user-facing decision)
+        # Always print viability scores
         print("\n  Synthesis viability scores (novelty / utility / foundational):")
-        for i, j, comp, e in scored[:7]:
+        for i, j, comp, e in scored[:10]:
             nov = e.get("novelty", "?")
             util = e.get("utility", "?")
             found = e.get("foundational", "?")
-            tool = e.get("tool_idea", "")[:50]
+            tool = e.get("tool_idea", "")[:60]
+            known = e.get("known_work", "")[:40]
             marker = "★" if comp >= 3.5 else "✓" if comp >= 2.5 else "✗"
-            print(f"    {marker} [{comp:.1f}] {names[i]} × {names[j]}  N={nov} U={util} F={found}  → {tool}")
+            trad_i = _FIELD_TRADITION.get(names[i], "?")
+            trad_j = _FIELD_TRADITION.get(names[j], "?")
+            print(f"    {marker} [{comp:.1f}] {names[i]}({trad_i}) × {names[j]}({trad_j})"
+                  f"  N={nov} U={util} F={found}")
+            if known and known.upper().strip() not in ("NONE", "NONE.", "N/A"):
+                print(f"         known: {known}")
+            print(f"         → {tool}")
         print()
 
-        # Select pairs with composite ≥ 3.5 (all dimensions solid)
+        # Select: prefer composite ≥ 3.5, relax to ≥ 2.5, then best
         threshold = 3.5
         good = [(i, j, c, e) for i, j, c, e in scored if c >= threshold]
 
         if not good:
-            self._log("  No pairs scored ≥%.1f; relaxing to ≥3.0.", threshold)
-            threshold = 3.0
+            self._log("  No pairs scored ≥%.1f; relaxing to ≥2.5.", threshold)
+            threshold = 2.5
             good = [(i, j, c, e) for i, j, c, e in scored if c >= threshold]
 
         if not good:
@@ -2811,12 +2957,14 @@ class FoundationPipeline:
                     cmd = parts[-1]  # keep only the subcommand
                 commands.append({
                     "name": cmd,
-                    "help": thm.get("cli_help", thm.get("capability", ""))[:200],
+                    "help": thm.get("cli_help", thm.get("capability", "")),
                     "input_type": thm.get("input_type", "JSON"),
                     "output_type": thm.get("output_type", "JSON"),
-                    "theorem": thm.get("theorem", "")[:200],
-                    "capability": thm.get("capability", "")[:120],
+                    "theorem": thm.get("theorem", ""),
+                    "capability": thm.get("capability", ""),
                     "who": thm.get("who_uses_this", ""),
+                    "field_a_contribution": thm.get("field_a_contribution", ""),
+                    "field_b_contribution": thm.get("field_b_contribution", ""),
                     "has_input": bool(thm.get("input_type", "")),
                 })
 
@@ -2851,7 +2999,14 @@ class FoundationPipeline:
         L.append("")
         L.append("Commands:")
         for c in commands:
-            L.append(f"  {c['name']:20s} {c['help'][:65]}")
+            L.append(f"  {c['name']}")
+            # Wrap long help text to avoid truncation
+            import textwrap as _tw
+            for wline in _tw.wrap(c["help"], width=76):
+                L.append(f"    {wline}")
+            if c["who"]:
+                L.append(f"    For: {c['who']}")
+            L.append("")
         L.append('"""')
         L.append("from __future__ import annotations")
         L.append("")
@@ -2862,15 +3017,29 @@ class FoundationPipeline:
         L.append("")
         L.append("")
 
-        # Generate handler functions
+        # Generate handler functions with full docstrings
         for c in commands:
             fn = re.sub(r"[^a-zA-Z0-9]", "_", c["name"])
             if c["has_input"]:
                 L.append(f"def _cmd_{fn}(args):")
-                L.append(f'    """{c["capability"][:100]}')
+                L.append(f'    """{c["capability"]}')
                 if c["theorem"]:
                     L.append(f"")
-                    L.append(f'    Mathematical basis: {c["theorem"][:160]}')
+                    L.append(f"    Mathematical basis:")
+                    import textwrap as _tw
+                    for wline in _tw.wrap(c["theorem"], width=72):
+                        L.append(f"    {wline}")
+                if c.get("field_a_contribution"):
+                    L.append(f"")
+                    for wline in _tw.wrap(c["field_a_contribution"], width=72):
+                        L.append(f"    {wline}")
+                if c.get("field_b_contribution"):
+                    L.append(f"")
+                    for wline in _tw.wrap(c["field_b_contribution"], width=72):
+                        L.append(f"    {wline}")
+                L.append(f"")
+                L.append(f"    Input: {c['input_type'][:200]}")
+                L.append(f"    Output: {c['output_type'][:200]}")
                 L.append(f'    """')
                 L.append(f"    from {module_name} import core, operations")
                 L.append(f"")
@@ -2910,12 +3079,13 @@ class FoundationPipeline:
         help_desc_lines.append("")
         help_desc_lines.append("COMMANDS:")
         for c in commands:
-            help_desc_lines.append(f"  {c['name']:20s} {c['help'][:65]}")
+            help_desc_lines.append(f"  {c['name']}")
+            import textwrap as _tw
+            for wline in _tw.wrap(c["capability"], width=72):
+                help_desc_lines.append(f"    {wline}")
             if c["who"]:
-                help_desc_lines.append(f"  {'':20s} (for: {c['who']})")
-        help_desc_lines.append("")
-        help_desc_lines.append(f"This tool uses the mathematical bridge between {field_a}")
-        help_desc_lines.append(f"and {field_b} to solve problems that neither field can solve alone.")
+                help_desc_lines.append(f"    For: {c['who']}")
+            help_desc_lines.append("")
         help_desc = "\\n".join(help_desc_lines)
 
         L.append("def main():")
@@ -2931,10 +3101,11 @@ class FoundationPipeline:
         # Register subcommands
         for c in commands:
             fn = re.sub(r"[^a-zA-Z0-9]", "_", c["name"])
-            safe_help = c["help"].replace('"', "'")[:200]
+            safe_help = c["help"].replace('"', '\\"')
             if c["has_input"]:
-                L.append(f'    p_{fn} = sub.add_parser("{c["name"]}", help="{safe_help}")')
-                safe_itype = c["input_type"].replace('"', "'")[:60]
+                L.append(f'    p_{fn} = sub.add_parser("{c["name"]}",')
+                L.append(f'        help="{safe_help}")')
+                safe_itype = c["input_type"].replace('"', "'")[:80]
                 L.append(f'    p_{fn}.add_argument("input", help="Input file ({safe_itype})")')
                 L.append(f'    p_{fn}.add_argument("-o", "--output", help="Output file (default: stdout)")')
             else:
@@ -3067,11 +3238,19 @@ class FoundationPipeline:
         *, killer_app: dict | None = None, comp_theorems: list | None = None,
         foundational_theorems: list | None = None,
     ) -> list[pathlib.Path]:
-        """Generate real Python code via LLM using GitHub Models API.
+        """Generate a substantial (~10K LoC) Python package via LLM.
 
-        To avoid blowing up prompt size, each file gets only the context
-        *relevant to that file*, compressed into a short summary.
-        Full detail is written to ``context.md`` in the output dir.
+        Architecture:
+        1. ``core.py`` — domain-specific types (not generic category theory)
+        2. ``numerics.py`` — shared numerical routines (sparse algebra, eigensolvers, etc.)
+        3. One module per CLI command (e.g. ``cmd_fingerprint.py``) — full implementation
+        4. ``operations.py`` — thin dispatcher that imports per-command modules
+        5. ``verification.py``, ``examples.py`` — tests and worked examples
+        6. ``__init__.py``
+
+        Each LLM call uses max_tokens=16384 to encourage substantial output.
+        Prompts explicitly ban generic category-theory boilerplate and require
+        domain-specific code rooted in the actual fields.
         """
         winner_name = getattr(winner, "name", "foundation")
         description = getattr(winner, "description", "")
@@ -3080,41 +3259,59 @@ class FoundationPipeline:
         field_a = ", ".join(str(c) for c in constituents[:1]) or "Field A"
         field_b = ", ".join(str(c) for c in constituents[1:2]) or "Field B"
 
-        # ---- Compact shared header (< 400 chars) ----
         ka = killer_app or {}
         tool = ka.get("tool_name", winner_name)
         one_liner = ka.get("one_liner", description[:120])
+        target_users = ka.get("target_users", "domain experts")
+        key_cap = ka.get("key_capability", "")
+        why_synth = ka.get("why_synthesis_needed", "")
+
+        ft = foundational_theorems or []
+        ct = comp_theorems or []
+        module_name = src_dir.name
+
+        # ---- Shared compact context for every prompt ----
         compact = (
-            f'Framework: "{winner_name}" — synthesis of {field_a} and {field_b}.\n'
-            f"Tool: {tool} — {one_liner}\n"
-            f"Standalone: no jugeo imports, no 'judgment geometry' references.\n"
-            f"Python 3.10+, from __future__ import annotations.\n"
+            f"PACKAGE: {module_name}\n"
+            f"TOOL: {tool} — {one_liner}\n"
+            f"FIELDS: {field_a} × {field_b}\n"
+            f"USERS: {target_users}\n"
+            f"KEY CAPABILITY: {key_cap}\n"
+            f"WHY SYNTHESIS: {why_synth}\n"
+            f"Python 3.10+, from __future__ import annotations, numpy+scipy allowed.\n"
+            f"FORBIDDEN: no jugeo imports, no 'judgment geometry', no 'sheaf-theoretic',\n"
+            f"  no 'Grothendieck', no 'descent', no 'trust algebra'.\n"
+            f"  Do NOT use generic names like SynthesisObject, MorphismSpace,\n"
+            f"  CategoryStructure, FunctorialMap, BridgeTheorem.\n"
+            f"  Name ALL classes/functions after concrete {field_a}/{field_b} concepts.\n"
         )
 
-        # ---- Per-file context builders ----
-        # core.py: foundational theorem names + one-line significance
-        ft = foundational_theorems or []
-        core_ctx = ""
+        # ---- Per-file context ----
+        # Foundational theorems context (for core.py)
+        ft_ctx = ""
         if ft:
-            lines = [f"  {i}. {t.get('name','?')}: {t.get('significance','')[:80]}" for i, t in enumerate(ft[:5], 1)]
-            core_ctx = "FOUNDATIONAL THEOREMS (implement types these refer to):\n" + "\n".join(lines) + "\n"
+            lines = []
+            for i, t in enumerate(ft[:5], 1):
+                lines.append(
+                    f"  {i}. {t.get('name','?')}\n"
+                    f"     Statement: {t.get('statement','')[:200]}\n"
+                    f"     Significance: {t.get('significance','')[:120]}"
+                )
+            ft_ctx = "FOUNDATIONAL THEOREMS (the types you define must make these expressible):\n" + "\n".join(lines) + "\n"
 
-        # operations.py: application theorem commands + capability
-        ct = comp_theorems or []
-        ops_ctx = ""
+        # Application theorems context (for per-command modules)
+        ct_ctx_brief = ""
         if ct:
-            lines = [f"  {t.get('cli_command','?')}: {t.get('capability','')[:80]}" for t in ct[:5]]
-            ops_ctx = (
-                f"COMMANDS (implement run_command(name, data) dispatcher):\n"
-                + "\n".join(lines) + "\n"
-            )
+            lines = [f"  {t.get('cli_command','?')}: {t.get('capability','')[:100]}" for t in ct[:5]]
+            ct_ctx_brief = "CLI COMMANDS:\n" + "\n".join(lines) + "\n"
 
-        # Short prop summary (only titles, ~60 chars each, max 6)
+        # Proposition summary
         prop_lines = []
-        for p in props[:6]:
+        for p in props[:8]:
             title = getattr(p, "title", "")
+            stmt = getattr(p, "statement", "")
             if title:
-                prop_lines.append(f"  - {title[:60]}")
+                prop_lines.append(f"  - {title}: {stmt[:120]}")
         prop_summary = "\n".join(prop_lines) if prop_lines else "  (none)"
 
         # ---- Write full context to disk for reference ----
@@ -3138,82 +3335,213 @@ class FoundationPipeline:
         except Exception:
             pass
 
-        # ---- File-specific prompts (each < 2000 chars) ----
-        file_specs = {
-            "core.py": (
-                f"Generate `core.py` — foundational types for:\n\n"
-                f"{compact}\n"
-                f"Key propositions:\n{prop_summary}\n\n"
-                f"{core_ctx}\n"
-                f"Requirements:\n"
-                f"- 3+ concrete mathematical classes specific to {field_a}×{field_b}\n"
-                f"- Real methods (numerical compute, algebraic ops), not data-only stubs\n"
-                f"- Type hints, docstrings with math explanations\n"
-                f"- Return ONLY Python code, no markdown fences\n"
-            ),
-            "operations.py": (
-                f"Generate `operations.py` — algorithms and bridge operations for:\n\n"
-                f"{compact}\n"
-                f"{ops_ctx}\n"
-                f"Requirements:\n"
-                f"- Import types from `.core`\n"
-                f"- 5+ functions: numerical, geometric, algebraic, combinatorial, bridge\n"
-                f"- Include `run_command(name: str, data: dict) -> dict` dispatcher\n"
-                f"  mapping each CLI command to its implementation\n"
-                f"- Real computation, not stubs\n"
-                f"- Return ONLY Python code, no markdown fences\n"
-            ),
-            "verification.py": (
-                f"Generate `verification.py` — property checks for:\n\n"
-                f"{compact}\n"
-                f"Key propositions:\n{prop_summary}\n\n"
-                f"Requirements:\n"
-                f"- Verify real math invariants (associativity, coherence, convergence)\n"
-                f"- 3+ verification functions with actual logic\n"
-                f"- `run_all_checks()` function\n"
-                f"- Import from `.core` and `.operations`\n"
-                f"- Return ONLY Python code, no markdown fences\n"
-            ),
-            "examples.py": (
-                f"Generate `examples.py` — worked examples for:\n\n"
-                f"{compact}\n"
-                f"{ops_ctx}\n"
-                f"Requirements:\n"
-                f"- 3+ concrete examples (numerical, geometric, algebraic)\n"
-                f"- Show bridge theorems in action on specific data\n"
-                f"- `main()` that runs all examples with print output\n"
-                f"- Import from `.core` and `.operations`\n"
-                f"- Return ONLY Python code, no markdown fences\n"
-            ),
-        }
-
         files: list[pathlib.Path] = []
-        for fname, prompt in file_specs.items():
-            self._log("    Generating %s via LLM …", fname)
-            try:
-                code = self._call_llm(prompt, max_tokens=4096)
-                # Strip markdown fences if present
-                code = re.sub(r"^```python\s*\n?", "", code.strip())
-                code = re.sub(r"\n?```\s*$", "", code.strip())
-                # Strip any remaining narrative before actual Python code
-                code_lines = code.split("\n")
-                start_idx = 0
-                for i, line in enumerate(code_lines):
-                    if (line.startswith("from ") or line.startswith("import ")
-                            or line.startswith("class ") or line.startswith("def ")
-                            or line.startswith("#") or line.startswith('"""')
-                            or line.startswith("__")):
-                        start_idx = i
-                        break
-                if start_idx > 0:
-                    code = "\n".join(code_lines[start_idx:])
-                fpath = src_dir / fname
-                fpath.write_text(code, encoding="utf-8")
-                files.append(fpath)
-            except Exception as exc:
-                self._log("    Failed to generate %s: %s", fname, exc)
 
-        # Ensure core.py exists — fall back to template if LLM didn't generate it
+        # ============================================================
+        # Phase 1: core.py — domain-specific types (~800+ lines)
+        # ============================================================
+        core_prompt = (
+            f"Generate `core.py` — the foundational data structures for {tool}.\n\n"
+            f"{compact}\n"
+            f"Propositions from {field_a} and {field_b}:\n{prop_summary}\n\n"
+            f"{ft_ctx}\n"
+            f"REQUIREMENTS — write AT LEAST 800 lines:\n"
+            f"- Define 8+ classes named after real {field_a}/{field_b} concepts\n"
+            f"  (e.g. for spectral geometry: SpectralTriple, CyclicCocycle, KTheoryClass;\n"
+            f"   for algebraic topology: ChainComplex, CohomologyRing, FiberBundle;\n"
+            f"   adapt these examples to YOUR actual fields)\n"
+            f"- Each class must have:\n"
+            f"  • Real numerical fields (numpy arrays, matrices, eigenvalues)\n"
+            f"  • 5+ methods that DO computation (not just getters)\n"
+            f"  • Constructors: from_matrix(), from_file(), random()\n"
+            f"  • __repr__, __eq__, serialization (to_dict/from_dict)\n"
+            f"- Include helper functions: parsing, validation, conversion\n"
+            f"- Import numpy, scipy.sparse, scipy.linalg as needed\n"
+            f"- Every class docstring explains the mathematical meaning\n"
+            f"- This is the CORE of the package; every other module imports from here\n"
+            f"- Return ONLY Python code, no markdown fences\n"
+        )
+        self._log("    Generating core.py via LLM (domain-specific types) …")
+        files.extend(self._llm_write_file(src_dir, "core.py", core_prompt, max_tokens=16384))
+
+        # ============================================================
+        # Phase 2: numerics.py — shared numerical algorithms (~1000+ lines)
+        # ============================================================
+        numerics_prompt = (
+            f"Generate `numerics.py` — numerical algorithms for {tool}.\n\n"
+            f"{compact}\n"
+            f"{ct_ctx_brief}\n"
+            f"This module contains the SHARED numerical routines that the\n"
+            f"per-command modules call. It must NOT duplicate what's in core.py\n"
+            f"(core.py has the data structures; this has the algorithms).\n\n"
+            f"REQUIREMENTS — write AT LEAST 800 lines:\n"
+            f"- Import types from .core\n"
+            f"- 15+ functions implementing real numerical algorithms:\n"
+            f"  • sparse matrix operations (Lanczos, Chebyshev expansion, KPM)\n"
+            f"  • eigenvalue/eigenvector computations with symmetry decomposition\n"
+            f"  • index/invariant computations (Chern, Bott, winding, Z2, etc.)\n"
+            f"  • spectral density estimation\n"
+            f"  • symmetry detection and decomposition\n"
+            f"  • parameter sweep utilities\n"
+            f"- Each function: full docstring with mathematical formula,\n"
+            f"  real implementation using numpy/scipy, proper error handling\n"
+            f"- Use scipy.sparse for all large matrices\n"
+            f"- Include convergence checks and numerical stability guards\n"
+            f"- Return ONLY Python code, no markdown fences\n"
+        )
+        self._log("    Generating numerics.py via LLM (shared algorithms) …")
+        files.extend(self._llm_write_file(src_dir, "numerics.py", numerics_prompt, max_tokens=16384))
+
+        # ============================================================
+        # Phase 3: per-command modules (~1200+ lines each)
+        # ============================================================
+        for thm in ct[:5]:
+            cmd = thm.get("cli_command", "").strip()
+            if not cmd:
+                continue
+            parts = cmd.split()
+            if len(parts) > 1:
+                cmd = parts[-1]
+            mod_name = "cmd_" + re.sub(r"[^a-zA-Z0-9]", "_", cmd)
+            fname = f"{mod_name}.py"
+
+            cmd_prompt = (
+                f"Generate `{fname}` — full implementation of the '{cmd}' command for {tool}.\n\n"
+                f"{compact}\n"
+                f"THIS COMMAND: {cmd}\n"
+                f"  Capability: {thm.get('capability', '')}\n"
+                f"  Theorem: {thm.get('theorem', '')[:300]}\n"
+                f"  Input: {thm.get('input_type', '')[:200]}\n"
+                f"  Output: {thm.get('output_type', '')[:200]}\n"
+                f"  {field_a} contributes: {thm.get('field_a_contribution', '')[:200]}\n"
+                f"  {field_b} contributes: {thm.get('field_b_contribution', '')[:200]}\n"
+                f"  Target user: {thm.get('who_uses_this', '')}\n"
+                f"  Without this tool they would: {thm.get('existing_alternative', '')[:150]}\n\n"
+                f"REQUIREMENTS — write AT LEAST 1000 lines:\n"
+                f"- Import types from .core and algorithms from .numerics\n"
+                f"- Define a main function: run(data: dict) -> dict\n"
+                f"  that implements the FULL pipeline for this command\n"
+                f"- Break the pipeline into 5+ well-documented steps:\n"
+                f"  1. Parse and validate input data\n"
+                f"  2. Construct domain objects (from .core)\n"
+                f"  3. Apply numerical algorithms (from .numerics)\n"
+                f"  4. Compute the result specific to this command\n"
+                f"  5. Format output\n"
+                f"- Include 3+ helper classes specific to this command\n"
+                f"- Include detailed logging/progress output\n"
+                f"- Handle edge cases: missing fields, degenerate inputs, numerical failures\n"
+                f"- Write real math, not stubs — if you compute an index, show HOW\n"
+                f"- Return ONLY Python code, no markdown fences\n"
+            )
+            self._log("    Generating %s via LLM (command: %s) …", fname, cmd)
+            files.extend(self._llm_write_file(src_dir, fname, cmd_prompt, max_tokens=16384))
+
+        # ============================================================
+        # Phase 4: operations.py — thin dispatcher importing per-command modules
+        # ============================================================
+        cmd_names = []
+        for thm in ct[:5]:
+            cmd = thm.get("cli_command", "").strip()
+            if cmd:
+                parts = cmd.split()
+                if len(parts) > 1:
+                    cmd = parts[-1]
+                cmd_names.append(cmd)
+
+        ops_lines = [
+            f'"""operations.py — Command dispatcher for {tool}.',
+            f"",
+            f"Routes CLI commands to their per-command implementation modules.",
+            f'"""',
+            f"from __future__ import annotations",
+            f"",
+            f"from typing import Any",
+            f"",
+            f"",
+        ]
+        # Build import + dispatch
+        dispatch_entries = []
+        for cmd in cmd_names:
+            mod = "cmd_" + re.sub(r"[^a-zA-Z0-9]", "_", cmd)
+            ops_lines.append(f"def _run_{re.sub(r'[^a-zA-Z0-9]', '_', cmd)}(data: dict[str, Any]) -> dict[str, Any]:")
+            ops_lines.append(f'    """Delegate to {mod} module."""')
+            ops_lines.append(f"    from {module_name} import {mod}")
+            ops_lines.append(f"    return {mod}.run(data)")
+            ops_lines.append("")
+            ops_lines.append("")
+            dispatch_entries.append(f'    "{cmd}": _run_{re.sub(r"[^a-zA-Z0-9]", "_", cmd)},')
+
+        ops_lines.append("_DISPATCH: dict[str, Any] = {")
+        ops_lines.extend(dispatch_entries)
+        ops_lines.append("}")
+        ops_lines.append("")
+        ops_lines.append("")
+        ops_lines.append("def run_command(command_name: str, data: dict[str, Any]) -> dict[str, Any]:")
+        ops_lines.append(f'    """Dispatch a CLI command to its implementation module."""')
+        ops_lines.append("    handler = _DISPATCH.get(command_name)")
+        ops_lines.append("    if handler is None:")
+        ops_lines.append("        return {")
+        ops_lines.append('            "error": f"Unknown command: {command_name}",')
+        ops_lines.append(f'            "available": {cmd_names!r},')
+        ops_lines.append("        }")
+        ops_lines.append("    return handler(data)")
+        ops_lines.append("")
+
+        ops_path = src_dir / "operations.py"
+        ops_path.write_text("\n".join(ops_lines) + "\n", encoding="utf-8")
+        files.append(ops_path)
+        self._log("    Wrote %s (dispatcher)", ops_path)
+
+        # ============================================================
+        # Phase 5: verification.py and examples.py
+        # ============================================================
+        verif_prompt = (
+            f"Generate `verification.py` — property verification for {tool}.\n\n"
+            f"{compact}\n"
+            f"Propositions:\n{prop_summary}\n\n"
+            f"REQUIREMENTS — write AT LEAST 400 lines:\n"
+            f"- Import from .core and .numerics\n"
+            f"- 8+ verification functions testing real mathematical invariants\n"
+            f"  from {field_a} and {field_b} (not generic 'coherence' checks)\n"
+            f"- Each function: construct a test case, compute, assert correctness\n"
+            f"- `run_all_checks() -> dict` that runs everything and reports results\n"
+            f"- Return ONLY Python code, no markdown fences\n"
+        )
+        self._log("    Generating verification.py via LLM …")
+        files.extend(self._llm_write_file(src_dir, "verification.py", verif_prompt, max_tokens=8192))
+
+        examples_prompt = (
+            f"Generate `examples.py` — worked examples for {tool}.\n\n"
+            f"{compact}\n"
+            f"{ct_ctx_brief}\n"
+            f"REQUIREMENTS — write AT LEAST 400 lines:\n"
+            f"- Import from .core, .numerics, and per-command modules\n"
+            f"- 5+ concrete examples with real numerical data\n"
+            f"- Each example: construct input, run computation, print results\n"
+            f"- Show what makes {field_a}×{field_b} more powerful than either alone\n"
+            f"- `main()` that runs all examples\n"
+            f"- Return ONLY Python code, no markdown fences\n"
+        )
+        self._log("    Generating examples.py via LLM …")
+        files.extend(self._llm_write_file(src_dir, "examples.py", examples_prompt, max_tokens=8192))
+
+        # ============================================================
+        # Phase 6: __init__.py
+        # ============================================================
+        init_code = textwrap.dedent(f'''\
+            """{module_name} — {one_liner}
+
+            {description[:300]}
+
+            This package provides the {tool} command-line tool for {target_users}.
+            """
+            __version__ = "0.1.0"
+        ''')
+        init_path = src_dir / "__init__.py"
+        init_path.write_text(init_code, encoding="utf-8")
+        files.insert(0, init_path)
+
+        # ---- Fallbacks: ensure critical files exist ----
         core_path = src_dir / "core.py"
         if not core_path.exists():
             self._log("    core.py missing from LLM output; using template fallback.")
@@ -3225,32 +3553,48 @@ class FoundationPipeline:
                 winner_name, constituents_str, description[:300], props_block,
             )
             core_path.write_text(core_code, encoding="utf-8")
-            files.insert(0, core_path)
+            files.insert(1, core_path)
 
-        # Ensure operations.py exists — critical for CLI (run_command dispatcher)
-        ops_path = src_dir / "operations.py"
-        if not ops_path.exists():
-            self._log("    operations.py missing from LLM output; using template fallback.")
+        ops_path2 = src_dir / "operations.py"
+        if not ops_path2.exists():
+            self._log("    operations.py missing; using template fallback.")
             template_files = self._template_generate_code(winner, src_dir)
             for tf in template_files:
                 if tf.name == "operations.py":
                     files.append(tf)
                     break
 
-        # Write __init__.py
-        module_name = src_dir.name
-        init_code = textwrap.dedent(f'''\
-            """{module_name} — Python implementation of: {winner_name}
-
-            {description[:200]}
-            """
-            __version__ = "0.1.0"
-        ''')
-        init_path = src_dir / "__init__.py"
-        init_path.write_text(init_code, encoding="utf-8")
-        files.insert(0, init_path)
-
         return files
+
+    def _llm_write_file(
+        self, src_dir: pathlib.Path, fname: str, prompt: str,
+        *, max_tokens: int = 16384,
+    ) -> list[pathlib.Path]:
+        """Call LLM, strip fences/prose, write to file. Returns [path] or []."""
+        try:
+            code = self._call_llm(prompt, max_tokens=max_tokens)
+            code = re.sub(r"^```python\s*\n?", "", code.strip())
+            code = re.sub(r"\n?```\s*$", "", code.strip())
+            # Strip narrative prose before actual Python
+            code_lines = code.split("\n")
+            start_idx = 0
+            for i, line in enumerate(code_lines):
+                if (line.startswith("from ") or line.startswith("import ")
+                        or line.startswith("class ") or line.startswith("def ")
+                        or line.startswith("#") or line.startswith('"""')
+                        or line.startswith("__")):
+                    start_idx = i
+                    break
+            if start_idx > 0:
+                code = "\n".join(code_lines[start_idx:])
+            fpath = src_dir / fname
+            fpath.write_text(code, encoding="utf-8")
+            lc = len(code.split("\n"))
+            self._log("    Wrote %s (%d lines)", fpath.name, lc)
+            return [fpath]
+        except Exception as exc:
+            self._log("    Failed to generate %s: %s", fname, exc)
+            return []
 
     @staticmethod
     def _build_core_py_template(
