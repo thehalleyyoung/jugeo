@@ -38,7 +38,7 @@ try:
         run_pipeline,
         PropositionRecord,
         FieldNode,
-        ALL_48_FIELDS,
+        ALL_128_FIELDS,
     )
     _HAS_FRONTIER = True
 except Exception:  # pragma: no cover
@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover
     run_pipeline = None  # type: ignore[assignment]
     PropositionRecord = None  # type: ignore[assignment,misc]
     FieldNode = None  # type: ignore[assignment,misc]
-    ALL_48_FIELDS = []  # type: ignore[assignment]
+    ALL_128_FIELDS = []  # type: ignore[assignment]
 
 # Discovery engine
 try:
@@ -1679,8 +1679,8 @@ class _IdeationReport:
 
 def _get_fields() -> list[Any]:
     """Return the field catalog, preferring the real one when available."""
-    if _HAS_FRONTIER and ALL_48_FIELDS:
-        return list(ALL_48_FIELDS)
+    if _HAS_FRONTIER and ALL_128_FIELDS:
+        return list(ALL_128_FIELDS)
     return list(_FALLBACK_FIELDS)
 
 

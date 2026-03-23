@@ -70,12 +70,8 @@ try:
     from jugeo.ideation.synthesis_frontier.fields import ALL_128_FIELDS
     _FIELDS_AVAILABLE = True
 except ImportError:
-    try:
-        from jugeo.ideation.synthesis_frontier.fields import ALL_48_FIELDS as ALL_128_FIELDS
-        _FIELDS_AVAILABLE = True
-    except ImportError:
-        _FIELDS_AVAILABLE = False
-        ALL_128_FIELDS = []
+    _FIELDS_AVAILABLE = False
+    ALL_128_FIELDS = []
 
 # Mathematical tradition categories — fields within the same tradition
 # are too close to produce genuinely novel syntheses.
@@ -155,6 +151,12 @@ _FIELD_TRADITION: dict[str, str] = {
     "Computational Geometry": "applied", "Finite Element Methods": "applied",
     "Fluid Dynamics": "applied", "Elasticity Theory": "applied",
     "Epidemiological Modeling": "applied",
+    "Signal Processing (Mathematical)": "applied",
+    "Mathematical Fluid Dynamics": "applied",
+    "Calculus of Variations": "analysis",
+    "Field Theory (Algebra)": "algebra",
+    "Cryptography (Mathematical)": "cs",
+    "Formal Language Theory": "logic",
     # Emerging / Interdisciplinary / Data
     "Topological Data Analysis": "data", "Persistent Homology": "data",
     "Geometric Deep Learning": "data", "Quantum Information Theory": "data",

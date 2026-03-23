@@ -165,11 +165,11 @@ except Exception:  # pragma: no cover
     Tournament = None  # type: ignore[assignment,misc]
 
 try:
-    from jugeo.ideation.synthesis_frontier.fields import ALL_48_FIELDS
+    from jugeo.ideation.synthesis_frontier.fields import ALL_128_FIELDS
     _HAS_FIELDS = True
 except Exception:  # pragma: no cover
     _HAS_FIELDS = False
-    ALL_48_FIELDS = []  # type: ignore[assignment]
+    ALL_128_FIELDS = []  # type: ignore[assignment]
 
 def _generation_registry() -> dict[str, type]:
     """Return a dict mapping class name → class for all generation classes.
@@ -1923,7 +1923,7 @@ def _run_novel_problems(
     verbose: bool = False,
 ) -> dict[str, Any]:
     """Identify novel inarticulable problems and generate code for them."""
-    if not _HAS_FIELDS or not ALL_48_FIELDS:
+    if not _HAS_FIELDS or not ALL_128_FIELDS:
         return {
             "mode": "novel_problems",
             "error": "synthesis_frontier.fields not available; "
@@ -1931,11 +1931,11 @@ def _run_novel_problems(
         }
 
     if _HAS_PIPELINE and Tournament is not None:
-        tournament = Tournament(list(ALL_48_FIELDS))
+        tournament = Tournament(list(ALL_128_FIELDS))
         state = tournament.run()
         winner = _winner_from_state(state)
     else:
-        winner = ALL_48_FIELDS[0]
+        winner = ALL_128_FIELDS[0]
 
     if _HAS_CODEGEN and NovelProblemCodegen is not None:
         codegen = NovelProblemCodegen(

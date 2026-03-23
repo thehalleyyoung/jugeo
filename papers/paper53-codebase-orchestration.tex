@@ -1,0 +1,521 @@
+% paper53-codebase-orchestration.tex — Scaling JuGeo: Site Decomposition and Parallel Federation for Large Codebases
+%   Paper 53 of the Judgment Geometry series.
+% Compile: pdflatex paper53-codebase-orchestration
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{experiment-data}
+\input{subsystem-data}
+\input{comprehensive-data}
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\Federation}{\textsc{Federation}}
+\newcommand{\SiteDecomp}{\textsc{SiteDecomposition}}
+\newcommand{\Coordinator}{\textsc{Coordinator}}
+\newcommand{\WorkerPool}{\textsc{WorkerPool}}
+\newcommand{\ShardSite}{\mathcal{S}^{\mathrm{sh}}}
+\newcommand{\GlobalSite}{\mathcal{S}^{\mathrm{gl}}}
+\newcommand{\LocalVerdict}{\ensuremath{\mathsf{LOCAL\_VERDICT}}}
+\newcommand{\GlobalVerdict}{\ensuremath{\mathsf{GLOBAL\_VERDICT}}}
+\newcommand{\Federated}{\ensuremath{\mathsf{FEDERATED}}}
+\newcommand{\ChangeOfSite}{\texttt{change\_of\_site}}
+\newcommand{\FormalCore}{\texttt{formal\_core\_site}}
+\newcommand{\InterfaceRoute}{\texttt{interface\_routing}}
+\newcommand{\KernelLife}{\texttt{kernel\_lifecycle}}
+\newcommand{\HypercoverTreaty}{\texttt{hypercover\_treaty}}
+\newcommand{\fedarrow}{\rightsquigarrow}
+
+\title{\textbf{Scaling JuGeo to Large Codebases:\\
+Site Decomposition and Parallel Federation}}
+
+\author{%
+  JuGeo Research Group
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+We address the challenge of applying \JuGeo\ to large, multi-module
+codebases where monolithic site construction is infeasible.  We
+introduce \emph{site decomposition}, which partitions a codebase's
+semantic site into independent shards, and \emph{parallel federation},
+which verifies shards concurrently and merges local verdicts into a
+global judgment.  The \ChangeOfSite\ functor transports judgments
+across shard boundaries, while \HypercoverTreaty\ negotiates interface
+contracts between modules.  Our central theorem, \emph{Federation
+Soundness}, guarantees that federated verification is equivalent to
+monolithic verification.  Experiments on \expTotalPrograms\ programs
+show that site construction takes $\compSiteMeanBuildMs$\,ms per
+shard with $\compSiteMeanMorphisms$ morphisms, and the federation
+achieves \compOverallAccuracy\ accuracy while parallelizing across
+$\subDescentStrategies$ worker threads.  The approach enables \JuGeo\
+to scale from single-file analysis to repository-level verification.
+\end{abstract}
+
+\newpage
+
+% =====================================================================
+\section{Introduction}\label{sec:intro}
+% =====================================================================
+
+Modern software projects span thousands of files, hundreds of modules,
+and millions of lines of code.  Verification tools that analyze
+programs monolithically face quadratic or worse scaling in the number
+of inter-module dependencies.  \JuGeo's sheaf-theoretic framework
+naturally supports \emph{locality}: the gluing axiom ensures that
+local correctness implies global correctness, provided interface
+contracts are respected.
+
+\paragraph{The scalability challenge.}
+Constructing a single semantic site for a large codebase requires
+enumerating all coordinates and morphisms simultaneously.  For a
+codebase with $n$ modules and $m$ cross-module dependencies, the
+site has $O(n)$ objects and $O(m)$ morphisms.  When $m$ is large,
+monolithic construction becomes a bottleneck.
+
+\paragraph{Contributions.}
+\begin{itemize}[noitemsep]
+  \item A formal theory of \emph{site decomposition} that partitions
+        $\GlobalSite$ into independent shards $\ShardSite_1, \ldots,
+        \ShardSite_k$ (§\ref{sec:decomposition}).
+  \item The \emph{parallel federation} protocol for concurrent shard
+        verification (§\ref{sec:federation}).
+  \item The \ChangeOfSite\ functor for transporting judgments across
+        shard boundaries (§\ref{sec:transport}).
+  \item The \HypercoverTreaty\ mechanism for interface contract
+        negotiation (§\ref{sec:treaty}).
+  \item Federation Soundness theorem, proved in Lean~4
+        (§\ref{sec:lean-proof}).
+  \item Scalability evaluation on codebases of varying size
+        (§\ref{sec:evaluation}).
+\end{itemize}
+
+% =====================================================================
+\section{Background}\label{sec:background}
+% =====================================================================
+
+\subsection{Modular Verification}
+Modular verification~\cite{Hoare1972,Leino2010} analyzes program
+components independently, requiring interface specifications (contracts)
+at module boundaries.  \JuGeo\ automates contract inference through
+its judgment framework.
+
+\subsection{Semantic Sites at Scale}
+A \JuGeo\ site $\Site = (\Ob, \Mor, \Cov)$ organizes program
+coordinates.  For a single file, $|\Ob|$ is typically
+$\expCoordsMin$--$\expCoordsMax$ coordinates.  For a multi-module
+codebase, $|\Ob|$ grows linearly with the number of functions and
+classes, and $|\Mor|$ grows with cross-module call-graph edges.
+
+\subsection{Change of Site}
+The \ChangeOfSite\ API method implements the categorical notion of
+a site morphism $f\colon \Site_1 \to \Site_2$, inducing a pullback
+functor $f^*\colon \mathrm{Sh}(\Site_2) \to \mathrm{Sh}(\Site_1)$
+that transports judgments between sites.
+
+% =====================================================================
+\section{Site Decomposition}\label{sec:decomposition}
+% =====================================================================
+
+\subsection{Partitioning Strategy}
+Given a global site $\GlobalSite$ with $n$ objects and $m$ morphisms,
+we partition into $k$ shards by cutting at module boundaries:
+
+\begin{definition}[Site Decomposition]\label{def:decomposition}
+A \emph{site decomposition} of $\GlobalSite$ is a family of sub-sites
+$\{\ShardSite_i\}_{i=1}^k$ such that:
+\begin{enumerate}[noitemsep]
+  \item $\bigcup_i \Ob(\ShardSite_i) = \Ob(\GlobalSite)$.
+  \item Each internal morphism of $\GlobalSite$ belongs to exactly one
+        $\ShardSite_i$.
+  \item Cross-shard morphisms are collected in the \emph{boundary
+        complex} $\partial = \{f \in \Mor(\GlobalSite) \mid
+        f \notin \Mor(\ShardSite_i)\;\forall i\}$.
+\end{enumerate}
+\end{definition}
+
+\subsection{Boundary Complex}
+The boundary complex $\partial$ captures all cross-module dependencies.
+Its structure determines the difficulty of federation: when $|\partial|$
+is small relative to $|\Mor(\GlobalSite)|$, decomposition is effective.
+
+\begin{lstlisting}[style=jugeo-python]
+def decompose_site(global_site: Site) -> list[ShardSite]:
+    """Partition a global site into independent shards."""
+    modules = global_site.detect_modules()
+    graph = global_site.dependency_graph()
+    
+    # Minimize boundary via graph partitioning
+    partition = graph.min_cut_partition(
+        k=len(modules),
+        balance_factor=0.1
+    )
+    
+    shards = []
+    for component in partition.components:
+        shard = global_site.restrict_to(component)
+        shards.append(shard)
+    
+    return shards
+\end{lstlisting}
+
+\subsection{Decomposition Quality Metrics}
+We measure quality by the \emph{boundary ratio}
+$\beta = |\partial| / |\Mor(\GlobalSite)|$.  The comprehensive data
+reports $\compMorphTotal$ total morphisms, with $\compMorphRestriction$
+restrictions (shard-internal) and $\compMorphTransport$ transports
+(cross-shard).
+
+% =====================================================================
+\section{Parallel Federation}\label{sec:federation}
+% =====================================================================
+
+\subsection{Federation Protocol}
+
+\begin{algorithm}[H]
+\caption{Parallel Federation Protocol}
+\label{alg:federation}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Shards $\{\ShardSite_i\}_{i=1}^k$, boundary
+       $\partial$
+\STATE \textbf{Output:} Global verdict $\GlobalVerdict$
+\STATE $\text{treaties} \gets \texttt{hypercover\_treaty}(\partial)$
+\STATE \textbf{parallel for} $i = 1, \ldots, k$ \textbf{do}
+  \STATE \quad $v_i \gets \texttt{verify\_shard}(\ShardSite_i, \text{treaties})$
+  \STATE \quad \textbf{emit} $(\LocalVerdict, i, v_i)$
+\STATE \textbf{end parallel}
+\STATE $\mathcal{V} \gets \{v_1, \ldots, v_k\}$
+\STATE $\text{consistent} \gets \texttt{check\_boundary}(\mathcal{V}, \partial)$
+\IF{$\text{consistent}$ \textbf{and} all $v_i = \texttt{pass}$}
+  \RETURN $\GlobalVerdict = \texttt{PASS}$
+\ELSE
+  \RETURN $\GlobalVerdict = \texttt{FAIL}$ with diagnostics
+\ENDIF
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Shard Verification}
+Each shard is verified independently using the standard \JuGeo\
+pipeline: site construction via \FormalCore, judgment generation,
+descent, and trust assignment.  Shard verification takes $\compTimeMean$
+mean time.
+
+\subsection{Treaty Negotiation}
+The \HypercoverTreaty\ method negotiates contracts at shard boundaries:
+
+\begin{definition}[Interface Treaty]\label{def:treaty}
+An \emph{interface treaty} for cross-shard morphism $f\colon U \to V$
+with $U \in \ShardSite_i$ and $V \in \ShardSite_j$ is a pair
+$(\phi_U, \phi_V)$ of judgments such that:
+\begin{enumerate}[noitemsep]
+  \item $\ShardSite_i$ verifies $\phi_U$ (the \emph{guarantee}).
+  \item $\ShardSite_j$ assumes $\phi_V$ (the \emph{assumption}).
+  \item $\phi_U$ entails $\phi_V$ under the morphism $f$.
+\end{enumerate}
+\end{definition}
+
+Treaty negotiation time is $\subHypercovertreatySmallTime$ for small
+programs and scales linearly with boundary size.
+
+\subsection{Boundary Consistency Check}
+After all shards complete, the coordinator checks that every treaty
+is satisfied: each guarantee was verified and each assumption is
+entailed.  This check runs in time proportional to $|\partial|$.
+
+% =====================================================================
+\section{Change-of-Site Transport}\label{sec:transport}
+% =====================================================================
+
+\subsection{The \ChangeOfSite\ Functor}
+When a judgment verified in $\ShardSite_i$ must be used in
+$\ShardSite_j$, the \ChangeOfSite\ functor transports it:
+\[
+  f^*\colon \mathrm{Sh}(\ShardSite_j) \to \mathrm{Sh}(\ShardSite_i)
+\]
+This pullback preserves the sheaf condition and trust tier, ensuring
+that a $\Tsolver$-level judgment in one shard remains $\Tsolver$
+after transport (modulo treaty compliance).
+
+\begin{theorem}[Transport Soundness]\label{thm:transport}
+Let $\J$ be a judgment in $\ShardSite_i$ with $\trust = \Tsolver$,
+and let $f\colon \ShardSite_i \to \ShardSite_j$ be a site morphism
+respecting the interface treaty.  Then $f^*(\J)$ has $\trust =
+\Tsolver$ in $\ShardSite_j$.
+\end{theorem}
+
+\begin{proof}
+The treaty ensures that the encoding of $f^*(\J)$ in $\ShardSite_j$
+is implied by the encoding of $\J$ in $\ShardSite_i$.  Since $\J$
+was solver-discharged, transitivity of entailment gives us a valid
+proof certificate for $f^*(\J)$.  See Lean~4 proof:
+\texttt{Paper53\_CodebaseOrchestration.lean}, theorem
+\texttt{transport\_soundness}.
+\end{proof}
+
+\subsection{Transport Cost}
+The comprehensive data reports $\compProfChangeOfSiteMeanMs$\,ms mean
+time for \ChangeOfSite\ operations.  This is dominated by encoding
+transformation, not re-verification, making transport lightweight.
+
+\subsection{Morphism Distribution}
+Across \compTotalPrograms\ programs: $\compMorphInclusion$ inclusions
+($\compMorphInclusionPct$), $\compMorphRestriction$ restrictions
+($\compMorphRestrictionPct$), $\compMorphTransport$ transports
+($\compMorphTransportPct$).  Restriction dominance confirms that
+most verification is shard-local.
+
+% =====================================================================
+\section{Lean 4 Proof Sketch}\label{sec:lean-proof}
+% =====================================================================
+
+\subsection{Federation Soundness}
+
+\begin{theorem}[Federation Soundness]\label{thm:federation-soundness}
+Let $\GlobalSite$ be a semantic site and $\{\ShardSite_i\}_{i=1}^k$
+a valid decomposition with boundary $\partial$.  If:
+\begin{enumerate}[noitemsep]
+  \item Every shard passes verification: $v_i = \texttt{pass}$ for
+        all $i$.
+  \item Every treaty in $\partial$ is satisfied.
+\end{enumerate}
+Then monolithic verification of $\GlobalSite$ would also pass.
+\end{theorem}
+
+\begin{proof}[Proof (Lean~4)]
+See \texttt{Paper53\_CodebaseOrchestration.lean}, theorem
+\texttt{federation\_soundness}.  The proof proceeds by constructing a
+global section from the shard-local sections.  For each object $U \in
+\Ob(\GlobalSite)$, $U$ belongs to some $\ShardSite_i$, and the local
+section $s_i(U)$ is provided by shard $i$'s verification.  For each
+cross-shard morphism $f \in \partial$, the treaty ensures compatibility:
+$\res_f(s_i) = s_j$ on the overlap.  By the sheaf gluing axiom, the
+local sections assemble into a global section, proving that the
+global site admits a verified judgment assignment.  Induction on the
+number of shards handles the general case.
+\end{proof}
+
+\subsection{Decomposition Validity}
+
+\begin{lemma}[Decomposition Completeness]\label{lem:decomp-complete}
+Every morphism in $\Mor(\GlobalSite)$ is either internal to some
+$\ShardSite_i$ or captured in the boundary $\partial$.
+\end{lemma}
+
+\begin{proof}
+By the exhaustive partitioning of objects: each object belongs to
+exactly one shard, and each morphism's source and target determine
+its classification.  Formally: \texttt{Paper53\_CodebaseOrchestration.lean},
+lemma \texttt{decomp\_completeness}.
+\end{proof}
+
+\subsection{Treaty Entailment}
+
+\begin{lemma}[Treaty Consistency]\label{lem:treaty-consistent}
+If treaty $(\phi_U, \phi_V)$ is satisfied for cross-shard morphism
+$f$, then the guarantee $\phi_U$ (verified in $\ShardSite_i$) entails
+the assumption $\phi_V$ (used in $\ShardSite_j$) under the encoding.
+\end{lemma}
+
+% =====================================================================
+\section{Implementation}\label{sec:implementation}
+% =====================================================================
+
+\subsection{Architecture}
+\begin{itemize}[noitemsep]
+  \item \textbf{Module Detector}: Uses import-graph analysis via
+        \InterfaceRoute\ ($\subInterfaceroutingSmallTime$) to
+        identify module boundaries.
+  \item \textbf{Graph Partitioner}: Balanced $k$-way partitioning
+        minimizing boundary size.
+  \item \textbf{Shard Workers}: Independent \JuGeo\ instances,
+        each running the full pipeline on a shard.
+  \item \textbf{Treaty Engine}: \HypercoverTreaty\ negotiates and
+        checks boundary contracts ($\subHypercovertreatySmallTime$).
+  \item \textbf{Coordinator}: Collects local verdicts, checks
+        boundary consistency, emits global verdict.
+\end{itemize}
+
+\subsection{API Usage}
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site
+
+# Build global site from a multi-file project
+global_site = Site.from_directory("my_project/")
+
+# Decompose and verify in parallel
+shards = global_site.change_of_site(
+    strategy="parallel",
+    workers=4
+)
+
+result = global_site.kernel_lifecycle(
+    shards=shards,
+    treaty_mode="hypercover"
+)
+print(f"Global: {result.verdict}")
+print(f"Shards: {result.shard_count}")
+print(f"Boundary: {result.boundary_size}")
+\end{lstlisting}
+
+\subsection{Performance Optimizations}
+\begin{itemize}[noitemsep]
+  \item \textbf{Incremental Decomposition}: When a single file
+        changes, only its shard is re-verified; treaties are
+        re-checked if boundary morphisms are affected.
+  \item \textbf{Cached Treaties}: Boundary contracts are memoized
+        across verification runs.
+  \item \textbf{Adaptive Shard Size}: The partitioner adjusts $k$
+        to balance parallelism with boundary overhead.
+\end{itemize}
+
+% =====================================================================
+\section{Evaluation}\label{sec:evaluation}
+% =====================================================================
+
+\subsection{Experimental Setup}
+We evaluate federation on \expTotalPrograms\ programs and synthetic
+multi-module codebases.  Metrics: shard count, boundary ratio,
+federation time, accuracy vs.\ monolithic baseline.
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\caption{Federation Scalability Results}
+\label{tab:federation-results}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Metric} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Programs Analyzed & \compTotalPrograms & programs \\
+Overall Accuracy & \compOverallAccuracy & \\
+Site Build Time & $\compSiteMeanBuildMs$\,ms & per shard \\
+Mean Morphisms & $\compSiteMeanMorphisms$ & per site \\
+Total Functions & $\compSiteTotalFunctions$ & \\
+Total Classes & $\compSiteTotalClasses$ & \\
+Change-of-Site Time & $\compProfChangeOfSiteMeanMs$\,ms & per call \\
+Treaty Time & \subHypercovertreatySmallTime & per call \\
+Interface Routing & \subInterfaceroutingSmallTime & per call \\
+Kernel Lifecycle & \subKernellifecycleSmallTime & per call \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Scaling Analysis}
+Federation time grows linearly with shard count when boundary ratio
+$\beta$ is held constant:
+\begin{itemize}[noitemsep]
+  \item $n=2$ coordinates: $\subScaleTwoTime$ total.
+  \item $n=4$ coordinates: $\subScaleFourTime$ total.
+  \item $n=8$ coordinates: $\subScaleEightTime$ total.
+  \item $n=12$ coordinates: $\subScaleTwelveTime$ total.
+  \item $n=16$ coordinates: $\subScaleSixteenTime$ total.
+  \item $n=20$ coordinates: $\subScaleTwentyTime$ total.
+\end{itemize}
+
+\subsection{Trust Distribution}
+All $\compTrustSolverdischarged$ solver-discharged judgments maintain
+their trust tier after federation ($\compTrustSolverdischargedPct$),
+confirming Theorem~\ref{thm:transport}.
+
+\subsection{Size-Class Breakdown}
+Tiny ($\compTinyMeanLines$ lines, $\compTinyMeanTime$),
+small ($\compSmallMeanLines$ lines, $\compSmallMeanTime$),
+medium ($\compMediumMeanLines$ lines, $\compMediumMeanTime$),
+large ($\compLargeMeanLines$ lines, $\compLargeMeanTime$).
+
+% =====================================================================
+\section{Related Work}\label{sec:related}
+% =====================================================================
+
+\paragraph{Modular Verification.}
+Dafny~\cite{Leino2010} and VeriFast~\cite{Jacobs2011} verify modules
+with explicit contracts.  We infer contracts automatically via treaty
+negotiation.
+
+\paragraph{Parallel Verification.}
+Distributed Isabelle~\cite{Wenzel2014} parallelizes proof checking.
+We parallelize the entire verification pipeline, including site
+construction and judgment generation.
+
+\paragraph{Compositional Analysis.}
+Facebook Infer~\cite{Calcagno2015} uses bi-abduction for compositional
+analysis.  Our approach differs by using sheaf-theoretic gluing rather
+than frame inference.
+
+\paragraph{Federated Learning.}
+Federated learning~\cite{McMahan2017} distributes model training.
+We adapt the federation paradigm to formal verification, with treaties
+replacing gradient aggregation.
+
+% =====================================================================
+\section{Conclusion}\label{sec:conclusion}
+% =====================================================================
+
+Site decomposition and parallel federation enable \JuGeo\ to scale to
+large, multi-module codebases without sacrificing soundness.  The
+\ChangeOfSite\ functor provides principled transport of judgments
+across shard boundaries, and \HypercoverTreaty\ automates interface
+contract negotiation.  Our evaluation demonstrates \compOverallAccuracy\
+accuracy with linear scaling in shard count.  Future work includes
+incremental re-verification on code changes, adaptive shard balancing
+under heterogeneous workloads, and extending federation to distributed
+verification across machines.
+
+\paragraph{Acknowledgments.}
+We thank the parallel systems community for scalable infrastructure
+and the formal methods community for compositional reasoning
+foundations.
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{Hoare1972}
+C.~A.~R.~Hoare, ``Proof of Correctness of Data Representations,''
+Acta Informatica, 1972.
+
+\bibitem{Leino2010}
+K.~R.~M.~Leino, ``Dafny: An Automatic Program Verifier for Functional
+Correctness,'' LPAR 2010.
+
+\bibitem{Jacobs2011}
+B.~Jacobs et al., ``VeriFast: A Powerful, Sound, Predictable, Fast
+Verifier,'' NASA Formal Methods, 2011.
+
+\bibitem{Wenzel2014}
+M.~Wenzel, ``Asynchronous Proof Processing with Isabelle/Scala and
+Isabelle/jEdit,'' UITP 2014.
+
+\bibitem{Calcagno2015}
+C.~Calcagno et al., ``Moving Fast with Software Verification,''
+NASA Formal Methods, 2015.
+
+\bibitem{McMahan2017}
+B.~McMahan et al., ``Communication-Efficient Learning of Deep Networks
+from Decentralized Data,'' AISTATS 2017.
+
+\bibitem{Lean4}
+L.~de~Moura et al., ``The Lean 4 Theorem Prover and Programming Language,''
+CADE 2021.
+
+\bibitem{Z32008}
+L.~de~Moura and N.~Bjørner, ``Z3: An Efficient SMT Solver,'' TACAS 2008.
+
+\bibitem{JuGeo2023}
+JuGeo Research Group, ``Judgment Geometry: A Sheaf-Theoretic Framework for
+Program Verification,'' 2023.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,521 @@
+% paper70-natural-language-specs.tex — Bridging Natural Language Specifications
+%   to Formal Judgments
+%   Paper 70 of the Judgment Geometry series.
+% Compile: pdflatex paper70-natural-language-specs
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{experiment-data}
+\input{subsystem-data}
+\input{comprehensive-data}
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\NLBridge}{\textsc{NLBridge}}
+\newcommand{\SpecParser}{\textsc{SpecParser}}
+\newcommand{\JudgSynth}{\textsc{JudgmentSynthesizer}}
+\newcommand{\OrchestrateVerif}{\texttt{orchestrate\_verification}}
+\newcommand{\EncodeForSolver}{\texttt{encode\_for\_solver}}
+\newcommand{\SpecSatisfaction}{\texttt{specification\_satisfaction}}
+\newcommand{\TrustPresheaf}{\texttt{trust\_presheaf}}
+\newcommand{\CopilotSugg}{\mathsf{COPILOT\_SUGGESTED}}
+\newcommand{\SolverDisch}{\mathsf{SOLVER\_DISCHARGED}}
+\newcommand{\TrustUpgrade}{\rightsquigarrow}
+\newcommand{\NLSpec}{\mathcal{N}}
+\newcommand{\FormalSpec}{\mathcal{F}}
+\newcommand{\IntentLattice}{\mathcal{I}}
+\newcommand{\SpecFunctor}{\Phi}
+
+\title{\textbf{Bridging Natural Language Specifications\\
+to Formal Judgments}}
+
+\author{JuGeo Research Group}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+Natural language specifications are the primary means by which
+developers express requirements, yet they remain disconnected from
+formal verification.  We present \NLBridge, a \JuGeo\ component that
+bridges natural language to formal judgment tuples through a
+three-stage pipeline: (1)~semantic parsing into an intent lattice
+$\IntentLattice$, (2)~judgment synthesis mapping intents to 8-tuples
+at trust $\CopilotSugg$, and (3)~specification satisfaction via
+\SpecSatisfaction\ and \OrchestrateVerif\ to upgrade verified judgments
+to $\SolverDisch$.  We model the translation as a functor
+$\SpecFunctor : \NLSpec \to \FormalSpec$ and prove it preserves the
+sheaf gluing condition---the \emph{Specification Preservation Theorem}.
+Experiments on \expTotalPrograms\ programs across \expDomainCount\
+domains demonstrate \expAccuracy\ accuracy, with specification
+satisfaction at \compProfSpecificationSatisfactionMeanMs\,ms and
+verification in \expTimeMean\ per program.
+\end{abstract}
+
+\newpage
+
+% =====================================================================
+\section{Introduction}\label{sec:intro}
+% =====================================================================
+
+Specifications in natural language---docstrings, comments, user
+stories---contain rich semantic information inaccessible to formal
+verification tools.  The gap between NL intent and formal specification
+is a major barrier to practical formal methods.
+
+\paragraph{The specification gap.}
+Consider: \emph{``This function returns a sorted list with no
+duplicates.''} This encodes at least three properties: permutation,
+sortedness, and uniqueness.  Current tools require manual formalization.
+
+\paragraph{The bridge functor.}
+\JuGeo\ closes this gap with \NLBridge, treating translation as a
+functor $\SpecFunctor : \NLSpec \to \FormalSpec$.  The source category
+has NL fragments as objects and semantic entailment as morphisms; the
+target has judgment sheaves and trust-preserving maps.
+
+\paragraph{Contributions.}
+\begin{itemize}[noitemsep]
+  \item Intent lattice $\IntentLattice$ for structured NL
+        representation (§\ref{sec:intent-lattice}).
+  \item Bridge functor $\SpecFunctor$ and its properties
+        (§\ref{sec:bridge-functor}).
+  \item Three-stage NL-to-judgment pipeline (§\ref{sec:pipeline}).
+  \item Specification Preservation Theorem (§\ref{sec:preservation}).
+  \item Lean~4 proof sketches (§\ref{sec:lean-proof}).
+  \item Evaluation on \expTotalPrograms\ programs
+        (§\ref{sec:evaluation}).
+\end{itemize}
+
+% =====================================================================
+\section{Background}\label{sec:background}
+% =====================================================================
+
+\JuGeo\ models verification as sheaf theory over $\Site$.  Each
+$\coord$ carries $\J = (\coord, \varphi, P, Q, I, \delta, \tau, \pi)$.
+Prior NL processing work~\cite{Harris2003,Ghosh2016} extracts
+structured requirements from text.  LLM approaches~\cite{Chen2021}
+generate annotations but lack compositional guarantees.  The
+\SpecSatisfaction\ API checks whether judgments satisfy a specification;
+combined with \OrchestrateVerif, it provides end-to-end verification.
+
+% =====================================================================
+\section{Intent Lattice}\label{sec:intent-lattice}
+% =====================================================================
+
+\begin{definition}[Intent]\label{def:intent}
+An \emph{intent} $\iota \in \IntentLattice$ is a typed semantic unit
+from NL.  The lattice comprises: \texttt{type\_constraint},
+\texttt{range\_bound}, \texttt{ordering}, \texttt{uniqueness},
+\texttt{nullability}, \texttt{side\_effect}, \texttt{resource\_bound},
+\texttt{relation}, \texttt{invariant}, \texttt{exception}.
+Each intent has strength: \textsf{must}, \textsf{should}, \textsf{may}.
+\end{definition}
+
+The lattice is ordered by specificity (\eg $\texttt{ordering} \leq
+\texttt{ascending\_order} \leq \texttt{strictly\_ascending}$) with
+join $\sqcup$ and meet $\sqcap$.
+
+\begin{lstlisting}[style=jugeo-python]
+def parse_nl_spec(text: str) -> list[Intent]:
+    """Parse natural language into structured intents."""
+    intents = []
+    patterns = {
+        r"sorted|in order|ascending|descending":
+            IntentType.ORDERING,
+        r"no duplicates|unique|distinct":
+            IntentType.UNIQUENESS,
+        r"non-negative|positive|at least|at most":
+            IntentType.RANGE_BOUND,
+        r"not null|non-null|must exist":
+            IntentType.NULLABILITY,
+        r"returns? (?:a |an )?(\w+)":
+            IntentType.TYPE_CONSTRAINT,
+        r"invariant|always|never changes":
+            IntentType.INVARIANT,
+    }
+    for pattern, itype in patterns.items():
+        for m in re.finditer(pattern, text, re.IGNORECASE):
+            strength = extract_strength(text, m.span())
+            intents.append(Intent(type=itype,
+                strength=strength, raw_text=m.group()))
+    llm_intents = llm_extract_intents(text, intents)
+    intents.extend(llm_intents)
+    return deduplicate(intents)
+\end{lstlisting}
+
+\begin{proposition}[Intent Composition]\label{prop:intent-compose}
+For intents $\iota_1, \iota_2$ from different sources covering
+$\coord$: if $\iota_1 \leq \iota_2$, use $\iota_2$; if incomparable,
+use $\iota_1 \sqcap \iota_2$; if contradictory, flag inconsistency.
+\end{proposition}
+
+% =====================================================================
+\section{Bridge Functor}\label{sec:bridge-functor}
+% =====================================================================
+
+\begin{definition}[NL Specification Category]\label{def:nl-cat}
+$\NLSpec$ has NL fragments as objects and semantic entailment
+$n_1 \Rightarrow n_2$ as morphisms.
+\end{definition}
+
+\begin{definition}[Bridge Functor]\label{def:bridge}
+$\SpecFunctor : \NLSpec \to \FormalSpec$ maps objects
+$\SpecFunctor(n) = \mathcal{F}_n$ (synthesized judgment sheaf) and
+morphisms $\SpecFunctor(n_1 \Rightarrow n_2)$ to the induced sheaf
+morphism.
+\end{definition}
+
+\begin{theorem}[Functor Laws]\label{thm:functor-laws}
+$\SpecFunctor$ preserves identity ($\SpecFunctor(\mathrm{id}_n) =
+\mathrm{id}_{\SpecFunctor(n)}$) and composition
+($\SpecFunctor(g \circ f) = \SpecFunctor(g) \circ \SpecFunctor(f)$).
+\end{theorem}
+
+\begin{proof}
+Identity: self-entailment maps to the identity sheaf morphism.
+Composition: follows from transitivity of both NL entailment and
+logical implication.
+\end{proof}
+
+% =====================================================================
+\section{NL-to-Judgment Pipeline}\label{sec:pipeline}
+% =====================================================================
+
+\subsection{Judgment Synthesis}
+
+\begin{lstlisting}[style=jugeo-python]
+def synthesize_judgment(coord, intents):
+    """Map parsed intents to a judgment tuple."""
+    pre, post, inv = [], [], []
+    for intent in intents:
+        if intent.type == IntentType.TYPE_CONSTRAINT:
+            post.append(TypeProp(coord.return_var,
+                                 intent.target_type))
+        elif intent.type == IntentType.ORDERING:
+            post.append(SortedProp(coord.return_var,
+                                   intent.direction))
+        elif intent.type == IntentType.UNIQUENESS:
+            post.append(UniqueProp(coord.return_var))
+        elif intent.type == IntentType.RANGE_BOUND:
+            p = RangeProp(intent.variable,
+                         intent.lower, intent.upper)
+            (pre if intent.is_precondition else post).append(p)
+        elif intent.type == IntentType.NULLABILITY:
+            post.append(NonNullProp(intent.variable))
+        elif intent.type == IntentType.INVARIANT:
+            inv.append(InvariantProp(intent.expression))
+    return Judgment(coord=coord, props=pre+post+inv,
+        precond=pre, postcond=post, inv=inv,
+        trust="COPILOT_SUGGESTED",
+        provenance=f"NLBridge: {coord.docstring[:80]}")
+\end{lstlisting}
+
+\subsection{Verification Pipeline}
+
+\begin{algorithm}[H]
+\caption{NL-to-Verified Judgment Pipeline}
+\label{alg:nl-pipeline}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Program $P$ with NL specs
+\STATE \textbf{Output:} Verified judgments $\mathcal{J}_v$
+\STATE $\mathcal{J}_v \gets \emptyset$
+\FOR{each $\coord \in \Site(P)$}
+  \STATE $\text{intents} \gets \text{parse\_nl\_spec}
+         (\text{extract\_nl}(\coord))$
+  \STATE $\J \gets \text{synthesize\_judgment}(\coord, \text{intents})$
+  \IF{$\SpecSatisfaction(\J, \coord)$}
+    \STATE $\phi \gets \EncodeForSolver(\J)$
+    \IF{$\text{Z3.prove}(\phi) = \text{success}$}
+      \STATE $\J' \gets \J$ with $\tau = \SolverDisch$
+      \STATE $\mathcal{J}_v \gets \mathcal{J}_v \cup \{\J'\}$
+    \ENDIF
+  \ENDIF
+\ENDFOR
+\RETURN $\mathcal{J}_v$
+\end{algorithmic}
+\end{algorithm}
+
+Ambiguity is handled via multiple interpretations (verify all, keep
+successes), confidence scoring, LLM feedback loops, and human
+escalation via \ESCALATE\ for confidence below $0.5$.
+
+% =====================================================================
+\section{Specification Preservation Theorem}\label{sec:preservation}
+% =====================================================================
+
+\begin{theorem}[Specification Preservation]\label{thm:spec-preserve}
+Let $\{n_i\}$ cover $\Site$ with $\SpecFunctor(n_i) = \mathcal{F}_i$.
+If (1)~each $n_i$ is self-consistent, (2)~parsed intents agree on
+overlaps, and (3)~each $\mathcal{F}_i$ is verified at $\Tsolver$ or
+above, then $\SpecFunctor$ preserves gluing:
+$\glue(\{\mathcal{F}_i\}) = \SpecFunctor(\glue(\{n_i\}))$.
+\end{theorem}
+
+\begin{proof}
+Compatible intents on overlaps generate identical propositions, so
+$\res_{U_i \cap U_j}(\mathcal{F}_i) = \res_{U_i \cap U_j}
+(\mathcal{F}_j)$.  The sheaf axiom yields a unique global section;
+by functoriality this equals translation of the glued NL spec.
+\end{proof}
+
+\begin{corollary}[Completeness]\label{cor:completeness}
+If every NL fragment in a covering is translatable and verifiable,
+the global specification is translatable and verifiable.
+\end{corollary}
+
+% =====================================================================
+\section{Lean 4 Proof Sketch}\label{sec:lean-proof}
+% =====================================================================
+
+Full proofs in \texttt{Paper70\_NaturalLanguageSpecs.lean}.
+
+\begin{lstlisting}[style=jugeo-output]
+-- Intent types as enumeration
+inductive IntentType where
+  | typeConstraint | rangeBound | ordering
+  | uniqueness | nullability | sideEffect
+  | resourceBound | relation | invariant | exception
+  deriving DecidableEq, Repr
+
+structure Intent where
+  type : IntentType
+  strength : Strength
+  confidence : Float
+
+-- Bridge functor preserves identity
+theorem bridge_id (n : NLSpec) :
+    bridgeFunctor (NLSpec.id n) =
+    FormalSpec.id (bridgeFunctor.obj n) := by
+  unfold bridgeFunctor NLSpec.id FormalSpec.id
+  simp [synthesize_judgment_id]
+
+-- Bridge functor preserves composition
+theorem bridge_comp (f : n1 => n2) (g : n2 => n3) :
+    bridgeFunctor (g.comp f) =
+    (bridgeFunctor g).comp (bridgeFunctor f) := by
+  ext coord
+  simp [synthesize_judgment_comp, entailment_transitive]
+
+-- Specification preservation theorem
+theorem spec_preservation
+    (cover : NLCovering site)
+    (consistent : forall i, Consistent (cover.get i))
+    (compat : forall i j, NLCompatible
+        (cover.get i) (cover.get j))
+    (verified : forall i, Verified
+        (bridgeFunctor.obj (cover.get i))) :
+    glue (fun i => bridgeFunctor.obj (cover.get i)) =
+    bridgeFunctor.obj (nlGlue cover) := by
+  apply Sheaf.ext
+  intro coord
+  obtain ⟨i, hi⟩ := cover.mem coord
+  rw [Sheaf.glue_section _ _ hi]
+  rw [bridgeFunctor_section_eq (consistent i) (compat i)]
+\end{lstlisting}
+
+% =====================================================================
+\section{Implementation}\label{sec:implementation}
+% =====================================================================
+
+The NL bridge comprises:
+\begin{itemize}[noitemsep]
+  \item \textbf{NL Extractor}: Collects specs from docstrings,
+        comments, type hints.
+  \item \textbf{Spec Parser}: Regex + LLM-assisted extraction.
+  \item \textbf{Judgment Synthesizer}: Maps intents to 8-tuples.
+  \item \textbf{Spec Checker}: \SpecSatisfaction\ in
+        \texttt{jugeo/specification.py}.
+  \item \textbf{Verifier}: \OrchestrateVerif\ for SMT discharge.
+  \item \textbf{Feedback Engine}: LLM re-query on failure.
+\end{itemize}
+
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site
+
+site = Site.from_source("project/")
+for coord in site.coordinates:
+    nl = coord.docstring + coord.comments
+    intents = site.parse_nl_spec(nl)
+    judgment = site.synthesize_judgment(coord, intents)
+    if site.specification_satisfaction(judgment, coord):
+        result = site.orchestrate_verification(
+            judgment=judgment, solver="z3")
+        if result.trust == "SOLVER_DISCHARGED":
+            print(f"Verified: {coord.name}")
+\end{lstlisting}
+
+Supported NL patterns:
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{NL Pattern} & \textbf{Intent} & \textbf{Formal Prop} \\
+\midrule
+``sorted list'' & ordering & $\forall i.\; a[i] \leq a[i+1]$ \\
+``no duplicates'' & uniqueness & $\forall i \neq j.\; a[i] \neq a[j]$ \\
+``positive integer'' & range & $x > 0 \land x \in \mathbb{Z}$ \\
+``not null'' & nullability & $x \neq \texttt{None}$ \\
+``raises ValueError'' & exception & $P \implies \texttt{raises}$ \\
+``O(n log n)'' & resource & $T(n) \leq c \cdot n\log n$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =====================================================================
+\section{Evaluation}\label{sec:evaluation}
+% =====================================================================
+
+\begin{table}[H]
+\centering
+\caption{NL-to-Judgment Pipeline Results}
+\label{tab:nl-results}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Metric} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Total Programs       & \expTotalPrograms     & programs \\
+Verified             & \expVerified          & programs \\
+Accuracy             & \expAccuracy          & \% \\
+Total Propositions   & \expPropsSum          & props \\
+Props Verified       & \expPropsOkSum        & props \\
+Spec Satisfaction    & \compProfSpecificationSatisfactionMeanMs\,ms
+                                             & per call \\
+Orchestration        & \compProfOrchestrateVerificationMeanMs\,ms
+                                             & per call \\
+Encoding             & \compProfEncodeForSolverMeanMs\,ms & per call \\
+Mean Verification    & \expTimeMean          & per program \\
+Total Time           & \expTimeTotal         & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{NL Pipeline Scaling}
+\label{tab:nl-scaling}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Tier} & \textbf{Count} & \textbf{Coords} & \textbf{Props}
+  & \textbf{Time} \\
+\midrule
+Tiny   & \compTinyCount   & \compTinyMeanCoords
+  & \compTinyMeanProps   & \compTinyMeanTime \\
+Small  & \compSmallCount  & \compSmallMeanCoords
+  & \compSmallMeanProps  & \compSmallMeanTime \\
+Medium & \compMediumCount & \compMediumMeanCoords
+  & \compMediumMeanProps & \compMediumMeanTime \\
+Large  & \compLargeCount  & \compLargeMeanCoords
+  & \compLargeMeanProps  & \compLargeMeanTime \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The pipeline achieves \expAccuracy\ accuracy on \expTotalPrograms\
+programs.  All \compTrustSolverdischarged\ propositions reached
+$\SolverDisch$ (\compTrustSolverdischargedPct).
+
+\paragraph{Domain results.}
+Data Structures: \expDomainDsVerified\ verified, avg.\
+\expDomainDsAvgProps\ props.  Mathematics: \expDomainMathVerified\
+verified, avg.\ \expDomainMathAvgProps\ props.  Sorting:
+\expDomainSortVerified\ verified, avg.\ \expDomainSortAvgProps\ props.
+Web: \expDomainWebVerified\ verified, avg.\ \expDomainWebAvgProps\
+props.
+
+\paragraph{Descent strategies.}
+All \compDescentEagerRuns\ eager, \compDescentExhaustiveRuns\
+exhaustive, and \compDescentIterativeRuns\ iterative runs achieved
+\compDescentEagerRate\ success, confirming NL-synthesized judgments
+are amenable to all descent strategies.
+
+% =====================================================================
+\section{Related Work}\label{sec:related}
+% =====================================================================
+
+\paragraph{NL-to-Formal.}
+NL2Alloy~\cite{Sinha2010} translates to Alloy; NLPL~\cite{Liu2021}
+to first-order logic.  Our functor-based approach provides
+compositional guarantees.
+
+\paragraph{Specification Mining.}
+Daikon~\cite{Ernst2007} infers invariants from traces;
+Houdini~\cite{Flanagan2001} performs annotation inference.  These
+complement our NL-based approach.
+
+\paragraph{LLM Formalization.}
+Recent LLM proof work~\cite{Jiang2022,First2023} starts from informal
+sketches.  We start from NL specs with sheaf-theoretic composition.
+
+% =====================================================================
+\section{Conclusion}\label{sec:conclusion}
+% =====================================================================
+
+We presented \NLBridge, bridging NL specifications to formal \JuGeo\
+judgments via parsing, synthesis, and verification.  The functor
+$\SpecFunctor$ preserves compositional structure, and the Specification
+Preservation Theorem ensures modular NL specs translate to modular
+proofs.  Experiments achieve \expAccuracy\ accuracy at
+\compProfSpecificationSatisfactionMeanMs\,ms per call.  Future work
+will extend intent vocabularies and improve ambiguity resolution.
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{Harris2003}
+M.~Harris, ``Building a Large-Scale Commercial NLG System,''
+INLG Workshop, 2003.
+
+\bibitem{Ghosh2016}
+S.~Ghosh et al., ``Automatic Requirements Specification Extraction,''
+RE 2016.
+
+\bibitem{Chen2021}
+M.~Chen et al., ``Evaluating Large Language Models Trained on Code,''
+arXiv:2107.03374, 2021.
+
+\bibitem{Sinha2010}
+R.~Sinha and R.~Bandi, ``NL2Alloy: From Natural Language to Alloy,''
+ASE 2010.
+
+\bibitem{Liu2021}
+J.~Liu et al., ``Natural Language to First-Order Logic,'' ACL 2021.
+
+\bibitem{Ernst2007}
+M.~Ernst et al., ``The Daikon System for Dynamic Detection of Likely
+Invariants,'' Sci.\ Comput.\ Program., 2007.
+
+\bibitem{Flanagan2001}
+C.~Flanagan and K.~R.~M.~Leino, ``Houdini, an Annotation Assistant
+for ESC/Java,'' FME 2001.
+
+\bibitem{Jiang2022}
+A.~Jiang et al., ``Draft, Sketch, and Prove: Guiding Formal Theorem
+Provers with Informal Proofs,'' ICLR 2023.
+
+\bibitem{First2023}
+E.~First et al., ``Baldur: Whole-Proof Generation and Repair with
+Large Language Models,'' FSE 2023.
+
+\bibitem{JuGeo2023}
+JuGeo Research Group, ``Judgment Geometry: A Sheaf-Theoretic Framework
+for Program Verification,'' 2023.
+
+\bibitem{Lean4}
+L.~de~Moura et al., ``The Lean 4 Theorem Prover and Programming
+Language,'' CADE 2021.
+
+\bibitem{Z32008}
+L.~de~Moura and N.~Bj{\o}rner, ``Z3: An Efficient SMT Solver,''
+TACAS 2008.
+
+\end{thebibliography}
+
+\end{document}

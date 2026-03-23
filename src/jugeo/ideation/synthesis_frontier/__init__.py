@@ -55,7 +55,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 try:
     from jugeo.ideation.synthesis_frontier.fields import (
-        ALL_48_FIELDS,
+        ALL_128_FIELDS,
         FIELD_BY_ID,
         FIELD_BY_NAME,
         get_fields_by_keywords,
@@ -64,7 +64,7 @@ try:
 except ImportError:
     try:
         from .fields import (  # type: ignore[no-redef]
-            ALL_48_FIELDS,
+            ALL_128_FIELDS,
             FIELD_BY_ID,
             FIELD_BY_NAME,
             get_fields_by_keywords,
@@ -206,7 +206,7 @@ __all__ = [
     "SynthesisPair",
     "TournamentState",
     # fields
-    "ALL_48_FIELDS",
+    "ALL_128_FIELDS",
     "FIELD_BY_ID",
     "FIELD_BY_NAME",
     "get_fields_by_keywords",

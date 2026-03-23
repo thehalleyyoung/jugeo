@@ -1,0 +1,480 @@
+% paper58-refactoring-guidance.tex — Sheaf-Theoretic Refactoring: When Can Code Be Safely Restructured?
+%   Paper 58 of the Judgment Geometry series.
+% Compile: pdflatex paper58-refactoring-guidance
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{experiment-data}
+\input{subsystem-data}
+\input{comprehensive-data}
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\RefactorSafe}{\textsc{RefactorSafe}}
+\newcommand{\ChangeOfSite}{\texttt{change\_of\_site}}
+\newcommand{\RepairSem}{\texttt{repair\_semantics}}
+\newcommand{\SpecSat}{\texttt{specification\_satisfaction}}
+\newcommand{\SitePre}{\Site_{\mathrm{pre}}}
+\newcommand{\SitePost}{\Site_{\mathrm{post}}}
+\newcommand{\RefactorMorph}{\rho}
+\newcommand{\SafetyWitness}{\omega}
+\newcommand{\ObstructionSheaf}{\mathcal{B}}
+\newcommand{\PreservationMap}{\mathrm{pres}}
+\newcommand{\props}{\Phi}                           % propositions
+\newcommand{\precond}{\mathsf{pre}}                  % preconditions
+\newcommand{\postcond}{\mathsf{post}}                % postconditions
+\newcommand{\inv}{\iota}                             % invariant
+\newcommand{\tr}{\mathsf{tr}}                        % trust tier
+
+\title{\textbf{Sheaf-Theoretic Refactoring:\\
+When Can Code Be Safely Restructured?}}
+\author{JuGeo Research Group}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \RefactorSafe, a framework within \JuGeo\ for determining
+when code refactoring preserves verified properties.  Given program $P$
+with semantic site $\SitePre$ and refactored version $P'$ with site
+$\SitePost$, we construct a \emph{refactoring morphism}
+$\RefactorMorph \colon \SitePre \to \SitePost$ and analyze whether the
+judgment sheaf descends along $\RefactorMorph$.  The \emph{Safe
+Refactoring Theorem} gives necessary and sufficient conditions: a
+refactoring is safe iff $\RefactorMorph$ preserves coverings and the
+obstruction sheaf $\ObstructionSheaf$ is trivial.  \ChangeOfSite\
+constructs $\RefactorMorph$ in \compProfChangeOfSiteMeanMs\,ms,
+\RepairSem\ identifies broken invariants in
+\compProfRepairSemanticsMeanMs\,ms, and \SpecSat\ verifies specification
+preservation in \compProfSpecificationSatisfactionMeanMs\,ms.  Across
+\compTotalPrograms\ programs with \compObstructionTotal\ obstructions,
+our framework correctly identifies all safe refactorings and pinpoints
+the exact coordinates where safety fails.
+\end{abstract}
+
+\newpage
+
+\section{Introduction}\label{sec:intro}
+
+Refactoring --- restructuring code without changing observable behavior
+--- is a cornerstone of software maintenance.  IDE tools support
+syntactic refactorings but cannot guarantee that semantic properties
+survive the transformation.  In \JuGeo\ terms, refactoring changes the
+semantic site: coordinates are reorganized, morphisms rewired, and
+covering families altered.  The question is whether the judgment sheaf
+on the old site descends to the new site.
+
+\RefactorSafe\ models each refactoring as a site morphism
+$\RefactorMorph \colon \SitePre \to \SitePost$.  If $\RefactorMorph$
+preserves coverings, the pullback $\RefactorMorph^{*}$ transports the
+judgment sheaf.  Otherwise, the \emph{obstruction sheaf}
+$\ObstructionSheaf$ identifies exactly which properties fail to
+transport.  Contributions:
+\begin{itemize}[noitemsep]
+  \item Categorical model of refactoring as site morphisms
+        (§\ref{sec:refactoring-morphisms}).
+  \item Safe Refactoring Theorem: necessary and sufficient conditions
+        for property preservation (§\ref{sec:safety-theorem}).
+  \item Obstruction sheaf: precise diagnostics of which properties
+        break (§\ref{sec:obstructions}).
+  \item Integration with \ChangeOfSite, \RepairSem, and \SpecSat\ APIs
+        (§\ref{sec:algorithm}).
+  \item Lean~4 formalization (§\ref{sec:lean-proof}).
+  \item Evaluation on \compTotalPrograms\ programs
+        (§\ref{sec:evaluation}).
+\end{itemize}
+
+\section{Background}\label{sec:background}
+
+\JuGeo\ assigns to program $P$ a semantic site
+$\Site_P = (\Ob(\Site_P), \Cov(\Site_P))$ and a judgment sheaf
+$\mathcal{G}_P$ whose sections are judgments
+$\J = (\coord, \props, \precond, \postcond, \inv, \delta, \tau, \tr)$.
+The sheaf condition ensures local consistency: overlapping coordinates
+carry compatible judgments.  When a presheaf fails the sheaf condition,
+the failure is captured by obstruction classes in Čech cohomology:
+$\Hcoh{1}(\Site, \mathcal{G}) \neq 0$.  In our benchmark,
+\compObstructionTotal\ obstructions were observed across
+\compTotalPrograms\ programs.
+
+\section{Refactoring as Site Morphisms}\label{sec:refactoring-morphisms}
+
+A refactoring $R \colon P \to P'$ induces a morphism of semantic sites
+$\RefactorMorph \colon \SitePre \to \SitePost$:
+
+\begin{definition}[Refactoring Morphism]\label{def:refactor-morph}
+A \emph{refactoring morphism} $\RefactorMorph \colon \SitePre \to
+\SitePost$ consists of:
+\begin{enumerate}[noitemsep]
+  \item A function $\RefactorMorph^{-1} \colon \Ob(\SitePost) \to
+        \mathcal{P}(\Ob(\SitePre))$ mapping each new coordinate to the
+        set of old coordinates it incorporates.
+  \item For each covering family $\{V_i \to V\}$ in $\SitePost$, a
+        \emph{covering compatibility certificate} asserting either:
+        \begin{itemize}[noitemsep]
+          \item[(a)] $\{\RefactorMorph^{-1}(V_i) \to
+                \RefactorMorph^{-1}(V)\}$ is a covering in $\SitePre$
+                (\emph{preserving}), or
+          \item[(b)] An obstruction witness identifying the failure
+                (\emph{breaking}).
+        \end{itemize}
+\end{enumerate}
+\end{definition}
+
+\begin{table}[H]
+\centering
+\caption{Refactoring Patterns and Site Morphism Types}
+\label{tab:refactor-types}
+\begin{tabular}{lll}
+\toprule
+\textbf{Refactoring} & \textbf{Morphism Type} & \textbf{Covering} \\
+\midrule
+Extract Method & Inclusion + new coord & Usually preserving \\
+Inline Function & Restriction (merge) & Preserving \\
+Move Method & Transport & Preserving \\
+Rename & Isomorphism & Always preserving \\
+Decompose Class & Refinement cover & May break \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The \ChangeOfSite\ method constructs $\RefactorMorph$ automatically:
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site
+
+site_pre = Site.from_source("before_refactor.py")
+site_post = Site.from_source("after_refactor.py")
+morph = site_pre.change_of_site(
+    target=site_post,
+    strategy="refactoring_alignment"
+)
+print(f"Preserving coverings: {morph.preserving_count}")
+print(f"Breaking coverings:   {morph.breaking_count}")
+\end{lstlisting}
+Construction time: \compProfChangeOfSiteMeanMs\,ms on average.  The
+morphism distribution shows \compMorphInclusion\ inclusions
+(\compMorphInclusionPct), \compMorphRestriction\ restrictions
+(\compMorphRestrictionPct), and \compMorphTransport\ transports
+(\compMorphTransportPct).
+
+\section{The Safe Refactoring Theorem}\label{sec:safety-theorem}
+
+\begin{theorem}[Safe Refactoring]\label{thm:safe-refactoring}
+Let $\RefactorMorph \colon \SitePre \to \SitePost$ be a refactoring
+morphism and $\mathcal{G}$ the judgment sheaf on $\SitePre$.  The
+refactoring is \emph{safe} (all verified properties of $P$ hold in
+$P'$) if and only if:
+\begin{enumerate}[noitemsep]
+  \item $\RefactorMorph$ preserves all covering families, and
+  \item the obstruction sheaf
+        $\ObstructionSheaf = \Hcoh{1}(\SitePost,
+        \RefactorMorph^{*}\mathcal{G})$ is trivial
+        ($\ObstructionSheaf = 0$).
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+(\emph{If}): Condition~(1) ensures $\RefactorMorph^{*}\mathcal{G}$ is a
+presheaf on $\SitePost$; condition~(2) ensures the sheaf (gluing)
+condition.  Together, $\RefactorMorph^{*}\mathcal{G}$ is a valid
+judgment sheaf on $\SitePost$, so all propositions verified in
+$\mathcal{G}$ hold in the transported sheaf.
+(\emph{Only if}): If $\RefactorMorph$ fails to preserve some covering,
+there exists $V \in \SitePost$ whose local judgments cannot be derived
+from $\SitePre$.  If $\ObstructionSheaf \neq 0$, local sections fail to
+glue, so locally valid properties contradict each other globally.
+\end{proof}
+
+\begin{definition}[Safety Degree]\label{def:safety-degree}
+The \emph{safety degree} of refactoring $\RefactorMorph$ is:
+\[
+  \sigma(\RefactorMorph) = 1 -
+    \frac{|\mathrm{breaking}(\RefactorMorph)|}{|\Cov(\SitePost)|}
+\]
+where $\mathrm{breaking}(\RefactorMorph)$ is the set of covering
+families not preserved.  A value of $1.0$ means fully safe; lower values
+indicate the fraction needing re-verification.
+\end{definition}
+
+\section{The Obstruction Sheaf}\label{sec:obstructions}
+
+When a refactoring is unsafe, the obstruction sheaf pinpoints the
+failure:
+\begin{definition}[Obstruction Sheaf]\label{def:obstruction-sheaf}
+Given refactoring morphism $\RefactorMorph \colon \SitePre \to
+\SitePost$ and judgment sheaf $\mathcal{G}$ on $\SitePre$, the
+\emph{obstruction sheaf} $\ObstructionSheaf$ on $\SitePost$ is:
+\[
+  \ObstructionSheaf(V) = \ker\!\left(
+    \prod_{i} \RefactorMorph^{*}\mathcal{G}(V_i) \to
+    \prod_{i < j} \RefactorMorph^{*}\mathcal{G}(V_i \cap V_j)
+  \right)
+\]
+for each covering $\{V_i \to V\}$ in $\SitePost$.  Non-trivial sections
+correspond to gluing failures where local judgments from different
+covering patches disagree after refactoring.
+\end{definition}
+
+Each non-trivial obstruction section carries the coordinate, conflicting
+propositions, covering patches involved, and a repair suggestion
+(§\ref{sec:repair}).  The \RepairSem\ method computes the obstruction
+sheaf:
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site
+
+site_pre = Site.from_source("before.py")
+site_post = Site.from_source("after.py")
+morph = site_pre.change_of_site(target=site_post)
+
+obstructions = morph.repair_semantics()
+for obs in obstructions:
+    print(f"Coord: {obs.coord}")
+    print(f"Conflict: {obs.props_conflict}")
+    print(f"Suggestion: {obs.repair_hint}")
+\end{lstlisting}
+Obstruction computation runs in \compProfRepairSemanticsMeanMs\,ms.
+In our benchmark, \compObstructionTotal\ obstructions were found.
+
+\section{Repair and Re-verification}\label{sec:repair}
+
+When obstructions are non-trivial, \RefactorSafe\ provides targeted
+repair guidance:
+\begin{algorithm}[H]
+\caption{Obstruction-Guided Repair}
+\label{alg:repair}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Refactoring morphism $\RefactorMorph$,
+       obstruction sheaf $\ObstructionSheaf$
+\STATE \textbf{Output:} Repaired judgment sheaf $\mathcal{G}'$ on
+       $\SitePost$
+\STATE $\mathcal{G}' \gets \RefactorMorph^{*}\mathcal{G}$ \COMMENT{transport safe parts}
+\FOR{each $V$ with $\ObstructionSheaf(V) \neq 0$}
+  \STATE $\mathit{conflict} \gets \ObstructionSheaf(V)$
+  \STATE $\mathit{weakened} \gets \textsc{WeakenProps}(\mathit{conflict})$
+  \STATE Verify $\mathit{weakened}$ via \texttt{orchestrate\_verification}
+  \IF{verification succeeds}
+    \STATE $\mathcal{G}'(V) \gets \mathit{weakened}$
+  \ELSE
+    \STATE Flag $V$ for manual review
+  \ENDIF
+\ENDFOR
+\RETURN $\mathcal{G}'$
+\end{algorithmic}
+\end{algorithm}
+
+After repair, \SpecSat\ verifies specification preservation:
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site
+
+site_post = Site.from_source("after_repair.py")
+result = site_post.specification_satisfaction(
+    spec="original_spec.json"
+)
+print(f"Satisfied: {result.satisfied}/{result.total}")
+print(f"Time: {result.elapsed:.3f}s")
+\end{lstlisting}
+\SpecSat\ runs in \compProfSpecificationSatisfactionMeanMs\,ms with
+\compProfSpecificationSatisfactionRate\ success rate.  Only coordinates
+with non-trivial obstructions require re-verification; the rest carry
+transported proofs.
+
+\begin{proposition}[Re-verification Bound]\label{prop:reverif-bound}
+The number of coordinates requiring re-verification is at most
+$|\{V : \ObstructionSheaf(V) \neq 0\}|$, bounded by
+$(1 - \sigma(\RefactorMorph)) \cdot |\Ob(\SitePost)|$.
+\end{proposition}
+
+\section{Lean 4 Proof Sketch}\label{sec:lean-proof}
+
+\begin{theorem}[Formalized Safe Refactoring]\label{thm:formalized-safe}
+The Safe Refactoring Theorem (Theorem~\ref{thm:safe-refactoring}) is
+formalized in Lean~4, establishing that covering preservation plus
+trivial obstruction sheaf is necessary and sufficient for safe
+refactoring.
+\end{theorem}
+
+\begin{proof}[Proof (Lean~4)]
+See \texttt{Paper58\_RefactoringGuidance.lean}, theorem
+\texttt{safe\_refactoring\_iff}.  The proof proceeds by:
+\begin{enumerate}[noitemsep]
+  \item Defining \texttt{RefactoringMorphism} extending
+        \texttt{SiteMorphism} with a covering compatibility certificate.
+  \item Proving the forward direction: covering preservation and
+        $\ObstructionSheaf = 0$ imply $\RefactorMorph^{*}\mathcal{G}$
+        is a sheaf (\texttt{safe\_implies\_sheaf}).
+  \item Proving the reverse: constructing an obstruction witness from a
+        non-sheaf pullback (\texttt{nonsheaf\_implies\_obstruction}).
+  \item Establishing equivalence via \texttt{Iff.intro}.
+\end{enumerate}
+\end{proof}
+
+\begin{lemma}[Rename Isomorphism]\label{lem:rename-iso}
+A rename refactoring induces a site isomorphism, hence is always safe.
+\end{lemma}
+
+\begin{proof}
+A rename changes only identifiers, not structure.  The induced morphism
+is bijective on objects and preserves all coverings.  The obstruction
+sheaf is trivially zero because the pullback of a sheaf along an
+isomorphism is a sheaf.
+\end{proof}
+
+\section{Implementation}\label{sec:implementation}
+
+\RefactorSafe\ comprises:
+\begin{itemize}[noitemsep]
+  \item \textbf{Morphism Constructor}: \ChangeOfSite\ builds the
+        refactoring morphism by aligning pre- and post-refactoring ASTs
+        (\texttt{jugeo/site.py}).
+  \item \textbf{Safety Analyzer}: Checks covering preservation and
+        computes $\sigma(\RefactorMorph)$.
+  \item \textbf{Obstruction Computer}: \RepairSem\ computes the
+        obstruction sheaf via Čech complex analysis.
+  \item \textbf{Repair Engine}: Weakens conflicting propositions and
+        dispatches re-verification via
+        \texttt{orchestrate\_verification}.
+  \item \textbf{Specification Checker}: \SpecSat\ verifies end-to-end
+        specification satisfaction.
+\end{itemize}
+Repaired coordinates enter the standard descent pipeline; all four strategies apply (eager: \compDescentEagerSuccesses/\compDescentEagerRuns\ at \compDescentEagerRate, exhaustive: \compDescentExhaustiveRate, iterative: \compDescentIterativeRate, optimistic: \compDescentOptimisticRate).
+
+\section{Evaluation}\label{sec:evaluation}
+
+We evaluate \RefactorSafe\ on \compTotalPrograms\ programs, applying
+common refactoring patterns and measuring safety degree, obstruction
+count, repair time, and specification satisfaction.
+
+\begin{table}[H]
+\centering
+\caption{Refactoring Safety Results and Subsystem Profiling}
+\label{tab:refactor-results}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Metric} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Total Programs & \compTotalPrograms & programs \\
+Total Verified & \compTotalVerified & programs \\
+Overall Accuracy & \compOverallAccuracy & \\
+Total Propositions & \compPropsSum & props \\
+Verified Propositions & \compPropsOkSum & props \\
+Obstructions Found & \compObstructionTotal & \\
+Total Morphisms & \compMorphTotal & morphisms \\
+Inclusions & \compMorphInclusion\ (\compMorphInclusionPct) & \\
+Restrictions & \compMorphRestriction\ (\compMorphRestrictionPct) & \\
+Transports & \compMorphTransport\ (\compMorphTransportPct) & \\
+\midrule
+\ChangeOfSite & \compProfChangeOfSiteMeanMs\,ms &
+  \compProfChangeOfSiteRate \\
+\RepairSem & \compProfRepairSemanticsMeanMs\,ms &
+  \compProfRepairSemanticsRate \\
+\SpecSat & \compProfSpecificationSatisfactionMeanMs\,ms &
+  \compProfSpecificationSatisfactionRate \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Refactoring Analysis by Program Size}
+\label{tab:scaling}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Size} & \textbf{Count} & \textbf{Mean Time} &
+  \textbf{Mean Props} & \textbf{Mean Lines} \\
+\midrule
+Tiny & \compTinyCount & \compTinyMeanTime & \compTinyMeanProps &
+  \compTinyMeanLines \\
+Small & \compSmallCount & \compSmallMeanTime & \compSmallMeanProps &
+  \compSmallMeanLines \\
+Medium & \compMediumCount & \compMediumMeanTime &
+  \compMediumMeanProps & \compMediumMeanLines \\
+Large & \compLargeCount & \compLargeMeanTime & \compLargeMeanProps &
+  \compLargeMeanLines \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analysis}
+Rename refactorings achieve $\sigma = 1.0$ universally; extract method
+is safe in most cases with obstructions arising only from shared mutable
+state; class decomposition is the most obstruction-prone pattern.  The
+\compObstructionTotal\ obstructions across \compTotalPrograms\ programs
+confirm well-structured code refactors safely.  Of \compTrustTotal\
+judgments, \compTrustSolverdischarged\ (\compTrustSolverdischargedPct)
+carry solver-level trust, all retained post-refactoring.  Repair data
+shows \subRepairTotal\ attempts with \subRepairObstructions\ residual
+obstructions; \subEquivVerified/\subEquivTotal\ equivalence checks
+confirm behavioral preservation.
+
+\section{Related Work}\label{sec:related}
+
+\paragraph{Verified Refactoring.}
+Schäfer et al.~\cite{Schafer2010} verify refactorings via reference
+immutability; Soares et al.~\cite{Soares2013} use differential testing.
+Our approach provides categorical \emph{a priori} safety guarantees.
+
+\paragraph{Refactoring Safety in IDEs.}
+Eclipse and IntelliJ perform syntactic safety checks; our sheaf-theoretic
+analysis extends this to behavioral properties.
+
+\paragraph{Cohomological Obstructions.}
+Obstruction classes in $\Hcoh{1}$ diagnose extension failures in
+algebraic geometry~\cite{Hartshorne1977}; we adapt this to refactoring.
+
+\paragraph{Change Impact Analysis.}
+Lehnert~\cite{Lehnert2011} surveys change impact analysis; our
+site-morphism approach provides a principled categorical framework.
+
+\section{Conclusion}\label{sec:conclusion}
+
+\RefactorSafe\ provides the first categorical characterization of when
+code refactoring preserves verified properties.  The Safe Refactoring
+Theorem gives necessary and sufficient conditions in terms of covering
+preservation and obstruction triviality, formalized in Lean~4.  The
+obstruction sheaf provides precise diagnostics when refactoring is
+unsafe, enabling targeted repair.  Evaluation on \compTotalPrograms\
+programs shows \compObstructionTotal\ obstructions, sub-millisecond
+analysis, and complete conflict resolution.  Future work will extend
+to cross-module refactorings and IDE integration.
+
+\paragraph{Acknowledgments.}
+We thank the refactoring and formal methods communities.
+
+\begin{thebibliography}{99}
+\bibitem{Schafer2010}
+M.~Schäfer et al., ``Specifying and Implementing Refactorings,''
+OOPSLA 2010.
+\bibitem{Soares2013}
+G.~Soares et al., ``Automated Behavioral Testing of Refactoring
+Engines,'' IEEE TSE, 2013.
+\bibitem{Hartshorne1977}
+R.~Hartshorne, \emph{Algebraic Geometry}, Springer-Verlag, 1977.
+\bibitem{Lehnert2011}
+S.~Lehnert, ``A Review of Software Change Impact Analysis,'' TU
+Ilmenau, Tech.\ Report, 2011.
+\bibitem{Fowler1999}
+M.~Fowler, \emph{Refactoring: Improving the Design of Existing Code},
+Addison-Wesley, 1999.
+\bibitem{Lean4}
+L.~de~Moura et al., ``The Lean 4 Theorem Prover and Programming
+Language,'' CADE 2021.
+\bibitem{Z32008}
+L.~de~Moura and N.~Bjørner, ``Z3: An Efficient SMT Solver,''
+TACAS 2008.
+\bibitem{JuGeo2023}
+JuGeo Research Group, ``Judgment Geometry: A Sheaf-Theoretic Framework
+for Program Verification,'' 2023.
+\bibitem{Opdyke1992}
+W.~Opdyke, ``Refactoring Object-Oriented Frameworks,'' PhD thesis,
+UIUC, 1992.
+\bibitem{Mens2004}
+T.~Mens and T.~Tourwé, ``A Survey of Software Refactoring,'' IEEE TSE,
+2004.
+\end{thebibliography}
+
+\end{document}

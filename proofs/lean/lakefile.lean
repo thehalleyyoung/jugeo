@@ -36,4 +36,7 @@ lean_lib «JudgmentGeometry» where
              `Paper44_JudgmentProducts, `Paper45_CallableSurfaces,
              `Paper46_SemanticFutures, `Paper47_SpecSatisfaction,
              `Paper48_LiveMutation, `Paper49_CyclicMaturity,
-             `Paper50_SemanticCenters]
+             `Paper50_SemanticCenters,
+             `Paper56_AnalogyTransport, `Paper57_SemanticSearch,
+             `Paper58_RefactoringGuidance, `Paper59_DocumentationGeneration,
+             `Paper60_TestGeneration]

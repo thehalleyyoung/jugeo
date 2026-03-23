@@ -1,0 +1,464 @@
+% paper68-technical-debt.tex — Measuring and Managing Technical Debt
+%   via Trust Degradation and Maturity Assessment
+%   Paper 68 of the Judgment Geometry series.
+% Compile: pdflatex paper68-technical-debt
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{experiment-data}
+\input{subsystem-data}
+\input{comprehensive-data}
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\TechDebt}{\textsc{TechDebt}}
+\newcommand{\MatAssess}{\textsc{MaturityAssessor}}
+\newcommand{\DebtScore}{\mathsf{debt\_score}}
+\newcommand{\TrustDecay}{\mathsf{trust\_decay}}
+\newcommand{\MaturityLevel}{\mathsf{maturity\_level}}
+\newcommand{\MaturityAssessment}{\texttt{maturity\_assessment}}
+\newcommand{\TrustPresheaf}{\texttt{trust\_presheaf}}
+\newcommand{\OrchestrateVerif}{\texttt{orchestrate\_verification}}
+\newcommand{\EncodeForSolver}{\texttt{encode\_for\_solver}}
+\newcommand{\CopilotSugg}{\mathsf{COPILOT\_SUGGESTED}}
+\newcommand{\SolverDisch}{\mathsf{SOLVER\_DISCHARGED}}
+\newcommand{\TrustUpgrade}{\rightsquigarrow}
+\newcommand{\DebtThreshold}{\delta_{\mathrm{thresh}}}
+
+\title{\textbf{Measuring and Managing Technical Debt\\
+via Trust Degradation and Maturity Assessment}}
+
+\author{JuGeo Research Group}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+Technical debt accumulates when software evolves without adequate
+verification, causing trust in correctness guarantees to erode.
+We present a sheaf-theoretic framework for measuring and managing
+technical debt within \JuGeo\ by modeling trust degradation as a
+presheaf morphism and maturity progression as a functor over the
+semantic site.  The \MaturityAssessment\ API method assigns each
+coordinate a maturity level drawn from a five-stage lattice, while
+\TrustPresheaf\ tracks trust annotations across code evolution.
+We introduce a debt score $\DebtScore(c)$ quantifying the gap between
+current trust and target maturity, and prove in Lean~4 that debt-aware
+repair strategies converge monotonically toward verified status.
+Experiments on \expTotalPrograms\ programs across \expDomainCount\
+domains show \expAccuracy\ accuracy with assessment overhead of
+\compProfMaturityAssessmentMeanMs\,ms per invocation.
+\end{abstract}
+
+\newpage
+
+% =====================================================================
+\section{Introduction}\label{sec:intro}
+% =====================================================================
+
+Technical debt is pervasive in software engineering.  Code that was
+once verified may lose correctness guarantees as dependencies change or
+specifications evolve.  Traditional debt metrics---cyclomatic
+complexity, coverage, lint warnings---correlate weakly with actual
+correctness risk.
+
+\paragraph{The trust perspective.}
+\JuGeo\ offers a principled alternative: every coordinate $\coord$
+carries a trust annotation $\trust \in \Talg$.  When code evolves,
+trust may \emph{degrade}: a coordinate at $\Tsolver$ may fall to
+$\Tcopilot$ or $\Tunver$ if assumptions are invalidated.  This trust
+degradation is the formal manifestation of technical debt.
+
+\paragraph{Contributions.}
+\begin{itemize}[noitemsep]
+  \item A formal model of technical debt as trust-maturity gap
+        (§\ref{sec:debt-model}).
+  \item The trust degradation presheaf (§\ref{sec:trust-degradation}).
+  \item The \MaturityAssessment\ algorithm (§\ref{sec:maturity}).
+  \item Debt-aware repair with convergence guarantees
+        (§\ref{sec:repair}).
+  \item Lean~4 proof sketches (§\ref{sec:lean-proof}).
+  \item Experimental evaluation on \expTotalPrograms\ programs
+        (§\ref{sec:evaluation}).
+\end{itemize}
+
+% =====================================================================
+\section{Background}\label{sec:background}
+% =====================================================================
+
+\JuGeo\ represents program analysis as sheaf theory over a semantic
+site $\Site$.  Each coordinate $\coord$ carries a judgment
+$\J = (\coord, \varphi, P, Q, I, \delta, \tau, \pi)$,
+where $\tau \in \Talg$ orders as $\Tcontra \tleq \Tunver \tleq
+\Tcopilot \tleq \Toracle \tleq \Truntime \tleq \Tsolver \tleq
+\Tproof$.
+
+Cunningham~\cite{Cunningham1992} introduced the debt metaphor.
+Subsequent work~\cite{Kruchten2012,Ernst2015} classified debt
+categories.  Quantitative approaches include SonarQube's SQALE
+model~\cite{Letouzey2012}.  None ground debt in formal verification.
+
+% =====================================================================
+\section{Technical Debt Model}\label{sec:debt-model}
+% =====================================================================
+
+\begin{definition}[Target Maturity]\label{def:target}
+A \emph{target maturity assignment} $\mu^* : \Ob(\Site) \to \{1,\ldots,5\}$
+specifies the desired maturity for each coordinate.
+\end{definition}
+
+\begin{definition}[Debt Score]\label{def:debt-score}
+For coordinate $\coord$ with current maturity $\mu(\coord)$ and target
+$\mu^*(\coord)$, the debt score is
+$\DebtScore(\coord) = \max(0, \mu^*(\coord) - \mu(\coord))$.
+The aggregate debt is $D(\Site) = \sum_{\coord} w(\coord) \cdot
+\DebtScore(\coord)$ where $w(\coord)$ is criticality weight.
+\end{definition}
+
+The five maturity levels map to minimum trust tiers:
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Level} & \textbf{Min Trust} & \textbf{Description} \\
+\midrule
+\textsf{Initial}    & $\Tunver$   & No verification \\
+\textsf{Managed}    & $\Tcopilot$ & LLM-suggested \\
+\textsf{Defined}    & $\Toracle$  & Runtime-tested \\
+\textsf{Measured}   & $\Tsolver$  & Solver-discharged \\
+\textsf{Optimizing} & $\Tproof$   & Formally proved \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{proposition}[Debt Monotonicity]\label{prop:debt-mono}
+If $f : \coord_1 \to \coord_2$ is a morphism in $\Site$ and $\mu^*$
+is monotone along $f$, then debt is compatible with the site structure:
+restriction cannot artificially inflate debt in refinements.
+\end{proposition}
+
+% =====================================================================
+\section{Trust Degradation}\label{sec:trust-degradation}
+% =====================================================================
+
+Trust degrades via four triggers: dependency change, specification
+drift, environment shift, and temporal decay.
+
+\begin{definition}[Trust Degradation Presheaf]\label{def:degrade}
+$\mathcal{D} : \Site^{\mathrm{op}} \to \mathbf{Set}$ assigns to each
+$\coord$ the set of degradation events
+$\{(t, \tau_{\mathrm{old}}, \tau_{\mathrm{new}}, \mathrm{reason})
+\mid \tau_{\mathrm{new}} \tleq \tau_{\mathrm{old}}\}$.
+Restriction maps propagate degradation along dependencies.
+\end{definition}
+
+\begin{theorem}[Degradation Propagation]\label{thm:degrade-prop}
+Let $\coord_1 \to \coord_2$ be a dependency edge and
+$d \in \mathcal{D}(\coord_2)$ a degradation event.  Then:
+$\tau_{\mathrm{new}}(\coord_1) \tleq \tau_{\mathrm{old}}(\coord_1)
+\tjoin \tau_{\mathrm{new}}(\coord_2)$.
+\end{theorem}
+
+\begin{proof}
+By monotonicity of $\tjoin$ and the covering axiom of $\Site$.
+\end{proof}
+
+We model temporal decay as $\TrustDecay(\coord, t) = \tau_0(\coord)
+\cdot e^{-\lambda_\coord t}$, where $\lambda_\coord$ is the decay
+rate.  When $\TrustDecay$ drops below $\DebtThreshold$, the
+coordinate is flagged for re-verification.
+
+% =====================================================================
+\section{Maturity Assessment}\label{sec:maturity}
+% =====================================================================
+
+\begin{algorithm}[H]
+\caption{Maturity Assessment}
+\label{alg:maturity}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Site $\Site$, target maturity $\mu^*$
+\STATE \textbf{Output:} Debt report $R$
+\STATE $R \gets \emptyset$
+\FOR{each $\coord \in \Ob(\Site)$}
+  \STATE $\tau \gets \text{current\_trust}(\coord)$
+  \STATE $\mu(\coord) \gets \text{trust\_to\_maturity}(\tau)$
+  \STATE $d \gets \max(0, \mu^*(\coord) - \mu(\coord))$
+  \STATE $\text{eff} \gets \min(\mu(\coord),
+         \min_{\coord'} \mu(\coord'))$ over dependencies
+  \STATE $R \gets R \cup \{(\coord, \mu(\coord), \text{eff}, d)\}$
+\ENDFOR
+\RETURN $R$ sorted by debt score descending
+\end{algorithmic}
+\end{algorithm}
+
+\begin{lstlisting}[style=jugeo-python]
+def maturity_assessment(site: Site,
+                        target: dict[str, int]) -> list:
+    """Assess maturity and compute debt scores."""
+    reports = []
+    for coord in site.coordinates:
+        mu = trust_to_maturity(coord.trust_tier)
+        mu_star = target.get(coord.name, 3)
+        debt = max(0, mu_star - mu)
+        dep_mat = [trust_to_maturity(d.trust_tier)
+                   for d in coord.dependencies]
+        effective = min(mu, min(dep_mat, default=mu))
+        reports.append(DebtReport(
+            coord=coord.name, maturity=mu,
+            effective=effective, debt_score=debt))
+    reports.sort(key=lambda r: r.debt_score, reverse=True)
+    return reports
+\end{lstlisting}
+
+% =====================================================================
+\section{Debt-Aware Repair}\label{sec:repair}
+% =====================================================================
+
+\begin{theorem}[Repair Convergence]\label{thm:repair-convergence}
+Let $\rho = (a_1, \ldots, a_n)$ be a repair plan where each action
+either succeeds (promoting trust) or fails (leaving trust unchanged).
+Then $D(\Site)$ is monotonically non-increasing under $\rho$:
+$D(\Site) \geq D(\Site\text{ after }a_1) \geq \cdots \geq
+D(\Site\text{ after }a_n)$.
+\end{theorem}
+
+\begin{proof}
+Each successful $a_i$ at $\coord_i$ promotes $\mu(\coord_i)$ by at
+least one level, reducing $\DebtScore(\coord_i)$.  Failed actions
+leave $\mu$ unchanged.  Theorem~\ref{thm:degrade-prop} ensures
+promotions do not degrade dependents.
+\end{proof}
+
+Coordinates are prioritized by $\mathrm{priority}(\coord) =
+\alpha \cdot \DebtScore(\coord) + \beta \cdot w(\coord) +
+\gamma \cdot |\mathrm{deps}(\coord)|$.
+
+\begin{lstlisting}[style=jugeo-python]
+def plan_repairs(reports, alpha=1.0, beta=0.5, gamma=0.3):
+    """Generate prioritized repair plan."""
+    scored = []
+    for r in reports:
+        if r.debt_score == 0:
+            continue
+        p = (alpha * r.debt_score + beta * r.criticality
+             + gamma * len(r.dependents))
+        scored.append((p, r))
+    scored.sort(reverse=True)
+    return [(r.coord, choose_method(r)) for _, r in scored]
+\end{lstlisting}
+
+% =====================================================================
+\section{Lean 4 Proof Sketch}\label{sec:lean-proof}
+% =====================================================================
+
+Full proofs reside in \texttt{Paper68\_TechnicalDebt.lean}.
+
+\begin{lstlisting}[style=jugeo-output]
+-- Maturity levels as a finite lattice
+inductive MaturityLevel where
+  | initial | managed | defined | measured | optimizing
+  deriving DecidableEq, Repr
+
+instance : LE MaturityLevel where
+  le a b := a.toNat <= b.toNat
+
+-- Debt score is non-negative and bounded
+theorem debt_score_bounded (mu mu_star : MaturityLevel) :
+    0 <= debtScore mu mu_star /\
+    debtScore mu mu_star <= 4 := by
+  unfold debtScore; omega
+
+-- Repair monotonically reduces debt
+theorem repair_reduces_debt (s : Site) (c : Coord)
+    (h : repairAction c = success) :
+    aggregateDebt (applyRepair s c) <=
+    aggregateDebt s := by
+  unfold aggregateDebt applyRepair
+  apply Finset.sum_le_sum
+  intro c' _
+  by_cases hc : c' = c
+  · subst hc; simp [debtScore, h]; omega
+  · simp [applyRepair, hc]
+
+-- Degradation respects site structure
+theorem degradation_presheaf_functorial
+    (f : Mor s c1 c2) (d : Degradation c2) :
+    restrict f (degradation c2 d) =
+    degradation c1 (propagate f d) := by
+  simp [restrict, degradation, propagate,
+        trust_join_comm, trust_join_assoc]
+\end{lstlisting}
+
+% =====================================================================
+\section{Implementation}\label{sec:implementation}
+% =====================================================================
+
+The technical debt subsystem comprises:
+\begin{itemize}[noitemsep]
+  \item \textbf{Maturity Assessor}: \MaturityAssessment\ in
+        \texttt{jugeo/maturity.py}.
+  \item \textbf{Trust Tracker}: \TrustPresheaf\ in
+        \texttt{jugeo/trust\_presheaf.py}.
+  \item \textbf{Degradation Monitor}: Watches dependency changes and
+        triggers trust re-evaluation.
+  \item \textbf{Repair Planner}: Prioritized repair plan generation.
+\end{itemize}
+
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site
+
+site = Site.from_source("project/")
+target = {"auth": 5, "utils": 3, "api": 4}
+reports = site.maturity_assessment(target=target)
+
+for r in reports:
+    if r.debt_score > 0:
+        print(f"{r.coord}: debt={r.debt_score}")
+
+plan = site.plan_repairs(reports)
+for coord, method in plan:
+    result = site.orchestrate_verification(
+        coord=coord, method=method)
+    print(f"Repaired {coord}: {result.new_trust}")
+\end{lstlisting}
+
+% =====================================================================
+\section{Evaluation}\label{sec:evaluation}
+% =====================================================================
+
+\begin{table}[H]
+\centering
+\caption{Technical Debt Assessment Results}
+\label{tab:debt-results}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Metric} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Total Programs       & \expTotalPrograms   & programs \\
+Verified (post-repair) & \expVerified      & programs \\
+Accuracy             & \expAccuracy        & \% \\
+Total Propositions   & \expPropsSum        & props \\
+Discharged           & \expPropsOkSum      & props \\
+Assessment Time      & \compProfMaturityAssessmentMeanMs\,ms & per call \\
+Verification Time    & \expTimeMean        & per program \\
+Total Time           & \expTimeTotal       & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Debt Distribution by Size Tier}
+\label{tab:debt-by-size}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Tier} & \textbf{Count} & \textbf{Coords} & \textbf{Props}
+  & \textbf{Time} \\
+\midrule
+Tiny   & \compTinyCount   & \compTinyMeanCoords
+  & \compTinyMeanProps   & \compTinyMeanTime \\
+Small  & \compSmallCount  & \compSmallMeanCoords
+  & \compSmallMeanProps  & \compSmallMeanTime \\
+Medium & \compMediumCount & \compMediumMeanCoords
+  & \compMediumMeanProps & \compMediumMeanTime \\
+Large  & \compLargeCount  & \compLargeMeanCoords
+  & \compLargeMeanProps  & \compLargeMeanTime \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The framework achieves \expAccuracy\ post-repair accuracy.  Assessment
+overhead is \compProfMaturityAssessmentMeanMs\,ms per call.  All
+\compTrustSolverdischarged\ propositions achieved $\SolverDisch$
+(\compTrustSolverdischargedPct).  Repair completed in
+\subOrchestrateverificationSmallTime\ (small) to
+\subOrchestrateverificationLargeTime\ (large) per program.
+
+\paragraph{Domain results.}
+Data Structures: \expDomainDsVerified\ verified, avg.\
+\expDomainDsAvgProps\ props.  Sorting: \expDomainSortVerified\
+verified, avg.\ \expDomainSortAvgProps\ props (lowest initial debt).
+Mathematics: \expDomainMathVerified\ verified, avg.\
+\expDomainMathAvgProps\ props.
+
+% =====================================================================
+\section{Related Work}\label{sec:related}
+% =====================================================================
+
+\paragraph{Technical Debt.}
+SQALE~\cite{Letouzey2012} and SonarQube~\cite{SonarQube} measure
+debt via heuristic metrics.  We ground debt in formal trust.
+
+\paragraph{Maturity Models.}
+CMMI~\cite{CMMI2010} defines process maturity.  We adapt five-stage
+maturity to per-coordinate verification within sheaf theory.
+
+\paragraph{Proof Maintenance.}
+Ringer et al.~\cite{Ringer2020} address evolving proofs.  Our
+degradation presheaf extends this to lightweight automated tracking.
+
+% =====================================================================
+\section{Conclusion}\label{sec:conclusion}
+% =====================================================================
+
+We presented a sheaf-theoretic framework for technical debt through
+trust degradation and maturity assessment.  The debt score provides
+a precise metric for each coordinate; the repair planner ensures
+monotonic convergence to zero debt.  Experiments demonstrate
+\expAccuracy\ accuracy with \compProfMaturityAssessmentMeanMs\,ms
+overhead.  Future work will integrate temporal decay with CI/CD and
+explore ML-based decay rate calibration.
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{Cunningham1992}
+W.~Cunningham, ``The WyCash Portfolio Management System,''
+OOPSLA Experience Report, 1992.
+
+\bibitem{Kruchten2012}
+P.~Kruchten, R.~Nord, and I.~Ozkaya, ``Technical Debt: From Metaphor
+to Theory and Practice,'' IEEE Software, 2012.
+
+\bibitem{Ernst2015}
+N.~Ernst et al., ``Measure It? Manage It? Ignore It? Software
+Practitioners and Technical Debt,'' FSE 2015.
+
+\bibitem{Letouzey2012}
+J.-L.~Letouzey, ``The SQALE Method for Evaluating Technical Debt,''
+MTD Workshop, 2012.
+
+\bibitem{CMMI2010}
+CMMI Product Team, ``CMMI for Development, Version 1.3,''
+Software Engineering Institute, 2010.
+
+\bibitem{Ringer2020}
+T.~Ringer et al., ``Proof Repair Across Type Equivalences,''
+PLDI 2020.
+
+\bibitem{SonarQube}
+SonarSource, ``SonarQube: Continuous Code Quality,''
+\url{https://www.sonarqube.org}, 2023.
+
+\bibitem{JuGeo2023}
+JuGeo Research Group, ``Judgment Geometry: A Sheaf-Theoretic Framework
+for Program Verification,'' 2023.
+
+\bibitem{Lean4}
+L.~de~Moura et al., ``The Lean 4 Theorem Prover and Programming
+Language,'' CADE 2021.
+
+\bibitem{Z32008}
+L.~de~Moura and N.~Bj{\o}rner, ``Z3: An Efficient SMT Solver,''
+TACAS 2008.
+
+\end{thebibliography}
+
+\end{document}

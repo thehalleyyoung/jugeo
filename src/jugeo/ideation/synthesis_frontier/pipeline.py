@@ -94,12 +94,12 @@ except ImportError:
 
 
 try:
-    from jugeo.ideation.synthesis_frontier.fields import ALL_48_FIELDS
+    from jugeo.ideation.synthesis_frontier.fields import ALL_128_FIELDS
 except ImportError:
     try:
-        from .fields import ALL_48_FIELDS  # type: ignore[no-redef]
+        from .fields import ALL_128_FIELDS  # type: ignore[no-redef]
     except ImportError:
-        ALL_48_FIELDS = []  # type: ignore[assignment]
+        ALL_128_FIELDS = []  # type: ignore[assignment]
 
 
 try:
@@ -601,7 +601,7 @@ class SynthesisFrontierPipeline:
         Parameters
         ----------
         fields:
-            FieldNodes to run the tournament over.  Uses ALL_48_FIELDS if None.
+            FieldNodes to run the tournament over.  Uses ALL_128_FIELDS if None.
 
         Returns
         -------
@@ -609,7 +609,7 @@ class SynthesisFrontierPipeline:
         """
         t0 = time.time()
         if fields is None:
-            fields = list(ALL_48_FIELDS)
+            fields = list(ALL_128_FIELDS)
         if not fields:
             _log.warning("No fields provided; returning empty result")
             return PipelineResult(
@@ -780,7 +780,7 @@ class SynthesisFrontierPipeline:
         tuple[TournamentState, list[RoundResult]]
         """
         if state is None:
-            state = TournamentState(active_nodes=list(ALL_48_FIELDS))
+            state = TournamentState(active_nodes=list(ALL_128_FIELDS))
             for node in state.active_nodes:
                 state.register_node(node)
 
@@ -844,7 +844,7 @@ class SynthesisFrontierPipeline:
         _log.info("Resuming from checkpoint: %s", latest)
         state, _ = self._checkpoint_manager.load(latest)
         # We can't fully reconstruct field graph from JSON alone, so we
-        # re-run from ALL_48_FIELDS with the round count from the checkpoint.
+        # re-run from ALL_128_FIELDS with the round count from the checkpoint.
         _log.warning(
             "Full state reconstruction not supported; re-running from scratch"
         )

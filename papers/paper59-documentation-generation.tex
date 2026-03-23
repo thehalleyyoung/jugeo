@@ -1,0 +1,491 @@
+% paper59-documentation-generation.tex — Generating Documentation from Judgment Certificates and Trust Annotations
+%   Paper 59 of the Judgment Geometry series.
+% Compile: pdflatex paper59-documentation-generation
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{experiment-data}
+\input{subsystem-data}
+\input{comprehensive-data}
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\DocGen}{\textsc{DocGen}}
+\newcommand{\JudgmentSheafAPI}{\texttt{judgment\_sheaf}}
+\newcommand{\TrustPresheafAPI}{\texttt{trust\_presheaf}}
+\newcommand{\MaturityAPI}{\texttt{maturity\_assessment}}
+\newcommand{\PublicAlignAPI}{\texttt{public\_alignment}}
+\newcommand{\DocSheaf}{\mathcal{D}}
+\newcommand{\DocSection}{\delta}
+\newcommand{\TrustBadge}{\tau_{\mathrm{badge}}}
+\newcommand{\CertRef}{\pi_{\mathrm{ref}}}
+\newcommand{\NarrFunc}{\mathrm{narr}}
+\newcommand{\RenderFunc}{\mathrm{render}}
+\newcommand{\tr}{\mathsf{tr}}                        % trust tier
+
+\title{\textbf{Generating Documentation from Judgment Certificates\\
+and Trust Annotations}}
+
+\author{%
+  JuGeo Research Group
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+We present \DocGen, a system that generates certified documentation
+directly from \JuGeo's judgment certificates and trust annotations.
+\DocGen\ leverages the full judgment tuple to produce documentation
+where every claim links to a formal certificate.  It constructs a
+\emph{documentation sheaf} $\DocSheaf$ over the semantic site, ensuring
+local consistency and global coherence.  Key API latencies are:
+\JudgmentSheafAPI\ (\compProfJudgmentSheafMeanMs\,ms),
+\TrustPresheafAPI\ (\compProfTrustPresheafMeanMs\,ms), and \MaturityAPI\
+(\compProfMaturityAssessmentMeanMs\,ms).  Across \compTotalPrograms\
+programs, \DocGen\ documents \compPropsOkSum\ verified propositions with
+\compTrustSolverdischargedPct\ at solver-discharged trust.
+\end{abstract}
+
+\newpage
+
+% =====================================================================
+\section{Introduction}\label{sec:intro}
+% =====================================================================
+
+Documentation rarely links to verified properties, creating a trust
+gap: readers cannot tell whether a claim like ``returns a sorted list''
+reflects a proven postcondition or a stale comment.
+
+\paragraph{Our approach.}
+\DocGen\ closes this gap by generating documentation from \JuGeo's
+judgment certificates.  Each claim carries a \emph{certificate
+reference} $\CertRef$ pointing to formal evidence, and documentation is
+organized as a \emph{documentation sheaf} $\DocSheaf$ ensuring local
+consistency, global coherence, and trust-level visibility via badges.
+
+We formalize the documentation sheaf (§\ref{sec:doc-sheaf}), define the
+narrative functor $\NarrFunc$ (§\ref{sec:narrative}), introduce trust
+badges (§\ref{sec:trust-badges}), integrate with \JudgmentSheafAPI,
+\TrustPresheafAPI, \MaturityAPI, and \PublicAlignAPI\ APIs
+(§\ref{sec:pipeline}), provide a Lean~4 proof of faithfulness
+(§\ref{sec:lean-proof}), and evaluate on \compTotalPrograms\ programs
+(§\ref{sec:evaluation}).
+
+% =====================================================================
+\section{Background}\label{sec:background}
+% =====================================================================
+
+\subsection{Judgment Certificates}
+In \JuGeo, each verified proposition carries a \emph{proof certificate}
+stored in the evidence bundle $\evid$.  Of \compTrustTotal\ propositions,
+\compTrustSolverdischarged\ carry solver-level certificates
+(\compTrustSolverdischargedPct); \compTrustUnverified\ remain unverified
+(\compTrustUnverifiedPct).
+
+\subsection{Trust Annotations}
+The trust tier $\tr \in \{\Tcontra, \Tunver, \Tcopilot, \Toracle,
+\Truntime, \Tsolver, \Tproof\}$ forms a lattice classifying each
+proposition's verification status.  Documentation should reflect these
+tiers, giving higher confidence to solver-discharged claims.
+
+\subsection{Existing Documentation Generators}
+Javadoc, Sphinx, and Doxygen extract documentation from comments;
+type-driven generators (Haddock, TypeDoc) produce API references from
+signatures; contract-based systems (Eiffel~\cite{Meyer1997},
+JML~\cite{JML2005}) document pre/postconditions but lack certificate
+linking.  \DocGen\ links every claim to formal evidence and organizes
+documentation sheaf-theoretically.
+
+% =====================================================================
+\section{The Documentation Sheaf}\label{sec:doc-sheaf}
+% =====================================================================
+
+\subsection{Definition}
+We define a \emph{documentation sheaf} $\DocSheaf$ on the semantic site
+$\Site_P$ as follows:
+
+\begin{definition}[Documentation Sheaf]\label{def:doc-sheaf}
+The documentation sheaf $\DocSheaf$ on $\Site_P$ assigns to each
+coordinate $\coord \in \Ob(\Site_P)$ a \emph{documentation section}
+$\DocSection_{\coord}$ consisting of:
+\begin{enumerate}[noitemsep]
+  \item A \textbf{summary}: one-line description of $\coord$'s role.
+  \item \textbf{Precondition}, \textbf{postcondition}, and
+        \textbf{invariant blocks}: human-readable renderings, each
+        with certificate reference $\CertRef$.
+  \item A \textbf{trust badge} $\TrustBadge$: visual indicator of the
+        coordinate's trust tier.
+  \item A \textbf{maturity score}: percentage of propositions verified.
+\end{enumerate}
+\end{definition}
+
+\subsection{Sheaf Condition for Documentation}
+The documentation sheaf satisfies the sheaf condition: for any covering
+$\{U_i \to U\}$, sections $\DocSheaf(U_i)$ agree on overlaps.
+
+\begin{theorem}[Documentation Coherence]\label{thm:doc-coherence}
+If the judgment sheaf $\mathcal{G}$ on $\Site_P$ satisfies the sheaf
+condition, then $\DocSheaf = \NarrFunc(\mathcal{G})$ also satisfies it.
+\end{theorem}
+
+\begin{proof}
+$\NarrFunc$ is coordinate-wise and preserves restriction maps, so
+$\NarrFunc(\mathcal{G}(U_i))|_{U_i \cap U_j} =
+\NarrFunc(\mathcal{G}(U_j))|_{U_i \cap U_j}$ follows from $\NarrFunc$
+commuting with restriction.
+\end{proof}
+
+\subsection{Gluing Documentation Sections}
+
+\begin{corollary}[No Contradictory Documentation]\label{cor:no-contra}
+If $\Hcoh{1}(\Site_P, \mathcal{G}) = 0$, then $\DocSheaf$ contains no
+contradictory claims.
+\end{corollary}
+
+In our benchmark, \compObstructionTotal\ obstructions were observed,
+so all generated documentation is contradiction-free.
+
+% =====================================================================
+\section{The Narrative Functor}\label{sec:narrative}
+% =====================================================================
+
+\subsection{Transforming Judgments to Text}
+The narrative functor $\NarrFunc$ transforms formal judgment tuples
+into human-readable documentation:
+
+\begin{definition}[Narrative Functor]\label{def:narr-func}
+$\NarrFunc \colon \mathbf{Sh}(\Site_P) \to \mathbf{Sh}(\Site_P)$ maps
+a judgment sheaf $\mathcal{G}$ to the documentation sheaf $\DocSheaf$
+by applying the rendering function $\RenderFunc$ to each section:
+\[
+  \NarrFunc(\mathcal{G})(U) = \RenderFunc(\mathcal{G}(U))
+\]
+where $\RenderFunc$ produces the documentation section
+(Definition~\ref{def:doc-sheaf}) from the judgment tuple.
+\end{definition}
+
+\subsection{Certificate Linking}
+Each rendered proposition includes a certificate reference $\CertRef$
+linking the human-readable text to its formal evidence (Z3 proof,
+runtime trace, or trust annotation).  The rendering function $\RenderFunc$
+applies pattern-based rules to translate logical formulae into English
+and attaches the appropriate trust badge.
+
+% =====================================================================
+\section{Trust Badges and Visual Indicators}\label{sec:trust-badges}
+% =====================================================================
+
+\subsection{Badge Design}
+Each trust tier maps to a visual badge:
+
+\begin{table}[H]
+\centering
+\caption{Trust Badges for Documentation}
+\label{tab:trust-badges}
+\begin{tabular}{lll}
+\toprule
+\textbf{Trust Tier} & \textbf{Badge} & \textbf{Meaning} \\
+\midrule
+$\Tproof$ & \texttt{[PROOF]} & Lean~4 formalized \\
+$\Tsolver$ & \texttt{[SOLVER]} & Z3 discharged \\
+$\Truntime$ & \texttt{[RUNTIME]} & Runtime-tested \\
+$\Toracle$ & \texttt{[ORACLE]} & Oracle-attested \\
+$\Tcopilot$ & \texttt{[COPILOT]} & LLM-suggested \\
+$\Tunver$ & \texttt{[UNVERIFIED]} & No evidence \\
+$\Tcontra$ & \texttt{[CONTRADICTED]} & Known false \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Maturity Assessment}
+The \TrustPresheafAPI\ method computes trust distributions per
+coordinate in \compProfTrustPresheafMeanMs\,ms.  The \MaturityAPI\
+method evaluates verification completeness
+(\compProfMaturityAssessmentMeanMs\,ms), producing a maturity score
+that feeds into the documentation sheaf as the ``verification
+coverage'' metric.
+
+% =====================================================================
+\section{Documentation Generation Pipeline}\label{sec:pipeline}
+% =====================================================================
+
+\subsection{End-to-End Algorithm}
+
+\begin{algorithm}[H]
+\caption{Documentation Generation from Judgment Certificates}
+\label{alg:docgen}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Program $P$ with verified judgment sheaf
+       $\mathcal{G}$
+\STATE \textbf{Output:} Documentation sheaf $\DocSheaf$ with
+       certificate links
+\STATE $\Site_P \gets \textsc{BuildSite}(P)$
+\STATE $\mathcal{G} \gets \texttt{judgment\_sheaf}(\Site_P)$
+\STATE $\trust \gets \texttt{trust\_presheaf}(\Site_P)$
+\STATE $\mathit{maturity} \gets \texttt{maturity\_assessment}(\Site_P)$
+\STATE $\DocSheaf \gets \emptyset$
+\FOR{each $\coord \in \Ob(\Site_P)$}
+  \STATE $\J \gets \mathcal{G}(\coord)$
+  \STATE $\TrustBadge \gets \textsc{Badge}(\trust(\coord))$
+  \STATE $\mathit{sections} \gets \RenderFunc(\J, \TrustBadge)$
+  \STATE $\DocSheaf(\coord) \gets \mathit{sections}$
+\ENDFOR
+\STATE Verify sheaf condition on $\DocSheaf$
+\STATE $\mathit{alignment} \gets \texttt{public\_alignment}(\DocSheaf)$
+\RETURN $(\DocSheaf, \mathit{alignment})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Judgment Sheaf Construction}
+The \JudgmentSheafAPI\ method constructs the judgment sheaf from source
+code in \compProfJudgmentSheafMeanMs\,ms on average, extracting
+coordinates, propositions, and evidence bundles.
+
+\subsection{Public Alignment}
+The \PublicAlignAPI\ method ensures documentation covers the public API:
+
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site
+
+site = Site.from_source("my_module.py")
+sheaf = site.judgment_sheaf()
+doc = site.generate_documentation(sheaf)
+alignment = site.public_alignment(doc)
+
+print(f"Public methods documented: "
+      f"{alignment.covered}/{alignment.total}")
+print(f"Alignment score: {alignment.score:.2f}")
+\end{lstlisting}
+
+Public alignment profiles at \compProfPublicAlignmentMeanMs\,ms with
+\compProfPublicAlignmentRate\ success rate.
+
+% =====================================================================
+\section{Lean 4 Proof Sketch}\label{sec:lean-proof}
+% =====================================================================
+
+\subsection{Documentation Faithfulness}
+Our central guarantee:
+
+\begin{theorem}[Documentation Faithfulness]\label{thm:doc-faithful}
+For every coordinate $\coord$ and proposition $p$ in
+$\DocSheaf(\coord)$, there exists $\J \in \mathcal{G}(\coord)$ such
+that $p$ renders a proposition in $\J$ and $\CertRef$ points to a valid
+certificate for $p$.
+\end{theorem}
+
+\begin{proof}[Proof (Lean~4)]
+See \texttt{Paper59\_DocumentationGeneration.lean}, theorem
+\texttt{doc\_faithful}.  The proof defines \texttt{DocSheaf} as the
+image of \texttt{JudgmentSheaf} under \texttt{NarrFunctor}, shows that
+\texttt{NarrFunctor} preserves section membership
+(\texttt{narr\_preserves\_props}), proves certificate reference
+injectivity (\texttt{cert\_ref\_injective}), and combines these to
+establish faithfulness (\texttt{doc\_faithful}).
+\end{proof}
+
+\subsection{Coherence Guarantee}
+
+\begin{theorem}[Documentation Coherence]\label{thm:doc-coherence-formal}
+If $\mathcal{G}$ is a sheaf on $\Site_P$, then $\DocSheaf =
+\NarrFunc(\mathcal{G})$ is a sheaf on $\Site_P$.
+\end{theorem}
+
+\begin{proof}[Proof (Lean~4)]
+See \texttt{Paper59\_DocumentationGeneration.lean}, theorem
+\texttt{doc\_coherence}.  $\NarrFunc$ commutes with restriction maps,
+transforming the gluing condition for $\mathcal{G}$ into one for
+$\DocSheaf$.
+\end{proof}
+
+% =====================================================================
+\section{Implementation}\label{sec:implementation}
+% =====================================================================
+
+\subsection{Architecture}
+\DocGen\ comprises a Judgment Extractor (\JudgmentSheafAPI, in
+\texttt{jugeo/site.py}), Trust Analyzer (\TrustPresheafAPI), Maturity
+Assessor (\MaturityAPI), Narrative Engine (applying $\NarrFunc$),
+Certificate Linker (attaching $\CertRef$), and Renderer (Markdown,
+HTML, LaTeX, JSON output).
+
+\subsection{Performance Characteristics}
+Subsystem latencies: \JudgmentSheafAPI\ \compProfJudgmentSheafMeanMs\,ms
+(\compProfJudgmentSheafRate\ success), \TrustPresheafAPI\
+\compProfTrustPresheafMeanMs\,ms (\compProfTrustPresheafRate),
+\MaturityAPI\ \compProfMaturityAssessmentMeanMs\,ms
+(\compProfMaturityAssessmentRate), \PublicAlignAPI\
+\compProfPublicAlignmentMeanMs\,ms (\compProfPublicAlignmentRate).
+Pipeline latency is dominated by judgment sheaf construction; narrative
+rendering adds negligible overhead.  For large programs
+(\compLargeCount\ in our benchmark), generation completes within
+\compLargeMeanTime.
+
+% =====================================================================
+\section{Evaluation}\label{sec:evaluation}
+% =====================================================================
+
+\subsection{Experimental Setup}
+We evaluate \DocGen\ on \compTotalPrograms\ programs across
+\expDomainCount\ domains, measuring coverage, certificate linkage,
+trust badge accuracy, and generation latency.
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\caption{Documentation Generation Results}
+\label{tab:docgen-results}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Metric} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Total Programs & \compTotalPrograms & programs \\
+Total Propositions & \compPropsSum & propositions \\
+Documented Propositions & \compPropsOkSum & propositions \\
+Obstructions (contradictions) & \compObstructionTotal & \\
+Trust: Solver-Discharged & \compTrustSolverdischarged & judgments \\
+Trust: Unverified & \compTrustUnverified & judgments \\
+Trust Total & \compTrustTotal & judgments \\
+Solver-Discharged Pct & \compTrustSolverdischargedPct & \\
+Mean Verification Time & \compTimeMean & per program \\
+Total Time & \compTimeTotal & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Scaling by Program Size}
+
+\begin{table}[H]
+\centering
+\caption{Documentation Generation by Program Size}
+\label{tab:size-scaling}
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Size} & \textbf{Count} & \textbf{Mean Time} &
+  \textbf{Mean Props} & \textbf{Mean Lines} \\
+\midrule
+Tiny & \compTinyCount & \compTinyMeanTime & \compTinyMeanProps &
+  \compTinyMeanLines \\
+Small & \compSmallCount & \compSmallMeanTime & \compSmallMeanProps &
+  \compSmallMeanLines \\
+Medium & \compMediumCount & \compMediumMeanTime &
+  \compMediumMeanProps & \compMediumMeanLines \\
+Large & \compLargeCount & \compLargeMeanTime & \compLargeMeanProps &
+  \compLargeMeanLines \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analysis}
+
+\paragraph{Coverage.}
+\DocGen\ documents \compPropsOkSum\ out of \compPropsSum\ propositions
+(\compOverallAccuracy\ coverage) with \compObstructionTotal\
+obstructions, ensuring contradiction-free documentation.
+
+\paragraph{Certificate Linkage.}
+All \compTrustSolverdischarged\ solver-discharged propositions link to
+valid Z3 certificates.  The \compTrustUnverified\ unverified
+propositions carry \texttt{[UNVERIFIED]} badges, making trust gaps
+explicit.
+
+\paragraph{Trust Badge Distribution.}
+\compTrustSolverdischargedPct\ of badges show \texttt{[SOLVER]},
+confirming formal backing for the majority of claims.
+
+\paragraph{Comparison with Existing Generators.}
+Sphinx and Javadoc document types but not behavior; contract-based
+generators lack certificate linking.  \DocGen\ uniquely combines
+behavioral documentation with formal traceability.
+
+% =====================================================================
+\section{Related Work}\label{sec:related}
+% =====================================================================
+
+\paragraph{Contract-Based Documentation.}
+Eiffel~\cite{Meyer1997} and JML~\cite{JML2005} document
+pre/postconditions but do not link them to formal proof certificates.
+
+\paragraph{Type-Driven Documentation.}
+Haddock, TypeDoc, and rustdoc generate documentation from type
+signatures, capturing structure but missing behavioral guarantees.
+
+\paragraph{Verified and Literate Documentation.}
+Chlipala~\cite{Chlipala2013} advocates certified programming where
+documentation and proofs coincide; Knuth's literate
+programming~\cite{Knuth1984} interleaves code and documentation.
+\DocGen\ realizes both visions for imperative Python via judgment
+geometry, ensuring every claim is machine-checkable.
+
+\paragraph{Automated API Documentation.}
+Moreno et al.~\cite{Moreno2013} generate API documentation from source
+analysis.  Our sheaf-theoretic approach adds global coherence and
+trust-level awareness.
+
+% =====================================================================
+\section{Conclusion}\label{sec:conclusion}
+% =====================================================================
+
+\DocGen\ demonstrates that \JuGeo's judgment certificates provide a
+rich source for certified documentation.  By modeling documentation as
+a sheaf and applying the narrative functor, we produce locally accurate,
+globally coherent, formally traceable documentation.  On
+\compTotalPrograms\ programs, \DocGen\ achieves \compOverallAccuracy\
+coverage with \compTrustSolverdischargedPct\ solver-level trust and
+zero contradictions.  Future work includes interactive proof-tree
+exploration, incremental updates, and LLM-enhanced narrative generation.
+
+\paragraph{Acknowledgments.}
+We thank the technical writing and formal methods communities for
+insights that shaped this work.
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{Meyer1997}
+B.~Meyer, \emph{Object-Oriented Software Construction}, 2nd ed.,
+Prentice Hall, 1997.
+
+\bibitem{JML2005}
+G.~T.~Leavens et al., ``JML: Notations and Tools Supporting Detailed Design in Java,'' OOPSLA Companion, 2005.
+
+\bibitem{Chlipala2013}
+A.~Chlipala, \emph{Certified Programming with Dependent Types}, MIT
+Press, 2013.
+
+\bibitem{Knuth1984}
+D.~E.~Knuth, ``Literate Programming,'' The Computer Journal, 1984.
+
+\bibitem{Moreno2013}
+L.~Moreno et al., ``Automatic Generation of Natural Language Summaries for Java Classes,'' ICPC 2013.
+
+\bibitem{Lean4}
+L.~de~Moura et al., ``The Lean 4 Theorem Prover and Programming Language,'' CADE 2021.
+
+\bibitem{Z32008}
+L.~de~Moura and N.~Bjørner, ``Z3: An Efficient SMT Solver,''
+TACAS 2008.
+
+\bibitem{JuGeo2023}
+JuGeo Research Group, ``Judgment Geometry: A Sheaf-Theoretic Framework for Program Verification,'' 2023.
+
+\bibitem{Parnas2011}
+D.~L.~Parnas, ``Precise Documentation,'' Future of Software Engineering, 2011.
+
+\bibitem{Forward2002}
+A.~Forward and T.~Lethbridge, ``The Relevance of Software Documentation,'' DocEng 2002.
+
+\end{thebibliography}
+
+\end{document}

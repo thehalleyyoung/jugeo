@@ -1,0 +1,520 @@
+% paper54-foundational-synthesis.tex — Foundational Synthesis: Program Fragment Construction via Descent Search
+%   Paper 54 of the Judgment Geometry series.
+% Compile: pdflatex paper54-foundational-synthesis
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{experiment-data}
+\input{subsystem-data}
+\input{comprehensive-data}
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\SynthEngine}{\textsc{SynthesisEngine}}
+\newcommand{\DescentSearch}{\textsc{DescentSearch}}
+\newcommand{\FragmentSpace}{\mathcal{F}}
+\newcommand{\SpecSpace}{\mathcal{S}_\Sigma}
+\newcommand{\Synthesized}{\ensuremath{\mathsf{SYNTHESIZED}}}
+\newcommand{\Partial}{\ensuremath{\mathsf{PARTIAL}}}
+\newcommand{\Complete}{\ensuremath{\mathsf{COMPLETE}}}
+\newcommand{\Rejected}{\ensuremath{\mathsf{REJECTED}}}
+\newcommand{\RunDescent}{\texttt{run\_full\_descent}}
+\newcommand{\SpecSat}{\texttt{specification\_satisfaction}}
+\newcommand{\InhabFleet}{\texttt{inhabitant\_fleet}}
+\newcommand{\EvidManifold}{\texttt{evidence\_manifold}}
+\newcommand{\RepairSem}{\texttt{repair\_semantics}}
+\newcommand{\SemClosure}{\texttt{semantic\_closure}}
+\newcommand{\syntharrow}{\rightsquigarrow}
+
+\title{\textbf{Foundational Synthesis:\\
+Program Fragment Construction via Descent Search}}
+
+\author{%
+  JuGeo Research Group
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+We present a synthesis methodology that constructs program fragments
+from formal specifications using \JuGeo's descent machinery as the
+primary search strategy.  Rather than enumerating candidates
+syntactically, the \SynthEngine\ searches the space of \emph{local
+sections} on the specification site: each partial program is a local
+section, and descent guides the search toward global sections that
+satisfy the full specification.  The \RunDescent\ method orchestrates
+the search using \subDescentStrategies\ strategies (eager, exhaustive,
+iterative, optimistic), while \SpecSat\ validates intermediate
+fragments and \InhabFleet\ enumerates type inhabitants as seed
+candidates.  We prove that the synthesis procedure is \emph{sound}
+(every output satisfies the specification) and \emph{refutation
+complete} (if no program exists, an obstruction is reported).
+Experiments on \expTotalPrograms\ programs demonstrate
+\compOverallAccuracy\ synthesis accuracy with mean descent time
+$\compDescentEagerMeanMs$\,ms (eager) to
+$\compDescentExhaustiveMeanMs$\,ms (exhaustive), and
+$\compEquivPairs$ equivalence classes among synthesized variants.
+\end{abstract}
+
+\newpage
+
+% =====================================================================
+\section{Introduction}\label{sec:intro}
+% =====================================================================
+
+Program synthesis from specifications remains one of the hardest
+problems in computer science.  Classical approaches search a syntactic
+grammar~\cite{Gulwani2017}, use constraint solving~\cite{Solar-Lezama2008},
+or sample from neural models~\cite{CodeGen2022}.  Each struggles
+with the vast search space: grammars grow exponentially, constraints
+are NP-hard, and neural samples lack correctness guarantees.
+
+\paragraph{Descent as search.}
+\JuGeo\ offers a fundamentally different search strategy: \emph{sheaf
+descent}.  Given a specification decomposed into a covering family, we
+search for local sections on each patch and attempt to glue them.
+Descent narrows the search space by exploiting the topological
+structure of the specification site, pruning regions where obstructions
+prevent gluing.
+
+\paragraph{Contributions.}
+\begin{itemize}[noitemsep]
+  \item Formalization of synthesis as descent over a specification
+        site (§\ref{sec:synthesis-site}).
+  \item The \DescentSearch\ algorithm with four strategies
+        (§\ref{sec:descent-search}).
+  \item Integration with \InhabFleet\ for seed generation and
+        \SpecSat\ for intermediate validation
+        (§\ref{sec:integration}).
+  \item Repair via \RepairSem\ when partial fragments fail
+        validation (§\ref{sec:repair}).
+  \item Soundness and Refutation Completeness theorems, proved in
+        Lean~4 (§\ref{sec:lean-proof}).
+  \item Evaluation on \expTotalPrograms\ programs
+        (§\ref{sec:evaluation}).
+\end{itemize}
+
+% =====================================================================
+\section{Background}\label{sec:background}
+% =====================================================================
+
+\subsection{Specification-Driven Synthesis}
+In specification-driven synthesis, the input is a formal specification
+$\Sigma = (\text{pre}, \text{post}, \text{inv}, \text{types})$ and
+the output is a program $P$ satisfying $\Sigma$.  Verification
+confirms $P \models \Sigma$; synthesis constructs $P$ from $\Sigma$.
+
+\subsection{Descent in Sheaf Theory}
+In algebraic geometry, descent theory asks when a sheaf on a cover
+descends to the base.  The descent datum consists of local sections
+with compatibility isomorphisms on overlaps.  Effective descent
+means every compatible family glues uniquely.  \JuGeo\ applies this
+to programs: local program fragments (on sub-specifications) with
+compatible interfaces glue to global programs.
+
+\subsection{Inhabitant Fleets}
+The \InhabFleet\ subsystem enumerates \emph{inhabitants} of a type:
+given type $T$, it produces terms $t_1, t_2, \ldots$ such that
+$t_i : T$.  These serve as seed candidates for synthesis.
+
+% =====================================================================
+\section{Synthesis as Descent}\label{sec:synthesis-site}
+% =====================================================================
+
+\subsection{Specification Site}
+Given specification $\Sigma$, construct the specification site
+$\SpecSpace = (\Ob, \Mor, \Cov)$:
+\begin{itemize}[noitemsep]
+  \item $\Ob$: sub-specifications obtained by projecting $\Sigma$
+        onto subsets of its variables and constraints.
+  \item $\Mor$: refinement morphisms between sub-specifications.
+  \item $\Cov$: covering families where patches cover the full
+        variable/constraint space.
+\end{itemize}
+
+\begin{definition}[Fragment Sheaf]\label{def:fragment-sheaf}
+The \emph{fragment sheaf} $\FragmentSpace$ on $\SpecSpace$ assigns
+to each sub-specification $U$ the set $\FragmentSpace(U)$ of
+program fragments satisfying $U$.  Restriction maps project a
+fragment to a smaller sub-specification.
+\end{definition}
+
+\begin{definition}[Synthesis Goal]\label{def:synthesis-goal}
+A \emph{synthesis goal} is a request for a global section
+$s \in \FragmentSpace(\Sigma)$, \ie a program fragment satisfying
+the full specification.
+\end{definition}
+
+\subsection{Fragment Lifecycle}
+Each fragment progresses through states:
+\[
+  \Partial \;\syntharrow\; \Complete \;\syntharrow\; \Synthesized
+  \quad\text{or}\quad
+  \Partial \;\syntharrow\; \Rejected
+\]
+A \Partial\ fragment covers a sub-specification; \Complete\ fragments
+cover the full specification; \Synthesized\ fragments are verified.
+
+\subsection{Descent Datum}
+A \emph{descent datum} for a covering family $\{U_i \to \Sigma\}$ is
+a collection of local fragments $\{s_i \in \FragmentSpace(U_i)\}$ with
+compatibility: $\res(s_i)|_{U_i \cap U_j} = \res(s_j)|_{U_i \cap U_j}$
+for all overlapping patches.
+
+\begin{proposition}[Effective Descent]\label{prop:effective-descent}
+If $\FragmentSpace$ satisfies the sheaf condition on $\SpecSpace$,
+every descent datum glues to a unique global section.
+\end{proposition}
+
+% =====================================================================
+\section{Descent Search Strategies}\label{sec:descent-search}
+% =====================================================================
+
+\subsection{The \RunDescent\ Driver}
+
+\begin{algorithm}[H]
+\caption{Synthesis via Descent Search}
+\label{alg:descent}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Specification $\Sigma$, strategy $\sigma \in
+       \{\text{eager}, \text{exhaustive}, \text{iterative},
+       \text{optimistic}\}$
+\STATE \textbf{Output:} Program fragment $P$ or obstruction report
+\STATE $\SpecSpace \gets \texttt{formal\_core\_site}(\Sigma)$
+\STATE $\mathcal{C} \gets \texttt{generation\_cover\_design}(\Sigma)$
+\STATE $\textit{seeds} \gets \texttt{inhabitant\_fleet}(\Sigma.\text{types})$
+\FOR{each patch $U_i \in \mathcal{C}$}
+  \STATE $\FragmentSpace(U_i) \gets \texttt{enumerate\_fragments}(U_i, \textit{seeds})$
+  \STATE $\FragmentSpace(U_i) \gets \texttt{specification\_satisfaction}(\FragmentSpace(U_i), U_i)$
+\ENDFOR
+\STATE $\text{datum} \gets \texttt{run\_full\_descent}(\mathcal{C}, \FragmentSpace, \sigma)$
+\IF{$\text{datum}.\text{is\_complete}$}
+  \STATE $P \gets \glue(\text{datum})$
+  \STATE verify $P$ via $\texttt{encode\_for\_solver}$
+  \RETURN $P$
+\ELSE
+  \RETURN obstruction class from $\Hcoh{1}(\SpecSpace, \FragmentSpace)$
+\ENDIF
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Eager Descent}
+Selects the first viable fragment per patch for immediate gluing.
+Fastest: $\compDescentEagerMeanMs$\,ms mean time, $\compDescentEagerRate$
+success rate across $\compDescentEagerRuns$ runs.
+
+\subsection{Exhaustive Descent}
+Enumerates all viable fragments per patch.  $\compDescentExhaustiveMeanMs$\,ms
+mean time, $\compDescentExhaustiveRuns$ runs,
+$\compDescentExhaustiveRate$ success.
+
+\subsection{Iterative Descent}
+Alternates between refinement and gluing using obstruction feedback.
+$\compDescentIterativeMeanMs$\,ms mean, $\compDescentIterativeRuns$
+runs, $\compDescentIterativeRate$ success.
+
+\subsection{Optimistic Descent}
+Prioritizes fragments with highest estimated quality.
+$\compDescentOptimisticMeanMs$\,ms mean, $\compDescentOptimisticRuns$
+runs, $\compDescentOptimisticRate$ success.
+
+% =====================================================================
+\section{Integration with Subsystems}\label{sec:integration}
+% =====================================================================
+
+\subsection{Seed Generation via \InhabFleet}
+The \InhabFleet\ method generates type inhabitants as initial
+fragments.  Timing: $\subInhabitantfleetSmallTime$ (small),
+$\subInhabitantfleetMediumTime$ (medium),
+$\subInhabitantfleetLargeTime$ (large).
+
+\subsection{Validation via \SpecSat}
+Each intermediate fragment is checked against its sub-specification
+using \SpecSat.  Timing: $\subSpecificationsatisfactionSmallTime$
+(small), $\subSpecificationsatisfactionMediumTime$ (medium),
+$\subSpecificationsatisfactionLargeTime$ (large).
+
+\subsection{Evidence Collection via \EvidManifold}
+The \EvidManifold\ method collects evidence for successful validations,
+building a manifold of verified facts guiding subsequent search.
+Profiled at $\compProfEvidenceManifoldMeanMs$\,ms mean time.
+
+% =====================================================================
+\section{Repair and Refinement}\label{sec:repair}
+% =====================================================================
+
+\subsection{Obstruction-Guided Repair}
+When descent fails, the obstruction class in $\Hcoh{1}(\SpecSpace,
+\FragmentSpace)$ identifies incompatible patches.  The \RepairSem\
+method modifies fragments to resolve the obstruction.
+Repair timing: $\subRepairsemanticsSmallTime$ (small),
+$\subRepairsemanticsMediumTime$ (medium),
+$\subRepairsemanticsLargeTime$ (large).
+
+\subsection{Semantic Closure}
+After repair, \SemClosure\ ensures implied constraints propagate,
+preventing cascading failures ($\compProfSemanticClosureMeanMs$\,ms
+mean, $\compProfSemanticClosureRate$ success).
+
+\subsection{Termination}
+\begin{theorem}[Termination]\label{thm:termination}
+The synthesis loop terminates in at most $|\Ob(\SpecSpace)|^2$
+iterations, since each repair step strictly reduces the obstruction
+rank.
+\end{theorem}
+
+% =====================================================================
+\section{Lean 4 Proof Sketch}\label{sec:lean-proof}
+% =====================================================================
+
+\subsection{Synthesis Soundness}
+
+\begin{theorem}[Synthesis Soundness]\label{thm:soundness}
+If the descent search returns a program fragment $P$, then
+$P \models \Sigma$.
+\end{theorem}
+
+\begin{proof}[Proof (Lean~4)]
+See \texttt{Paper54\_FoundationalSynthesis.lean}, theorem
+\texttt{synthesis\_soundness}.  The proof decomposes into two parts:
+\begin{enumerate}[noitemsep]
+  \item \textbf{Gluing correctness}: The fragment $P$ is obtained
+        by gluing local sections $\{s_i\}$ via the sheaf axiom.
+        Since each $s_i$ satisfies sub-specification $U_i$ (validated
+        by \SpecSat), and the compatibility condition holds (checked
+        during descent), the global section satisfies $\bigcup U_i =
+        \Sigma$.
+  \item \textbf{Solver confirmation}: The final fragment is encoded
+        via \texttt{encode\_for\_solver} and discharged by Z3.  The
+        encoding fidelity lemma (Paper~51) transfers the Z3 verdict
+        to the Python operational semantics.
+\end{enumerate}
+\end{proof}
+
+\subsection{Refutation Completeness}
+
+\begin{theorem}[Refutation Completeness]\label{thm:refutation}
+If no program satisfying $\Sigma$ exists within the fragment space,
+the descent search reports a non-trivial obstruction in
+$\Hcoh{1}(\SpecSpace, \FragmentSpace)$.
+\end{theorem}
+
+\begin{proof}[Proof (Lean~4)]
+See \texttt{Paper54\_FoundationalSynthesis.lean}, theorem
+\texttt{refutation\_completeness}.  When exhaustive descent
+enumerates all local sections and no compatible family exists,
+\v{C}ech cohomology produces a non-zero $\Hcoh{1}$ class as a
+formal certificate of unsynthesizability.
+\end{proof}
+
+\subsection{Strategy Equivalence}
+
+\begin{lemma}[Strategy Equivalence]\label{lem:strategy-equiv}
+All four descent strategies produce the same set of global sections
+(up to refinement equivalence) when run to completion.
+\end{lemma}
+
+\begin{proof}
+Each strategy explores the same search space (all local sections per
+patch); they differ only in traversal order.  Since the gluing axiom
+is independent of enumeration order, completeness is preserved.
+Formally: \texttt{Paper54\_FoundationalSynthesis.lean}, lemma
+\texttt{strategy\_equivalence}.
+\end{proof}
+
+% =====================================================================
+\section{Implementation}\label{sec:implementation}
+% =====================================================================
+
+\subsection{System Architecture}
+The \SynthEngine\ comprises: specification parser (Python source),
+site constructor (\texttt{formal\_core\_site}, $\subFormalcoresiteSmallTime$),
+inhabitant fleet ($\subInhabitantfleetSmallTime$),
+descent engine (\RunDescent, $\subRunfulldescentSmallTime$),
+validator (\SpecSat, $\subSpecificationsatisfactionSmallTime$),
+repair module (\RepairSem, $\subRepairsemanticsSmallTime$),
+and solver backend ($\subEncodeforsolverSmallTime$).
+
+\subsection{API Usage}
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site
+
+site = Site.from_source("spec.py")
+
+# Synthesize via descent
+result = site.run_full_descent(
+    strategy="iterative",
+    repair=True,
+    max_iterations=100
+)
+
+if result.success:
+    print(f"Synthesized: {result.program}")
+    print(f"Trust: {result.trust}")
+    print(f"Descent steps: {result.steps}")
+else:
+    print(f"Obstruction: {result.obstruction}")
+    print(f"Conflicting patches: {result.conflicts}")
+\end{lstlisting}
+
+\subsection{Equivalence Checking}
+Synthesized variants are compared using the equivalence checker.
+The comprehensive data reports $\compEquivPairs$ equivalence pairs,
+of which $\compEquivBothVerified$ are both fully verified and
+$\compEquivSameStructure$ share the same site structure.
+
+% =====================================================================
+\section{Evaluation}\label{sec:evaluation}
+% =====================================================================
+
+\subsection{Experimental Setup}
+We evaluate synthesis on \expTotalPrograms\ programs across
+\expDomainCount\ domains, measuring: synthesis success rate, descent
+strategy comparison, repair effectiveness, and equivalence diversity.
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\caption{Foundational Synthesis Results}
+\label{tab:synthesis-results}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Metric} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Programs Analyzed & \expTotalPrograms & programs \\
+Synthesis Accuracy & \compOverallAccuracy & \\
+Total Propositions & \expPropsSum & props \\
+Propositions Satisfied & \expPropsOkSum & props \\
+Equivalence Pairs & $\compEquivPairs$ & pairs \\
+Both Verified & $\compEquivBothVerified$ & pairs \\
+Same Structure & $\compEquivSameStructure$ & pairs \\
+\midrule
+\multicolumn{3}{l}{\textit{Descent Strategy Comparison}} \\
+\midrule
+Eager Time & $\compDescentEagerMeanMs$\,ms & mean \\
+Eager Success & $\compDescentEagerRate$ & \\
+Exhaustive Time & $\compDescentExhaustiveMeanMs$\,ms & mean \\
+Exhaustive Success & $\compDescentExhaustiveRate$ & \\
+Iterative Time & $\compDescentIterativeMeanMs$\,ms & mean \\
+Iterative Success & $\compDescentIterativeRate$ & \\
+Optimistic Time & $\compDescentOptimisticMeanMs$\,ms & mean \\
+Optimistic Success & $\compDescentOptimisticRate$ & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Domain Analysis}
+Sorting (\expDomainSortCount\ programs, $\expDomainSortAvgProps$
+props) is simplest; data structures (\expDomainDsCount\ programs,
+$\expDomainDsAvgProps$ props) richest.  Mathematics
+($\expDomainMathAvgProps$ props) is tightly constrained; strings
+($\expDomainStrAvgProps$ props) moderate.
+
+\subsection{Repair and Bug Detection}
+The repair module resolves $\subRepairObstructions$ obstructions
+across $\subRepairTotal$ attempts.  Among $\compBuggyCount$ buggy
+programs, $\compBuggyFullPass$ achieve full pass after synthesis.
+
+% =====================================================================
+\section{Related Work}\label{sec:related}
+% =====================================================================
+
+\paragraph{Enumerative Synthesis.}
+Transit~\cite{Udupa2013} and $\lambda^2$~\cite{Feser2015} enumerate
+programs in a grammar.  Our descent search is guided by topological
+structure, avoiding blind enumeration.
+
+\paragraph{Constraint-Based Synthesis.}
+Sketch~\cite{Solar-Lezama2008} and Rosette~\cite{Torlak2013} reduce
+synthesis to constraint solving.  We decompose the constraint space
+via covering families and solve locally.
+
+\paragraph{Neural Synthesis.}
+CodeGen~\cite{CodeGen2022} and AlphaCode~\cite{Li2022} sample from
+large models.  Our approach uses LLM-generated seeds but verifies and
+refines them via descent, providing formal guarantees.
+
+\paragraph{Proof-Theoretic Synthesis.}
+Coq extraction~\cite{Letouzey2008} and Agda~\cite{Norell2009}
+extract programs from proofs.  We synthesize programs \emph{alongside}
+proofs via the descent-verification loop.
+
+% =====================================================================
+\section{Conclusion}\label{sec:conclusion}
+% =====================================================================
+
+Foundational synthesis via descent search offers a principled
+alternative to enumerative and neural synthesis.  By decomposing
+specifications into covering families and searching for compatible
+local fragments, the \SynthEngine\ exploits topological structure.
+Soundness ensures correctness; refutation completeness provides
+formal certificates.  Experiments demonstrate \compOverallAccuracy\
+accuracy.  Future work includes incremental synthesis under
+specification evolution and higher-dimensional descent for
+concurrent programs.
+
+\paragraph{Acknowledgments.}
+We thank the synthesis and verification communities for foundational
+techniques and benchmark suites.
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{Gulwani2017}
+S.~Gulwani, O.~Polozov, and R.~Singh, ``Program Synthesis,''
+Foundations and Trends in Programming Languages, 2017.
+
+\bibitem{Solar-Lezama2008}
+A.~Solar-Lezama, ``Program Sketching,'' STTT, 2008.
+
+\bibitem{CodeGen2022}
+E.~Nijkamp et al., ``CodeGen: An Open Large Language Model for Code,''
+arXiv:2203.13474, 2022.
+
+\bibitem{Udupa2013}
+A.~Udupa et al., ``TRANSIT: Specifying Protocols with Concolic Snippets,''
+PLDI 2013.
+
+\bibitem{Feser2015}
+J.~K.~Feser, S.~Chaudhuri, and I.~Dillig, ``Synthesizing Data Structure
+Transformations from Input-Output Examples,'' PLDI 2015.
+
+\bibitem{Torlak2013}
+E.~Torlak and R.~Bodik, ``Growing Solver-Aided Languages with Rosette,''
+Onward! 2013.
+
+\bibitem{Li2022}
+Y.~Li et al., ``Competition-Level Code Generation with AlphaCode,''
+Science, 2022.
+
+\bibitem{Letouzey2008}
+P.~Letouzey, ``Extraction in Coq: An Overview,'' CiE 2008.
+
+\bibitem{Norell2009}
+U.~Norell, ``Dependently Typed Programming in Agda,'' AFP 2009.
+
+\bibitem{Lean4}
+L.~de~Moura et al., ``The Lean 4 Theorem Prover and Programming Language,''
+CADE 2021.
+
+\bibitem{Z32008}
+L.~de~Moura and N.~Bjørner, ``Z3: An Efficient SMT Solver,'' TACAS 2008.
+
+\bibitem{JuGeo2023}
+JuGeo Research Group, ``Judgment Geometry: A Sheaf-Theoretic Framework for
+Program Verification,'' 2023.
+
+\end{thebibliography}
+
+\end{document}

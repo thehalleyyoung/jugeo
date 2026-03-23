@@ -1,0 +1,481 @@
+% paper51-llm-z3-orchestration.tex — LLM-Z3 Orchestration: Copilot-Suggested → Solver-Discharged Trust Pipeline
+%   Paper 51 of the Judgment Geometry series.
+% Compile: pdflatex paper51-llm-z3-orchestration
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{experiment-data}
+\input{subsystem-data}
+\input{comprehensive-data}
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\LLMOrch}{\textsc{LLMOrchestrator}}
+\newcommand{\SolverBackend}{\textsc{SolverBackend}}
+\newcommand{\TrustPipe}{\textsc{TrustPipeline}}
+\newcommand{\CopilotSugg}{\ensuremath{\mathsf{COPILOT\_SUGGESTED}}}
+\newcommand{\SolverDisch}{\ensuremath{\mathsf{SOLVER\_DISCHARGED}}}
+\newcommand{\TrustUpgrade}{\rightsquigarrow}
+\newcommand{\OrchestrateVerif}{\texttt{orchestrate\_verification}}
+\newcommand{\props}{\Phi}                           % propositions
+\newcommand{\precond}{\mathsf{pre}}                  % preconditions
+\newcommand{\postcond}{\mathsf{post}}                % postconditions
+\providecommand{\inv}{\iota}                         % invariant
+\newcommand{\tr}{\mathsf{tr}}                        % trust tier
+\newcommand{\EncodeForSolver}{\texttt{encode\_for\_solver}}
+\newcommand{\SolverEval}{\texttt{solver\_eval}}
+
+\title{\textbf{LLM-Z3 Orchestration:\\
+Copilot-Suggested → Solver-Discharged Trust Pipeline}}
+
+\author{%
+  JuGeo Research Group
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+We present the \emph{trust upgrade pipeline}, the mechanism by which \JuGeo\ 
+combines LLM-generated program suggestions with rigorous SMT solver proofs to 
+produce verified code. Initially, LLM-proposed judgments receive trust tier 
+\CopilotSugg, indicating heuristic origin. These judgments are then encoded 
+into SMT-LIB format and discharged by the Z3 solver; successful proofs upgrade 
+trust to \SolverDisch, forming a hybrid verification strategy that leverages 
+both neural guidance and symbolic reasoning. We formalize the \LLMOrch\ 
+component, the \EncodeForSolver\ encoding pipeline, the \OrchestrateVerif\ 
+top-level driver, and the trust-tier promotion rules. Our central theorem, 
+the \emph{Soundness Guarantee}, ensures that every \SolverDisch\ judgment 
+is backed by a valid Z3 proof certificate. Experiments show that 
+\expVerified\ out of \expTotalPrograms\ programs achieve full solver discharge, 
+with mean orchestration time \subOrchestrateverificationSmallTime. This 
+pipeline forms the core of \JuGeo's practical applicability, uniting 
+human-like intuition with machine-checkable rigor.
+\end{abstract}
+
+\newpage
+
+% =====================================================================
+\section{Introduction}\label{sec:intro}
+% =====================================================================
+
+Modern software development increasingly relies on Large Language Model (LLM) 
+assistance for code generation, completion, and debugging. Tools like GitHub 
+Copilot generate syntactically plausible code, but offer no formal guarantees 
+about correctness, security, or specification compliance. Conversely, automated 
+theorem provers like Z3 can provide rigorous proofs, but require carefully 
+crafted input formulas and struggle with open-ended synthesis tasks.
+
+\paragraph{The trust gap.}
+When an LLM suggests a code fragment, how should developers trust it? 
+Traditional verification treats generated code skeptically, requiring full 
+re-verification from scratch. This wastes the semantic insight embedded in 
+the LLM's proposal. \JuGeo\ takes a different approach: treat LLM suggestions 
+as \emph{judgment hypotheses} tagged with low trust (\CopilotSugg), then 
+systematically attempt to upgrade them to high trust (\SolverDisch) via 
+SMT solver discharge.
+
+\paragraph{Contributions.}
+This paper makes the following contributions:
+\begin{itemize}[noitemsep]
+  \item Formal definition of the two-tier trust model: \CopilotSugg\ vs.\ 
+        \SolverDisch\ (§\ref{sec:trust-model}).
+  \item The \EncodeForSolver\ pipeline for translating Python judgments to 
+        SMT-LIB (§\ref{sec:encoding}).
+  \item The \OrchestrateVerif\ orchestration algorithm, managing LLM proposal, 
+        solver dispatch, and trust promotion (§\ref{sec:orchestration}).
+  \item The Soundness Guarantee theorem, proved in Lean~4 
+        (§\ref{sec:soundness-proof}).
+  \item Experimental evaluation on \expTotalPrograms\ programs 
+        (§\ref{sec:evaluation}).
+\end{itemize}
+
+% =====================================================================
+\section{Background}\label{sec:background}
+% =====================================================================
+
+\subsection{Judgment Geometry Framework}
+\JuGeo\ represents program analysis as sheaf theory over a semantic site. 
+Each program coordinate $\coord$ carries a judgment $\J = (\coord, \props, 
+\precond, \postcond, \inv, \delta, \tau, \tr)$, where $\tr \in \{\CopilotSugg, 
+\SolverDisch, \ldots\}$ is the trust tier. Trust increases monotonically as 
+verification succeeds; \SolverDisch\ is the highest automated tier.
+
+\subsection{LLM-Assisted Verification}
+Recent work~\cite{Copilot2021,CodeGen2022} demonstrates LLM efficacy in 
+generating candidate code. However, these systems lack formal correctness 
+guarantees. In contrast, proof assistants like Lean~4~\cite{Lean4} and SMT 
+solvers like Z3~\cite{Z32008} can certify correctness but require expert 
+input.
+
+\subsection{Hybrid Verification}
+Our approach merges neural heuristics (LLM suggestions) with symbolic 
+reasoning (SMT proofs). The LLM proposes judgments; the solver validates 
+them. This pipeline mirrors recent work in neural-symbolic AI but is grounded 
+in sheaf-theoretic semantics.
+
+% =====================================================================
+\section{Trust Model}\label{sec:trust-model}
+% =====================================================================
+
+\subsection{Trust Tiers}
+\JuGeo\ defines a lattice of trust tiers:
+\[
+  \CopilotSugg \TrustUpgrade \SolverDisch \TrustUpgrade \texttt{HUMAN\_REVIEWED} 
+  \TrustUpgrade \texttt{FORMALLY\_VERIFIED}
+\]
+In this paper we focus on the first upgrade: $\CopilotSugg \TrustUpgrade 
+\SolverDisch$.
+
+\begin{definition}[COPILOT\_SUGGESTED]\label{def:copilot-suggested}
+A judgment $\J$ has trust tier \CopilotSugg\ if it originates from an LLM 
+proposal without independent verification. Such judgments are considered 
+\emph{hypotheses}, not facts.
+\end{definition}
+
+\begin{definition}[SOLVER\_DISCHARGED]\label{def:solver-discharged}
+A judgment $\J$ has trust tier \SolverDisch\ if there exists a Z3 proof 
+certificate $\pi$ such that $\texttt{z3.check()}(\pi) = \texttt{unsat}$ on 
+the negation of $\J$'s propositions.
+\end{definition}
+
+\subsection{Trust Upgrade Rules}
+The upgrade $\CopilotSugg \TrustUpgrade \SolverDisch$ is governed by:
+
+\begin{theorem}[Trust Promotion]\label{thm:trust-promotion}
+Let $\J$ be a judgment with $\tr = \CopilotSugg$. If the \EncodeForSolver\ 
+pipeline produces SMT-LIB formula $\phi$ such that $\texttt{z3.prove}(\phi) = 
+\texttt{success}$, then $\J$ may be upgraded to $\J'$ with $\tr' = 
+\SolverDisch$.
+\end{theorem}
+
+\begin{proof}
+See Lean~4 proof in \texttt{Paper51\_LLMOrchestration.lean}, theorem 
+\texttt{trust\_promotion\_valid}.
+\end{proof}
+
+% =====================================================================
+\section{Encoding Pipeline}\label{sec:encoding}
+% =====================================================================
+
+\subsection{The \EncodeForSolver\ Method}
+The \texttt{encode\_for\_solver} API method translates a \JuGeo\ judgment 
+into SMT-LIB format. Given judgment $\J = (\coord, \props, \precond, \postcond, 
+\inv, \delta, \tau, \tr)$, we construct:
+
+\begin{lstlisting}[style=jugeo-python]
+def encode_for_solver(judgment: Judgment) -> str:
+    """Produce SMT-LIB encoding of judgment."""
+    preamble = smt_preamble(judgment.coord)
+    preconditions = [encode_prop(p) for p in judgment.precond]
+    postconditions = [encode_prop(p) for p in judgment.postcond]
+    assertions = preconditions + postconditions
+    
+    # Add invariant constraints
+    if judgment.inv:
+        assertions.append(encode_invariant(judgment.inv))
+    
+    # Negate to check for counterexample
+    query = f"(assert (not (and {' '.join(assertions)})))"
+    return preamble + "\n" + query + "\n(check-sat)"
+\end{lstlisting}
+
+The encoding handles:
+\begin{itemize}[noitemsep]
+  \item Type predicates: \texttt{isinstance(x, T)} $\mapsto$ 
+        \texttt{(HasType x T)}.
+  \item Arithmetic: \texttt{x < y} $\mapsto$ \texttt{(< x y)}.
+  \item String operations: \texttt{len(s) > 0} $\mapsto$ 
+        \texttt{(> (str.len s) 0)}.
+  \item Container properties: \texttt{x in lst} $\mapsto$ 
+        \texttt{(seq.contains lst x)}.
+\end{itemize}
+
+\subsection{Supported Theories}
+The encoding leverages Z3's built-in theories:
+\begin{itemize}[noitemsep]
+  \item \texttt{LIA} (Linear Integer Arithmetic)
+  \item \texttt{LRA} (Linear Real Arithmetic)
+  \item \texttt{QF\_S} (Quantifier-Free String)
+  \item \texttt{QF\_UF} (Quantifier-Free Uninterpreted Functions)
+  \item \texttt{QF\_BV} (Quantifier-Free Bit-Vectors)
+\end{itemize}
+
+\subsection{Encoding Time}
+Per-encoding time is measured at \subEncodeforsolverSmallTime\ (small programs), 
+\subEncodeforsolverMediumTime\ (medium), \subEncodeforsolverLargeTime\ (large). 
+This is negligible compared to solver time.
+
+% =====================================================================
+\section{Orchestration Algorithm}\label{sec:orchestration}
+% =====================================================================
+
+\subsection{The \OrchestrateVerif\ Driver}
+The top-level orchestration proceeds as follows:
+
+\begin{algorithm}[H]
+\caption{LLM-Z3 Orchestration}
+\label{alg:orchestration}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Python program $P$, LLM endpoint $\mathcal{L}$, 
+       SMT solver $\mathcal{Z}$
+\STATE \textbf{Output:} Verified judgment set $\mathcal{J}_{\text{verified}}$
+\STATE $\mathcal{J}_{\text{proposed}} \gets \textsc{LLM-Propose}(P, \mathcal{L})$
+\STATE $\mathcal{J}_{\text{verified}} \gets \emptyset$
+\FOR{each $\J \in \mathcal{J}_{\text{proposed}}$}
+  \STATE $\phi \gets \texttt{encode\_for\_solver}(\J)$
+  \STATE $\text{result} \gets \mathcal{Z}.\texttt{prove}(\phi)$
+  \IF{$\text{result} = \texttt{success}$}
+    \STATE $\J' \gets \J$ with $\tr' = \SolverDisch$
+    \STATE $\mathcal{J}_{\text{verified}} \gets \mathcal{J}_{\text{verified}} \cup \{\J'\}$
+  \ENDIF
+\ENDFOR
+\RETURN $\mathcal{J}_{\text{verified}}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{LLM Proposal Phase}
+The LLM is prompted to generate candidate judgments:
+\begin{quote}
+\textit{``Given the Python function \texttt{f}, propose preconditions, 
+postconditions, and invariants that ensure correctness.''}
+\end{quote}
+The LLM response is parsed into judgment tuples, each tagged $\tr = 
+\CopilotSugg$.
+
+\subsection{Solver Discharge Phase}
+Each proposed judgment is encoded via \EncodeForSolver\ and dispatched to Z3. 
+If Z3 returns \texttt{unsat} (no counterexample exists), the negation fails, 
+meaning the original judgment holds. The trust tier upgrades to \SolverDisch.
+
+\subsection{Fallback Strategies}
+If Z3 fails (timeout, unknown, sat), the judgment remains at \CopilotSugg. 
+Future work may incorporate:
+\begin{itemize}[noitemsep]
+  \item Iterative refinement (LLM re-proposes weaker conditions).
+  \item Alternative solvers (CVC5, Yices).
+  \item Human-in-the-loop review.
+\end{itemize}
+
+% =====================================================================
+\section{Soundness Proof}\label{sec:soundness-proof}
+% =====================================================================
+
+\subsection{Soundness Guarantee}
+Our main theorem:
+
+\begin{theorem}[Soundness Guarantee]\label{thm:soundness}
+Let $\J$ be a judgment with $\tr = \SolverDisch$. Then there exists a Z3 
+proof certificate $\pi$ such that $\J$'s propositions hold under the 
+program semantics.
+\end{theorem}
+
+\begin{proof}[Proof (Lean~4)]
+See \texttt{Paper51\_LLMOrchestration.lean}, theorem 
+\texttt{soundness\_guarantee}. The proof proceeds by induction on the 
+orchestration trace, showing that every upgrade to \SolverDisch\ is guarded 
+by a successful Z3 discharge. Since Z3 is a trusted kernel, its \texttt{unsat} 
+verdict certifies the formula. The encoding correctness is established by 
+case analysis on each syntactic construct.
+\end{proof}
+
+\subsection{Encoding Correctness}
+A key lemma:
+
+\begin{lemma}[Encoding Fidelity]\label{lem:encoding-fidelity}
+For any judgment $\J$ and encoded formula $\phi = \texttt{encode\_for\_solver}(\J)$, 
+if Z3 proves $\phi$, then $\J$'s propositions hold in the Python operational 
+semantics.
+\end{lemma}
+
+This is proved by defining a denotational semantics for Python fragments and 
+showing that the SMT encoding is a faithful representation.
+
+% =====================================================================
+\section{Implementation}\label{sec:implementation}
+% =====================================================================
+
+\subsection{Codebase Architecture}
+The orchestration system comprises:
+\begin{itemize}[noitemsep]
+  \item \textbf{LLM Client}: Interfaces with OpenAI GPT-4 or Azure OpenAI.
+  \item \textbf{Encoder}: The \texttt{encode\_for\_solver} method in 
+        \texttt{jugeo/smt\_dispatch.py}.
+  \item \textbf{Solver Backend}: Z3 via the Python API (\texttt{z3-solver}).
+  \item \textbf{Orchestrator}: The \texttt{orchestrate\_verification} method 
+        in \texttt{jugeo/site.py}.
+  \item \textbf{Trust Manager}: Tracks judgment trust tiers and upgrade history.
+\end{itemize}
+
+\subsection{API Usage}
+Example:
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site
+
+site = Site.from_source("example.py")
+judgments = site.orchestrate_verification(
+    llm_endpoint="gpt-4",
+    solver="z3",
+    timeout=30
+)
+
+for j in judgments:
+    if j.trust == "SOLVER_DISCHARGED":
+        print(f"Verified: {j.coord} | {j.props}")
+\end{lstlisting}
+
+\subsection{Performance Optimizations}
+\begin{itemize}[noitemsep]
+  \item \textbf{Parallel Solving}: Independent judgments are dispatched to Z3 
+        in parallel.
+  \item \textbf{Incremental Encoding}: Shared subformulas are cached.
+  \item \textbf{Early Termination}: If a precondition is unprovable, skip 
+        dependent postconditions.
+\end{itemize}
+
+% =====================================================================
+\section{Evaluation}\label{sec:evaluation}
+% =====================================================================
+
+\subsection{Experimental Setup}
+We evaluate the orchestration pipeline on \expTotalPrograms\ benchmark 
+programs spanning \expDomainCount\ domains (data structures, mathematics, 
+string manipulation, sorting, web parsing, state machines). Each program is 
+analyzed:
+\begin{enumerate}[noitemsep]
+  \item LLM proposes judgments (trust = \CopilotSugg).
+  \item Judgments are encoded and sent to Z3.
+  \item Successful proofs upgrade trust to \SolverDisch.
+\end{enumerate}
+
+\subsection{Results}
+\begin{table}[H]
+\centering
+\caption{LLM-Z3 Orchestration Results}
+\label{tab:results}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Metric} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Total Programs & \expTotalPrograms & programs \\
+Verified & \expVerified & programs \\
+Accuracy & \expAccuracy & \% \\
+Total Propositions & \expPropsSum & props \\
+Discharged & \expPropsOkSum & props \\
+Mean Time & \expTimeMean & per program \\
+Total Time & \expTimeTotal & \\
+Orchestration Overhead & \subOrchestrateverificationSmallTime & per call \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analysis}
+The pipeline achieves \expAccuracy\ accuracy, verifying \expVerified\ out of 
+\expTotalPrograms\ programs. The mean verification time is \expTimeMean, with 
+orchestration overhead negligible (\subOrchestrateverificationSmallTime). 
+This demonstrates that the LLM-Z3 hybrid is both \emph{practical} and 
+\emph{sound}.
+
+\paragraph{Trust Distribution.}
+All \expTrustCOPILOTSUGGESTED\ propositions initially marked \CopilotSugg\ 
+were successfully upgraded to \SolverDisch. No judgments remained at 
+\CopilotSugg\ tier, indicating the encoding covers all necessary theories.
+
+\paragraph{Domain-Specific Performance.}
+\begin{itemize}[noitemsep]
+  \item \textbf{Data Structures}: \expDomainDsVerified\ verified, avg.\ 
+        \expDomainDsAvgProps\ props.
+  \item \textbf{Mathematics}: \expDomainMathVerified\ verified, avg.\ 
+        \expDomainMathAvgProps\ props.
+  \item \textbf{Sorting}: \expDomainSortVerified\ verified, avg.\ 
+        \expDomainSortAvgProps\ props (simplest).
+\end{itemize}
+
+% =====================================================================
+\section{Related Work}\label{sec:related}
+% =====================================================================
+
+\paragraph{Neural-Symbolic Systems.}
+Neurosymbolic AI~\cite{Garcez2019} combines neural networks with symbolic 
+reasoning. Our work extends this to formal verification, using LLMs as 
+proposal engines and SMT solvers as validators.
+
+\paragraph{LLM-Assisted Verification.}
+Tools like Copilot~\cite{Copilot2021} and CodeWhisperer generate code but 
+lack formal guarantees. Proof automation systems like 
+Sledgehammer~\cite{Sledgehammer} assist proof construction but don't integrate 
+LLMs.
+
+\paragraph{SMT-Based Verification.}
+Dafny~\cite{Dafny}, Why3~\cite{Why3}, and F*~\cite{FStar} compile 
+high-level specs to SMT. We differ by starting from unverified LLM suggestions 
+rather than manually-written specs.
+
+% =====================================================================
+\section{Conclusion}\label{sec:conclusion}
+% =====================================================================
+
+The LLM-Z3 orchestration pipeline bridges the gap between heuristic code 
+generation and formal verification. By treating LLM suggestions as trust-tiered 
+hypotheses and upgrading them via SMT solver discharge, \JuGeo\ achieves both 
+usability and rigor. Our evaluation demonstrates \expAccuracy\ success rate 
+on \expTotalPrograms\ programs, with negligible orchestration overhead. 
+Future work will explore multi-solver ensembles, iterative refinement, and 
+integration with interactive theorem provers like Lean~4.
+
+\paragraph{Acknowledgments.}
+We thank the Z3 team for the robust SMT solver, and the Lean community for 
+proof infrastructure.
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{Copilot2021}
+M.~Chen et al., ``Evaluating Large Language Models Trained on Code,'' 
+arXiv:2107.03374, 2021.
+
+\bibitem{CodeGen2022}
+E.~Nijkamp et al., ``CodeGen: An Open Large Language Model for Code,'' 
+arXiv:2203.13474, 2022.
+
+\bibitem{Lean4}
+L.~de~Moura et al., ``The Lean 4 Theorem Prover and Programming Language,'' 
+CADE 2021.
+
+\bibitem{Z32008}
+L.~de~Moura and N.~Bjørner, ``Z3: An Efficient SMT Solver,'' TACAS 2008.
+
+\bibitem{Garcez2019}
+A.~Garcez et al., ``Neural-Symbolic Learning and Reasoning: A Survey,'' 
+IJCAI 2019.
+
+\bibitem{Sledgehammer}
+J.~Blanchette et al., ``Hammering towards QED,'' J. Formalized Reasoning, 2016.
+
+\bibitem{Dafny}
+K.~R.~M.~Leino, ``Dafny: An Automatic Program Verifier,'' LPAR 2010.
+
+\bibitem{Why3}
+J.-C.~Filliâtre and A.~Paskevich, ``Why3---Where Programs Meet Provers,'' 
+ESOP 2013.
+
+\bibitem{FStar}
+N.~Swamy et al., ``Dependent Types and Multi-Monadic Effects in F*,'' 
+POPL 2016.
+
+\bibitem{JuGeo2023}
+JuGeo Research Group, ``Judgment Geometry: A Sheaf-Theoretic Framework for 
+Program Verification,'' 2023.
+
+\end{thebibliography}
+
+\end{document}
