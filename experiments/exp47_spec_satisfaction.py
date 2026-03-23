@@ -42,7 +42,7 @@ def write_temp_py(source):
 def fmt_time(secs):
     if secs < 0.001: return f"{secs*1_000_000:.0f}\\,\\mu s"
     if secs < 1.0: return f"{secs*1000:.1f}\\,ms"
-    return f"{secs:.2f}\\,s"
+    return f"{secs*1000:.2f}\\,ms"
 
 
 def fmt_pct(val):

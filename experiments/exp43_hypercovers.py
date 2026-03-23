@@ -367,7 +367,8 @@ def main():
     hyper_verif_times = []
     flat_missed_list = []
     hyper_missed_list = []
-    build_times = []
+    flat_build_times = []
+    hyper_build_times = []
     max_depth = 0
     kind_cech = 0
     kind_trunc = 0
@@ -429,7 +430,8 @@ def main():
         hyper_verif_times.append(hyper_verif_s)
         flat_missed_list.append(flat_missed)
         hyper_missed_list.append(hyper_missed)
-        build_times.append(hyper_build_s)
+        flat_build_times.append(flat_build_s)
+        hyper_build_times.append(hyper_build_s)
 
         rec = {
             "name": name,
@@ -439,6 +441,7 @@ def main():
             "hyper_verif_s": hyper_verif_s,
             "flat_missed": flat_missed,
             "hyper_missed": hyper_missed,
+            "flat_build_s": flat_build_s,
             "hyper_build_s": hyper_build_s,
             "levels": n_levels,
             "kind": kind_sel,
@@ -460,8 +463,24 @@ def main():
     mean_hyper_verif = safe_mean(hyper_verif_times)
     mean_flat_missed = safe_mean(flat_missed_list)
     mean_hyper_missed = safe_mean(hyper_missed_list)
-    mean_build_time = safe_mean(build_times)
+    mean_flat_build = safe_mean(flat_build_times)
+    mean_hyper_build = safe_mean(hyper_build_times)
     speedup = mean_flat_verif / mean_hyper_verif if mean_hyper_verif > 0 else 1.0
+
+    # Per-depth aggregates
+    depth_groups = {}
+    for rec in per_program:
+        d = rec["depth"]
+        depth_groups.setdefault(d, []).append(rec)
+
+    depth_stats = {}
+    for d in sorted(depth_groups.keys()):
+        recs = depth_groups[d]
+        depth_stats[d] = {
+            "count": len(recs),
+            "flat_missed": safe_mean([r["flat_missed"] for r in recs]),
+            "hyper_missed": safe_mean([r["hyper_missed"] for r in recs]),
+        }
 
     print()
     print(f"  Total programs:      {total_programs}")
@@ -469,16 +488,22 @@ def main():
     print(f"  Mean hyper verif:    {mean_hyper_verif*1000:.1f} ms")
     print(f"  Mean flat missed:    {mean_flat_missed:.1f}")
     print(f"  Mean hyper missed:   {mean_hyper_missed:.1f}")
-    print(f"  Mean build time:     {mean_build_time*1000:.2f} ms")
+    print(f"  Mean flat build:     {mean_flat_build*1000:.2f} ms")
+    print(f"  Mean hyper build:    {mean_hyper_build*1000:.2f} ms")
     print(f"  Max depth tested:    {max_depth}")
     print(f"  Speedup ratio:       {speedup:.2f}x")
     print(f"  Kind Čech:           {kind_cech}")
     print(f"  Kind truncated:      {kind_trunc}")
+    for d in sorted(depth_stats.keys()):
+        ds = depth_stats[d]
+        print(f"  Depth {d}: n={ds['count']}  flat_miss={ds['flat_missed']:.1f}  hyper_miss={ds['hyper_missed']:.1f}")
 
     # ------------------------------------------------------------------
     # Write LaTeX macros
     # ------------------------------------------------------------------
     P = "ppFortyThree"
+
+    DEPTH_WORDS = {1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five"}
 
     macros = {}
 
@@ -490,11 +515,19 @@ def main():
     m("HyperVerifTime", fmt_time(mean_hyper_verif))
     m("FlatMissed", f"{mean_flat_missed:.1f}")
     m("HyperMissed", f"{mean_hyper_missed:.1f}")
-    m("MeanBuildTime", fmt_time(mean_build_time))
+    m("FlatBuildTime", fmt_time(mean_flat_build))
+    m("HyperBuildTime", fmt_time(mean_hyper_build))
     m("MaxDepth", max_depth)
     m("Speedup", f"{speedup:.2f}\\times")
     m("KindCech", kind_cech)
     m("KindTrunc", kind_trunc)
+
+    for d in sorted(depth_stats.keys()):
+        ds = depth_stats[d]
+        word = DEPTH_WORDS[d]
+        m(f"Depth{word}Count", ds["count"])
+        m(f"Depth{word}FlatMiss", f"{ds['flat_missed']:.1f}")
+        m(f"Depth{word}HyperMiss", f"{ds['hyper_missed']:.1f}")
 
     tex_path = os.path.join(ROOT, "papers", "data-paper43.tex")
     os.makedirs(os.path.dirname(tex_path), exist_ok=True)
@@ -519,11 +552,13 @@ def main():
             "mean_hyper_verif_s": mean_hyper_verif,
             "mean_flat_missed": mean_flat_missed,
             "mean_hyper_missed": mean_hyper_missed,
-            "mean_build_time_s": mean_build_time,
+            "mean_flat_build_s": mean_flat_build,
+            "mean_hyper_build_s": mean_hyper_build,
             "max_depth": max_depth,
             "speedup": speedup,
             "kind_cech": kind_cech,
             "kind_trunc": kind_trunc,
+            "depth_stats": {str(d): v for d, v in depth_stats.items()},
             "per_program": per_program,
         }, fh, indent=2)
 
