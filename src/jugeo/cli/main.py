@@ -177,6 +177,11 @@ def _cmd_bugs(args: argparse.Namespace) -> int:
 # ===========================================================================
 
 def _cmd_spec(args: argparse.Namespace) -> int:
+    # Support --spec/--impl as aliases for positional args
+    if getattr(args, 'spec', None) and not args.spec_file:
+        args.spec_file = args.spec
+    if getattr(args, 'impl', None) and not args.program:
+        args.program = args.impl
     from jugeo.cli.cmd_spec import run_spec
     return run_spec(args)
 
@@ -303,6 +308,9 @@ def _cmd_test(args: argparse.Namespace) -> int:
 # ===========================================================================
 
 def _cmd_ideate(args: argparse.Namespace) -> int:
+    # --topic is an alias for --field
+    if getattr(args, 'topic', None) and not getattr(args, 'field', None):
+        args.field = args.topic
     from jugeo.cli.cmd_ideate import run_ideate
     return run_ideate(args)
 
@@ -312,6 +320,14 @@ def _cmd_ideate(args: argparse.Namespace) -> int:
 # ===========================================================================
 
 def _cmd_prove(args: argparse.Namespace) -> int:
+    # Support --spec/--impl as aliases for positional files
+    if getattr(args, 'impl', None) and args.impl not in (args.files or []):
+        args.files = (args.files or []) + [args.impl]
+    if getattr(args, 'spec', None) and args.spec not in (args.files or []):
+        args.files = (args.files or []) + [args.spec]
+    # Normalize strategy to lowercase
+    if hasattr(args, 'strategy') and args.strategy:
+        args.strategy = args.strategy.lower()
     from jugeo.cli.cmd_prove import run_prove
     return run_prove(args)
 
@@ -396,6 +412,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_spec = subs.add_parser("spec", help="Check code against a specification.")
     p_spec.add_argument("spec_file", nargs="?", default=None, help="Specification file (text or JSON).")
     p_spec.add_argument("program", nargs="?", default=None, help="Python program to verify.")
+    p_spec.add_argument("--spec", type=str, default=None, help="Specification file (alias for positional).")
+    p_spec.add_argument("--impl", type=str, default=None, help="Implementation file (alias for positional).")
     p_spec.add_argument("--strict", action="store_true", default=False,
                          help="Fail on any residual obligation.")
     p_spec.add_argument("--registry", action="store_true", default=False,
@@ -405,6 +423,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # -- repair --
     p_repair = subs.add_parser("repair", help="Suggest repairs for buggy code.")
     p_repair.add_argument("files", nargs="*", help="Python file(s) to repair.")
+    p_repair.add_argument("--spec", type=str, default=None, help="Specification file to repair against.")
     p_repair.add_argument("--max-repairs", type=int, default=5, metavar="N",
                            help="Maximum repairs to suggest (default: 5).")
     p_repair.add_argument("--auto-apply", action="store_true", default=False,
@@ -426,6 +445,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # -- evaluate --
     p_eval = subs.add_parser("evaluate", help="Evaluate code quality, maturity, and trust.")
     p_eval.add_argument("target", nargs="?", default=".", help="File or directory to evaluate.")
+    p_eval.add_argument("--spec", type=str, default=None, help="Specification file to evaluate against.")
     p_eval.add_argument("--ablation", action="store_true", default=False, help="Run ablation study.")
     p_eval.add_argument("--calibration", action="store_true", default=False, help="Run calibration metrics.")
     p_eval.add_argument("--benchmarks", action="store_true", default=False, help="Run benchmark suite.")
@@ -440,9 +460,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gen.add_argument("--novel-problems", action="store_true", default=False,
                         help="Identify and codify novel (previously inarticulable) problems.")
     p_gen.add_argument("--goal", type=str, default=None, help="High-level generation goal description.")
+    p_gen.add_argument("--spec", type=str, default=None, help="Specification file to generate from.")
+    p_gen.add_argument("--target", type=str, default=None, help="Output file path for generated code.")
+    p_gen.add_argument("--verify", action="store_true", default=False,
+                        help="Run jugeo prove on generated code before writing.")
     p_gen.add_argument("--strategy", choices=["cover_design", "inhabitant_fleet", "full_pipeline"],
                         default="full_pipeline",
                         help="Generation strategy: cover_design, inhabitant_fleet, or full_pipeline (default).")
+    p_gen.add_argument("--registry", action="store_true", default=False,
+                        help="Show all registered generation classes.")
     p_gen.set_defaults(func=_cmd_generate)
 
     # -- run --
@@ -479,17 +505,21 @@ def _build_parser() -> argparse.ArgumentParser:
     # -- encode --
     p_enc = subs.add_parser("encode", help="Encode a Python program to Z3/SMT representation.")
     p_enc.add_argument("files", nargs="+", help="Python file(s) to encode.")
-    p_enc.add_argument("--encoding", choices=["scalar", "structural", "tensor", "sequence", "text", "all"],
+    p_enc.add_argument("--encoding", choices=["scalar", "structural", "tensor", "sequence", "text", "bitvec", "all"],
                         default="all", help="Encoding family (default: all).")
-    p_enc.add_argument("--emit-smt2", action="store_true", default=False, help="Emit SMT-LIB2 file.")
+    p_enc.add_argument("--emit-smt2", "--smtlib", action="store_true", default=False,
+                        help="Emit SMT-LIB2 file.")
     p_enc.add_argument("--encoding-families", action="store_true", default=False,
                         help="Show rich multi-family encoding analysis across all encoding sub-packages.")
+    p_enc.add_argument("--registry", action="store_true", default=False,
+                        help="Show all registered encoding classes.")
     p_enc.set_defaults(func=_cmd_encode)
 
     # -- classify --
     p_cls = subs.add_parser("classify", help="Classify a problem via the problem atlas.")
-    p_cls.add_argument("description", nargs="?", default=None, help="Problem description (text).")
+    p_cls.add_argument("description", nargs="?", default=None, help="Problem description (text) or file path.")
     p_cls.add_argument("--file", type=str, default=None, help="Read problem from file.")
+    p_cls.add_argument("--top-k", type=int, default=3, help="Number of top classifications to show (default: 3).")
     p_cls.add_argument("--registry", action="store_true", default=False,
                         help="List all registered problem-atlas classes.")
     p_cls.set_defaults(func=_cmd_classify)
@@ -497,7 +527,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # -- alignment --
     p_align = subs.add_parser("alignment", help="Check public documentation for honest projection.")
     p_align.add_argument("program", nargs="?", default=None, help="Program or internal claim source.")
-    p_align.add_argument("--docs", type=str, default=None, help="Documentation file to check against.")
+    p_align.add_argument("--docs", "--readme", type=str, default=None, help="Documentation file to check against.")
     p_align.add_argument("--registry", action="store_true", default=False,
                           help="List all registered public-alignment classes.")
     p_align.set_defaults(func=_cmd_alignment)
@@ -506,8 +536,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mix = subs.add_parser("mixed", help="Mixed-mode: bugs + spec + equiv simultaneously.")
     p_mix.add_argument("files", nargs="+", help="Python file(s) to analyze.")
     p_mix.add_argument("--spec", type=str, default=None, help="Optional spec file.")
+    p_mix.add_argument("--impl", type=str, default=None, help="Implementation file (alias, appended to files).")
+    p_mix.add_argument("--reference", type=str, default=None, help="Reference implementation for equiv comparison.")
     p_mix.add_argument("--routing", action="store_true", default=False,
                         help="Show rich mixed-evidence routing output with channels and negotiation.")
+    p_mix.add_argument("--registry", action="store_true", default=False,
+                        help="List all registered orchestration classes.")
     p_mix.set_defaults(func=_cmd_mixed)
 
     # -- info --
@@ -528,6 +562,8 @@ def _build_parser() -> argparse.ArgumentParser:
                                             "judgment", "encode", "bugs", "spec",
                                             "equiv", "unit"],
                          default="all", help="Test suite to run (default: all).")
+    p_test.add_argument("--fast", action="store_true", default=False,
+                         help="Run fast subset of tests (skip slow integration tests).")
     p_test.add_argument("--registry", action="store_true", default=False,
                          help="List all registered benchmark classes.")
     p_test.set_defaults(func=_cmd_test)
@@ -535,10 +571,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # -- prove --
     sub_prove = subs.add_parser("prove", help="Full sheaf-theoretic program verification.")
     sub_prove.add_argument("files", nargs="*", help="Python file(s) to verify.")
+    sub_prove.add_argument("--spec", type=str, default=None, help="Specification file.")
+    sub_prove.add_argument("--impl", type=str, default=None, help="Implementation file to verify.")
     sub_prove.add_argument("--trust-floor", choices=["unverified", "copilot", "solver", "proven"],
                            default="copilot")
     sub_prove.add_argument("--max-depth", type=int, default=5)
-    sub_prove.add_argument("--strategy", choices=["eager", "exhaustive", "iterative"],
+    sub_prove.add_argument("--strategy", choices=["eager", "exhaustive", "iterative", "EAGER", "EXHAUSTIVE", "ITERATIVE"],
                            default="eager")
     sub_prove.add_argument("--registry", action="store_true",
                            help="Show all available foundations classes.")
@@ -563,8 +601,14 @@ def _build_parser() -> argparse.ArgumentParser:
     sub_ideate.add_argument("--cross-domain", action="store_true", help="Run cross-domain synthesis.")
     sub_ideate.add_argument("--registry", action="store_true",
                             help="Show all available ideation classes.")
-    sub_ideate.add_argument("--field", type=str, default=None, metavar="FIELD",
+    sub_ideate.add_argument("--field", "--domain", type=str, default=None, metavar="FIELD",
                             help="Run theorem ecology for a mathematical field (e.g. algebra, topology).")
+    sub_ideate.add_argument("--topic", type=str, default=None, metavar="TOPIC",
+                            help="Ideation topic (alias for --field).")
+    sub_ideate.add_argument("--budget", type=int, default=10, metavar="N",
+                            help="Number of candidates to generate (default: 10).")
+    sub_ideate.add_argument("--count", type=int, default=5, metavar="N",
+                            help="Number of results to return (default: 5).")
     sub_ideate.add_argument("--analogy", type=str, default=None, metavar="SPEC",
                             help='Run analogy transport between domains (e.g. "topology → verification").')
     sub_ideate.add_argument("--discover-engine", action="store_true",

@@ -3090,6 +3090,10 @@ def run_encode(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
 
+    # Alias mapping for encoding families used in documentation
+    _ENCODING_ALIASES = {"bitvec": "scalar", "bv": "scalar", "smt": "scalar"}
+    if encoding in _ENCODING_ALIASES:
+        encoding = _ENCODING_ALIASES[encoding]
     families = list(_ENCODING_FAMILIES) if encoding == "all" else [encoding]
     for fam in families:
         if fam not in _ENCODING_FAMILIES:

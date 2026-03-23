@@ -2180,7 +2180,11 @@ def run_generate(args: argparse.Namespace) -> int:
             print(f"  {name}: {registry[name].__module__}")
         return 0
 
-    output_dir = Path(output).resolve()
+    # --target overrides --output if no output was given
+    if output is None and getattr(args, 'target', None):
+        import os
+        output = os.path.dirname(os.path.abspath(args.target)) or '.'
+    output_dir = Path(output or '.').resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     use_llm = not no_llm
 
