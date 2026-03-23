@@ -2896,207 +2896,124 @@ class FoundationPipeline:
         *, killer_app: dict | None = None, comp_theorems: list | None = None,
         foundational_theorems: list | None = None,
     ) -> list[pathlib.Path]:
-        """Generate real Python code via LLM using GitHub Models API."""
+        """Generate real Python code via LLM using GitHub Models API.
+
+        To avoid blowing up prompt size, each file gets only the context
+        *relevant to that file*, compressed into a short summary.
+        Full detail is written to ``context.md`` in the output dir.
+        """
         winner_name = getattr(winner, "name", "foundation")
         description = getattr(winner, "description", "")
         props = list(getattr(winner, "propositions", ()))
         constituents = list(getattr(winner, "constituent_fields", ()))
+        field_a = ", ".join(str(c) for c in constituents[:1]) or "Field A"
+        field_b = ", ".join(str(c) for c in constituents[1:2]) or "Field B"
 
-        # Gather the most interesting bridge theorems and definitions
-        theorems = []
-        definitions = []
-        for p in props:
-            kind = str(getattr(p, "kind", ""))
-            title = getattr(p, "title", "")
-            statement = getattr(p, "statement", "")
-            if not title:
-                continue
-            entry = f"  - {title}: {statement[:200]}"
-            if "theorem" in kind.lower() or "bridge" in kind.lower():
-                theorems.append(entry)
-            elif "definition" in kind.lower() or "axiom" in kind.lower():
-                definitions.append(entry)
-            else:
-                theorems.append(entry)
-
-        # Build a substantive prompt for each file
-        context = textwrap.dedent(f"""\
-            Mathematical framework: "{winner_name}"
-            Description: {description[:500]}
-            Constituent fields: {', '.join(str(c) for c in constituents[:12])}
-
-            Key definitions:
-            {chr(10).join(definitions[:6]) or '  (none extracted)'}
-
-            Key theorems and bridge results:
-            {chr(10).join(theorems[:8]) or '  (none extracted)'}
-        """)
-
-        # NOTE: Generated code is standalone — it does NOT depend on jugeo.
-        # jugeo is used internally by the pipeline for ideation/verification,
-        # but the output program must be self-contained.
-        standalone_context = (
-            "IMPORTANT: The generated code must be completely STANDALONE. It must NOT import\n"
-            "or depend on 'jugeo' or any external verification framework.\n"
-            "Do NOT use 'from jugeo...' imports. Do NOT reference 'judgment geometry',\n"
-            "'sheaf-theoretic verification', 'Grothendieck topology', or 'descent'.\n"
-            "Instead, implement the mathematical structures directly using standard Python\n"
-            "(dataclasses, numpy if needed, etc.).\n"
-            "The code should be pip-installable without any special dependencies.\n"
+        # ---- Compact shared header (< 400 chars) ----
+        ka = killer_app or {}
+        tool = ka.get("tool_name", winner_name)
+        one_liner = ka.get("one_liner", description[:120])
+        compact = (
+            f'Framework: "{winner_name}" — synthesis of {field_a} and {field_b}.\n'
+            f"Tool: {tool} — {one_liner}\n"
+            f"Standalone: no jugeo imports, no 'judgment geometry' references.\n"
+            f"Python 3.10+, from __future__ import annotations.\n"
         )
 
-        # Add computational theorem context so generated code implements
-        # the actual capabilities, not generic stubs
-        ct = comp_theorems or []
-        ka = killer_app or {}
-        theorem_context = ""
-        if ct:
-            theorem_context = (
-                "\nCOMPUTATIONAL CAPABILITIES THIS CODE MUST IMPLEMENT:\n"
-                f"Tool: {ka.get('tool_name', '?')} — {ka.get('one_liner', '?')}\n"
-                f"Target users: {ka.get('target_users', '?')}\n\n"
-            )
-            for i, t in enumerate(ct[:6], 1):
-                theorem_context += (
-                    f"Capability {i}: {t.get('capability', '?')}\n"
-                    f"  CLI command: {t.get('cli_command', '?')}\n"
-                    f"  Input: {t.get('input_type', '?')}\n"
-                    f"  Output: {t.get('output_type', '?')}\n"
-                    f"  Mathematical basis: {t.get('theorem', '?')[:200]}\n\n"
-                )
-            theorem_context += (
-                "The operations.py module MUST include a `run_command(name, data)` dispatcher\n"
-                "that routes each CLI command name to the right implementation.\n"
-                "The code must implement these capabilities concretely, not as stubs.\n"
-            )
-
-        # Add foundational theorem context so core.py implements the
-        # mathematical structures that the foundational theorems require
+        # ---- Per-file context builders ----
+        # core.py: foundational theorem names + one-line significance
         ft = foundational_theorems or []
-        foundational_context = ""
+        core_ctx = ""
         if ft:
-            foundational_context = (
-                "\nFOUNDATIONAL THEOREMS (these define the mathematical structures\n"
-                "your core.py must represent — implement the types and operations\n"
-                "these theorems refer to):\n\n"
+            lines = [f"  {i}. {t.get('name','?')}: {t.get('significance','')[:80]}" for i, t in enumerate(ft[:5], 1)]
+            core_ctx = "FOUNDATIONAL THEOREMS (implement types these refer to):\n" + "\n".join(lines) + "\n"
+
+        # operations.py: application theorem commands + capability
+        ct = comp_theorems or []
+        ops_ctx = ""
+        if ct:
+            lines = [f"  {t.get('cli_command','?')}: {t.get('capability','')[:80]}" for t in ct[:5]]
+            ops_ctx = (
+                f"COMMANDS (implement run_command(name, data) dispatcher):\n"
+                + "\n".join(lines) + "\n"
             )
-            for i, t in enumerate(ft[:5], 1):
-                foundational_context += (
-                    f"Theorem {i} ({t.get('name', t.get('category', '?'))}): "
-                    f"{t.get('statement', '')[:300]}\n"
-                    f"  Significance: {t.get('significance', '')[:150]}\n\n"
-                )
 
+        # Short prop summary (only titles, ~60 chars each, max 6)
+        prop_lines = []
+        for p in props[:6]:
+            title = getattr(p, "title", "")
+            if title:
+                prop_lines.append(f"  - {title[:60]}")
+        prop_summary = "\n".join(prop_lines) if prop_lines else "  (none)"
+
+        # ---- Write full context to disk for reference ----
+        ctx_path = src_dir.parent.parent / "context.md"
+        try:
+            full_detail = [f"# {winner_name}\n", f"{description}\n"]
+            if ft:
+                full_detail.append("\n## Foundational Theorems\n")
+                for t in ft:
+                    full_detail.append(f"### {t.get('name','?')}\n{t.get('statement','')}\n")
+                    full_detail.append(f"*Significance:* {t.get('significance','')}\n")
+                    full_detail.append(f"*Proof sketch:* {t.get('proof_sketch','')}\n\n")
+            if ct:
+                full_detail.append("\n## Application Theorems\n")
+                for t in ct:
+                    full_detail.append(f"### {t.get('cli_command','?')}\n{t.get('theorem','')}\n")
+                    full_detail.append(f"*Capability:* {t.get('capability','')}\n")
+                    full_detail.append(f"*Input:* {t.get('input_type','')}\n")
+                    full_detail.append(f"*Output:* {t.get('output_type','')}\n\n")
+            ctx_path.write_text("".join(full_detail), encoding="utf-8")
+        except Exception:
+            pass
+
+        # ---- File-specific prompts (each < 2000 chars) ----
         file_specs = {
-            "core.py": textwrap.dedent(f"""\
-                You are an expert mathematical software engineer.
-                Generate a Python module `core.py` implementing foundational types for
-                the mathematical framework described below.
-
-                {context}
-
-                {standalone_context}
-
-                {foundational_context}
-
-                {theorem_context}
-
-                Requirements:
-                  (e.g., the spaces, groups, algebras, sheaves, or structures relevant
-                  to this specific synthesis — NOT generic "SynthesisObject" stubs)
-                - Implement at least 3 concrete mathematical structures that arise from
-                  the synthesis of the constituent fields
-                - The types should be BROADLY USEFUL: suitable for numerical computing
-                  (include methods that compute with floats/arrays), geometric reasoning
-                  (manifolds, metrics, curvature), and algebraic manipulation (composition,
-                  products, dualities) — not just formal verification
-                - Include proper type hints, docstrings with mathematical explanations
-                - Each class should have meaningful methods (not just data holders)
-                - Use Python 3.10+, `from __future__ import annotations`
-                - Return ONLY the Python code, no markdown fences
-            """),
-            "operations.py": textwrap.dedent(f"""\
-                You are an expert mathematical software engineer.
-                Generate a Python module `operations.py` implementing key operations
-                and algorithms for the mathematical framework described below.
-
-                {context}
-
-                {standalone_context}
-
-                {theorem_context}
-
-                Requirements:
-                - Implement the bridge theorems as executable REWRITE RULES and
-                  COMPUTATIONAL PROCEDURES — not just type-checking stubs
-                - Include at least 5 substantive operations spanning different areas:
-                  * A NUMERICAL/COMPUTATIONAL operation (e.g., iterative solver,
-                    approximation scheme, spectral method, optimization step)
-                  * A GEOMETRIC operation (e.g., transport along a connection,
-                    curvature computation, geodesic calculation, metric deformation)
-                  * An ALGEBRAIC operation (e.g., composition, tensor product,
-                    spectral sequence differential, representation decomposition)
-                  * A COMBINATORIAL/DISCRETE operation (e.g., generating function,
-                    graph algorithm, lattice computation, matroid operation)
-                  * A BRIDGE/REWRITE operation that translates a problem from one
-                    mathematical domain into another (the core value of synthesis)
-                - Each function should do real computation, not just return stubs
-                - Include docstrings explaining the mathematical content
-                - Use Python 3.10+, `from __future__ import annotations`
-                - Import types from `.core` as needed
-                - Return ONLY the Python code, no markdown fences
-            """),
-            "verification.py": textwrap.dedent(f"""\
-                You are an expert mathematical software engineer.
-                Generate a Python module `verification.py` with property checks
-                and verification functions for the mathematical framework below.
-
-                {context}
-
-                {standalone_context}
-
-                {theorem_context}
-
-                Requirements:
-                - Implement checks for the key mathematical properties, not just
-                  type assertions — verify actual mathematical invariants:
-                  * Algebraic identities (associativity, commutativity, Jacobi, etc.)
-                  * Numerical convergence (does an iterative method converge?)
-                  * Geometric consistency (does parallel transport preserve the metric?)
-                  * Categorical coherence (do diagrams commute?)
-                - Include at least 3 verification functions with real logic
-                - Include a `run_all_checks()` function that exercises the framework
-                - Use Python 3.10+, `from __future__ import annotations`
-                - Import from `.core` and `.operations` as needed
-                - Return ONLY the Python code, no markdown fences
-            """),
-            "examples.py": textwrap.dedent(f"""\
-                You are an expert mathematical software engineer.
-                Generate a Python module `examples.py` with concrete worked examples
-                for the mathematical framework described below.
-
-                {context}
-
-                {standalone_context}
-
-                {theorem_context}
-
-                Requirements:
-                - Create at least 3 concrete examples spanning different use cases:
-                  * A NUMERICAL example (computing something with real numbers,
-                    showing convergence or approximation)
-                  * A GEOMETRIC example (constructing a manifold, computing curvature,
-                    transporting data along paths)
-                  * An ALGEBRAIC/STRUCTURAL example (building a complex object
-                    from pieces, applying a bridge theorem to rewrite a problem)
-                - Show the bridge theorems in action on specific objects
-                - Each example should demonstrate how the SYNTHESIS creates value
-                  beyond what either field provides alone
-                - Include a `main()` function that runs all examples with print output
-                - Use Python 3.10+, `from __future__ import annotations`
-                - Import from `.core` and `.operations` as needed
-                - Return ONLY the Python code, no markdown fences
-            """),
+            "core.py": (
+                f"Generate `core.py` — foundational types for:\n\n"
+                f"{compact}\n"
+                f"Key propositions:\n{prop_summary}\n\n"
+                f"{core_ctx}\n"
+                f"Requirements:\n"
+                f"- 3+ concrete mathematical classes specific to {field_a}×{field_b}\n"
+                f"- Real methods (numerical compute, algebraic ops), not data-only stubs\n"
+                f"- Type hints, docstrings with math explanations\n"
+                f"- Return ONLY Python code, no markdown fences\n"
+            ),
+            "operations.py": (
+                f"Generate `operations.py` — algorithms and bridge operations for:\n\n"
+                f"{compact}\n"
+                f"{ops_ctx}\n"
+                f"Requirements:\n"
+                f"- Import types from `.core`\n"
+                f"- 5+ functions: numerical, geometric, algebraic, combinatorial, bridge\n"
+                f"- Include `run_command(name: str, data: dict) -> dict` dispatcher\n"
+                f"  mapping each CLI command to its implementation\n"
+                f"- Real computation, not stubs\n"
+                f"- Return ONLY Python code, no markdown fences\n"
+            ),
+            "verification.py": (
+                f"Generate `verification.py` — property checks for:\n\n"
+                f"{compact}\n"
+                f"Key propositions:\n{prop_summary}\n\n"
+                f"Requirements:\n"
+                f"- Verify real math invariants (associativity, coherence, convergence)\n"
+                f"- 3+ verification functions with actual logic\n"
+                f"- `run_all_checks()` function\n"
+                f"- Import from `.core` and `.operations`\n"
+                f"- Return ONLY Python code, no markdown fences\n"
+            ),
+            "examples.py": (
+                f"Generate `examples.py` — worked examples for:\n\n"
+                f"{compact}\n"
+                f"{ops_ctx}\n"
+                f"Requirements:\n"
+                f"- 3+ concrete examples (numerical, geometric, algebraic)\n"
+                f"- Show bridge theorems in action on specific data\n"
+                f"- `main()` that runs all examples with print output\n"
+                f"- Import from `.core` and `.operations`\n"
+                f"- Return ONLY Python code, no markdown fences\n"
+            ),
         }
 
         files: list[pathlib.Path] = []
@@ -4341,71 +4258,37 @@ class FoundationPipeline:
             else:
                 theorems.append(entry)
 
-        const_str = ", ".join(str(c) for c in constituents[:24])
+        const_str = ", ".join(str(c) for c in constituents[:6])
         def_summary = "\n".join(
-            f"  - {d['title']}: {d['statement'][:150]}" for d in definitions[:10]
+            f"  - {d['title'][:60]}" for d in definitions[:5]
         )
         thm_summary = "\n".join(
-            f"  - {t['title']}: {t['statement'][:150]}" for t in theorems[:12]
+            f"  - {t['title'][:60]}" for t in theorems[:6]
         )
 
         tool_name = killer_app.get("tool_name", name)
-        one_liner = killer_app.get("one_liner", description[:200])
-        math_prereqs = killer_app.get("math_prerequisites", [])
-        prereqs_str = "\n".join(f"  - {p}" for p in math_prereqs[:10])
+        one_liner = killer_app.get("one_liner", description[:120])
 
-        context_block = textwrap.dedent(f"""\
-            Framework name: {name}
-            Description: {description[:500]}
-            Constituent fields: {const_str}
-            Number of propositions: {len(props)}
-
-            Key definitions:
-            {def_summary or '  (none)'}
-
-            Key theorems:
-            {thm_summary or '  (none)'}
-
-            Mathematical prerequisites for the tool:
-            {prereqs_str or '  (none)'}
-        """)
+        # Compact context block — just enough for the LLM to orient
+        context_block = (
+            f"Framework: {name} ({const_str}). Tool: {tool_name}.\n"
+            f"Definitions: {def_summary or '(none)'}\n"
+            f"Theorems: {thm_summary or '(none)'}\n"
+        )
 
         # Field A and Field B for chapter organization
         field_a = str(constituents[0]) if constituents else "the first constituent field"
         field_b = str(constituents[1]) if len(constituents) > 1 else "the second constituent field"
 
         # Common preamble for every chapter prompt — enforces key constraints
-        chapter_preamble = textwrap.dedent(f"""\
-            You are writing a mathematics textbook about {field_a} and {field_b} and the
-            novel connections between them that make a new software tool possible.
-
-            CRITICAL CONSTRAINTS:
-            - DO NOT mention "judgment geometry", "jugeo", "sheaves", "sheaf-theoretic",
-              "Grothendieck topology", "descent", "trust algebra", "coordinates" (in the
-              JG sense), or any verification meta-framework. None of these concepts should
-              appear anywhere in the text.
-            - Write as if you are a domain expert in {field_a} and {field_b} who discovered
-              a novel bridge between these fields and is writing a textbook about it.
-            - The mathematical content should be about {field_a} and {field_b} themselves —
-              their structures, theorems, and computational applications — NOT about any
-              abstract framework used to discover or organize them.
-            - The textbook is motivated by a software tool called "{tool_name}" that
-              {one_liner}. Each chapter should explain the math that makes this tool work.
-
-            PROOF REQUIREMENTS:
-            - For every theorem, provide a COMPLETE, RIGOROUS PROOF. Do not write "proof sketch",
-              "the proof follows from...", "left as an exercise", or "the proof follows from
-              standard arguments". Write the full proof with all steps.
-            - Proofs should use standard mathematical reasoning in {field_a} and {field_b},
-              not abstract categorical machinery unless it is standard in those fields.
-
-            EXPOSITION REQUIREMENTS:
-            - After each definition, explain WHY it matters — what feature of {tool_name} does
-              it enable? What would be impossible without this concept?
-            - After each theorem, explain its computational significance — how does {tool_name}
-              use this result?
-            - Include concrete examples with specific numbers, not just abstract constructions.
-        """)
+        chapter_preamble = (
+            f"You are writing a math textbook on {field_a} × {field_b}.\n"
+            f"Tool: {tool_name} — {one_liner}\n\n"
+            f"CONSTRAINTS: Never mention 'judgment geometry', 'jugeo', 'sheaf-theoretic',\n"
+            f"'Grothendieck topology', 'descent', 'trust algebra'. Write as a domain expert.\n"
+            f"Give COMPLETE proofs (not sketches). After each theorem, explain its\n"
+            f"computational significance for {tool_name}. Include concrete examples.\n"
+        )
 
         # Build summaries of the foundational and application theorem tiers
         ft = foundational_theorems or []
@@ -4413,228 +4296,82 @@ class FoundationPipeline:
 
         foundational_block = ""
         if ft:
-            foundational_block = (
-                "FOUNDATIONAL THEOREMS (these are the 5 main results that establish\n"
-                "this synthesis as a genuine new area of mathematics — they MUST\n"
-                "appear in the Bridge Theorems chapter with full proofs):\n\n"
-            )
+            foundational_block = "FOUNDATIONAL THEOREMS (prove each fully):\n"
             for i, t in enumerate(ft[:5], 1):
                 foundational_block += (
-                    f"  {i}. {t.get('name', f'Theorem {i}')} "
-                    f"[{t.get('category', '?')}]\n"
-                    f"     Statement: {t.get('statement', '')[:300]}\n"
-                    f"     Significance: {t.get('significance', '')[:200]}\n"
-                    f"     Proof idea: {t.get('proof_sketch', '')[:200]}\n"
-                    f"     Analogues: {t.get('analogues', '')}\n\n"
+                    f"  {i}. {t.get('name', f'Thm {i}')}: "
+                    f"{t.get('statement', '')[:120]}\n"
                 )
 
         application_block = ""
         if at:
-            application_block = (
-                "APPLICATION THEOREMS (these are the 5 computational capabilities\n"
-                "that the synthesis enables — they should appear in the Applications\n"
-                "chapter with worked examples):\n\n"
-            )
+            application_block = "APPLICATION THEOREMS (worked example for each):\n"
             for i, t in enumerate(at[:5], 1):
                 application_block += (
-                    f"  {i}. {t.get('cli_command', f'command-{i}')}: "
-                    f"{t.get('capability', '')[:200]}\n"
-                    f"     Mathematical basis: {t.get('theorem', '')[:200]}\n"
-                    f"     Who uses this: {t.get('who_uses_this', '?')}\n\n"
+                    f"  {i}. {t.get('cli_command', '?')}: "
+                    f"{t.get('capability', '')[:100]}\n"
                 )
 
         # --- Generate chapters via separate LLM calls ---
         chapters: dict[str, str] = {}
+        # --- Compact chapter prompts (~500-800 chars each) ---
         chapter_prompts = {
-            "introduction": textwrap.dedent(f"""\
-                {chapter_preamble}
-
-                Write the Introduction chapter (in LaTeX, using \\section, \\subsection,
-                \\begin{{definition}}, \\begin{{theorem}}, etc.) for this textbook.
-
-                This chapter should be approximately 6 PAGES (~3000 lines of LaTeX). Include:
-
-                1. A motivating section: What does {tool_name} do? What problem does it solve?
-                   Why should a practitioner care? Give a concrete scenario with specific data.
-                2. An overview of the mathematical landscape: What are the two (or more) fields
-                   being brought together? Why has this combination not been explored before?
-                3. A roadmap of the book: What will each chapter cover and why?
-                4. A precise statement of the 2-3 central questions the theory addresses.
-                5. An informal preview of the main bridge result (stated precisely but without proof).
-                6. Historical context: What prior work exists in each constituent field?
-                   Include specific references to key papers and books.
-                7. Notation and conventions section with a comprehensive symbol table.
-                8. A section on the computational model: what inputs does {tool_name} take,
-                   what outputs does it produce, and what guarantees does it provide?
-                9. A comparison with existing tools/approaches and why they fall short.
-
-                {context_block}
-
-                Return ONLY LaTeX body content (no \\chapter, no \\documentclass).
-                Use standard amsthm environments.
-            """),
-            "prerequisites_a": textwrap.dedent(f"""\
-                {chapter_preamble}
-
-                Write the "Prerequisites: {field_a}" chapter (in LaTeX) for this textbook.
-                This chapter covers the mathematical background from {field_a} needed to
-                understand the bridge theorems and algorithms.
-
-                This chapter should be approximately 10 PAGES (~4000 lines of LaTeX). Include:
-
-                1. The 6-8 most important definitions from {field_a}, each with:
-                   - A precise formal definition using \\begin{{definition}}
-                   - A remark explaining WHY this definition matters for {tool_name}
-                   - At least one concrete example
-                   - A non-example showing what fails if conditions are removed
-                2. The 5-7 key theorems from {field_a}, each with:
-                   - A precise statement using \\begin{{theorem}}
-                   - A COMPLETE proof (not a sketch!) using \\begin{{proof}}
-                   - A corollary or application
-                3. At least 4 key lemmas needed later in the bridge chapter, each proved
-                4. At least 2 worked examples showing computations in {field_a}
-                5. A section summarizing the key structural properties that will transfer
-                   across the bridge
-
-                {context_block}
-
-                Return ONLY LaTeX body content (no \\chapter, no \\documentclass).
-                Use standard amsthm environments.
-            """),
-            "prerequisites_b": textwrap.dedent(f"""\
-                {chapter_preamble}
-
-                Write the "Prerequisites: {field_b}" chapter (in LaTeX) for this textbook.
-                This chapter covers the mathematical background from {field_b} needed to
-                understand the bridge theorems and algorithms.
-
-                This chapter should be approximately 10 PAGES (~4000 lines of LaTeX). Include:
-
-                1. The 4-6 most important definitions from {field_b}, each with:
-                   - A precise formal definition using \\begin{{definition}}
-                   - A remark explaining WHY this definition matters for {tool_name}
-                   - At least one example
-                2. The 3-5 key theorems from {field_b}, each with:
-                   - A precise statement using \\begin{{theorem}}
-                   - A COMPLETE proof (not a sketch!) using \\begin{{proof}}
-                   - A corollary or application
-                3. Key lemmas needed later in the bridge chapter
-                4. At least one worked example showing a computation in {field_b}
-
-                {context_block}
-
-                Return ONLY LaTeX body content (no \\chapter, no \\documentclass).
-                Use standard amsthm environments.
-            """),
-            "bridge_theorems": textwrap.dedent(f"""\
-                {chapter_preamble}
-
-                Write the "Bridge Theorems" chapter (in LaTeX) for this textbook.
-                This is the CORE chapter — it contains the main results that connect
-                {field_a} and {field_b}, which are the theoretical foundation for {tool_name}.
-
-                This chapter should be approximately 15 PAGES (~6000 lines of LaTeX).
-
-                THE FIVE FOUNDATIONAL THEOREMS below are the backbone of this chapter.
-                You MUST state and FULLY PROVE each one.  These theorems establish the
-                synthesis as a genuine new area of mathematics:
-
-                {foundational_block}
-
-                In addition, include:
-                1. At least 6 supporting lemmas, each fully proved.
-                2. A section on the categorical perspective: organize the bridges as
-                   functors or natural transformations with commutative diagrams
-                   (using \\begin{{tikzcd}}).
-                3. After each theorem, explain what feature of {tool_name} it enables.
-                4. At least 2 concrete worked examples showing the theorems in action.
-
-                Here are additional propositions from the tournament:
-                {thm_summary}
-
-                {context_block}
-
-                Return ONLY LaTeX body content (no \\chapter, no \\documentclass).
-                You may use \\begin{{tikzcd}} for diagrams.
-            """),
-            "algorithms": textwrap.dedent(f"""\
-                {chapter_preamble}
-
-                Write the "Algorithms" chapter (in LaTeX) for this textbook.
-                This chapter translates the mathematical theory into concrete computation —
-                these are the algorithms that {tool_name} implements.
-
-                This chapter should be approximately 10 PAGES (~4000 lines of LaTeX). Include:
-
-                1. For each major feature of {tool_name}, describe the algorithm:
-                   - Input/output specification
-                   - Pseudocode in an algorithmic environment (use \\begin{{algorithmic}} or
-                     a similar LaTeX pseudocode environment)
-                   - Correctness proof: prove the algorithm produces the right answer
-                     (reference specific theorems from earlier chapters)
-                   - Complexity analysis (time and space)
-                2. At least 3 distinct algorithms covering different aspects:
-                   - A translation/bridge algorithm (converting between representations)
-                   - A verification algorithm (checking that a solution is correct)
-                   - A computation/solver algorithm (producing new results)
-                3. Convergence analysis where applicable (for iterative methods)
-                4. At least one detailed worked example showing step-by-step execution
-
-                {context_block}
-
-                Return ONLY LaTeX body content (no \\chapter, no \\documentclass).
-                Use standard algorithmic environments.
-            """),
-            "applications": textwrap.dedent(f"""\
-                {chapter_preamble}
-
-                Write the "Applications and Worked Examples" chapter (in LaTeX) for this textbook.
-
-                This chapter should be approximately 10 PAGES (~4000 lines of LaTeX).
-
-                THE FIVE APPLICATION THEOREMS below describe the concrete computational
-                capabilities of {tool_name}.  For EACH one, provide:
-                - A precise theorem statement (the computational guarantee)
-                - A worked example with specific numerical data
-                - A comparison showing what happens without the bridge
-
-                {application_block}
-
-                In addition, include:
-                1. A section discussing the practical implications: who benefits,
-                   what workflow changes, what new analyses become possible
-                2. A COMPARISON example: show how solving a problem WITHOUT the bridge
-                   requires much more work than WITH it
-                3. Reference specific foundational theorems from earlier chapters
-                   and explain which bridge result makes each computation possible
-
-                {context_block}
-
-                Return ONLY LaTeX body content (no \\chapter, no \\documentclass).
-            """),
-            "open_problems": textwrap.dedent(f"""\
-                {chapter_preamble}
-
-                Write the "Open Problems and Future Directions" chapter (in LaTeX) for this textbook.
-
-                This chapter should be approximately 4 PAGES (~1600 lines of LaTeX). Include:
-
-                1. State 5-8 genuine open problems or conjectures motivated by the theory.
-                2. Each problem should be mathematically precise and non-trivial.
-                3. Problems should span different areas: at least one computational/algorithmic,
-                   at least one geometric, at least one algebraic, at least one analytical.
-                4. For each problem, explain:
-                   - Why it is open (what makes it hard?)
-                   - What solving it would unlock (new features for {tool_name}?)
-                   - What partial progress exists
-                5. A section on potential extensions: what other fields could be bridged?
-                6. A section on computational frontiers: what are the limits of the current
-                   algorithms and what would improve them?
-
-                {context_block}
-
-                Return ONLY LaTeX body content (no \\chapter, no \\documentclass).
-            """),
+            "introduction": (
+                f"{chapter_preamble}\n"
+                f"Write the INTRODUCTION chapter in LaTeX (~6 pages). Include:\n"
+                f"motivation, overview of {field_a} and {field_b}, roadmap,\n"
+                f"central questions, preview of bridge, history, notation,\n"
+                f"what {tool_name} does.\n{context_block}\n"
+                f"Return ONLY LaTeX body (no \\chapter, no \\documentclass). Use amsthm.\n"
+            ),
+            "prerequisites_a": (
+                f"{chapter_preamble}\n"
+                f"Write 'Prerequisites: {field_a}' chapter in LaTeX (~10 pages).\n"
+                f"6-8 definitions (with examples), 5-7 theorems (FULL proofs),\n"
+                f"4+ lemmas for bridge chapter, 2+ worked computations.\n"
+                f"{context_block}\n"
+                f"Return ONLY LaTeX body. Use amsthm.\n"
+            ),
+            "prerequisites_b": (
+                f"{chapter_preamble}\n"
+                f"Write 'Prerequisites: {field_b}' chapter in LaTeX (~10 pages).\n"
+                f"4-6 definitions, 3-5 theorems (FULL proofs), key lemmas,\n"
+                f"worked examples.\n{context_block}\n"
+                f"Return ONLY LaTeX body. Use amsthm.\n"
+            ),
+            "bridge_theorems": (
+                f"{chapter_preamble}\n"
+                f"Write 'Bridge Theorems' chapter in LaTeX (~15 pages).\n"
+                f"CORE chapter. State and FULLY PROVE each:\n\n"
+                f"{foundational_block}\n"
+                f"Also: 6+ supporting lemmas (proved), categorical perspective\n"
+                f"with tikzcd diagrams, 2+ worked examples.\n{context_block}\n"
+                f"Return ONLY LaTeX body. May use tikzcd.\n"
+            ),
+            "algorithms": (
+                f"{chapter_preamble}\n"
+                f"Write 'Algorithms' chapter in LaTeX (~10 pages).\n"
+                f"For each capability of {tool_name}:\n"
+                f"pseudocode (algorithmic env), correctness proof, complexity.\n"
+                f"3+ algorithms, 1+ step-by-step worked example.\n"
+                f"{context_block}\n"
+                f"Return ONLY LaTeX body. Use algorithmic environments.\n"
+            ),
+            "applications": (
+                f"{chapter_preamble}\n"
+                f"Write 'Applications' chapter in LaTeX (~10 pages).\n"
+                f"For EACH application theorem, give a worked example:\n\n"
+                f"{application_block}\n"
+                f"Compare WITH vs WITHOUT the bridge.\n{context_block}\n"
+                f"Return ONLY LaTeX body.\n"
+            ),
+            "open_problems": (
+                f"{chapter_preamble}\n"
+                f"Write 'Open Problems' chapter in LaTeX (~4 pages).\n"
+                f"5-8 precise conjectures. For each: why hard, what it unlocks.\n"
+                f"Span: computational, geometric, algebraic, analytical.\n"
+                f"{context_block}\nReturn ONLY LaTeX body.\n"
+            ),
         }
 
         for chap_key, prompt in chapter_prompts.items():
