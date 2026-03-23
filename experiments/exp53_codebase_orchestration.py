@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
-"""
-Experiment 53 — Codebase Orchestration: Scaling JuGeo to Large Codebases
-=========================================================================
+"""Paper 53 Experiment — Codebase Orchestration: Scaling to Large Codebases.
 
-Studies how JuGeo scales with program size by running load, evaluate, and
-encode on programs ranging from tiny (5 lines) to large (80+ lines).
+Hypothesis: JuGeo scales sub-linearly with program size for site construction,
+evaluation, and encoding.
 
-Writes macros to papers/data-paper53.tex with prefix ppLIII.
 Re-run: python3 experiments/exp53_codebase_orchestration.py
 """
+import subprocess, json, os, tempfile, time, statistics
 
-import ast, json, os, statistics, subprocess, sys, tempfile, time
-
-REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-
-
-# ── CLI helper ────────────────────────────────────────────────────────────────
+ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 def run_jugeo(*args):
-    """Run jugeo CLI and return a list of parsed JSON objects."""
     cmd = ["python3", "-m", "jugeo", "--format", "json"] + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     lines = [l for l in result.stdout.splitlines()
              if not (len(l) > 8 and l[2] == ':' and l[5] == ':')
              and not l.startswith("JuGeo v")]
@@ -40,67 +32,60 @@ def run_jugeo(*args):
             break
     return objects
 
-
 def write_temp_py(source):
-    """Write source to a temporary .py file and return its path."""
     f = tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False, dir='/tmp')
     f.write(source)
     f.close()
     return f.name
 
-
-def write_macro(fh, name, value):
-    fh.write("\\newcommand{\\" + name + "}{" + str(value) + "}\n")
-
-
-# ── Test programs (10 programs, tiny → large) ────────────────────────────────
+def cleanup(path):
+    try: os.unlink(path)
+    except OSError: pass
 
 PROGRAMS = {
-    "increment": '''\
+    "tiny_incr": '''\
 def increment(x):
-    """Return x + 1."""
     return x + 1
 
-result = increment(5)
+def decrement(x):
+    return x - 1
 ''',
-
-    "absolute_value": '''\
-def absolute_value(x):
-    """Return absolute value of x."""
+    "tiny_abs": '''\
+def absolute(x):
     if x < 0:
         return -x
     return x
 
 def sign(x):
-    if x > 0:
-        return 1
-    elif x < 0:
-        return -1
+    if x > 0: return 1
+    if x < 0: return -1
     return 0
 ''',
-
-    "factorial": '''\
+    "small_factorial": '''\
 def factorial(n):
-    """Compute n! iteratively."""
     if n < 0:
-        raise ValueError("Negative input")
+        raise ValueError("n must be non-negative")
     result = 1
     for i in range(2, n + 1):
         result *= i
     return result
 
-def factorial_recursive(n):
-    if n <= 1:
-        return 1
-    return n * factorial_recursive(n - 1)
+def double_factorial(n):
+    result = 1
+    i = n
+    while i > 0:
+        result *= i
+        i -= 2
+    return result
 
-assert factorial(5) == 120
-assert factorial_recursive(5) == 120
+def falling_factorial(n, k):
+    result = 1
+    for i in range(k):
+        result *= (n - i)
+    return result
 ''',
-
-    "binary_search": '''\
+    "small_bsearch": '''\
 def binary_search(arr, target):
-    """Return index of target in sorted arr, or -1."""
     lo, hi = 0, len(arr) - 1
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -112,54 +97,55 @@ def binary_search(arr, target):
             hi = mid - 1
     return -1
 
-def binary_search_recursive(arr, target, lo=0, hi=None):
-    if hi is None:
-        hi = len(arr) - 1
-    if lo > hi:
-        return -1
-    mid = (lo + hi) // 2
-    if arr[mid] == target:
-        return mid
-    elif arr[mid] < target:
-        return binary_search_recursive(arr, target, mid + 1, hi)
-    else:
-        return binary_search_recursive(arr, target, lo, mid - 1)
-''',
+def lower_bound(arr, target):
+    lo, hi = 0, len(arr)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if arr[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
 
-    "linked_list": '''\
+def upper_bound(arr, target):
+    lo, hi = 0, len(arr)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if arr[mid] <= target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+''',
+    "medium_linked_list": '''\
 class Node:
-    def __init__(self, val, next_node=None):
+    def __init__(self, val):
         self.val = val
-        self.next = next_node
+        self.next = None
 
 class LinkedList:
     def __init__(self):
         self.head = None
         self.size = 0
 
-    def prepend(self, val):
-        self.head = Node(val, self.head)
-        self.size += 1
-
     def append(self, val):
+        node = Node(val)
         if not self.head:
-            self.head = Node(val)
+            self.head = node
         else:
             cur = self.head
             while cur.next:
                 cur = cur.next
-            cur.next = Node(val)
+            cur.next = node
         self.size += 1
 
-    def find(self, val):
-        cur = self.head
-        while cur:
-            if cur.val == val:
-                return True
-            cur = cur.next
-        return False
+    def prepend(self, val):
+        node = Node(val)
+        node.next = self.head
+        self.head = node
+        self.size += 1
 
-    def remove(self, val):
+    def delete(self, val):
         if not self.head:
             return False
         if self.head.val == val:
@@ -174,9 +160,26 @@ class LinkedList:
                 return True
             cur = cur.next
         return False
-''',
 
-    "hash_table": '''\
+    def find(self, val):
+        cur = self.head
+        idx = 0
+        while cur:
+            if cur.val == val:
+                return idx
+            cur = cur.next
+            idx += 1
+        return -1
+
+    def to_list(self):
+        result = []
+        cur = self.head
+        while cur:
+            result.append(cur.val)
+            cur = cur.next
+        return result
+''',
+    "medium_hashtable": '''\
 class HashTable:
     def __init__(self, capacity=16):
         self.capacity = capacity
@@ -223,88 +226,70 @@ class HashTable:
                 self.put(k, v)
 
     def keys(self):
-        result = []
-        for bucket in self.buckets:
-            for k, v in bucket:
-                result.append(k)
-        return result
+        return [k for bucket in self.buckets for k, v in bucket]
+
+    def values(self):
+        return [v for bucket in self.buckets for k, v in bucket]
 ''',
-
-    "expression_evaluator": '''\
-class Token:
-    def __init__(self, kind, value):
-        self.kind = kind
-        self.value = value
-
+    "medium_expr_eval": '''\
 def tokenize(expr):
-    tokens = []
-    i = 0
+    tokens, i = [], 0
     while i < len(expr):
-        ch = expr[i]
-        if ch.isspace():
-            i += 1
-        elif ch.isdigit():
+        if expr[i].isdigit() or expr[i] == '.':
             j = i
-            while j < len(expr) and expr[j].isdigit():
+            while j < len(expr) and (expr[j].isdigit() or expr[j] == '.'):
                 j += 1
-            tokens.append(Token("NUM", int(expr[i:j])))
+            tokens.append(('NUM', float(expr[i:j])))
             i = j
-        elif ch in "+-*/()":
-            tokens.append(Token("OP", ch))
+        elif expr[i] in '+-*/()':
+            tokens.append(('OP', expr[i]))
+            i += 1
+        elif expr[i].isspace():
             i += 1
         else:
-            raise ValueError(f"Unexpected char: {ch}")
+            raise ValueError(f"Unknown char: {expr[i]}")
     return tokens
 
-class Parser:
-    def __init__(self, tokens):
-        self.tokens = tokens
-        self.pos = 0
-
-    def peek(self):
-        if self.pos < len(self.tokens):
-            return self.tokens[self.pos]
-        return None
-
-    def consume(self, kind=None):
-        tok = self.peek()
-        if tok is None:
-            raise ValueError("Unexpected end")
-        if kind and tok.kind != kind:
-            raise ValueError(f"Expected {kind}")
-        self.pos += 1
-        return tok
-
-    def parse_expr(self):
-        result = self.parse_term()
-        while self.peek() and self.peek().value in "+-":
-            op = self.consume().value
-            right = self.parse_term()
-            result = (op, result, right)
-        return result
-
-    def parse_term(self):
-        result = self.parse_factor()
-        while self.peek() and self.peek().value in "*/":
-            op = self.consume().value
-            right = self.parse_factor()
-            result = (op, result, right)
-        return result
-
-    def parse_factor(self):
-        tok = self.peek()
-        if tok.kind == "NUM":
-            self.consume()
-            return tok.value
-        elif tok.value == "(":
-            self.consume()
-            result = self.parse_expr()
-            self.consume()
-            return result
+def evaluate(expr):
+    tokens = tokenize(expr)
+    pos = [0]
+    def peek():
+        return tokens[pos[0]] if pos[0] < len(tokens) else None
+    def consume():
+        t = tokens[pos[0]]; pos[0] += 1; return t
+    def parse_expr():
+        left = parse_term()
+        while peek() and peek()[1] in ('+', '-'):
+            op = consume()[1]
+            right = parse_term()
+            left = left + right if op == '+' else left - right
+        return left
+    def parse_term():
+        left = parse_factor()
+        while peek() and peek()[1] in ('*', '/'):
+            op = consume()[1]
+            right = parse_factor()
+            left = left * right if op == '*' else left / right
+        return left
+    def parse_factor():
+        t = peek()
+        if t[0] == 'NUM':
+            consume(); return t[1]
+        if t[1] == '(':
+            consume()
+            val = parse_expr()
+            consume()
+            return val
         raise ValueError("Unexpected token")
-''',
+    return parse_expr()
 
-    "sorting_algorithms": '''\
+def safe_evaluate(expr):
+    try:
+        return evaluate(expr), None
+    except Exception as e:
+        return None, str(e)
+''',
+    "large_sorting": '''\
 def insertion_sort(arr):
     for i in range(1, len(arr)):
         key = arr[i]
@@ -321,76 +306,65 @@ def merge_sort(arr):
     mid = len(arr) // 2
     left = merge_sort(arr[:mid])
     right = merge_sort(arr[mid:])
-    return merge(left, right)
+    return _merge(left, right)
 
-def merge(left, right):
+def _merge(left, right):
     result = []
     i = j = 0
     while i < len(left) and j < len(right):
         if left[i] <= right[j]:
-            result.append(left[i])
-            i += 1
+            result.append(left[i]); i += 1
         else:
-            result.append(right[j])
-            j += 1
+            result.append(right[j]); j += 1
     result.extend(left[i:])
     result.extend(right[j:])
     return result
 
-def quick_sort(arr):
+def quicksort(arr):
     if len(arr) <= 1:
         return arr
     pivot = arr[len(arr) // 2]
     left = [x for x in arr if x < pivot]
-    middle = [x for x in arr if x == pivot]
+    mid = [x for x in arr if x == pivot]
     right = [x for x in arr if x > pivot]
-    return quick_sort(left) + middle + quick_sort(right)
+    return quicksort(left) + mid + quicksort(right)
 
-def selection_sort(arr):
+def heapsort(arr):
+    def sift_down(a, start, end):
+        root = start
+        while 2 * root + 1 <= end:
+            child = 2 * root + 1
+            if child + 1 <= end and a[child] < a[child + 1]:
+                child += 1
+            if a[root] < a[child]:
+                a[root], a[child] = a[child], a[root]
+                root = child
+            else:
+                return
     n = len(arr)
-    for i in range(n):
-        min_idx = i
-        for j in range(i + 1, n):
-            if arr[j] < arr[min_idx]:
-                min_idx = j
-        arr[i], arr[min_idx] = arr[min_idx], arr[i]
-    return arr
-
-def heap_sort(arr):
-    def heapify(a, n, i):
-        largest = i
-        l = 2 * i + 1
-        r = 2 * i + 2
-        if l < n and a[l] > a[largest]:
-            largest = l
-        if r < n and a[r] > a[largest]:
-            largest = r
-        if largest != i:
-            a[i], a[largest] = a[largest], a[i]
-            heapify(a, n, largest)
-    n = len(arr)
-    for i in range(n // 2 - 1, -1, -1):
-        heapify(arr, n, i)
-    for i in range(n - 1, 0, -1):
-        arr[0], arr[i] = arr[i], arr[0]
-        heapify(arr, i, 0)
+    for start in range(n // 2 - 1, -1, -1):
+        sift_down(arr, start, n - 1)
+    for end in range(n - 1, 0, -1):
+        arr[0], arr[end] = arr[end], arr[0]
+        sift_down(arr, 0, end - 1)
     return arr
 ''',
-
-    "graph_algorithms": '''\
-from collections import deque, defaultdict
+    "large_graph": '''\
+from collections import deque
+import heapq
 
 def bfs(graph, start):
     visited = set()
     queue = deque([start])
     order = []
-    visited.add(start)
     while queue:
         node = queue.popleft()
+        if node in visited:
+            continue
+        visited.add(node)
         order.append(node)
-        for neighbor in graph.get(node, []):
+        for neighbor in sorted(graph.get(node, [])):
             if neighbor not in visited:
-                visited.add(neighbor)
                 queue.append(neighbor)
     return order
 
@@ -398,406 +372,314 @@ def dfs(graph, start):
     visited = set()
     order = []
     def _dfs(node):
+        if node in visited:
+            return
         visited.add(node)
         order.append(node)
-        for neighbor in graph.get(node, []):
-            if neighbor not in visited:
-                _dfs(neighbor)
+        for neighbor in sorted(graph.get(node, [])):
+            _dfs(neighbor)
     _dfs(start)
     return order
 
-def shortest_path(graph, start, end):
-    queue = deque([(start, [start])])
-    visited = {start}
-    while queue:
-        node, path = queue.popleft()
-        if node == end:
-            return path
-        for neighbor in graph.get(node, []):
-            if neighbor not in visited:
-                visited.add(neighbor)
-                queue.append((neighbor, path + [neighbor]))
-    return None
+def dijkstra(graph, start):
+    dist = {start: 0}
+    heap = [(0, start)]
+    while heap:
+        d, u = heapq.heappop(heap)
+        if d > dist.get(u, float('inf')):
+            continue
+        for v, w in graph.get(u, []):
+            nd = d + w
+            if nd < dist.get(v, float('inf')):
+                dist[v] = nd
+                heapq.heappush(heap, (nd, v))
+    return dist
 
-def has_cycle(graph):
-    visited = set()
-    rec_stack = set()
-    def _cycle(node):
-        visited.add(node)
-        rec_stack.add(node)
-        for neighbor in graph.get(node, []):
-            if neighbor not in visited:
-                if _cycle(neighbor):
-                    return True
-            elif neighbor in rec_stack:
-                return True
-        rec_stack.discard(node)
-        return False
+def topological_sort(graph):
+    in_degree = {}
     for node in graph:
-        if node not in visited:
-            if _cycle(node):
-                return True
-    return False
+        in_degree.setdefault(node, 0)
+        for neighbor in graph[node]:
+            in_degree[neighbor] = in_degree.get(neighbor, 0) + 1
+    queue = deque([n for n in in_degree if in_degree[n] == 0])
+    order = []
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+        for neighbor in graph.get(node, []):
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+    return order
 
 def connected_components(graph):
     visited = set()
     components = []
-    def _explore(node, component):
-        visited.add(node)
-        component.append(node)
-        for neighbor in graph.get(node, []):
-            if neighbor not in visited:
-                _explore(neighbor, component)
     for node in graph:
         if node not in visited:
-            comp = []
-            _explore(node, comp)
-            components.append(comp)
+            component = bfs(graph, node)
+            visited.update(component)
+            components.append(component)
     return components
 ''',
+    "large_calculator": '''\
+class Token:
+    def __init__(self, kind, value):
+        self.kind = kind
+        self.value = value
 
-    "full_calculator": '''\
-class CalcError(Exception):
-    pass
-
-class Lexer:
-    def __init__(self, text):
-        self.text = text
-        self.pos = 0
-        self.tokens = []
-        self._scan()
-
-    def _scan(self):
-        while self.pos < len(self.text):
-            ch = self.text[self.pos]
-            if ch.isspace():
-                self.pos += 1
-            elif ch.isdigit() or ch == '.':
-                self._number()
-            elif ch.isalpha():
-                self._identifier()
-            elif ch in '+-*/()^%=,':
-                self.tokens.append(('OP', ch))
-                self.pos += 1
-            else:
-                raise CalcError(f"Unknown character: {ch}")
-
-    def _number(self):
-        start = self.pos
-        while self.pos < len(self.text) and (self.text[self.pos].isdigit() or self.text[self.pos] == '.'):
-            self.pos += 1
-        self.tokens.append(('NUM', float(self.text[start:self.pos])))
-
-    def _identifier(self):
-        start = self.pos
-        while self.pos < len(self.text) and self.text[self.pos].isalnum():
-            self.pos += 1
-        self.tokens.append(('ID', self.text[start:self.pos]))
+def lex(text):
+    tokens = []
+    i = 0
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+        elif text[i].isdigit() or text[i] == '.':
+            j = i
+            while j < len(text) and (text[j].isdigit() or text[j] == '.'):
+                j += 1
+            tokens.append(Token('NUM', float(text[i:j])))
+            i = j
+        elif text[i].isalpha():
+            j = i
+            while j < len(text) and text[j].isalnum():
+                j += 1
+            tokens.append(Token('ID', text[i:j]))
+            i = j
+        elif text[i] in '+-*/()^%=,':
+            tokens.append(Token('OP', text[i]))
+            i += 1
+        else:
+            raise ValueError(f"Unknown: {text[i]}")
+    return tokens
 
 class Calculator:
-    BUILTINS = {'abs': abs, 'max': max, 'min': min, 'round': round}
-
     def __init__(self):
         self.variables = {}
+        self.functions = {
+            'abs': abs, 'min': min, 'max': max,
+            'round': round, 'int': int, 'float': float,
+        }
 
-    def evaluate(self, text):
-        lexer = Lexer(text)
-        tokens = lexer.tokens
-        if not tokens:
-            return 0
-        if len(tokens) >= 3 and tokens[0][0] == 'ID' and tokens[1] == ('OP', '='):
-            name = tokens[0][1]
-            value = self._eval_expr(tokens[2:])
-            self.variables[name] = value
-            return value
-        return self._eval_expr(tokens)
+    def evaluate(self, expr):
+        tokens = lex(expr)
+        if len(tokens) >= 3 and tokens[1].value == '=':
+            name = tokens[0].value
+            val = self._parse(tokens[2:])
+            self.variables[name] = val
+            return val
+        return self._parse(tokens)
 
-    def _eval_expr(self, tokens):
-        result, rest = self._term(tokens)
-        while rest and rest[0][0] == 'OP' and rest[0][1] in '+-':
-            op = rest[0][1]
-            right, rest = self._term(rest[1:])
-            result = result + right if op == '+' else result - right
-        return result
-
-    def _term(self, tokens):
-        result, rest = self._power(tokens)
-        while rest and rest[0][0] == 'OP' and rest[0][1] in '*/%':
-            op = rest[0][1]
-            right, rest = self._power(rest[1:])
-            if op == '*':
-                result *= right
-            elif op == '/':
-                if right == 0:
-                    raise CalcError("Division by zero")
-                result /= right
-            else:
-                result %= right
-        return result, rest
-
-    def _power(self, tokens):
-        base, rest = self._factor(tokens)
-        if rest and rest[0] == ('OP', '^'):
-            exp, rest = self._power(rest[1:])
-            base = base ** exp
-        return base, rest
-
-    def _factor(self, tokens):
-        if not tokens:
-            raise CalcError("Unexpected end of expression")
-        tok = tokens[0]
-        if tok[0] == 'NUM':
-            return tok[1], tokens[1:]
-        if tok[0] == 'ID':
-            name = tok[1]
-            rest = tokens[1:]
-            if rest and rest[0] == ('OP', '('):
-                args, rest = self._parse_args(rest[1:])
-                if name in self.BUILTINS:
-                    return self.BUILTINS[name](*args), rest
-                raise CalcError(f"Unknown function: {name}")
-            if name in self.variables:
-                return self.variables[name], rest
-            raise CalcError(f"Undefined variable: {name}")
-        if tok == ('OP', '('):
-            result = self._eval_expr(tokens[1:])
-            return result, []
-        if tok == ('OP', '-'):
-            val, rest = self._factor(tokens[1:])
-            return -val, rest
-        raise CalcError(f"Unexpected token: {tok}")
-
-    def _parse_args(self, tokens):
-        args = []
-        if tokens and tokens[0] == ('OP', ')'):
-            return args, tokens[1:]
-        args.append(self._eval_expr(tokens))
-        return args, []
+    def _parse(self, tokens):
+        pos = [0]
+        def peek():
+            return tokens[pos[0]] if pos[0] < len(tokens) else None
+        def consume():
+            t = tokens[pos[0]]; pos[0] += 1; return t
+        def expr():
+            left = term()
+            while peek() and peek().value in ('+', '-'):
+                op = consume().value
+                right = term()
+                left = left + right if op == '+' else left - right
+            return left
+        def term():
+            left = power()
+            while peek() and peek().value in ('*', '/', '%'):
+                op = consume().value
+                right = power()
+                if op == '*': left *= right
+                elif op == '/': left /= right
+                else: left %= right
+            return left
+        def power():
+            base = factor()
+            if peek() and peek().value == '^':
+                consume()
+                exp = power()
+                return base ** exp
+            return base
+        def factor():
+            t = peek()
+            if t.kind == 'NUM':
+                return consume().value
+            if t.kind == 'ID':
+                name = consume().value
+                if peek() and peek().value == '(':
+                    consume()
+                    args = []
+                    if peek() and peek().value != ')':
+                        args.append(expr())
+                        while peek() and peek().value == ',':
+                            consume()
+                            args.append(expr())
+                    consume()
+                    return self.functions[name](*args)
+                return self.variables.get(name, 0)
+            if t.value == '(':
+                consume()
+                val = expr()
+                consume()
+                return val
+            if t.value == '-':
+                consume()
+                return -factor()
+            raise ValueError(f"Unexpected: {t.value}")
+        return expr()
 ''',
 }
 
-
-# ── Size classification helpers ───────────────────────────────────────────────
-
-def classify_size(n_lines):
-    if n_lines <= 20:
-        return "small"
-    elif n_lines <= 50:
-        return "medium"
-    else:
-        return "large"
+SIZE_CLASSES = {
+    "tiny_incr": "small", "tiny_abs": "small",
+    "small_factorial": "small", "small_bsearch": "small",
+    "medium_linked_list": "medium", "medium_hashtable": "medium",
+    "medium_expr_eval": "medium",
+    "large_sorting": "large", "large_graph": "large",
+    "large_calculator": "large",
+}
 
 
-def safe_mean(values):
-    return statistics.mean(values) if values else 0.0
+def measure_program(name, source):
+    tmp = write_temp_py(source)
+    lines = len(source.strip().splitlines())
+    try:
+        t0 = time.perf_counter()
+        load_objs = run_jugeo("load", tmp)
+        build_time = time.perf_counter() - t0
+
+        t1 = time.perf_counter()
+        eval_objs = run_jugeo("evaluate", tmp)
+        eval_time = time.perf_counter() - t1
+
+        t2 = time.perf_counter()
+        enc_objs = run_jugeo("encode", tmp)
+        encode_time = time.perf_counter() - t2
+
+        load_data = load_objs[0] if load_objs else {}
+        summary = load_data.get("summary", {})
+        coords = summary.get("coordinates", 0)
+        morphisms = summary.get("morphisms", 0)
+
+        eval_data = eval_objs[0] if eval_objs else {}
+        per_coord = eval_data.get("per_coordinate", [])
+        cover_q = eval_data.get("cover_quality", {}).get("total_score", 0)
+        descent = eval_data.get("descent", {})
+        total_funcs = sum(1 for c in per_coord if c.get("functions", 0) > 0)
+        total_classes = sum(1 for c in per_coord if "class" in str(c.get("coordinate", "")).lower())
+        verified = eval_data.get("descent", {}).get("coverage", 0) > 0
+
+        enc_data = enc_objs[0] if enc_objs else {}
+        enc_files = enc_data.get("files", [{}])
+        enc_file = enc_files[0] if enc_files else {}
+        enc_coords = enc_file.get("coordinates", {})
+        total_assertions = sum(c.get("assertions", 0) for c in enc_coords.values())
+
+        return {
+            "name": name, "lines": lines,
+            "size_class": SIZE_CLASSES.get(name, "medium"),
+            "build_time": round(build_time, 4),
+            "eval_time": round(eval_time, 4),
+            "encode_time": round(encode_time, 4),
+            "coords": coords, "morphisms": morphisms,
+            "total_functions": total_funcs,
+            "total_classes": total_classes,
+            "cover_quality": cover_q,
+            "verified": verified,
+            "total_assertions": total_assertions,
+        }
+    finally:
+        cleanup(tmp)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def fmt_time(s):
+    return f"{s*1000:.1f}\\,ms" if s < 0.01 else f"{s:.2f}\\,s"
+
+def fmt_float(v, d=1):
+    return f"{v:.{d}f}"
+
+def fmt_pct(r):
+    return f"{r*100:.1f}\\%"
+
 
 def main():
-    print("=" * 70)
-    print("Experiment 53 — Codebase Orchestration: Scaling JuGeo")
-    print("=" * 70)
+    print("=" * 72)
+    print("Paper 53: Codebase Orchestration — Scaling Analysis")
+    print("=" * 72)
 
-    tmpfiles = []
     results = []
-
     for name, source in PROGRAMS.items():
-        path = write_temp_py(source)
-        tmpfiles.append(path)
+        print(f"\n  Measuring {name}...")
+        m = measure_program(name, source)
+        results.append(m)
+        print(f"    Lines: {m['lines']}, Size: {m['size_class']}")
+        print(f"    Coords: {m['coords']}, Morphisms: {m['morphisms']}")
+        print(f"    Build: {m['build_time']:.3f}s, Eval: {m['eval_time']:.3f}s")
 
-        # Count program complexity via AST
-        tree = ast.parse(source)
-        n_lines = len([l for l in source.splitlines() if l.strip()])
-        n_funcs = sum(1 for n in ast.walk(tree)
-                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
-        n_classes = sum(1 for n in ast.walk(tree)
-                        if isinstance(n, ast.ClassDef))
+    n = len(results)
+    small = [r for r in results if r["size_class"] == "small"]
+    medium = [r for r in results if r["size_class"] == "medium"]
+    large = [r for r in results if r["size_class"] == "large"]
 
-        # ── 1. jugeo load ────────────────────────────────────────────────
-        t0 = time.perf_counter()
-        load_objs = run_jugeo("load", path)
-        load_wall = time.perf_counter() - t0
-        load_data = load_objs[0] if load_objs else {}
-        load_summary = load_data.get("summary", load_data)
+    mean_build = statistics.mean([r["build_time"] for r in results])
+    mean_eval = statistics.mean([r["eval_time"] for r in results])
+    mean_coords = statistics.mean([r["coords"] for r in results])
+    mean_morphisms = statistics.mean([r["morphisms"] for r in results])
+    total_funcs = sum(r["total_functions"] for r in results)
+    total_classes = sum(r["total_classes"] for r in results)
+    mean_encode = statistics.mean([r["encode_time"] for r in results])
+    small_mean = statistics.mean([r["eval_time"] for r in small]) if small else 0
+    medium_mean = statistics.mean([r["eval_time"] for r in medium]) if medium else 0
+    large_mean = statistics.mean([r["eval_time"] for r in large]) if large else 0
+    scaling_ratio = large_mean / small_mean if small_mean > 0 else 0
+    verified = sum(1 for r in results if r["verified"])
+    accuracy = verified / n if n else 0
+    cover_q_mean = statistics.mean([r["cover_quality"] for r in results])
 
-        # ── 2. jugeo evaluate ────────────────────────────────────────────
-        t1 = time.perf_counter()
-        eval_objs = run_jugeo("evaluate", path)
-        eval_wall = time.perf_counter() - t1
-        eval_data = eval_objs[0] if eval_objs else {}
+    # Descent time via separate descend calls
+    desc_times = []
+    for name, source in PROGRAMS.items():
+        tmp = write_temp_py(source)
+        try:
+            t0 = time.perf_counter()
+            run_jugeo("descend", tmp)
+            desc_times.append(time.perf_counter() - t0)
+        finally:
+            cleanup(tmp)
+    mean_descent = statistics.mean(desc_times) if desc_times else 0
 
-        # ── 3. jugeo encode ──────────────────────────────────────────────
-        t2 = time.perf_counter()
-        encode_objs = run_jugeo("encode", path)
-        encode_wall = time.perf_counter() - t2
-        encode_data = encode_objs[0] if encode_objs else {}
+    print("\n" + "=" * 72)
+    print("SUMMARY")
+    print(f"  Programs:        {n}")
+    print(f"  Mean build:      {fmt_time(mean_build)}")
+    print(f"  Small mean:      {fmt_time(small_mean)}")
+    print(f"  Large mean:      {fmt_time(large_mean)}")
+    print(f"  Scaling ratio:   {scaling_ratio:.2f}x")
 
-        # Extract metrics
-        coords = load_summary.get("coordinates", 0)
-        morphisms = load_summary.get("morphisms", 0)
-
-        eval_verdict = eval_data.get("verdict", "unknown")
-        eval_trust = eval_data.get("trust", "unknown")
-        eval_descent = eval_data.get("descent_ok", False)
-        eval_cover_quality = eval_data.get("cover_quality", 0.0)
-        eval_descent_time = eval_data.get("descent_time_s",
-                                          eval_data.get("descent_wall_s", 0.0))
-
-        encode_coords = encode_data.get("coordinates", 0)
-        encode_morphisms = encode_data.get("morphisms", 0)
-
-        row = {
-            "program": name,
-            "lines": n_lines,
-            "functions": n_funcs,
-            "classes": n_classes,
-            "size_class": classify_size(n_lines),
-            "load_coords": coords,
-            "load_morphisms": morphisms,
-            "load_wall_s": round(load_wall, 4),
-            "eval_verdict": eval_verdict,
-            "eval_trust": eval_trust,
-            "eval_descent_ok": eval_descent,
-            "eval_cover_quality": eval_cover_quality,
-            "eval_descent_time_s": round(eval_descent_time, 4) if isinstance(eval_descent_time, (int, float)) else 0.0,
-            "eval_wall_s": round(eval_wall, 4),
-            "encode_coords": encode_coords,
-            "encode_morphisms": encode_morphisms,
-            "encode_wall_s": round(encode_wall, 4),
-            "total_wall_s": round(load_wall + eval_wall + encode_wall, 4),
-        }
-        results.append(row)
-
-        print("  {:<24} lines={:>3}  coords={:>3}  morphs={:>3}  "
-              "verdict={:<12}  total={:.2f}s".format(
-                  name, n_lines, coords, encode_morphisms,
-                  eval_verdict, row["total_wall_s"]))
-
-    # ── Aggregate statistics ──────────────────────────────────────────────────
-
-    n_total = len(results)
-    total_functions = sum(r["functions"] for r in results)
-    total_classes = sum(r["classes"] for r in results)
-
-    verified = sum(1 for r in results if r["eval_verdict"] == "verified")
-    accuracy = (verified / max(n_total, 1)) * 100
-
-    load_times = [r["load_wall_s"] for r in results]
-    eval_times = [r["eval_wall_s"] for r in results]
-    encode_times = [r["encode_wall_s"] for r in results]
-    descent_times = [r["eval_descent_time_s"] for r in results if r["eval_descent_time_s"] > 0]
-    cover_quals = [r["eval_cover_quality"] for r in results
-                   if isinstance(r["eval_cover_quality"], (int, float)) and r["eval_cover_quality"] > 0]
-
-    coord_vals = [r["load_coords"] for r in results]
-    morph_vals = [r["encode_morphisms"] for r in results]
-
-    # Size-bucketed timing
-    small_times = [r["total_wall_s"] for r in results if r["size_class"] == "small"]
-    medium_times = [r["total_wall_s"] for r in results if r["size_class"] == "medium"]
-    large_times = [r["total_wall_s"] for r in results if r["size_class"] == "large"]
-
-    mean_small = safe_mean(small_times)
-    mean_medium = safe_mean(medium_times)
-    mean_large = safe_mean(large_times)
-    scaling_ratio = round(mean_large / mean_small, 2) if mean_small > 0 else 0.0
-
-    # ── Print summary ─────────────────────────────────────────────────────────
-
-    print()
-    print("-" * 70)
-    print(f"  Total programs:        {n_total}")
-    print(f"  Total functions:       {total_functions}")
-    print(f"  Total classes:         {total_classes}")
-    print(f"  Verified:              {verified}/{n_total} ({accuracy:.1f}%)")
-    print(f"  Mean load time:        {safe_mean(load_times):.4f}s")
-    print(f"  Mean eval time:        {safe_mean(eval_times):.4f}s")
-    print(f"  Mean encode time:      {safe_mean(encode_times):.4f}s")
-    print(f"  Mean coords:           {safe_mean(coord_vals):.1f}")
-    print(f"  Mean morphisms:        {safe_mean(morph_vals):.1f}")
-    print(f"  Small mean time:       {mean_small:.4f}s")
-    print(f"  Medium mean time:      {mean_medium:.4f}s")
-    print(f"  Large mean time:       {mean_large:.4f}s")
-    print(f"  Scaling ratio (L/S):   {scaling_ratio}")
-    print("-" * 70)
-
-    # ── Write LaTeX macros ────────────────────────────────────────────────────
-
-    tex_path = os.path.join(REPO_ROOT, "papers", "data-paper53.tex")
-    os.makedirs(os.path.dirname(tex_path), exist_ok=True)
-
-    with open(tex_path, "w") as fh:
-        fh.write("% data-paper53.tex — AUTO-GENERATED by exp53_codebase_orchestration.py\n")
-        fh.write("% DO NOT EDIT — regenerate with: python3 experiments/exp53_codebase_orchestration.py\n\n")
-
-        fh.write("% ── Overall statistics ────────────────────────────────────────────────\n")
-        write_macro(fh, "ppLIIItotalPrograms", n_total)
-        write_macro(fh, "ppLIIItotalFunctions", total_functions)
-        write_macro(fh, "ppLIIItotalClasses", total_classes)
-        write_macro(fh, "ppLIIIoverallAccuracy", "{:.1f}\\%".format(accuracy))
-
-        fh.write("\n% ── Timing statistics ─────────────────────────────────────────────────\n")
-        write_macro(fh, "ppLIIImeanBuildTime", "{:.3f}\\,s".format(safe_mean(load_times)))
-        write_macro(fh, "ppLIIImeanEvalTime", "{:.3f}\\,s".format(safe_mean(eval_times)))
-        write_macro(fh, "ppLIIImeanEncodeTime", "{:.3f}\\,s".format(safe_mean(encode_times)))
-        write_macro(fh, "ppLIIImeanDescentTime",
-                    "{:.3f}\\,s".format(safe_mean(descent_times)) if descent_times else "N/A")
-
-        fh.write("\n% ── Structural metrics ────────────────────────────────────────────────\n")
-        write_macro(fh, "ppLIIImeanCoords", "{:.1f}".format(safe_mean(coord_vals)))
-        write_macro(fh, "ppLIIImeanMorphisms", "{:.1f}".format(safe_mean(morph_vals)))
-        write_macro(fh, "ppLIIIcoverQualityMean",
-                    "{:.3f}".format(safe_mean(cover_quals)) if cover_quals else "N/A")
-
-        fh.write("\n% ── Scaling by program size ───────────────────────────────────────────\n")
-        write_macro(fh, "ppLIIIsmallMeanTime", "{:.3f}\\,s".format(mean_small))
-        write_macro(fh, "ppLIIImediumMeanTime", "{:.3f}\\,s".format(mean_medium))
-        write_macro(fh, "ppLIIIlargeMeanTime", "{:.3f}\\,s".format(mean_large))
-        write_macro(fh, "ppLIIIscalingRatio", "{:.2f}$\\times$".format(scaling_ratio))
-
-    print(f"\n  Macros written to: {tex_path}")
-
-    # ── Save JSON results ─────────────────────────────────────────────────────
+    tex_path = os.path.join(ROOT, "papers", "data-paper53.tex")
+    with open(tex_path, "w") as f:
+        f.write("% data-paper53.tex — AUTO-GENERATED by exp53_codebase_orchestration.py\n")
+        f.write("% DO NOT EDIT — regenerate with: python3 experiments/exp53_codebase_orchestration.py\n\n")
+        f.write(f"\\newcommand{{\\ppLIIItotalPrograms}}{{{n}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIImeanBuildTime}}{{{fmt_time(mean_build)}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIImeanEvalTime}}{{{fmt_time(mean_eval)}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIImeanCoords}}{{{fmt_float(mean_coords)}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIImeanMorphisms}}{{{fmt_float(mean_morphisms)}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIItotalFunctions}}{{{total_funcs}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIItotalClasses}}{{{total_classes}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIImeanEncodeTime}}{{{fmt_time(mean_encode)}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIIsmallMeanTime}}{{{fmt_time(small_mean)}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIImediumMeanTime}}{{{fmt_time(medium_mean)}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIIlargeMeanTime}}{{{fmt_time(large_mean)}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIIscalingRatio}}{{{fmt_float(scaling_ratio)}$\\times$}}\n")
+        f.write(f"\\newcommand{{\\ppLIIIoverallAccuracy}}{{{fmt_pct(accuracy)}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIIcoverQualityMean}}{{{fmt_float(cover_q_mean, 3)}}}\n")
+        f.write(f"\\newcommand{{\\ppLIIImeanDescentTime}}{{{fmt_time(mean_descent)}}}\n")
+    print(f"\nLaTeX macros written to {tex_path}")
 
     json_path = os.path.join(os.path.dirname(__file__), "results_paper53.json")
     with open(json_path, "w") as f:
-        json.dump({
-            "experiment": "codebase_orchestration",
-            "paper": 53,
-            "note": "All numbers from subprocess CLI calls to jugeo load/evaluate/encode.",
-            "n_programs": n_total,
-            "results": results,
-            "summary": {
-                "total_functions": total_functions,
-                "total_classes": total_classes,
-                "verified": verified,
-                "accuracy_pct": round(accuracy, 1),
-                "mean_load_s": round(safe_mean(load_times), 4),
-                "mean_eval_s": round(safe_mean(eval_times), 4),
-                "mean_encode_s": round(safe_mean(encode_times), 4),
-                "mean_descent_s": round(safe_mean(descent_times), 4) if descent_times else None,
-                "mean_coords": round(safe_mean(coord_vals), 1),
-                "mean_morphisms": round(safe_mean(morph_vals), 1),
-                "cover_quality_mean": round(safe_mean(cover_quals), 3) if cover_quals else None,
-                "small_mean_s": round(mean_small, 4),
-                "medium_mean_s": round(mean_medium, 4),
-                "large_mean_s": round(mean_large, 4),
-                "scaling_ratio": scaling_ratio,
-            },
-        }, f, indent=2, default=str)
-
-    print(f"  Results saved to:  {json_path}")
-
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-
-    for p in tmpfiles:
-        try:
-            os.unlink(p)
-        except OSError:
-            pass
-
-    print("\nDone.")
+        json.dump({"programs": results}, f, indent=2, default=str)
+    print(f"Results saved to {json_path}")
 
 
 if __name__ == "__main__":

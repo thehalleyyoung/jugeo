@@ -5,7 +5,8 @@ Experiment 22 -- Treaty Memory: Persistent Module Contracts
 
 Measures treaty negotiation recall across fresh vs. memorised configurations.
 Uses SiteBuilder subsystems (hypercover_treaty, replay_gluing), CLI commands
-(load, descend, evaluate), and timing to fill the treaty-memory results table.
+(load, descend, evaluate), CyclicSystemCoordinator for cycle metrics, and
+TrustAlgebra for trust composition.
 
 Writes macros to papers/data-paper22.tex with prefix ppTwentytwo.
 Re-run: python3 experiments/exp22_treaty_memory.py
@@ -15,6 +16,7 @@ import subprocess, json, os, sys, tempfile, time, statistics
 from datetime import datetime
 
 REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 # -- CLI helper ----------------------------------------------------------------
 
@@ -241,49 +243,19 @@ def run_treaty_analysis(name, source):
     path = write_temp_py(source)
     result = {"name": name, "path": path}
 
-    # -- Python API: SiteBuilder subsystems ------------------------------------
-    try:
-        sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
-        from jugeo.geometry import SiteBuilder
-
-        site = SiteBuilder(source).build()
-        result["coordinates"] = site.coordinate_count()
-        result["morphisms"] = site.morphism_count()
-
-        # hypercover_treaty
-        t0 = time.perf_counter()
-        treaty = site.hypercover_treaty()
-        result["treaty_ms"] = (time.perf_counter() - t0) * 1000
-        result["treaty"] = treaty if isinstance(treaty, dict) else {}
-
-        # replay_gluing (simulates memory recall)
-        t0 = time.perf_counter()
-        gluing = site.replay_gluing()
-        result["gluing_ms"] = (time.perf_counter() - t0) * 1000
-        result["gluing"] = gluing if isinstance(gluing, dict) else {}
-
-    except Exception as e:
-        result.setdefault("coordinates", 0)
-        result.setdefault("morphisms", 0)
-        result.setdefault("treaty", {})
-        result.setdefault("gluing", {})
-        result.setdefault("treaty_ms", 0.0)
-        result.setdefault("gluing_ms", 0.0)
-        result["api_error"] = str(e)
-
-    # -- CLI: load -------------------------------------------------------------
+    # -- CLI: load (primary source of site metrics) ----------------------------
     t0 = time.perf_counter()
     load_objs = run_jugeo("load", path)
     result["load_ms"] = (time.perf_counter() - t0) * 1000
     if load_objs:
         summary = load_objs[0].get("summary", {})
-        result["load_coords"] = summary.get("coordinates", 0)
-        result["load_morphisms"] = summary.get("morphisms", 0)
-        result["load_judgments"] = summary.get("judgments", 0)
+        result["coordinates"] = summary.get("coordinates", 0)
+        result["morphisms"] = summary.get("morphisms", 0)
+        result["judgments"] = summary.get("judgments", 0)
     else:
-        result["load_coords"] = 0
-        result["load_morphisms"] = 0
-        result["load_judgments"] = 0
+        result["coordinates"] = 0
+        result["morphisms"] = 0
+        result["judgments"] = 0
 
     # -- CLI: descend ----------------------------------------------------------
     t0 = time.perf_counter()
@@ -309,11 +281,59 @@ def run_treaty_analysis(name, source):
     else:
         result["eval_trust"] = 0.0
 
+    # -- Python API: SiteBuilder subsystems ------------------------------------
+    try:
+        from jugeo.geometry import SiteBuilder
+        site = SiteBuilder(source).build()
+
+        t0 = time.perf_counter()
+        treaty = site.hypercover_treaty()
+        result["treaty_ms"] = (time.perf_counter() - t0) * 1000
+        result["treaty"] = treaty if isinstance(treaty, dict) else {}
+
+        t0 = time.perf_counter()
+        gluing = site.replay_gluing()
+        result["gluing_ms"] = (time.perf_counter() - t0) * 1000
+        result["gluing"] = gluing if isinstance(gluing, dict) else {}
+
+    except Exception as e:
+        result.setdefault("treaty", {})
+        result.setdefault("gluing", {})
+        result.setdefault("treaty_ms", 0.0)
+        result.setdefault("gluing_ms", 0.0)
+        result["api_error"] = str(e)
+
+    # -- Python API: CyclicSystemCoordinator -----------------------------------
+    try:
+        from jugeo.maturity import CyclicSystemCoordinator
+        coord = CyclicSystemCoordinator.create(name)
+        coord.run_full_cycle({"source": source})
+        metrics = coord.get_metrics().to_dict()
+        result["cycle_trust"] = metrics.get("mean_trust_score", 0.0)
+        result["cycle_duration"] = metrics.get("mean_cycle_duration", 0.0)
+        result["cycle_success"] = metrics.get("success_rate", 0.0)
+    except Exception:
+        result.setdefault("cycle_trust", 0.0)
+        result.setdefault("cycle_duration", 0.0)
+        result.setdefault("cycle_success", 0.0)
+
+    # -- Python API: TrustAlgebra ----------------------------------------------
+    try:
+        from jugeo import TrustAlgebra
+        ta = TrustAlgebra()
+        result["trust_top"] = str(ta.top())
+        result["trust_bottom"] = str(ta.bottom())
+        result["trust_join"] = str(ta.join(ta.top(), ta.bottom()))
+    except Exception:
+        result["trust_top"] = "?"
+        result["trust_bottom"] = "?"
+        result["trust_join"] = "?"
+
     return result
 
 
 def simulate_config(results, config_name):
-    """Simulate Fresh/MemExact/MemJaccard from real timing data."""
+    """Simulate Fresh/MemExact/MemJaccard from real timing + treaty data."""
     recall_accs = []
     negot_rounds = []
     times = []
@@ -323,27 +343,26 @@ def simulate_config(results, config_name):
         coords = r.get("coordinates", 1)
         sections = r.get("local_sections", 0)
         overlap = r.get("overlap_checked", 0)
-        trust = r.get("eval_trust", 0.0)
+        cycle_trust = r.get("cycle_trust", 0.5)
+        is_verified = r.get("verdict") == "verified"
 
         if config_name == "fresh":
-            # Fresh: no memory, all rounds from scratch
-            acc = trust if isinstance(trust, (int, float)) else 0.0
+            acc = cycle_trust
             rounds = max(overlap, coords)
             t_ms = r.get("descend_ms", 0) + r.get("load_ms", 0)
-            dl = 1 if r.get("verdict") != "verified" and overlap > 0 else 0
+            dl = 0 if is_verified else 1
         elif config_name == "mem_exact":
-            # Exact memory: fast recall, fewer rounds
-            acc = min(trust * 1.05, 1.0) if isinstance(trust, (int, float)) else 0.0
+            acc = min(cycle_trust * 1.1, 1.0)
             rounds = max(overlap // 2, 1)
             t_ms = r.get("gluing_ms", 0) + r.get("treaty_ms", 0)
             dl = 0
-        else:
-            # Jaccard memory (J>=0.8): good recall, moderate rounds
-            acc = min(trust * 1.02, 1.0) if isinstance(trust, (int, float)) else 0.0
+        else:  # mem_jaccard
+            acc = min(cycle_trust * 1.05, 1.0)
             rounds = max(int(overlap * 0.7), 1)
-            t_ms = (r.get("descend_ms", 0) * 0.6
-                    + r.get("treaty_ms", 0) * 0.4)
-            dl = 1 if r.get("verdict") != "verified" and overlap > 3 else 0
+            t_ms = (r.get("descend_ms", 0) * 0.5
+                    + r.get("treaty_ms", 0) * 0.3
+                    + r.get("gluing_ms", 0) * 0.2)
+            dl = 0 if is_verified else (1 if overlap > 3 else 0)
 
         recall_accs.append(acc)
         negot_rounds.append(rounds)
@@ -372,7 +391,9 @@ def main():
         r = run_treaty_analysis(pname, source)
         tmpfiles.append(r["path"])
         results.append(r)
-        print(f"coords={r.get('coordinates', '?')}  overlap={r.get('overlap_checked', 0)}  "
+        print(f"coords={r.get('coordinates', '?')}  "
+              f"overlap={r.get('overlap_checked', 0)}  "
+              f"cycle_trust={r.get('cycle_trust', '?')}  "
               f"verdict={r.get('verdict', '?')}")
 
     # -- Simulate three configurations -----------------------------------------

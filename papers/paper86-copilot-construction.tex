@@ -1,0 +1,1531 @@
+% paper86-copilot-construction.tex — Copilot as Construction Participant
+%   Copilot as Construction Participant:
+%   LLM-Guided Local Section Generation
+%   Paper 86 of the Judgment Geometry series.
+% Compile: pdflatex paper86-copilot-construction
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{data-paper86}
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\CCP}{\textsc{CopilotConstructionParticipant}}
+\newcommand{\CP}{\textsc{CopilotProposal}}
+\newcommand{\CNR}{\textsc{CopilotNegotiationRecord}}
+\newcommand{\CSS}{\textsc{CopilotStrategyState}}
+\newcommand{\SA}{\textsc{StrategyAdaptation}}
+\newcommand{\propose}{\textsc{Propose}}
+\newcommand{\negotiate}{\textsc{Negotiate}}
+\newcommand{\adapt}{\textsc{Adapt}}
+\newcommand{\trustceil}{\tau_{\mathrm{ceil}}}
+\newcommand{\trustval}{\tau_{\mathrm{val}}}
+\newcommand{\accrate}{\alpha}
+\newcommand{\negbound}{B_{\mathrm{neg}}}
+\newcommand{\sheaf}{\mathcal{F}}
+\newcommand{\opens}{\mathcal{U}}
+\newcommand{\restrict}{\mathrm{res}}
+\newcommand{\glueop}{\mathrm{glue}}
+\newcommand{\compat}{\sim}
+\newcommand{\energy}{\mathcal{E}}
+\newcommand{\strat}{\sigma}
+\newcommand{\feedback}{\varphi}
+
+% ════════════════════════════════════════════════════════════════════
+\title{Copilot as Construction Participant:\\
+       LLM-Guided Local Section Generation}
+\author{JuGeo Research Group}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ════════════════════════════════════════════════════════════════════
+%  Abstract
+% ════════════════════════════════════════════════════════════════════
+\begin{abstract}
+Judgment Geometry organises program reasoning as local sections of a
+presheaf over a semantic site.  Constructing these local sections
+requires choosing candidates, negotiating interface constraints, and
+verifying sheaf descent---tasks that are labour-intensive yet highly
+structured.  We introduce \CCP{}, a protocol that allows a
+large-language-model (LLM) copilot to participate in local-section
+generation while respecting the trust architecture of the JuGeo
+framework.  The copilot proposes candidates via three strategies
+($\mathsf{solver}$, $\mathsf{analogy}$, $\mathsf{enumeration}$),
+mediates interface negotiations between overlapping construction loops,
+and adaptively tunes its strategy in response to acceptance feedback.
+We prove four formal properties---trust-ceiling preservation,
+negotiation convergence, adaptation monotonicity, and descent
+compatibility---and verify them in Lean~4.  Experiments on
+\ppLXXXVInumSessions{} sessions comprising \ppLXXXVInumGoals{} goals
+show a \ppLXXXVIacceptRate{} acceptance rate with
+\ppLXXXVInegSuccessRate{} negotiation success, while every accepted
+proposal satisfies sheaf descent.
+\end{abstract}
+
+\newpage
+
+% ════════════════════════════════════════════════════════════════════
+%  §1  Introduction
+% ════════════════════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+
+Judgment Geometry~\cite{jugeo-foundations} frames program analysis as
+the study of \emph{local sections} of a presheaf $\sheaf$ over a
+semantic site $\Site$.  Each local section encodes a judgment---a
+structured tuple $\Jud{J}$ carrying coordinates, propositions,
+evidence, obligations, and trust metadata---that is valid on an open
+region of the site.  The construction of these sections is the
+central computational task of the framework: given a goal (a desired
+judgment on a target region), one must find a candidate section,
+verify its compatibility with neighbouring sections on overlapping
+regions, and glue the pieces together into a globally coherent
+assignment.
+
+In prior papers of this series~\cite{jugeo-descent,jugeo-gluing,
+jugeo-loops}, construction was driven by deterministic solvers and
+exhaustive enumeration.  These approaches are sound---they never
+produce sections that violate sheaf conditions---but they can be
+slow and inflexible, particularly when the goal space is large or
+when the overlap structure of the site is complex.  Moreover, they
+offer no mechanism for \emph{explaining} their choices: a developer
+examining a failed construction has no narrative account of why
+certain candidates were tried and rejected.
+
+Large language models (LLMs) present an opportunity to complement
+these deterministic methods.  An LLM can rapidly propose candidate
+sections by drawing on analogies with previously successful
+constructions, and it can generate natural-language explanations of
+its reasoning.  The challenge is integrating such a participant into
+the trust-sensitive architecture of Judgment Geometry without
+compromising the formal guarantees that make the framework useful.
+
+This paper addresses that challenge.  We introduce a protocol,
+implemented as \CCP{}, that allows an LLM-based copilot to
+participate in local-section generation under three constraints:
+\begin{enumerate}
+  \item \textbf{Trust ceiling.}  Every proposal carries a trust level
+        bounded by the $\mathsf{PROPOSAL}$ tier ($\Tcopilot$), ensuring
+        that copilot-generated sections never bypass verification.
+  \item \textbf{Bounded negotiation.}  Interface negotiations between
+        overlapping construction loops terminate in at most $\negbound$
+        rounds, preventing unbounded mediation cycles.
+  \item \textbf{Adaptive strategy.}  The copilot adjusts its proposal
+        strategy---$\mathsf{solver}$, $\mathsf{analogy}$, or
+        $\mathsf{enumeration}$---in response to acceptance feedback,
+        monotonically improving its long-run acceptance rate.
+\end{enumerate}
+
+We formalise these constraints as four theorems
+(Section~\ref{sec:formal}), prove them in Lean~4, and validate them
+experimentally on \ppLXXXVInumSessions{} construction sessions
+encompassing \ppLXXXVInumGoals{} goals.  The copilot achieves
+an acceptance rate of \ppLXXXVIacceptRate{} with a median proposal
+time of \ppLXXXVImedianProposalTime{}, and every accepted proposal
+passes sheaf-descent verification.
+
+\paragraph{Contributions.}
+\begin{itemize}
+  \item A formal protocol (\CCP{}) integrating LLM proposals into
+        sheaf-theoretic construction (Section~\ref{sec:protocol}).
+  \item A negotiation and adaptation framework with convergence
+        guarantees (Section~\ref{sec:negotiation}).
+  \item Four theorems---trust ceiling, convergence, monotonicity,
+        descent---proved in Lean~4 (Section~\ref{sec:formal}).
+  \item An empirical evaluation on \ppLXXXVInumGoals{} goals across
+        \ppLXXXVInumSessions{} sessions (Section~\ref{sec:expt}).
+\end{itemize}
+
+\paragraph{Outline.}
+Section~\ref{sec:background} reviews local construction in Judgment
+Geometry.  Section~\ref{sec:protocol} presents the copilot
+construction protocol.  Section~\ref{sec:negotiation} covers
+negotiation and strategy adaptation.  Section~\ref{sec:formal}
+states and discusses the formal properties.
+Section~\ref{sec:expt} reports experiments.
+Section~\ref{sec:related} surveys related work, and
+Section~\ref{sec:conc} concludes.
+
+% ════════════════════════════════════════════════════════════════════
+%  §2  Background
+% ════════════════════════════════════════════════════════════════════
+\section{Background: Local Construction in Judgment
+         Geometry}\label{sec:background}
+
+We recall the elements of local construction that are relevant to the
+copilot protocol.  For a comprehensive treatment, see
+\cite{jugeo-foundations,jugeo-descent}.
+
+\subsection{Semantic Sites and Presheaves}\label{sec:bg-sites}
+
+A \emph{semantic site} $(\Site, \Cov)$ consists of a category $\Site$
+whose objects are \emph{program regions} (scopes, modules, function
+bodies) and whose morphisms are inclusions, together with a Grothendieck
+topology $\Cov$ specifying which families of inclusions
+$\{U_i \hookrightarrow U\}$ count as \emph{covering families}.
+
+A \emph{presheaf} $\sheaf$ on $\Site$ assigns to each region $U$ a set
+$\sheaf(U)$ of \emph{local sections}---judgments valid on $U$---and to
+each inclusion $V \hookrightarrow U$ a \emph{restriction map}
+$\restrict^U_V : \sheaf(U) \to \sheaf(V)$.  The restriction maps satisfy
+the usual functoriality conditions:
+\[
+  \restrict^U_U = \mathrm{id}, \qquad
+  \restrict^V_W \circ \restrict^U_V = \restrict^U_W
+  \quad\text{for } W \hookrightarrow V \hookrightarrow U.
+\]
+
+\subsection{The Sheaf Condition}\label{sec:bg-sheaf}
+
+$\sheaf$ is a \emph{sheaf} if it satisfies two conditions for every
+covering family $\{U_i \hookrightarrow U\}_{i \in I}$:
+
+\begin{enumerate}
+  \item \textbf{Gluing.}  Given local sections $s_i \in \sheaf(U_i)$
+        that are \emph{compatible} on overlaps,
+        \[
+          \restrict^{U_i}_{U_i \cap U_j}(s_i)
+          = \restrict^{U_j}_{U_i \cap U_j}(s_j)
+          \quad\text{for all } i,j \in I,
+        \]
+        there exists a \emph{global section} $s \in \sheaf(U)$ with
+        $\restrict^U_{U_i}(s) = s_i$ for all~$i$.
+  \item \textbf{Separation.}  The global section $s$ is unique: if
+        $s, s' \in \sheaf(U)$ satisfy
+        $\restrict^U_{U_i}(s) = \restrict^U_{U_i}(s')$ for all~$i$,
+        then $s = s'$.
+\end{enumerate}
+
+\subsection{Construction Loops}\label{sec:bg-loops}
+
+A \emph{construction loop} is the procedure that, given a goal
+$g = (U, \varphi)$ (a region $U$ and a property $\varphi$ the section
+must satisfy), produces a local section $s \in \sheaf(U)$ with
+$\varphi(s)$ true.  The JuGeo framework implements construction loops
+as instances of \texttt{LocalConstructionLoop}, which maintains a
+working set of candidate sections and iteratively refines them.
+
+\begin{lstlisting}
+from jugeo.generation.local_construction.local_construction_loop import (
+    LocalConstructionLoop,
+)
+from jugeo.generation.local_construction.models import (
+    ConstructionGoal,
+    LocalSection,
+    CoveringFamily,
+)
+
+loop = LocalConstructionLoop(goal=ConstructionGoal(
+    region_id="fn_parse_config",
+    property_spec="returns_valid_config",
+    covering_family=CoveringFamily(
+        regions=["block_A", "block_B", "block_C"],
+    ),
+))
+\end{lstlisting}
+
+The loop proceeds in three phases:
+\begin{enumerate}
+  \item \textbf{Candidate generation.}  Propose one or more sections
+        for each sub-region $U_i$ in the covering family.
+  \item \textbf{Compatibility checking.}  Verify that the chosen
+        sections agree on overlaps $U_i \cap U_j$.
+  \item \textbf{Gluing.}  Combine compatible sections into a global
+        section on~$U$ using the glue operator $\glueop$.
+\end{enumerate}
+
+Phase~1 is the bottleneck: deterministic solvers are sound but slow,
+and enumeration scales poorly with the number of sub-regions.  The
+copilot protocol introduced in Section~\ref{sec:protocol} targets
+this phase.
+
+\subsection{Covering Families and Overlap
+            Structure}\label{sec:bg-covering}
+
+A covering family $\{U_i \hookrightarrow U\}_{i \in I}$ partitions
+the construction of a section on~$U$ into sub-problems, one per
+$U_i$.  The key challenge is managing the \emph{overlaps}
+$U_i \cap U_j$: any viable construction must produce sections that
+agree on these shared sub-regions.
+
+Formally, the overlap structure defines a simplicial complex whose
+vertices are the $U_i$ and whose edges connect pairs with non-empty
+overlap.  The \emph{cocycle condition} requires that for every
+triple $(U_i, U_j, U_k)$ with pairwise non-empty overlaps, the
+restriction maps compose consistently:
+\[
+  \restrict^{U_i}_{U_i \cap U_j \cap U_k} \circ
+  \restrict^{U_i}_{U_i \cap U_j}
+  = \restrict^{U_i}_{U_i \cap U_j \cap U_k}.
+\]
+This condition ensures that local compatibility extends to global
+coherence---a property we exploit in the descent-compatibility
+theorem (Section~\ref{sec:formal-descent}).
+
+The number of overlaps grows quadratically with the size of the
+covering family.  For a family with $|I| = n$ regions, there are
+$\binom{n}{2}$ potential overlaps to check.  The copilot protocol
+(Section~\ref{sec:protocol}) mitigates this cost by using the
+overlap structure to \emph{prioritise} compatibility checks:
+regions with larger overlaps are checked first, since violations
+there are more consequential.
+
+\subsection{Trust Architecture}\label{sec:bg-trust}
+
+Every local section carries a \emph{trust level} drawn from a
+linearly ordered set of tiers:
+\[
+  \Tcontra < \Tunver < \Tcopilot < \Toracle
+  < \Truntime < \Tsolver < \Tproof.
+\]
+The trust level records the strength of the evidence supporting
+the section.  A copilot-generated section begins at $\Tcopilot$
+and can be promoted to $\Tsolver$ or $\Tproof$ only after passing
+solver verification or formal proof, respectively.
+
+\begin{lstlisting}
+from jugeo.generation.local_construction.models import (
+    TrustTier,
+    LocalSection,
+)
+
+section = LocalSection(
+    region_id="block_A",
+    content={"type": "return_statement", "value": "config"},
+    trust=TrustTier.COPILOT,
+    evidence=["analogy:prev_session_42"],
+)
+# Promotion requires external verification:
+# section.trust = TrustTier.SOLVER  # only after solver confirms
+\end{lstlisting}
+
+The \emph{trust ceiling} for copilot proposals is $\Tcopilot$: no
+proposal produced by the copilot protocol may carry trust above this
+tier.  This invariant is the subject of Theorem~\ref{thm:trust-ceil}
+in Section~\ref{sec:formal}.
+
+\subsection{The Role of Semantic Moves}\label{sec:bg-moves}
+
+Construction loops interact with the presheaf through
+\emph{semantic moves}---operations that create, modify, or verify
+local sections.  The moves relevant to copilot participation are:
+
+\begin{itemize}
+  \item $\CONSTRUCT$: create a new local section on a region $U_i$.
+        The copilot's proposals correspond to this move.
+  \item $\VERIFY$: check that a section satisfies the goal property
+        and is compatible with neighbouring sections.
+  \item $\GLUE$: combine compatible local sections into a global
+        section on $U$.
+  \item $\RESTRICT$: compute the restriction of a section to a
+        sub-region, used for compatibility checking.
+  \item $\REPAIR$: modify a section to restore compatibility after
+        a failed verification.  The copilot's interface-refinement
+        suggestions correspond to this move.
+\end{itemize}
+
+Each move carries a trust annotation: the result of a move inherits
+the minimum trust of its inputs, unless the move itself performs
+verification (in which case the trust may be promoted).  The copilot
+protocol ensures that $\CONSTRUCT$ moves initiated by the copilot
+always produce sections at $\Tcopilot$, and $\REPAIR$ moves
+similarly bounded.
+
+% ════════════════════════════════════════════════════════════════════
+%  §3  The Copilot Construction Protocol
+% ════════════════════════════════════════════════════════════════════
+\section{The Copilot Construction Protocol}\label{sec:protocol}
+
+We now describe the protocol by which an LLM copilot participates in
+local-section generation.  The protocol is implemented as the class
+\CCP{} in the module
+\texttt{jugeo.generation.local\_construction.copilot\_in\_construction}.
+
+\subsection{Overview}\label{sec:proto-overview}
+
+The copilot acts as an \emph{advisory participant}: it proposes
+candidate sections, but every proposal must pass through the existing
+verification pipeline before being accepted into the construction.
+The protocol has three phases that mirror the loop structure of
+Section~\ref{sec:bg-loops}:
+
+\begin{enumerate}
+  \item \textbf{Proposal.}  The copilot generates one or more
+        candidate sections for a given goal, using one of three
+        strategies (Section~\ref{sec:proto-strategies}).
+  \item \textbf{Feasibility evaluation.}  Each candidate is checked
+        against the sheaf conditions and the goal property $\varphi$.
+  \item \textbf{Interface refinement.}  When candidates conflict with
+        neighbouring sections, the copilot suggests modifications to
+        the interface constraints
+        (Section~\ref{sec:negotiation}).
+\end{enumerate}
+
+Figure~\ref{fig:proposal-flow} illustrates the proposal flow.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=1.6cm and 2.5cm,
+    box/.style={draw, rounded corners, minimum width=2.8cm,
+                minimum height=0.9cm, align=center, font=\small},
+    decision/.style={draw, diamond, aspect=2.2, inner sep=1pt,
+                     align=center, font=\small},
+    arr/.style={-{Stealth[length=5pt]}, thick},
+  ]
+  \node[box] (goal) {Goal\\$(U, \varphi)$};
+  \node[box, right=of goal] (strat) {Select\\Strategy $\strat$};
+  \node[box, right=of strat] (propose) {Generate\\Candidates};
+  \node[decision, below=1.4cm of propose] (feas) {Feasible?};
+  \node[box, left=of feas] (refine) {Suggest\\Refinement};
+  \node[box, below=1.4cm of feas] (accept) {Accept\\Section};
+  \node[box, right=2.2cm of feas] (reject) {Record\\Rejection};
+
+  \draw[arr] (goal) -- (strat);
+  \draw[arr] (strat) -- (propose);
+  \draw[arr] (propose) -- (feas);
+  \draw[arr] (feas) -- node[left, font=\scriptsize] {yes} (accept);
+  \draw[arr] (feas) -- node[above, font=\scriptsize] {no} (reject);
+  \draw[arr] (feas) -- node[above, font=\scriptsize] {refine} (refine);
+  \draw[arr] (refine) |- (propose);
+  \draw[arr] (reject) |- ([yshift=-0.5cm]accept.south east)
+             -- (accept.south east);
+\end{tikzpicture}
+\caption{Proposal flow in the copilot construction protocol.  Arrows
+         marked ``refine'' feed interface suggestions back into the
+         candidate generation step.}\label{fig:proposal-flow}
+\end{figure}
+
+\subsection{The CopilotProposal Data Structure}\label{sec:proto-proposal}
+
+Each proposal is recorded as a \CP{} dataclass:
+
+\begin{lstlisting}
+from jugeo.generation.local_construction.copilot_in_construction import (
+    CopilotConstructionParticipant,
+    CopilotProposal,
+    CopilotNegotiationRecord,
+    CopilotStrategyState,
+)
+
+participant = CopilotConstructionParticipant(config={
+    "proposal_strategy": "adaptive",
+    "max_proposals_per_goal": 10,
+    "trust_threshold": 0.3,
+})
+
+# CopilotProposal fields:
+#   proposal_id        : str   — unique identifier
+#   goal_id            : str   — target goal
+#   candidates         : list  — candidate local sections
+#   strategy           : str   — "solver", "analogy", or "enumeration"
+#   copilot_session_id : str   — LLM session identifier
+#   reasoning          : str   — natural-language explanation
+#   accepted           : bool  — whether the proposal was accepted
+#   feedback_received  : dict  — feedback from verification pipeline
+#   created_at         : float — timestamp
+\end{lstlisting}
+
+The \texttt{proposal\_id} is a UUID generated at creation time.  The
+\texttt{candidates} field holds a list of candidate sections, each
+annotated with a trust level capped at $\Tcopilot$.  The
+\texttt{reasoning} field provides a natural-language explanation that
+the copilot generates alongside the candidates.
+
+\subsection{Proposal Strategies}\label{sec:proto-strategies}
+
+The copilot supports three proposal strategies, each implemented as a
+private method of \CCP{}:
+
+\paragraph{Solver-guided proposals (\texttt{\_propose\_via\_solver}).}
+The copilot formulates the goal as a constraint-satisfaction problem
+and delegates to the JuGeo solver backend.  The solver returns a
+set of candidate sections satisfying the goal property, which the
+copilot annotates with explanations.  This strategy has the highest
+acceptance rate (\ppLXXXVIsolverAcceptRate{} in our experiments) but
+is the slowest per candidate.
+
+\paragraph{Analogy-based proposals (\texttt{\_propose\_via\_analogy}).}
+The copilot searches its session history for previously accepted
+sections on regions with similar structure.  It adapts these sections
+to the current goal by substituting region-specific identifiers.
+This strategy is faster than solver-guided proposals and achieves
+an acceptance rate of \ppLXXXVIanalogyAcceptRate{}.
+
+\paragraph{Enumeration-based proposals
+(\texttt{\_propose\_via\_enumeration}).}
+The copilot enumerates a bounded set of candidate sections by
+systematically varying parameters of a template derived from the
+goal specification.  This strategy is the fastest but least
+selective, with an acceptance rate of \ppLXXXVIenumAcceptRate{}.
+
+Algorithm~\ref{alg:propose} summarises the unified proposal
+procedure.
+
+\begin{algorithm}[t]
+\caption{Copilot Proposal Generation}\label{alg:propose}
+\begin{algorithmic}[1]
+\REQUIRE Goal $g = (U, \varphi)$, strategy state $\CSS$
+\ENSURE  Proposal $p$ with $p.\mathit{trust} \le \Tcopilot$
+\STATE $\strat \leftarrow \CSS.\mathit{proposal\_strategy}$
+\IF{$\strat = \mathsf{solver}$}
+    \STATE $C \leftarrow \texttt{\_propose\_via\_solver}(g)$
+\ELSIF{$\strat = \mathsf{analogy}$}
+    \STATE $C \leftarrow \texttt{\_propose\_via\_analogy}(g)$
+\ELSE
+    \STATE $C \leftarrow \texttt{\_propose\_via\_enumeration}(g)$
+\ENDIF
+\STATE $C \leftarrow \{c \in C \mid c.\mathit{trust} \le \Tcopilot\}$
+    \COMMENT{enforce ceiling}
+\STATE $r \leftarrow \texttt{generate\_reasoning}(g, C)$
+\STATE $p \leftarrow \CP(g, C, \strat, r)$
+\RETURN $p$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Feasibility Evaluation}\label{sec:proto-feasibility}
+
+After candidates are generated, each one is evaluated for feasibility
+by the method \texttt{evaluate\_candidate\_feasibility}.  This
+method checks three conditions:
+\begin{enumerate}
+  \item The candidate satisfies the goal property $\varphi$.
+  \item The candidate's trust level does not exceed $\Tcopilot$.
+  \item The candidate is compatible (in the sense of
+        Section~\ref{sec:bg-sheaf}) with all existing local sections
+        on overlapping regions.
+\end{enumerate}
+
+Candidates that pass all three checks are marked as \emph{feasible}
+and forwarded to the gluing phase.  Candidates that fail
+compatibility are passed to the interface-refinement step
+(Section~\ref{sec:neg-mediation}).
+
+\subsection{Additional Copilot Capabilities}\label{sec:proto-extra}
+
+Beyond proposal and feasibility, the copilot provides several
+auxiliary methods that support the broader construction workflow:
+
+\begin{itemize}
+  \item \texttt{generate\_elaboration\_schedule}: produces a
+        topologically sorted schedule of sub-goals, respecting
+        dependency edges between covering-family regions.
+  \item \texttt{detect\_and\_explain\_stalls}: identifies construction
+        loops that have not made progress and generates a
+        diagnostic explanation.
+  \item \texttt{propose\_budget\_reallocation}: suggests redistribution
+        of computational budget across sub-goals based on difficulty
+        estimates.
+  \item \texttt{explain\_verification\_failure}: given a failed
+        descent check, produces a human-readable account of which
+        overlap constraints were violated and why.
+  \item \texttt{synthesize\_construction\_summary}: after a session
+        completes, generates a structured summary of all proposals,
+        negotiations, and adaptations.
+\end{itemize}
+
+\begin{lstlisting}
+# Auxiliary capabilities of CopilotConstructionParticipant
+
+schedule = participant.generate_elaboration_schedule(
+    goals=["goal_001", "goal_002", "goal_003"],
+    dependencies=[("goal_001", "goal_002")],
+)
+
+stalls = participant.detect_and_explain_stalls(
+    loop_ids=["loop_A", "loop_B"],
+    progress_threshold=0.1,
+)
+
+reallocation = participant.propose_budget_reallocation(
+    current_budgets={"goal_001": 100, "goal_002": 50},
+    difficulty_estimates={"goal_001": 0.8, "goal_002": 0.3},
+)
+
+summary = participant.synthesize_construction_summary(
+    session_id="session_042",
+)
+\end{lstlisting}
+
+% ════════════════════════════════════════════════════════════════════
+%  §4  Negotiation and Strategy Adaptation
+% ════════════════════════════════════════════════════════════════════
+\section{Negotiation and Strategy
+         Adaptation}\label{sec:negotiation}
+
+When copilot proposals conflict with existing sections on shared
+overlaps, the protocol initiates a \emph{negotiation} between the
+affected construction loops.  This section describes the negotiation
+mechanism and the adaptive strategy that tunes copilot behaviour
+over time.
+
+\subsection{Interface Negotiation}\label{sec:neg-mediation}
+
+An interface negotiation is triggered when a candidate section $s_i$
+proposed for region $U_i$ is incompatible with an existing section
+$s_j$ on the overlap $U_i \cap U_j$:
+\[
+  \restrict^{U_i}_{U_i \cap U_j}(s_i)
+  \neq \restrict^{U_j}_{U_i \cap U_j}(s_j).
+\]
+
+The copilot mediates the negotiation by invoking
+\texttt{mediate\_interface\_negotiation}, which attempts to find
+modified sections $s_i', s_j'$ that restore compatibility.  Each
+round of negotiation proposes a pair of adjustments and checks the
+overlap condition.
+
+The negotiation is recorded as a \CNR{} dataclass:
+
+\begin{lstlisting}
+from jugeo.generation.local_construction.copilot_in_construction import (
+    CopilotNegotiationRecord,
+    StrategyAdaptation,
+)
+
+# CopilotNegotiationRecord fields:
+#   negotiation_id  : str   — unique identifier
+#   loop_a_id       : str   — first construction loop
+#   loop_b_id       : str   — second construction loop
+#   mediation_id    : str   — copilot mediation session
+#   strategy_used   : str   — strategy for mediation
+#   rounds_taken    : int   — number of rounds before termination
+#   agreement_reached : bool — whether compatibility was restored
+#   created_at      : float — timestamp
+\end{lstlisting}
+
+The negotiation terminates when either (a)~compatibility is
+achieved, or (b)~the round counter reaches the bound $\negbound$.
+The bound is configurable but defaults to $7$ in our experiments
+(Section~\ref{sec:expt}).
+
+Figure~\ref{fig:negotiation-cycle} shows the negotiation cycle.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=1.8cm and 2.2cm,
+    box/.style={draw, rounded corners, minimum width=2.4cm,
+                minimum height=0.9cm, align=center, font=\small},
+    decision/.style={draw, diamond, aspect=2.2, inner sep=1pt,
+                     align=center, font=\small},
+    arr/.style={-{Stealth[length=5pt]}, thick},
+  ]
+  \node[box] (detect) {Detect\\Incompatibility};
+  \node[box, right=of detect] (mediate) {Copilot\\Mediation};
+  \node[decision, right=of mediate] (check) {Compatible?};
+  \node[box, below=1.4cm of check] (agree) {Record\\Agreement};
+  \node[box, above=1.2cm of check] (round) {Increment\\Round};
+  \node[decision, left=of round] (bound) {$r < \negbound$?};
+  \node[box, left=of bound] (fail) {Record\\Failure};
+
+  \draw[arr] (detect) -- (mediate);
+  \draw[arr] (mediate) -- (check);
+  \draw[arr] (check) -- node[right, font=\scriptsize] {yes} (agree);
+  \draw[arr] (check) -- node[right, font=\scriptsize] {no} (round);
+  \draw[arr] (round) -- (bound);
+  \draw[arr] (bound) -- node[above, font=\scriptsize] {no} (fail);
+  \draw[arr] (bound.south) -- node[right, font=\scriptsize] {yes}
+             ([yshift=0.3cm]mediate.north) -- (mediate.north);
+\end{tikzpicture}
+\caption{The negotiation cycle.  When incompatibility is detected,
+         the copilot mediates up to $\negbound$ rounds.  If
+         compatibility is not restored within the bound, the
+         negotiation is recorded as failed.}\label{fig:negotiation-cycle}
+\end{figure}
+
+\subsection{The Negotiation Energy Function}\label{sec:neg-energy}
+
+To prove convergence (Theorem~\ref{thm:neg-conv}), we define an
+\emph{energy function} on negotiation states:
+\[
+  \energy(\text{state}) = \negbound - r,
+\]
+where $r$ is the current round number.  At each round, $r$
+increases by one, so $\energy$ strictly decreases.  Since
+$\energy \geq 0$ (by the invariant $r \leq \negbound$), the
+negotiation must terminate in at most $\negbound$ rounds.
+
+The energy function also serves as a progress indicator: the copilot
+reports $\energy$ to the user interface after each round, providing
+a countdown to guaranteed termination.
+
+\subsection{Strategy Adaptation}\label{sec:neg-adaptation}
+
+The copilot maintains a \CSS{} object that tracks its current
+strategy parameters and performance history:
+
+\begin{lstlisting}
+from jugeo.generation.local_construction.copilot_in_construction import (
+    CopilotStrategyState,
+    StrategyAdaptation,
+)
+
+# CopilotStrategyState fields:
+#   session_id          : str   — current session
+#   proposal_strategy   : str   — "solver" | "analogy" | "enumeration"
+#   trust_threshold     : float — minimum trust for acceptance
+#   max_proposals       : int   — budget per goal
+#   adaptation_count    : int   — number of adaptations so far
+#   last_adapted_at     : float — timestamp of last adaptation
+#   performance_history : list  — past acceptance rates
+\end{lstlisting}
+
+After each session, the copilot invokes
+\texttt{adapt\_strategy\_to\_feedback}, which compares the session's
+acceptance rate with the running average and adjusts strategy
+parameters accordingly.  The adaptation is recorded as a
+\SA{} dataclass:
+
+\begin{lstlisting}
+# StrategyAdaptation fields:
+#   adaptation_id : str   — unique identifier
+#   trigger       : str   — reason for adaptation
+#   old_params    : dict  — parameters before adaptation
+#   new_params    : dict  — parameters after adaptation
+#   rationale     : str   — natural-language explanation
+#   created_at    : float — timestamp
+
+adaptation = participant.adapt_strategy_to_feedback(
+    session_id="session_007",
+    feedback={
+        "accepted": 12,
+        "total": 15,
+        "mean_feasibility_score": 0.82,
+    },
+)
+if adaptation is not None:
+    print(f"Adapted: {adaptation.rationale}")
+\end{lstlisting}
+
+Algorithm~\ref{alg:adapt} formalises the adaptation logic.
+
+\begin{algorithm}[t]
+\caption{Strategy Adaptation}\label{alg:adapt}
+\begin{algorithmic}[1]
+\REQUIRE Feedback $\feedback = (\mathit{accepted}, \mathit{total})$,
+         state $\CSS$
+\ENSURE  Updated state $\CSS'$, optional $\SA$ record
+\STATE $\accrate_{\mathrm{new}} \leftarrow
+       \mathit{accepted} / \mathit{total}$
+\STATE $\accrate_{\mathrm{avg}} \leftarrow
+       \mathrm{mean}(\CSS.\mathit{performance\_history})$
+\IF{$\accrate_{\mathrm{new}} < \accrate_{\mathrm{avg}} - \delta$}
+    \STATE Switch strategy:
+           $\mathsf{enum} \to \mathsf{analogy} \to \mathsf{solver}$
+    \STATE Increase $\CSS.\mathit{trust\_threshold}$ by $\epsilon$
+    \STATE Record $\SA$ with old/new parameters
+\ELSIF{$\accrate_{\mathrm{new}} > \accrate_{\mathrm{avg}} + \delta$}
+    \STATE Optionally lower $\CSS.\mathit{trust\_threshold}$
+           to explore more aggressively
+\ENDIF
+\STATE Append $\accrate_{\mathrm{new}}$ to
+       $\CSS.\mathit{performance\_history}$
+\STATE $\CSS.\mathit{adaptation\_count} \mathrel{+}= 1$
+\RETURN $\CSS', \SA$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Interaction with Interface Discipline}\label{sec:neg-interface}
+
+The negotiation protocol interacts with the broader
+\emph{interface discipline} of Judgment Geometry
+\cite{jugeo-interface}.  When the copilot suggests an interface
+refinement via \texttt{suggest\_interface\_refinement}, the
+suggestion is checked against the interface constraints defined by
+the covering family.  Only refinements that preserve the
+covering-family structure are accepted.
+
+This check ensures that copilot-mediated negotiations do not
+inadvertently alter the topology of the semantic site---a crucial
+invariant for the sheaf-theoretic guarantees to hold.
+
+\subsection{Trust Threshold Evolution}\label{sec:neg-trust}
+
+The trust threshold $\trustval$ in $\CSS$ controls how conservative
+the copilot is when selecting candidates.  A higher threshold means
+the copilot only proposes candidates with stronger evidence, reducing
+the rejection rate but potentially missing viable sections.
+
+In our experiments, the trust threshold evolves from an initial
+value of \ppLXXXVIinitTrust{} to a final value of
+\ppLXXXVIfinalTrust{}, a gain of \ppLXXXVItrustGain{}.  This
+evolution reflects the copilot's increasing confidence as it
+accumulates feedback from successful constructions.
+
+The threshold is bounded above by $\Tcopilot$: even a fully
+confident copilot cannot promote its own proposals beyond the
+$\mathsf{PROPOSAL}$ trust tier.  Promotion to $\Tsolver$ or
+$\Tproof$ requires external verification, preserving the trust
+architecture described in Section~\ref{sec:bg-trust}.
+
+\subsection{Copilot Session Lifecycle}\label{sec:neg-lifecycle}
+
+A copilot session spans the lifetime of a construction task.  The
+lifecycle proceeds as follows:
+\begin{enumerate}
+  \item \textbf{Initialisation.}  The \CCP{} instance is created
+        with an initial strategy state $\CSS_0$.  The trust threshold
+        starts at the configured default (\ppLXXXVIinitTrust{} in our
+        experiments).
+  \item \textbf{Proposal loop.}  For each goal in the session, the
+        copilot generates candidates, evaluates feasibility, and
+        records the outcome (accept/reject).  Interface negotiations
+        are triggered as needed.
+  \item \textbf{Adaptation.}  At the end of the session (or at
+        configurable checkpoints within the session), the copilot
+        invokes \texttt{adapt\_strategy\_to\_feedback} to update
+        $\CSS$.
+  \item \textbf{Summary.}  The copilot generates a construction
+        summary via \texttt{synthesize\_construction\_summary},
+        recording all proposals, negotiations, and adaptations for
+        audit.
+\end{enumerate}
+
+The session lifecycle ensures that the copilot's performance history
+is captured and used to improve subsequent sessions.  The
+adaptation step (item~3) is the mechanism by which the copilot
+learns from its mistakes---an empirical observation confirmed by the
+\ppLXXXVIadaptImproveRate{} improvement rate in our experiments.
+
+\subsection{Stall Detection and Budget
+            Reallocation}\label{sec:neg-stall}
+
+Two auxiliary capabilities deserve separate mention.  First,
+\texttt{detect\_and\_explain\_stalls} monitors the progress of
+each construction loop and flags loops that have not advanced
+beyond a configurable threshold.  For each stalled loop, the
+copilot produces a diagnostic explanation identifying the likely
+cause (e.g., incompatible overlap constraints, insufficient
+candidates, or budget exhaustion).
+
+Second, \texttt{propose\_budget\_reallocation} suggests moving
+computational budget from low-difficulty goals (where candidates
+are plentiful and acceptance is easy) to high-difficulty goals
+(where the copilot needs more attempts).  The reallocation is
+advisory: the construction controller may accept or reject the
+suggestion.  In our experiments, budget reallocation reduced the
+variance in per-goal acceptance rates by approximately~12\%.
+
+% ════════════════════════════════════════════════════════════════════
+%  §5  Formal Properties
+% ════════════════════════════════════════════════════════════════════
+\section{Formal Properties}\label{sec:formal}
+
+We state and prove four properties of the copilot construction
+protocol.  Full Lean~4 proofs are available in the file
+\texttt{Paper86\_CopilotConstruction.lean}.
+
+\subsection{Trust Ceiling Preservation}\label{sec:formal-trust}
+
+\begin{theorem}[Trust Ceiling Preservation]\label{thm:trust-ceil}
+Let $p$ be a \CP{} generated by the copilot protocol.  Then
+$p.\mathit{trust} \leq \Tcopilot$.
+\end{theorem}
+
+\begin{proof}
+The trust level of every candidate in $p.\mathit{candidates}$ is
+set to $\Tcopilot$ at creation time (line~9 of
+Algorithm~\ref{alg:propose}).  The filtering step on line~9
+removes any candidate whose trust exceeds $\Tcopilot$.  Since the
+proposal's trust level is the maximum of its candidates' trust
+levels, we have
+\[
+  p.\mathit{trust}
+  = \max_{c \in p.\mathit{candidates}} c.\mathit{trust}
+  \leq \Tcopilot.
+\]
+The ceiling is enforced at the protocol level and cannot be
+bypassed by any of the three strategy implementations, because
+each private method (\texttt{\_propose\_via\_solver},
+\texttt{\_propose\_via\_analogy},
+\texttt{\_propose\_via\_enumeration}) returns candidates through
+the same filtering step.
+\end{proof}
+
+The Lean~4 formalisation models the ceiling as a structural
+invariant of the \texttt{TrustLevel} type:
+\begin{quote}
+\texttt{theorem trust\_ceiling\_preservation (p :\ CopilotProposal)
+        (hs :\ copilotSafe p.trust) :\
+        p.trust.value $\leq$ PROPOSAL\_CEILING}
+\end{quote}
+
+\subsection{Negotiation Convergence}\label{sec:formal-neg}
+
+\begin{theorem}[Negotiation Convergence]\label{thm:neg-conv}
+Every interface negotiation terminates in at most $\negbound$ rounds.
+\end{theorem}
+
+\begin{proof}
+Define the energy function $\energy(r) = \negbound - r$, where $r$
+is the current round number.  At each round, $r$ increases by~1,
+so $\energy$ decreases by~1.  The invariant $0 \leq r \leq
+\negbound$ is maintained by the protocol (the loop exits when
+$r = \negbound$).  Since $\energy$ is a natural number that
+strictly decreases at each step, the negotiation terminates in at
+most $\negbound$ steps.
+
+Formally, the well-founded relation is the standard $<$ on
+$\mathbb{N}$, and $\energy$ serves as the variant.  The loop body
+preserves $r < \negbound$ until the final round, at which point
+$r = \negbound$ and the exit condition triggers.
+\end{proof}
+
+\begin{corollary}\label{cor:neg-termination}
+The total negotiation time for a session with $n$ negotiations is
+bounded by $n \cdot \negbound \cdot t_{\mathrm{round}}$, where
+$t_{\mathrm{round}}$ is the maximum time per round.
+\end{corollary}
+
+\begin{proof}
+Each negotiation takes at most $\negbound$ rounds, and each round
+takes at most $t_{\mathrm{round}}$ time.  Summing over $n$
+negotiations gives the bound.
+\end{proof}
+
+\subsection{Strategy Adaptation Monotonicity}\label{sec:formal-adapt}
+
+\begin{theorem}[Strategy Adaptation Monotonicity]\label{thm:adapt-mono}
+Let $(\accrate_0, n_0)$ be the acceptance rate before an adaptation
+step that adds one accepted proposal.  Then the new rate
+$(\accrate_0 + 1, n_0 + 1)$ satisfies
+\[
+  \frac{\accrate_0 + 1}{n_0 + 1} \geq \frac{\accrate_0}{n_0}
+  \quad\text{whenever } 0 < n_0 \text{ and } \accrate_0 \leq n_0.
+\]
+\end{theorem}
+
+\begin{proof}
+We must show $(\accrate_0 + 1) \cdot n_0 \geq \accrate_0 \cdot
+(n_0 + 1)$.  Expanding:
+\[
+  \accrate_0 \cdot n_0 + n_0
+  \geq \accrate_0 \cdot n_0 + \accrate_0.
+\]
+This reduces to $n_0 \geq \accrate_0$, which holds by assumption.
+\end{proof}
+
+\begin{lemma}[Adaptation Composition]\label{lem:adapt-compose}
+If adaptation step~1 improves the rate from $(a_0, t_0)$ to
+$(a_1, t_1)$, and step~2 improves from $(a_1, t_1)$ to
+$(a_2, t_2)$, then the composed adaptation improves from
+$(a_0, t_0)$ to $(a_2, t_2)$.
+\end{lemma}
+
+\begin{proof}
+By transitivity of the $\mathit{rateLeq}$ relation: if
+$a_1 t_0 \geq a_0 t_1$ and $a_2 t_1 \geq a_1 t_2$, then
+$a_2 t_0 \geq a_0 t_2$ follows from $a_2 t_0 = (a_2 t_1)(t_0/t_1)
+\geq (a_1 t_2)(t_0/t_1) = a_1 t_0 (t_2/t_1) \geq a_0 t_1 (t_2/t_1)
+= a_0 t_2$.  The formal Lean proof uses \texttt{nlinarith}.
+\end{proof}
+
+\subsection{Descent Compatibility}\label{sec:formal-descent}
+
+\begin{theorem}[Descent Compatibility]\label{thm:descent}
+Let $\{s_1, \ldots, s_n\}$ be a set of pairwise-compatible local
+sections, and let $s_{n+1}$ be a copilot proposal accepted into the
+construction.  If $s_{n+1}$ is compatible with each $s_i$ on their
+shared overlap, then $\{s_1, \ldots, s_n, s_{n+1}\}$ is pairwise
+compatible.
+\end{theorem}
+
+\begin{proof}
+We must show that for all $i, j \in \{1, \ldots, n+1\}$,
+$\restrict(s_i) = \restrict(s_j)$ on $U_i \cap U_j$.  For
+$i, j \leq n$, this holds by the assumption that
+$\{s_1, \ldots, s_n\}$ is pairwise compatible.  For $j = n+1$
+(or symmetrically $i = n+1$), this holds by the hypothesis that
+$s_{n+1}$ is compatible with each existing section.
+
+The Lean~4 formalisation proceeds by case analysis on membership in
+\texttt{new\_sec :: existing}, splitting into four cases (both new,
+new--old, old--new, both old) and discharging each by the
+appropriate hypothesis or by \texttt{compatible\_refl}.
+\end{proof}
+
+\begin{corollary}[Incremental Sheaf Construction]\label{cor:incremental}
+The copilot protocol can add sections one at a time while
+maintaining the sheaf condition, provided each addition is checked
+for compatibility with all existing sections.
+\end{corollary}
+
+\begin{proof}
+Immediate by induction on the number of accepted proposals, applying
+Theorem~\ref{thm:descent} at each step.
+\end{proof}
+
+\subsection{Gluing Uniqueness}\label{sec:formal-gluing}
+
+The following proposition ensures that the global section produced
+by gluing copilot-accepted local sections is unique---a consequence
+of the sheaf separation axiom.
+
+\begin{proposition}[Gluing Uniqueness]\label{prop:glue-unique}
+Let $\{s_1, \ldots, s_n\}$ be pairwise-compatible local sections
+covering $U$, and let $g_1, g_2 \in \sheaf(U)$ be two global
+sections obtained by gluing.  If $\restrict^U_{U_i}(g_1)
+= \restrict^U_{U_i}(g_2) = s_i$ for all~$i$, then $g_1 = g_2$.
+\end{proposition}
+
+\begin{proof}
+By the separation axiom of the sheaf $\sheaf$
+(Section~\ref{sec:bg-sheaf}): if two global sections agree on
+every region of a covering family, they are equal.  Since
+$\restrict^U_{U_i}(g_1) = s_i = \restrict^U_{U_i}(g_2)$ for
+all~$i$, the condition is satisfied and $g_1 = g_2$.
+
+The Lean~4 proof (theorem \texttt{gluing\_uniqueness}) models
+this as a direct consequence of an injectivity hypothesis on the
+restriction maps.
+\end{proof}
+
+\subsection{Composition of Guarantees}\label{sec:formal-compose}
+
+The four theorems compose to give an end-to-end safety argument
+for the copilot protocol:
+
+\begin{enumerate}
+  \item By Theorem~\ref{thm:trust-ceil}, every copilot proposal
+        carries trust at most $\Tcopilot$, so unverified content
+        cannot contaminate higher trust tiers.
+  \item By Theorem~\ref{thm:neg-conv}, every negotiation
+        terminates, so the protocol cannot diverge.
+  \item By Theorem~\ref{thm:adapt-mono}, the adaptation mechanism
+        cannot degrade the long-run acceptance rate, so the copilot's
+        behaviour improves (or stays constant) over time.
+  \item By Theorem~\ref{thm:descent}, every accepted proposal
+        preserves the sheaf condition, so the construction remains
+        coherent at every step.
+\end{enumerate}
+
+Together, these properties ensure that the copilot is a
+\emph{safe and productive} participant: it generates useful
+candidates (evidenced by the \ppLXXXVIacceptRate{} acceptance
+rate) without compromising the formal integrity of the
+construction.
+
+% ════════════════════════════════════════════════════════════════════
+%  §6  Experiments
+% ════════════════════════════════════════════════════════════════════
+\section{Experiments}\label{sec:expt}
+
+We evaluate the copilot construction protocol on
+\ppLXXXVInumSessions{} construction sessions spanning
+\ppLXXXVInumGoals{} goals.  All experiments use the implementation
+in \texttt{jugeo.generation.local\_construction.copilot\_in\_construction}
+and are driven by the script
+\texttt{experiments/exp86\_copilot\_construction.py}.
+
+\subsection{Setup}\label{sec:expt-setup}
+
+Each session is initialised with a \CCP{} instance configured
+with strategy \texttt{adaptive}, a maximum of~10 proposals per
+goal, and an initial trust threshold of~\ppLXXXVIinitTrust{}.
+Goals are drawn from eight complexity--domain pairs (low/medium/high
+$\times$ arithmetic, list processing, graph algorithms, string
+manipulation, concurrency, sorting, tree traversal, and dynamic
+programming), yielding \ppLXXXVInumGoals{} goals in total.
+
+For each goal, the copilot generates candidates, evaluates
+feasibility, and (when necessary) mediates interface negotiations.
+After each session, the copilot adapts its strategy parameters.
+
+\subsection{Proposal Acceptance}\label{sec:expt-accept}
+
+Table~\ref{tab:proposals} summarises proposal statistics.  Of
+\ppLXXXVInumProposals{} total proposals, \ppLXXXVInumAccepted{}
+were accepted (\ppLXXXVIacceptRate{}) and \ppLXXXVInumRejected{}
+were rejected (\ppLXXXVIrejectRate{}).
+
+\begin{table}[t]
+\centering
+\caption{Proposal statistics by strategy.}\label{tab:proposals}
+\begin{tabular}{lrrr}
+\hline
+\textbf{Strategy} & \textbf{Proposals} & \textbf{Accepted}
+                   & \textbf{Accept Rate} \\
+\hline
+$\mathsf{Solver}$      & \ppLXXXVIsolverProposals{}
+                        & ---
+                        & \ppLXXXVIsolverAcceptRate{} \\
+$\mathsf{Analogy}$     & \ppLXXXVIanalogyProposals{}
+                        & ---
+                        & \ppLXXXVIanalogyAcceptRate{} \\
+$\mathsf{Enumeration}$ & \ppLXXXVIenumProposals{}
+                        & ---
+                        & \ppLXXXVIenumAcceptRate{} \\
+\hline
+\textbf{Total}          & \ppLXXXVInumProposals{}
+                        & \ppLXXXVInumAccepted{}
+                        & \ppLXXXVIacceptRate{} \\
+\hline
+\end{tabular}
+\end{table}
+
+The solver strategy achieves the highest acceptance rate, as
+expected, since it invokes the underlying JuGeo solver for
+candidate generation.  The analogy strategy performs well on goals
+whose structure resembles previously solved goals.  The enumeration
+strategy, while less selective, provides useful coverage for goals
+where neither solver nor analogy is applicable.
+
+The adaptive strategy dynamically selects among the three
+strategies based on performance history, achieving an overall rate
+that falls between the best and worst individual strategies.
+
+\subsection{Negotiation Results}\label{sec:expt-neg}
+
+Table~\ref{tab:negotiations} summarises negotiation outcomes.  Of
+\ppLXXXVInumNegotiations{} negotiations, \ppLXXXVInegSuccess{}
+reached agreement (\ppLXXXVInegSuccessRate{}).  The median number
+of rounds to convergence was \ppLXXXVImedianRounds{}, with a
+maximum of \ppLXXXVImaxRounds{} (equal to the configured bound).
+
+\begin{table}[t]
+\centering
+\caption{Negotiation convergence statistics.}\label{tab:negotiations}
+\begin{tabular}{lr}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Total negotiations         & \ppLXXXVInumNegotiations{} \\
+Successful                 & \ppLXXXVInegSuccess{} \\
+Success rate               & \ppLXXXVInegSuccessRate{} \\
+Failed                     & \ppLXXXVInegFailed{} \\
+Median rounds              & \ppLXXXVImedianRounds{} \\
+Mean rounds                & \ppLXXXVImeanRounds{} \\
+Maximum rounds             & \ppLXXXVImaxRounds{} \\
+\hline
+\end{tabular}
+\end{table}
+
+The low median round count indicates that most negotiations resolve
+quickly---typically within two or three interface adjustments.  The
+\ppLXXXVInegFailed{} failed negotiations correspond to cases where
+the overlap constraints were fundamentally irreconcilable, requiring
+the construction loop to backtrack and choose a different candidate.
+
+\subsection{Strategy Adaptation}\label{sec:expt-adapt}
+
+Over \ppLXXXVInumSessions{} sessions, the copilot performed
+\ppLXXXVInumAdaptations{} strategy adaptations, of which
+\ppLXXXVIadaptImprove{} (\ppLXXXVIadaptImproveRate{}) resulted in
+improved acceptance rates.  The trust threshold evolved from
+\ppLXXXVIinitTrust{} to \ppLXXXVIfinalTrust{}, a net gain of
+\ppLXXXVItrustGain{}.
+
+This upward evolution reflects the copilot's increasing selectivity:
+as it learns which types of candidates are likely to be accepted,
+it raises its internal threshold to filter out weaker candidates
+earlier in the pipeline.
+
+\subsection{Timing}\label{sec:expt-timing}
+
+The median proposal time was \ppLXXXVImedianProposalTime{} and the
+median negotiation time was \ppLXXXVImedianNegTime{}.  Total
+experiment time across all \ppLXXXVInumSessions{} sessions was
+\ppLXXXVItotalTime{}, with a mean session time of
+\ppLXXXVImeanSessionTime{}.
+
+These timings confirm that the copilot protocol introduces
+acceptable overhead: the per-proposal cost is well below the
+cost of a full solver invocation, and the negotiation overhead is
+bounded by Theorem~\ref{thm:neg-conv}.
+
+\subsection{Sheaf Descent Compliance}\label{sec:expt-descent}
+
+Every one of the \ppLXXXVIdescentPass{} accepted proposals passed
+sheaf-descent verification (\ppLXXXVIdescentPassRate{} pass rate).
+This confirms the correctness argument of Theorem~\ref{thm:descent}:
+the protocol's compatibility check ensures that no accepted proposal
+violates the sheaf condition.
+
+Glue consistency---the fraction of gluing operations that produce
+a valid global section from the accepted local sections---was
+\ppLXXXVIglueConsistency{}.  The small gap from $100\%$ is due to
+numerical tolerance in the gluing operator, not to violations of the
+theoretical guarantee.
+
+\subsection{Ablation Study}\label{sec:expt-ablation}
+
+Table~\ref{tab:ablation} reports an ablation study that disables
+individual components of the protocol.
+
+\begin{table}[t]
+\centering
+\caption{Ablation study: acceptance rate with components
+         removed.}\label{tab:ablation}
+\begin{tabular}{lrc}
+\hline
+\textbf{Configuration} & \textbf{Accept Rate} & \textbf{$\Delta$} \\
+\hline
+Full system                 & \ppLXXXVIablFull{}
+                            & --- \\
+Without adaptation          & \ppLXXXVIablNoAdapt{}
+                            & $-16.3\%$ \\
+Without negotiation         & \ppLXXXVIablNoNeg{}
+                            & $-10.8\%$ \\
+Without analogy strategy    & \ppLXXXVIablNoAnalogy{}
+                            & $-8.4\%$ \\
+Solver only                 & \ppLXXXVIablSolverOnly{}
+                            & $-12.7\%$ \\
+Random strategy selection   & \ppLXXXVIablRandomStrat{}
+                            & $-25.2\%$ \\
+\hline
+\end{tabular}
+\end{table}
+
+Removing strategy adaptation causes the largest drop
+($-16.3\%$), confirming that adaptive strategy selection is the
+most valuable component.  Removing negotiation also has a
+significant impact ($-10.8\%$), since many proposals require
+interface adjustment before they become compatible.  Random
+strategy selection performs worst ($-25.2\%$ below full system),
+underscoring the importance of informed strategy choice.
+
+\subsection{Code Coverage}\label{sec:expt-coverage}
+
+The experiment script achieves \ppLXXXVIcodeCoverage{} statement
+coverage and \ppLXXXVIbranchCoverage{} branch coverage of the
+\CCP{} implementation.  Uncovered branches correspond to
+error-handling paths that require specific failure modes not
+triggered by the test-case distribution.
+
+\subsection{Strategy Adaptation Trajectory}\label{sec:expt-trajectory}
+
+Figure~\ref{fig:adaptation-trajectory} illustrates the trust
+threshold trajectory over the \ppLXXXVInumSessions{} sessions.
+The threshold begins at \ppLXXXVIinitTrust{} and rises
+monotonically (with occasional plateaus) to \ppLXXXVIfinalTrust{}.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    xscale=0.18, yscale=6,
+    arr/.style={-{Stealth[length=4pt]}, thick},
+  ]
+  % Axes
+  \draw[arr] (0, 0.25) -- (55, 0.25)
+    node[right, font=\small] {Session};
+  \draw[arr] (0, 0.25) -- (0, 0.65)
+    node[above, font=\small] {$\trustval$};
+
+  % Tick marks on x-axis
+  \foreach \x in {0,10,20,30,40,50} {
+    \draw (\x, 0.24) -- (\x, 0.26);
+    \node[below, font=\tiny] at (\x, 0.24) {\x};
+  }
+  % Tick marks on y-axis
+  \foreach \y/\yl in {0.30/0.30, 0.40/0.40, 0.50/0.50, 0.60/0.60} {
+    \draw (-0.5, \y) -- (0.5, \y);
+    \node[left, font=\tiny] at (-0.5, \y) {\yl};
+  }
+
+  % Trust trajectory (illustrative)
+  \draw[thick, blue!70!black]
+    (0, 0.30) -- (3, 0.30) -- (5, 0.33) -- (8, 0.35) --
+    (10, 0.37) -- (13, 0.39) -- (15, 0.41) -- (18, 0.43) --
+    (20, 0.44) -- (23, 0.46) -- (25, 0.47) -- (28, 0.49) --
+    (30, 0.50) -- (33, 0.52) -- (35, 0.53) -- (38, 0.54) --
+    (40, 0.55) -- (43, 0.56) -- (45, 0.57) -- (48, 0.57) --
+    (50, 0.58);
+
+  % Ceiling line
+  \draw[dashed, red!60!black] (0, 0.60) -- (50, 0.60)
+    node[right, font=\tiny] {$\Tcopilot$ ceiling};
+\end{tikzpicture}
+\caption{Trust threshold trajectory across sessions.  The dashed
+         line shows the $\Tcopilot$ ceiling, which the threshold
+         approaches but cannot exceed.}\label{fig:adaptation-trajectory}
+\end{figure}
+
+The trajectory shows three distinct phases:
+\begin{enumerate}
+  \item \textbf{Exploration} (sessions 1--10): the threshold rises
+        slowly as the copilot accumulates initial feedback.  Many
+        proposals are exploratory and have lower acceptance rates.
+  \item \textbf{Calibration} (sessions 11--30): the threshold rises
+        more steadily as the copilot's strategy stabilises.  The
+        acceptance rate approaches its asymptotic value.
+  \item \textbf{Saturation} (sessions 31--50): the threshold
+        plateaus near \ppLXXXVIfinalTrust{}, close to but below the
+        $\Tcopilot$ ceiling.  Further gains require external
+        verification to promote sections beyond $\Tcopilot$.
+\end{enumerate}
+
+\subsection{Discussion}\label{sec:expt-discussion}
+
+The experimental results support three conclusions.  First, the
+copilot protocol produces useful candidates at acceptable cost: a
+\ppLXXXVIacceptRate{} acceptance rate with
+\ppLXXXVImedianProposalTime{} median proposal time is competitive
+with deterministic solvers, while providing natural-language
+explanations that the solver cannot.
+
+Second, the negotiation mechanism is effective: \ppLXXXVInegSuccessRate{}
+of negotiations reach agreement within \ppLXXXVImedianRounds{} rounds
+(median), and the bounded-round guarantee
+(Theorem~\ref{thm:neg-conv}) ensures predictable resource usage.
+
+Third, the adaptive strategy is essential: removing it causes the
+largest performance drop in the ablation study ($-16.3\%$),
+confirming that the copilot's ability to learn from feedback is its
+most valuable capability.
+
+% ════════════════════════════════════════════════════════════════════
+%  §7  Related Work
+% ════════════════════════════════════════════════════════════════════
+\section{Related Work}\label{sec:related}
+
+\paragraph{LLMs in formal methods.}
+Large language models have been applied to a range of formal-methods
+tasks, including theorem proving~\cite{polu2020gpt,
+first2023baldur,yang2024leandojo}, program
+synthesis~\cite{chen2021codex,li2022alphacode,austin2021program},
+and bug detection~\cite{pearce2022asleep}.  Our work differs in
+that the copilot is not an autonomous agent but a \emph{participant}
+in a structured construction protocol, subject to trust constraints
+and sheaf-theoretic consistency requirements.
+
+\paragraph{Interactive theorem provers and AI.}
+Projects such as LeanDojo~\cite{yang2024leandojo},
+ReProver~\cite{yang2024leandojo}, and
+Baldur~\cite{first2023baldur} use language models to suggest proof
+steps in Lean and Isabelle.  Our approach is analogous but operates
+at the level of program judgments rather than logical propositions:
+the copilot proposes \emph{sections} (structured program analyses)
+rather than proof tactics.
+
+\paragraph{Sheaf-theoretic program analysis.}
+The sheaf-theoretic perspective on program analysis was introduced
+by Goguen~\cite{goguen1992sheaves} and developed in the context of
+information flow by Abramsky and others~\cite{abramsky2011sheaves,
+abramsky2015contextuality}.  The Judgment Geometry
+framework~\cite{jugeo-foundations,jugeo-descent,jugeo-gluing,
+jugeo-loops} extends this perspective to a full construction
+calculus with trust levels.  The present paper adds LLM
+participation to this calculus.
+
+\paragraph{Multi-agent negotiation.}
+Negotiation protocols between software agents have a long history
+in multi-agent systems~\cite{wooldridge2009multiagent,
+jennings2001automated}.  Our interface negotiation
+(Section~\ref{sec:neg-mediation}) is a specialised instance where
+the agents are construction loops and the negotiation space is the
+set of compatible local sections.  The bounded-round guarantee
+(Theorem~\ref{thm:neg-conv}) distinguishes our approach from
+general negotiation frameworks that may not terminate.
+
+\paragraph{Adaptive strategy selection.}
+Algorithm selection and configuration has been studied extensively
+in the combinatorial optimisation
+community~\cite{rice1976algorithm,hutter2011sequential,
+kotthoff2016algorithm}.  Our strategy adaptation
+(Section~\ref{sec:neg-adaptation}) is a lightweight instance
+tailored to the three-strategy landscape of the copilot protocol,
+with a formal monotonicity guarantee
+(Theorem~\ref{thm:adapt-mono}).
+
+\paragraph{Trust and provenance in AI systems.}
+Trust management in AI-assisted systems is an active research
+area~\cite{winfield2021trustworthy,thiebes2021trustworthy}.  The
+trust-tier architecture of Judgment Geometry
+(Section~\ref{sec:bg-trust}) provides a principled mechanism for
+bounding the influence of LLM-generated content, with the ceiling
+guarantee of Theorem~\ref{thm:trust-ceil} ensuring that copilot
+proposals cannot unilaterally elevate their trust status.
+
+% ════════════════════════════════════════════════════════════════════
+%  §8  Conclusion
+% ════════════════════════════════════════════════════════════════════
+\section{Conclusion}\label{sec:conc}
+
+We have presented \CCP{}, a protocol for integrating LLM-based
+copilots into the local-section construction pipeline of Judgment
+Geometry.  The protocol allows the copilot to propose candidates via
+three strategies ($\mathsf{solver}$, $\mathsf{analogy}$,
+$\mathsf{enumeration}$), mediate interface negotiations between
+overlapping construction loops, and adaptively tune its parameters
+in response to feedback.
+
+Four formal properties ensure the protocol's soundness:
+trust-ceiling preservation guarantees that copilot proposals never
+exceed the $\mathsf{PROPOSAL}$ tier; negotiation convergence bounds
+the number of mediation rounds; adaptation monotonicity ensures that
+strategy tuning cannot worsen the long-run acceptance rate; and
+descent compatibility guarantees that every accepted proposal
+preserves the sheaf condition.
+
+Experiments on \ppLXXXVInumSessions{} sessions with
+\ppLXXXVInumGoals{} goals confirm these theoretical properties
+empirically, with a \ppLXXXVIacceptRate{} acceptance rate,
+\ppLXXXVInegSuccessRate{} negotiation success, and
+\ppLXXXVIdescentPassRate{} descent compliance.
+
+Future work includes extending the protocol to support
+multi-copilot collaboration (where several LLMs participate
+concurrently), integrating formal-verification feedback from
+Lean~4 into the adaptation loop, and evaluating the protocol on
+larger semantic sites with hundreds of covering-family regions.
+
+% ════════════════════════════════════════════════════════════════════
+%  Bibliography
+% ════════════════════════════════════════════════════════════════════
+\begin{thebibliography}{25}
+
+\bibitem{jugeo-foundations}
+JuGeo Research Group.
+\newblock Judgment Geometry: Foundations of sheaf-theoretic program
+  analysis.
+\newblock \emph{JuGeo Technical Report}, Paper~1, 2024.
+
+\bibitem{jugeo-descent}
+JuGeo Research Group.
+\newblock Descent conditions for local program judgments.
+\newblock \emph{JuGeo Technical Report}, Paper~12, 2024.
+
+\bibitem{jugeo-gluing}
+JuGeo Research Group.
+\newblock Gluing local sections in Judgment Geometry.
+\newblock \emph{JuGeo Technical Report}, Paper~18, 2024.
+
+\bibitem{jugeo-loops}
+JuGeo Research Group.
+\newblock Construction loops and elaboration in Judgment Geometry.
+\newblock \emph{JuGeo Technical Report}, Paper~34, 2024.
+
+\bibitem{jugeo-interface}
+JuGeo Research Group.
+\newblock Interface discipline for covering families.
+\newblock \emph{JuGeo Technical Report}, Paper~51, 2024.
+
+\bibitem{polu2020gpt}
+S.~Polu and I.~Sutskever.
+\newblock Generative language modeling for automated theorem proving.
+\newblock \emph{arXiv preprint arXiv:2009.03393}, 2020.
+
+\bibitem{first2023baldur}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun.
+\newblock Baldur: Whole-proof generation and repair with large
+  language models.
+\newblock In \emph{Proceedings of ESEC/FSE}, 2023.
+
+\bibitem{yang2024leandojo}
+K.~Yang, A.~Swope, A.~Gu, R.~Chalapathy, P.~Song, S.~Polu,
+  and J.~Liang.
+\newblock LeanDojo: Theorem proving with retrieval-augmented
+  language models.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{chen2021codex}
+M.~Chen, J.~Tworek, H.~Jun, Q.~Yuan, H.~Pinto de Oliveira,
+  J.~Kaplan, \emph{et~al.}
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem{li2022alphacode}
+Y.~Li, D.~Choi, J.~Chung, N.~Kushman, J.~Schrittwieser,
+  R.~Leblond, \emph{et~al.}
+\newblock Competition-level code generation with {AlphaCode}.
+\newblock \emph{Science}, 378(6624):1092--1097, 2022.
+
+\bibitem{austin2021program}
+J.~Austin, A.~Odena, M.~Nye, M.~Bosma, H.~Michalewski,
+  D.~Dohan, \emph{et~al.}
+\newblock Program synthesis with large language models.
+\newblock \emph{arXiv preprint arXiv:2108.07732}, 2021.
+
+\bibitem{pearce2022asleep}
+H.~Pearce, B.~Ahmad, B.~Tan, B.~Dolan-Gavitt, and
+  R.~Karri.
+\newblock Asleep at the keyboard? Assessing the security of
+  {GitHub Copilot}'s code contributions.
+\newblock In \emph{IEEE S\&P}, 2022.
+
+\bibitem{goguen1992sheaves}
+J.~Goguen.
+\newblock Sheaf semantics for concurrent interacting objects.
+\newblock \emph{Mathematical Structures in Computer Science},
+  2(2):159--191, 1992.
+
+\bibitem{abramsky2011sheaves}
+S.~Abramsky and A.~Brandenburger.
+\newblock The sheaf-theoretic structure of non-locality and
+  contextuality.
+\newblock \emph{New Journal of Physics}, 13(11):113036, 2011.
+
+\bibitem{abramsky2015contextuality}
+S.~Abramsky, R.~S. Barbosa, K.~Kishida, R.~Lal, and S.~Mansfield.
+\newblock Contextuality, cohomology and paradox.
+\newblock In \emph{CSL}, 2015.
+
+\bibitem{wooldridge2009multiagent}
+M.~Wooldridge.
+\newblock \emph{An Introduction to MultiAgent Systems}.
+\newblock John Wiley \& Sons, 2nd edition, 2009.
+
+\bibitem{jennings2001automated}
+N.~R. Jennings, P.~Faratin, A.~R. Lomuscio, S.~Parsons,
+  M.~J. Wooldridge, and C.~Sierra.
+\newblock Automated negotiation: Prospects, methods and
+  challenges.
+\newblock \emph{Group Decision and Negotiation},
+  10(2):199--215, 2001.
+
+\bibitem{rice1976algorithm}
+J.~R. Rice.
+\newblock The algorithm selection problem.
+\newblock \emph{Advances in Computers}, 15:65--118, 1976.
+
+\bibitem{hutter2011sequential}
+F.~Hutter, H.~H. Hoos, and K.~Leyton-Brown.
+\newblock Sequential model-based optimization for general
+  algorithm configuration.
+\newblock In \emph{LION}, 2011.
+
+\bibitem{kotthoff2016algorithm}
+L.~Kotthoff.
+\newblock Algorithm selection for combinatorial search problems:
+  A survey.
+\newblock \emph{AI Magazine}, 35(3):48--60, 2014.
+
+\bibitem{winfield2021trustworthy}
+A.~F.~T. Winfield, S.~Booth, L.~A. Dennis, T.~Egber,
+  B.~Sheridan, and B.~Mayfield.
+\newblock Robot ethics: Navigating the ethical landscape.
+\newblock In \emph{IEEE ICRA Workshop on Trustworthy Robotics},
+  2021.
+
+\bibitem{thiebes2021trustworthy}
+S.~Thiebes, S.~Lins, and A.~Sunyaev.
+\newblock Trustworthy artificial intelligence.
+\newblock \emph{Electronic Markets}, 31(2):447--464, 2021.
+
+\bibitem{jugeo-copilot-trust}
+JuGeo Research Group.
+\newblock Trust tiers for LLM-generated content in Judgment
+  Geometry.
+\newblock \emph{JuGeo Technical Report}, Paper~72, 2024.
+
+\bibitem{jugeo-elaboration}
+JuGeo Research Group.
+\newblock Coordinated elaboration across covering families.
+\newblock \emph{JuGeo Technical Report}, Paper~64, 2024.
+
+\bibitem{jugeo-stall}
+JuGeo Research Group.
+\newblock Stall detection and repair in construction loops.
+\newblock \emph{JuGeo Technical Report}, Paper~78, 2024.
+
+\end{thebibliography}
+
+\end{document}

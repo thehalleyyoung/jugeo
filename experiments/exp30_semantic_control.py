@@ -250,35 +250,38 @@ def main():
         pid = prog["id"]
 
         try:
-            # ---- Site complexity via SiteBuilder ----
-            site = SiteBuilder(prog["code"]).build()
-            n_coords = site.coordinate_count()
-            n_morphisms = site.morphism_count()
-            n_objects = len(site.objects())
-            n_families = len(site.covering_families())
+            # ---- Site complexity via CLI load ----
+            load_objs = run_jugeo("load", tmp)
+            load_data = load_objs[0] if load_objs else {}
+            summary = load_data.get("summary", load_data)
+            n_coords = summary.get("coordinates", 0)
+            n_morphisms = summary.get("morphisms", 0)
+            n_families = summary.get("covering_families", 0)
+            n_judgments = summary.get("judgments", 0)
+            n_bindings = summary.get("context_bindings", 0)
 
+            # SiteDiagnostics for coverage
+            site = SiteBuilder(prog["code"]).build()
             diag = SiteDiagnostics(site)
-            axiom_result = diag.check_axioms()
             coverage_ratio = diag.coverage_ratio()
             refinements = diag.suggest_refinements()
             n_refinements = (len(refinements) if isinstance(refinements, list)
-                             else refinements.get("count", 0)
-                             if isinstance(refinements, dict) else 0)
+                             else 0)
 
             complexity_stats.append({
                 "id": pid,
                 "coords": n_coords,
                 "morphisms": n_morphisms,
-                "objects": n_objects,
                 "families": n_families,
+                "judgments": n_judgments,
                 "coverage": coverage_ratio if isinstance(coverage_ratio, (int, float)) else 0,
                 "refinements": n_refinements,
             })
 
-            # ---- orchestrate_verification ----
+            # ---- orchestrate_verification → ControlDecision object ----
             ov = site.orchestrate_verification()
-            ov_steps = ov.get("steps", ov.get("phases", []))
-            ov_verdict = ov.get("verdict", ov.get("status", "unknown"))
+            ov_goal = getattr(ov, 'goal', None)
+            ov_notes = getattr(ov, 'notes', ())
 
             # ---- CLI descend (default / eager) ----
             t0 = time.perf_counter()
@@ -296,7 +299,7 @@ def main():
                 "overlaps": eager_overlaps,
             })
 
-            # ---- Exhaustive: run load + descend + evaluate ----
+            # ---- Exhaustive: load + descend + evaluate ----
             t0 = time.perf_counter()
             run_jugeo("load", tmp)
             desc_objs2 = run_jugeo("descend", tmp)
@@ -311,15 +314,16 @@ def main():
                 "overlaps": desc_exh.get("overlap_conditions_checked", 0),
             })
 
-            # ---- Iterative: SiteBuilder + orchestrate ----
+            # ---- Iterative: SiteBuilder + orchestrate_verification ----
             t0 = time.perf_counter()
             site2 = SiteBuilder(prog["code"]).build()
             ov2 = site2.orchestrate_verification()
             t_iterative = (time.perf_counter() - t0) * 1000
+            ov2_goal = getattr(ov2, 'goal', None)
 
             strategy_results["iterative"].append({
                 "id": pid, "time_ms": t_iterative,
-                "verdict": ov2.get("verdict", ov2.get("status", "unknown")),
+                "verdict": "verified" if ov2_goal is None and not getattr(ov2, 'reasons', ()) else "incomplete",
                 "sections": eager_sections,
                 "overlaps": eager_overlaps,
             })
@@ -329,19 +333,19 @@ def main():
             record = coord.run_full_cycle({"source": prog["code"]})
             met = coord.get_metrics().to_dict()
 
-            cycles = met.get("cycles", met.get("total_cycles", 1))
-            convergence = met.get("convergence",
-                                  met.get("converged", True))
-            avg_cycle_ms = met.get("avg_cycle_ms",
-                                   met.get("average_cycle_time", 0))
+            cycles = met.get("total_cycles", met.get("cycles", 1))
+            success_rate = met.get("success_rate", 0)
+            mean_duration = met.get("mean_cycle_duration", 0)
 
             control_loop_metrics.append({
                 "id": pid,
                 "cycles": cycles if isinstance(cycles, (int, float)) else 1,
-                "converged": bool(convergence),
-                "avg_cycle_ms": (avg_cycle_ms
-                                 if isinstance(avg_cycle_ms, (int, float))
+                "converged": success_rate >= 0.5,
+                "avg_cycle_ms": (mean_duration * 1000
+                                 if isinstance(mean_duration, (int, float))
                                  else 0),
+                "success_rate": success_rate,
+                "trust_score": met.get("mean_trust_score", 0),
             })
 
             print(f"  {pid:18s}  coords={n_coords:3d}  morph={n_morphisms:3d}  "
@@ -352,7 +356,7 @@ def main():
             print(f"  {pid:18s}  ERROR: {e}")
             complexity_stats.append({
                 "id": pid, "coords": 0, "morphisms": 0,
-                "objects": 0, "families": 0, "coverage": 0,
+                "families": 0, "judgments": 0, "coverage": 0,
                 "refinements": 0,
             })
             for strat in strategy_results:
@@ -387,8 +391,8 @@ def main():
 
     coords_list = [c["coords"] for c in complexity_stats]
     morphisms_list = [c["morphisms"] for c in complexity_stats]
-    objects_list = [c["objects"] for c in complexity_stats]
     families_list = [c["families"] for c in complexity_stats]
+    judgments_list = [c["judgments"] for c in complexity_stats]
     coverage_list = [c["coverage"] for c in complexity_stats
                      if isinstance(c["coverage"], (int, float))]
 
@@ -400,23 +404,23 @@ def main():
 
     avg_coords = safe_mean(coords_list)
     avg_morphisms = safe_mean(morphisms_list)
-    avg_objects = safe_mean(objects_list)
     avg_families = safe_mean(families_list)
+    avg_judgments = safe_mean(judgments_list)
     avg_coverage = safe_mean(coverage_list)
 
     print(f"  Programs:    {len(PROGRAMS)}")
     print(f"  Avg coords:  {avg_coords:.1f}")
     print(f"  Avg morph:   {avg_morphisms:.1f}")
-    print(f"  Avg objects: {avg_objects:.1f}")
     print(f"  Avg families:{avg_families:.1f}")
+    print(f"  Avg judgmts: {avg_judgments:.1f}")
     print(f"  Avg coverage:{avg_coverage:.2f}")
 
     m("ProgCount", len(PROGRAMS))
     m("AvgCoords", f"{avg_coords:.1f}")
     m("MaxCoords", safe_max(coords_list))
     m("AvgMorphisms", f"{avg_morphisms:.1f}")
-    m("AvgObjects", f"{avg_objects:.1f}")
     m("AvgFamilies", f"{avg_families:.1f}")
+    m("AvgJudgments", f"{avg_judgments:.1f}")
     m("AvgCoverage", f"{avg_coverage:.2f}")
     m("TotalCoords", sum(coords_list))
     m("TotalMorphisms", sum(morphisms_list))

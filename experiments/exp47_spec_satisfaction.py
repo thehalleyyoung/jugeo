@@ -206,13 +206,16 @@ def main():
         site = SiteBuilder(prog["code"]).build()
         spec_info = site.specification_satisfaction()
 
-        # Run evaluate CLI for per-program verification baseline
+        # Run evaluate CLI once for per-program verification baseline
+        t_eval_start = time.perf_counter()
         ev_objs = run_jugeo("evaluate", tmp)
+        eval_time = time.perf_counter() - t_eval_start
         ev = ev_objs[0] if ev_objs else {}
 
         # Incremental specification checking via maturity cycles k=1..5
+        # Each cycle adds one spec level; cumulative_k = sum of cycle times 1..k
         coord = CyclicSystemCoordinator.create(prog["name"] + "-spec")
-        prev_total = 0.0
+        cumulative = 0.0
 
         for k in range(1, MAX_K + 1):
             t0 = time.perf_counter()
@@ -220,25 +223,17 @@ def main():
                 "source": prog["code"],
                 "spec_level": k,
             })
-            cycle_time = time.perf_counter() - t0
+            cycle_k_time = time.perf_counter() - t0
 
-            metrics = coord.get_metrics().to_dict()
-            total_time = metrics["mean_cycle_duration"] * metrics["total_cycles"]
-            marginal = total_time - prev_total
+            # Total at level k = evaluate baseline + cumulative cycle cost
+            cumulative += cycle_k_time
+            total_at_k = eval_time + cumulative
+            marginal_at_k = cycle_k_time  # cost of adding spec level k
 
-            # Also include real wall-clock cost of the CLI evaluate
-            t1 = time.perf_counter()
-            run_jugeo("evaluate", tmp)
-            eval_time = time.perf_counter() - t1
+            per_k[k]["total_times"].append(total_at_k)
+            per_k[k]["marginal_times"].append(marginal_at_k)
 
-            combined_total = cycle_time + eval_time / MAX_K
-            combined_marginal = combined_total - (prev_total if k > 1 else 0.0)
-
-            per_k[k]["total_times"].append(combined_total)
-            per_k[k]["marginal_times"].append(combined_marginal)
-            prev_total = combined_total
-
-            print(f"    k={k}: total={combined_total:.4f}s  marginal={combined_marginal:.4f}s")
+            print(f"    k={k}: total={total_at_k*1000:.1f}ms  marginal={marginal_at_k*1000:.3f}ms")
 
         # Satisfaction level: trust score after all cycles
         final_metrics = coord.get_metrics().to_dict()
@@ -257,14 +252,14 @@ def main():
 
     mean_sat_level = safe_mean(all_sat_levels)
 
-    # Compute incremental overhead: mean of marginal/total across k=2..5
+    # Incremental overhead: mean ratio of marginal_k / marginal_1 for k=2..5
     overhead_ratios = []
     for k in range(2, MAX_K + 1):
         for i in range(len(PROGRAMS)):
-            total = per_k[k]["total_times"][i]
-            marginal = per_k[k]["marginal_times"][i]
-            if total > 0:
-                overhead_ratios.append(marginal / total)
+            base_marginal = per_k[1]["marginal_times"][i]
+            extra_marginal = per_k[k]["marginal_times"][i]
+            if base_marginal > 0:
+                overhead_ratios.append(extra_marginal / base_marginal)
     incremental_overhead = safe_mean(overhead_ratios) if overhead_ratios else 0.0
 
     # Print summary

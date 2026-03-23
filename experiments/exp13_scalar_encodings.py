@@ -12,7 +12,7 @@ Methodology:
   - jugeo descend → verification verdict
   - FragmentClassifier → classify generated formulas by SMT fragment
 
-Writes macros to papers/data-paper13.tex with prefix \ppThirteen.
+Writes macros to papers/data-paper13.tex with prefix \\ppThirteen.
 Re-run: python3 experiments/exp13_scalar_encodings.py
 """
 

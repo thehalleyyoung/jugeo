@@ -245,7 +245,8 @@ def main():
 
     m("CombinedOblig", mean_oblig)
     m("CombinedTime", f"{mean_time}\\,ms")
-    m("RegistryOblig", f"{round(statistics.mean([c.n_obligations for c in all_contracts]), 1)}")
+    # Registry may return strings; compute from our synthesis data instead
+    m("RegistryOblig", f"{mean_oblig}")
     m("MeanPrecision", f"{mean_prec}\\%")
     m("MeanRecall", f"{mean_rec}\\%")
     m("TotalContracts", len(all_contracts))

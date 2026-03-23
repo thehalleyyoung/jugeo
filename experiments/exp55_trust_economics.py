@@ -1,37 +1,21 @@
 #!/usr/bin/env python3
 """Paper 55 Experiment — Trust Economics: Economic Models for Trust Allocation.
 
-Studies trust algebra operations, maturity cycle economics, and per-coordinate
-quality across programs with varying trust-relevant patterns.
+Hypothesis: JuGeo's trust algebra and maturity cycles produce economically
+meaningful trust scores across security-sensitive programs.
 
-Every number is produced by calling the ``python3 -m jugeo`` CLI as a subprocess
-or via the public Python API.
 Re-run: python3 experiments/exp55_trust_economics.py
-Outputs: papers/data-paper55.tex  (LaTeX macros with \\ppLV… prefix)
-         experiments/results_paper55.json
 """
-import ast, json, os, random, statistics, subprocess, sys, tempfile, time
+import subprocess, json, os, tempfile, time, statistics
 
-random.seed(42)
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "src"))
-
-from jugeo import TrustAlgebra
-from jugeo.evidence.trust import TrustLevel
-from jugeo.geometry.site import Coordinate, CoordinateKind
-from jugeo.geometry import SiteBuilder
-from jugeo.maturity import CyclicSystemCoordinator
-
-# ── helpers ──────────────────────────────────────────────────────────────
+ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 def run_jugeo(*args):
-    """Run jugeo CLI and return a list of parsed JSON objects."""
     cmd = ["python3", "-m", "jugeo", "--format", "json"] + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     lines = [l for l in result.stdout.splitlines()
-             if not (len(l) > 8 and l[2] == ':' and l[5] == ':')]
-    lines = [l for l in lines if not l.startswith("JuGeo v")]
+             if not (len(l) > 8 and l[2] == ':' and l[5] == ':')
+             and not l.startswith("JuGeo v")]
     text = "\n".join(lines)
     objects = []
     decoder = json.JSONDecoder()
@@ -48,26 +32,18 @@ def run_jugeo(*args):
             break
     return objects
 
-
-def write_temp(source):
-    """Write source to a temp .py file and return its path."""
-    f = tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False)
+def write_temp_py(source):
+    f = tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False, dir='/tmp')
     f.write(source)
     f.close()
     return f.name
 
-
 def cleanup(path):
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
-# ── test programs ────────────────────────────────────────────────────────
+    try: os.unlink(path)
+    except OSError: pass
 
 PROGRAMS = {
-    "bank_account": '''
+    "bank_account": '''\
 class BankAccount:
     def __init__(self, owner, balance=0):
         self.owner = owner
@@ -78,8 +54,7 @@ class BankAccount:
         if amount <= 0:
             raise ValueError("Deposit must be positive")
         self.balance += amount
-        self.history.append(("deposit", amount))
-        return self.balance
+        self.history.append(('deposit', amount))
 
     def withdraw(self, amount):
         if amount <= 0:
@@ -87,178 +62,119 @@ class BankAccount:
         if amount > self.balance:
             raise ValueError("Insufficient funds")
         self.balance -= amount
-        self.history.append(("withdraw", amount))
-        return self.balance
+        self.history.append(('withdraw', amount))
 
-    def check_balance(self):
+    def get_balance(self):
         return self.balance
-
-    def transfer(self, other, amount):
-        self.withdraw(amount)
-        other.deposit(amount)
-        return True
 ''',
-
-    "auth_module": '''
+    "auth_module": '''\
 import hashlib
 
 def hash_password(password, salt="default_salt"):
-    return hashlib.sha256((salt + password).encode()).hexdigest()
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
 def verify_password(password, hashed, salt="default_salt"):
     return hash_password(password, salt) == hashed
 
-class AuthManager:
-    def __init__(self):
-        self.users = {}
-        self.sessions = {}
+def create_user(username, password):
+    hashed = hash_password(password)
+    return {"username": username, "password_hash": hashed, "active": True}
 
-    def register(self, username, password):
-        if username in self.users:
-            return False
-        self.users[username] = hash_password(password)
-        return True
-
-    def login(self, username, password):
-        if username not in self.users:
-            return None
-        if not verify_password(password, self.users[username]):
-            return None
-        token = hashlib.sha256(f"{username}{id(self)}".encode()).hexdigest()[:16]
-        self.sessions[token] = username
-        return token
-
-    def validate_session(self, token):
-        return self.sessions.get(token)
+def authenticate(user, password):
+    if not user.get("active", False):
+        return False
+    return verify_password(password, user["password_hash"])
 ''',
-
-    "rate_limiter": '''
+    "rate_limiter": '''\
 import time as _time
 
 class RateLimiter:
-    def __init__(self, max_calls, window_seconds):
-        self.max_calls = max_calls
+    def __init__(self, max_requests, window_seconds):
+        self.max_requests = max_requests
         self.window = window_seconds
-        self.calls = {}
+        self.requests = []
 
-    def allow(self, client_id):
+    def allow(self):
         now = _time.time()
-        if client_id not in self.calls:
-            self.calls[client_id] = []
-        self.calls[client_id] = [
-            t for t in self.calls[client_id] if now - t < self.window
-        ]
-        if len(self.calls[client_id]) >= self.max_calls:
-            return False
-        self.calls[client_id].append(now)
-        return True
+        self.requests = [t for t in self.requests if now - t < self.window]
+        if len(self.requests) < self.max_requests:
+            self.requests.append(now)
+            return True
+        return False
 
-    def remaining(self, client_id):
+    def remaining(self):
         now = _time.time()
-        recent = [t for t in self.calls.get(client_id, []) if now - t < self.window]
-        return max(0, self.max_calls - len(recent))
-
-    def reset(self, client_id):
-        self.calls.pop(client_id, None)
+        self.requests = [t for t in self.requests if now - t < self.window]
+        return max(0, self.max_requests - len(self.requests))
 ''',
-
-    "xor_cipher": '''
+    "xor_cipher": '''\
 def xor_encrypt(plaintext, key):
-    key_bytes = key.encode() if isinstance(key, str) else key
-    plain_bytes = plaintext.encode() if isinstance(plaintext, str) else plaintext
-    encrypted = bytearray()
-    for i, b in enumerate(plain_bytes):
-        encrypted.append(b ^ key_bytes[i % len(key_bytes)])
-    return bytes(encrypted)
+    result = []
+    for i, ch in enumerate(plaintext):
+        result.append(chr(ord(ch) ^ ord(key[i % len(key)])))
+    return ''.join(result)
 
 def xor_decrypt(ciphertext, key):
     return xor_encrypt(ciphertext, key)
 
 def rotate_key(key, n):
-    key_bytes = key.encode() if isinstance(key, str) else key
-    n = n % len(key_bytes)
-    return bytes(key_bytes[n:] + key_bytes[:n])
-
-def double_encrypt(plaintext, key1, key2):
-    first_pass = xor_encrypt(plaintext, key1)
-    return xor_encrypt(first_pass, key2)
+    n = n % len(key)
+    return key[n:] + key[:n]
 ''',
-
-    "access_control": '''
-class Permission:
-    READ = "read"
-    WRITE = "write"
-    EXECUTE = "execute"
-    ADMIN = "admin"
-
-class ACL:
+    "acl": '''\
+class AccessControl:
     def __init__(self):
-        self.rules = {}
+        self.permissions = {}
 
     def grant(self, user, resource, permission):
         key = (user, resource)
-        if key not in self.rules:
-            self.rules[key] = set()
-        self.rules[key].add(permission)
+        if key not in self.permissions:
+            self.permissions[key] = set()
+        self.permissions[key].add(permission)
 
     def revoke(self, user, resource, permission):
         key = (user, resource)
-        if key in self.rules:
-            self.rules[key].discard(permission)
+        if key in self.permissions:
+            self.permissions[key].discard(permission)
 
     def check(self, user, resource, permission):
         key = (user, resource)
-        return permission in self.rules.get(key, set())
+        return permission in self.permissions.get(key, set())
 
     def list_permissions(self, user, resource):
-        return list(self.rules.get((user, resource), set()))
-
-    def has_admin(self, user, resource):
-        return self.check(user, resource, Permission.ADMIN)
+        key = (user, resource)
+        return list(self.permissions.get(key, set()))
 ''',
-
-    "voting_system": '''
-class Ballot:
-    def __init__(self, voter_id, choices):
-        self.voter_id = voter_id
-        self.choices = choices
-        self.timestamp = None
-
+    "voting": '''\
 class VotingSystem:
     def __init__(self, candidates):
         self.candidates = list(candidates)
-        self.ballots = {}
-        self.closed = False
+        self.votes = {c: 0 for c in candidates}
+        self.voters = set()
 
-    def cast_vote(self, voter_id, choice):
-        if self.closed:
-            raise ValueError("Voting is closed")
-        if choice not in self.candidates:
-            raise ValueError(f"Invalid candidate: {choice}")
-        if voter_id in self.ballots:
+    def cast_vote(self, voter_id, candidate):
+        if voter_id in self.voters:
             raise ValueError("Already voted")
-        self.ballots[voter_id] = Ballot(voter_id, choice)
-        return True
+        if candidate not in self.votes:
+            raise ValueError("Invalid candidate")
+        self.votes[candidate] += 1
+        self.voters.add(voter_id)
 
     def tally(self):
-        counts = {c: 0 for c in self.candidates}
-        for ballot in self.ballots.values():
-            counts[ballot.choices] += 1
-        return counts
+        return dict(self.votes)
 
     def winner(self):
-        counts = self.tally()
-        return max(counts, key=counts.get)
+        if not self.voters:
+            return None
+        return max(self.votes, key=self.votes.get)
 
-    def close(self):
-        self.closed = True
-        return self.tally()
+    def turnout(self, total_eligible):
+        return len(self.voters) / total_eligible if total_eligible > 0 else 0
 ''',
-
-    "contract_checker": '''
+    "contract_checker": '''\
 def requires(condition, message="Precondition failed"):
     if not condition:
-        raise AssertionError(message)
+        raise ValueError(message)
 
 def ensures(condition, message="Postcondition failed"):
     if not condition:
@@ -267,404 +183,242 @@ def ensures(condition, message="Postcondition failed"):
 def checked_divide(a, b):
     requires(b != 0, "Division by zero")
     result = a / b
-    ensures(isinstance(result, float), "Result must be float")
+    ensures(isinstance(result, (int, float)), "Result must be numeric")
     return result
 
 def checked_sqrt(x):
     requires(x >= 0, "Cannot take sqrt of negative")
     result = x ** 0.5
     ensures(result >= 0, "sqrt must be non-negative")
-    ensures(abs(result * result - x) < 1e-10, "sqrt accuracy")
     return result
 
-def checked_factorial(n):
-    requires(isinstance(n, int) and n >= 0, "n must be non-negative integer")
-    result = 1
-    for i in range(1, n + 1):
-        result *= i
-    ensures(result >= 1, "Factorial must be >= 1")
-    return result
-
-def invariant_check(obj, predicate, message="Invariant violated"):
-    if not predicate(obj):
-        raise AssertionError(message)
+def checked_index(lst, i):
+    requires(0 <= i < len(lst), f"Index {i} out of bounds")
+    return lst[i]
 ''',
-
-    "audit_logger": '''
-import json as _json
+    "audit_logger": '''\
 from datetime import datetime
-
-class AuditEntry:
-    def __init__(self, action, user, resource, success):
-        self.action = action
-        self.user = user
-        self.resource = resource
-        self.success = success
-        self.timestamp = datetime.now().isoformat()
-
-    def to_dict(self):
-        return {
-            "action": self.action,
-            "user": self.user,
-            "resource": self.resource,
-            "success": self.success,
-            "timestamp": self.timestamp,
-        }
 
 class AuditLogger:
     def __init__(self):
         self.entries = []
 
-    def log(self, action, user, resource, success=True):
-        entry = AuditEntry(action, user, resource, success)
+    def log(self, action, user, details=None):
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "action": action,
+            "user": user,
+            "details": details,
+        }
         self.entries.append(entry)
         return entry
 
     def query(self, user=None, action=None):
         results = self.entries
         if user:
-            results = [e for e in results if e.user == user]
+            results = [e for e in results if e["user"] == user]
         if action:
-            results = [e for e in results if e.action == action]
+            results = [e for e in results if e["action"] == action]
         return results
 
-    def export_json(self):
-        return _json.dumps([e.to_dict() for e in self.entries], indent=2)
-
-    def count_failures(self):
-        return sum(1 for e in self.entries if not e.success)
+    def count(self):
+        return len(self.entries)
 ''',
-
-    "checksum_calc": '''
-def adler32(data):
-    a = 1
-    b = 0
-    MOD = 65521
+    "checksum": '''\
+def checksum_xor(data):
+    result = 0
     for byte in data:
-        a = (a + byte) % MOD
-        b = (b + a) % MOD
-    return (b << 16) | a
+        result ^= byte
+    return result
 
-def fletcher16(data):
-    sum1 = 0
-    sum2 = 0
+def checksum_sum(data, modulus=256):
+    return sum(data) % modulus
+
+def crc_simple(data, polynomial=0x1021):
+    crc = 0xFFFF
     for byte in data:
-        sum1 = (sum1 + byte) % 255
-        sum2 = (sum2 + sum1) % 255
-    return (sum2 << 8) | sum1
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ polynomial
+            else:
+                crc <<= 1
+            crc &= 0xFFFF
+    return crc
 
-def simple_hash(data, modulus=1000003):
-    h = 0
-    for i, byte in enumerate(data):
-        h = (h * 31 + byte) % modulus
-    return h
-
-def verify_checksum(data, expected, algorithm="adler32"):
-    funcs = {"adler32": adler32, "fletcher16": fletcher16, "simple_hash": simple_hash}
-    if algorithm not in funcs:
-        raise ValueError(f"Unknown algorithm: {algorithm}")
-    return funcs[algorithm](data) == expected
+def verify_checksum(data, expected, method='xor'):
+    if method == 'xor':
+        return checksum_xor(data) == expected
+    elif method == 'sum':
+        return checksum_sum(data) == expected
+    return False
 ''',
-
-    "digital_signature": '''
+    "signature_stub": '''\
 import hashlib
 
-def generate_keypair(seed):
+def sign_message(message, private_key):
+    combined = message + private_key
+    return hashlib.sha256(combined.encode()).hexdigest()
+
+def verify_signature(message, signature, private_key):
+    expected = sign_message(message, private_key)
+    return expected == signature
+
+def create_keypair(seed):
     private = hashlib.sha256(seed.encode()).hexdigest()
     public = hashlib.sha256(private.encode()).hexdigest()
-    return private, public
-
-def sign_message(message, private_key):
-    combined = f"{private_key}:{message}"
-    signature = hashlib.sha256(combined.encode()).hexdigest()
-    return signature
-
-def verify_signature(message, signature, public_key):
-    expected_private = None
-    rehash = hashlib.sha256(signature.encode()).hexdigest()
-    return len(signature) == 64
-
-def sign_document(doc_lines, private_key):
-    content_hash = hashlib.sha256("\\n".join(doc_lines).encode()).hexdigest()
-    return sign_message(content_hash, private_key)
-
-def create_certificate(subject, issuer_key):
-    sig = sign_message(subject, issuer_key)
-    return {"subject": subject, "signature": sig, "valid": True}
+    return {"private": private, "public": public}
 ''',
 }
 
-# ── trust algebra experiment ─────────────────────────────────────────────
 
-TRUST_LEVELS = [
-    TrustLevel.CONTRADICTED,
-    TrustLevel.LOW,
-    TrustLevel.COPILOT_SUGGESTED,
-    TrustLevel.ORACLE_PROPOSED,
-    TrustLevel.RUNTIME_WITNESSED,
-    TrustLevel.HUMAN_ATTESTED,
-    TrustLevel.SOLVER_DISCHARGED,
-    TrustLevel.MECHANICALLY_VERIFIED,
-]
+def measure_program(name, source):
+    tmp = write_temp_py(source)
+    try:
+        t0 = time.perf_counter()
+        eval_objs = run_jugeo("evaluate", tmp)
+        eval_time = time.perf_counter() - t0
 
+        t1 = time.perf_counter()
+        enc_objs = run_jugeo("encode", tmp)
+        encode_time = time.perf_counter() - t1
 
-def run_trust_algebra_experiments(ta):
-    """Exercise every pairwise trust-algebra operation and collect stats."""
-    ops_count = 0
-    admissible_count = 0
-    sheaf_pass = 0
-    yields = []
+        eval_data = eval_objs[0] if eval_objs else {}
+        per_coord = eval_data.get("per_coordinate", [])
+        qualities = [c.get("quality", 0) for c in per_coord]
 
-    for a in TRUST_LEVELS:
-        for b in TRUST_LEVELS:
-            ta.compose(a, b)
-            ta.meet(a, b)
-            ta.join(a, b)
-            ops_count += 3
+        enc_data = enc_objs[0] if enc_objs else {}
+        enc_files = enc_data.get("files", [{}])
+        enc_file = enc_files[0] if enc_files else {}
+        coordinates = enc_file.get("coordinates", {})
+        discharge_count = sum(1 for c in coordinates.values() if c.get("assertions", 0) > 0)
+        total_assertions = sum(c.get("assertions", 0) for c in coordinates.values())
 
-    for level in TRUST_LEVELS:
-        try:
-            if ta.is_admissible({"evidence": [level]}):
+        # Run maturity cycle
+        from jugeo.maturity import CyclicSystemCoordinator
+        coord = CyclicSystemCoordinator.create(name)
+        record, transitions = coord.run_full_cycle({'source': source})
+        metrics = coord.get_metrics().to_dict()
+
+        # Trust algebra ops
+        from jugeo import TrustAlgebra
+        from jugeo.evidence.trust import TrustLevel
+        ta = TrustAlgebra()
+        levels = list(TrustLevel)
+        ops_count = 0
+        admissible_count = 0
+        sheaf_pass = 0
+        yields = []
+        for lev in levels:
+            if ta.is_admissible(lev):
                 admissible_count += 1
-        except Exception:
-            pass
-
+            ops_count += 1
+            try:
+                y = ta.theorem_yield(lev)
+                yields.append(y if isinstance(y, (int, float)) else 0)
+            except Exception:
+                yields.append(0)
+        for i in range(len(levels)):
+            for j in range(len(levels)):
+                ta.compose(levels[i], levels[j])
+                ops_count += 1
         try:
-            ta.promote(level, "experiment_justification")
+            sheaf_result = ta.sheaf_condition_check(levels[:3])
+            sheaf_pass = 1 if sheaf_result else 0
         except Exception:
-            pass
+            sheaf_pass = 0
 
-        try:
-            y = ta.theorem_yield(level)
-            if isinstance(y, dict) and "yield" in y:
-                yields.append(1.0 if y["yield"] == "computed" else 0.0)
-        except Exception:
-            pass
-
-    # Sheaf checks on small sites
-    for i in range(len(TRUST_LEVELS)):
-        try:
-            sb = SiteBuilder()
-            sb.add_coordinate(Coordinate(f"c{i}", CoordinateKind.FUNCTION))
-            site = sb.build()
-            result = ta.sheaf_condition_check(
-                site, {f"c{i}": TRUST_LEVELS[i]}
-            )
-            if result.get("satisfied", False):
-                sheaf_pass += 1
-        except Exception:
-            pass
-
-    return {
-        "ops_count": ops_count,
-        "admissible_count": admissible_count,
-        "admissible_total": len(TRUST_LEVELS),
-        "sheaf_pass": sheaf_pass,
-        "sheaf_total": len(TRUST_LEVELS),
-        "mean_yield": round(statistics.mean(yields), 4) if yields else 0.0,
-    }
+        return {
+            "name": name,
+            "eval_time": round(eval_time, 4),
+            "mean_quality": statistics.mean(qualities) if qualities else 0,
+            "discharge_count": discharge_count,
+            "total_assertions": total_assertions,
+            "trust_score": metrics.get("mean_trust_score", 0),
+            "cycle_duration": metrics.get("mean_cycle_duration", 0),
+            "success_rate": metrics.get("success_rate", 0),
+            "obstruction_rate": metrics.get("obstruction_rate", 0),
+            "phases_completed": len(record.phases_completed),
+            "ops_count": ops_count,
+            "admissible_count": admissible_count,
+            "sheaf_pass": sheaf_pass,
+            "mean_yield": statistics.mean(yields) if yields else 0,
+            "total_props": total_assertions,
+        }
+    finally:
+        cleanup(tmp)
 
 
-# ── main ─────────────────────────────────────────────────────────────────
+def fmt_time(s):
+    return f"{s*1000:.1f}\\,ms" if s < 0.01 else f"{s:.2f}\\,s"
+
+def fmt_float(v, d=1):
+    return f"{v:.{d}f}"
+
+def fmt_pct(r):
+    return f"{r*100:.1f}\\%"
+
 
 def main():
     print("=" * 72)
-    print("EXPERIMENT 55 — Trust Economics")
-    print("  All numbers from `python3 -m jugeo` CLI + Python API")
+    print("Paper 55: Trust Economics — Economic Models for Trust Allocation")
     print("=" * 72)
-    print()
 
-    ta = TrustAlgebra()
-    tmpfiles = []
-    program_results = []
-
-    eval_times = []
-    cycle_durations = []
-    trust_scores = []
-    phase_counts = []
-    qualities = []
-    total_judgments = 0
-    discharge_count = 0
-    total_encode_coords = 0
-    cycle_successes = 0
-    obstruction_total = 0
-
+    results = []
     for name, source in PROGRAMS.items():
-        print(f"  [{name}]")
-        path = write_temp(source)
-        tmpfiles.append(path)
+        print(f"\n  Measuring {name}...")
+        m = measure_program(name, source)
+        results.append(m)
+        print(f"    Trust: {m['trust_score']:.2f}, Quality: {m['mean_quality']:.3f}")
+        print(f"    Discharge: {m['discharge_count']}, Assertions: {m['total_assertions']}")
 
-        # ── evaluate ─────────────────────────────────────────────────────
-        t0 = time.perf_counter()
-        eval_objs = run_jugeo("evaluate", path)
-        eval_wall = time.perf_counter() - t0
-        eval_times.append(eval_wall)
-
-        ev = eval_objs[0] if eval_objs else {}
-        trust_info = ev.get("trust", {})
-        per_coord = ev.get("per_coordinate", [])
-        cover_quality = ev.get("cover_quality", {})
-
-        for pc in per_coord:
-            qualities.append(pc.get("quality", 0.0))
-
-        # ── encode ───────────────────────────────────────────────────────
-        enc_objs = run_jugeo("encode", path)
-        enc = enc_objs[0] if enc_objs else {}
-        files_enc = (enc.get("files") or [{}])
-        if isinstance(files_enc, list) and files_enc:
-            file_enc = files_enc[0]
-        elif isinstance(enc, dict) and "coordinates" in enc:
-            file_enc = enc
-        else:
-            file_enc = {}
-
-        coords_dict = file_enc.get("coordinates", {})
-        judgments_list = file_enc.get("judgments", [])
-        total_judgments += len(judgments_list)
-
-        for cname, cdata in coords_dict.items():
-            total_encode_coords += 1
-            assertions = cdata.get("assertions", 0)
-            if assertions > 0:
-                discharge_count += 1
-
-        # ── maturity cycle ───────────────────────────────────────────────
-        try:
-            coord = CyclicSystemCoordinator.create(name)
-            record, transitions = coord.run_full_cycle({"source": source})
-            metrics = coord.get_metrics().to_dict()
-
-            trust_scores.append(metrics.get("mean_trust_score", 0.0))
-            cycle_durations.append(metrics.get("mean_cycle_duration", 0.0))
-            phase_counts.append(len(record.phases_completed))
-            obstruction_total += metrics.get("total_obstructions", 0)
-            if metrics.get("success_rate", 0.0) > 0:
-                cycle_successes += 1
-        except Exception as exc:
-            print(f"    maturity cycle error: {exc}")
-            trust_scores.append(0.0)
-            cycle_durations.append(0.0)
-            phase_counts.append(0)
-
-        prog_result = {
-            "name": name,
-            "eval_wall_s": round(eval_wall, 4),
-            "trust": trust_info.get("aggregate_trust", "unknown"),
-            "cover_quality": cover_quality.get("total_score", 0.0),
-            "coordinates_encoded": len(coords_dict),
-            "judgments": len(judgments_list),
-            "per_coord_qualities": [pc.get("quality", 0.0) for pc in per_coord],
-        }
-        program_results.append(prog_result)
-        print(f"    eval={eval_wall:.3f}s  coords={len(coords_dict)}  "
-              f"judgments={len(judgments_list)}  trust={trust_info.get('aggregate_trust', '?')}")
-
-    # ── trust algebra pairwise experiment ────────────────────────────────
-    print("\n  Running trust algebra experiments …")
-    ta_results = run_trust_algebra_experiments(ta)
-    print(f"    ops={ta_results['ops_count']}  admissible={ta_results['admissible_count']}/{ta_results['admissible_total']}  "
-          f"sheaf_pass={ta_results['sheaf_pass']}/{ta_results['sheaf_total']}  "
-          f"mean_yield={ta_results['mean_yield']}")
-
-    # ── aggregate stats ──────────────────────────────────────────────────
-    n = len(PROGRAMS)
-    mean_trust = round(statistics.mean(trust_scores), 4) if trust_scores else 0.0
-    mean_cycle = round(statistics.mean(cycle_durations), 4) if cycle_durations else 0.0
-    success_rate = round(cycle_successes / n * 100, 1) if n else 0.0
-    obstruction_rate = round(obstruction_total / n * 100, 1) if n else 0.0
-    mean_phases = round(statistics.mean(phase_counts), 1) if phase_counts else 0.0
-    discharge_pct = round(discharge_count / total_encode_coords * 100, 1) if total_encode_coords else 0.0
-    mean_quality = round(statistics.mean(qualities), 4) if qualities else 0.0
-    admissible_pct = round(ta_results["admissible_count"] / ta_results["admissible_total"] * 100, 1) \
-        if ta_results["admissible_total"] else 0.0
-    mean_eval = round(statistics.mean(eval_times), 4) if eval_times else 0.0
+    n = len(results)
+    mean_trust = statistics.mean([r["trust_score"] for r in results])
+    mean_cycle = statistics.mean([r["cycle_duration"] for r in results])
+    success_rate = statistics.mean([r["success_rate"] for r in results])
+    obs_rate = statistics.mean([r["obstruction_rate"] for r in results])
+    mean_phases = statistics.mean([r["phases_completed"] for r in results])
+    total_judgments = sum(r["total_props"] for r in results)
+    total_discharge = sum(r["discharge_count"] for r in results)
+    discharge_pct = total_discharge / max(1, sum(len(PROGRAMS[r["name"]].splitlines()) for r in results))
+    mean_quality = statistics.mean([r["mean_quality"] for r in results])
+    total_ops = sum(r["ops_count"] for r in results)
+    admissible_pct = statistics.mean([r["admissible_count"] / 8 for r in results])
+    sheaf_passes = sum(r["sheaf_pass"] for r in results)
+    mean_yield = statistics.mean([r["mean_yield"] for r in results])
+    mean_eval = statistics.mean([r["eval_time"] for r in results])
 
     print("\n" + "=" * 72)
     print("SUMMARY")
-    print(f"  Programs:            {n}")
-    print(f"  Mean trust score:    {mean_trust}")
-    print(f"  Mean cycle duration: {mean_cycle}s")
-    print(f"  Success rate:        {success_rate}%")
-    print(f"  Obstruction rate:    {obstruction_rate}%")
-    print(f"  Mean phases/cycle:   {mean_phases}")
-    print(f"  Total judgments:     {total_judgments}")
-    print(f"  Discharge count:     {discharge_count}/{total_encode_coords}  ({discharge_pct}%)")
-    print(f"  Mean coord quality:  {mean_quality}")
-    print(f"  Trust lattice ops:   {ta_results['ops_count']}")
-    print(f"  Admissible pct:      {admissible_pct}%")
-    print(f"  Sheaf check pass:    {ta_results['sheaf_pass']}")
-    print(f"  Mean theorem yield:  {ta_results['mean_yield']}")
-    print(f"  Mean eval time:      {mean_eval}s")
-    print("=" * 72)
-
-    # ── write LaTeX macros ───────────────────────────────────────────────
-    P = "ppLV"
-    tex = [
-        "% data-paper55.tex — AUTO-GENERATED by exp55_trust_economics.py",
-        "% DO NOT EDIT — regenerate with: python3 experiments/exp55_trust_economics.py",
-        "",
-    ]
-
-    def m(name, val):
-        tex.append(f"\\newcommand{{\\{P}{name}}}{{{val}}}")
-
-    m("totalPrograms", n)
-    m("meanTrustScore", mean_trust)
-    m("meanCycleDuration", f"{mean_cycle}\\,s")
-    m("successRate", f"{success_rate}\\%")
-    m("obstructionRate", f"{obstruction_rate}\\%")
-    m("meanPhases", mean_phases)
-    m("totalJudgments", total_judgments)
-    m("dischargeCount", discharge_count)
-    m("dischargePct", f"{discharge_pct}\\%")
-    m("meanQuality", mean_quality)
-    m("trustLatticeOps", ta_results["ops_count"])
-    m("admissiblePct", f"{admissible_pct}\\%")
-    m("sheafCheckPass", ta_results["sheaf_pass"])
-    m("meanYield", ta_results["mean_yield"])
-    m("meanEvalTime", f"{mean_eval}\\,s")
+    print(f"  Programs:      {n}")
+    print(f"  Mean trust:    {mean_trust:.3f}")
+    print(f"  Success rate:  {fmt_pct(success_rate)}")
 
     tex_path = os.path.join(ROOT, "papers", "data-paper55.tex")
     with open(tex_path, "w") as f:
-        f.write("\n".join(tex) + "\n")
-    print(f"\nWrote {tex_path}")
+        f.write("% data-paper55.tex — AUTO-GENERATED by exp55_trust_economics.py\n")
+        f.write("% DO NOT EDIT — regenerate with: python3 experiments/exp55_trust_economics.py\n\n")
+        f.write(f"\\newcommand{{\\ppLVtotalPrograms}}{{{n}}}\n")
+        f.write(f"\\newcommand{{\\ppLVmeanTrustScore}}{{{fmt_float(mean_trust, 3)}}}\n")
+        f.write(f"\\newcommand{{\\ppLVmeanCycleDuration}}{{{fmt_time(mean_cycle)}}}\n")
+        f.write(f"\\newcommand{{\\ppLVsuccessRate}}{{{fmt_pct(success_rate)}}}\n")
+        f.write(f"\\newcommand{{\\ppLVobstructionRate}}{{{fmt_pct(obs_rate)}}}\n")
+        f.write(f"\\newcommand{{\\ppLVmeanPhases}}{{{fmt_float(mean_phases)}}}\n")
+        f.write(f"\\newcommand{{\\ppLVtotalJudgments}}{{{total_judgments}}}\n")
+        f.write(f"\\newcommand{{\\ppLVdischargeCount}}{{{total_discharge}}}\n")
+        f.write(f"\\newcommand{{\\ppLVdischargePct}}{{{fmt_pct(discharge_pct)}}}\n")
+        f.write(f"\\newcommand{{\\ppLVmeanQuality}}{{{fmt_float(mean_quality, 3)}}}\n")
+        f.write(f"\\newcommand{{\\ppLVtrustLatticeOps}}{{{total_ops}}}\n")
+        f.write(f"\\newcommand{{\\ppLVadmissiblePct}}{{{fmt_pct(admissible_pct)}}}\n")
+        f.write(f"\\newcommand{{\\ppLVsheafCheckPass}}{{{sheaf_passes}}}\n")
+        f.write(f"\\newcommand{{\\ppLVmeanYield}}{{{fmt_float(mean_yield, 3)}}}\n")
+        f.write(f"\\newcommand{{\\ppLVmeanEvalTime}}{{{fmt_time(mean_eval)}}}\n")
+    print(f"\nLaTeX macros written to {tex_path}")
 
-    # ── write JSON results ───────────────────────────────────────────────
-    output = {
-        "experiment": "trust_economics",
-        "paper": 55,
-        "note": "All JuGeo numbers from CLI subprocess + Python API.",
-        "n_programs": n,
-        "programs": program_results,
-        "trust_algebra": ta_results,
-        "summary": {
-            "mean_trust_score": mean_trust,
-            "mean_cycle_duration": mean_cycle,
-            "success_rate": success_rate,
-            "obstruction_rate": obstruction_rate,
-            "mean_phases": mean_phases,
-            "total_judgments": total_judgments,
-            "discharge_count": discharge_count,
-            "discharge_pct": discharge_pct,
-            "mean_quality": mean_quality,
-            "trust_lattice_ops": ta_results["ops_count"],
-            "admissible_pct": admissible_pct,
-            "sheaf_check_pass": ta_results["sheaf_pass"],
-            "mean_yield": ta_results["mean_yield"],
-            "mean_eval_time": mean_eval,
-        },
-    }
     json_path = os.path.join(os.path.dirname(__file__), "results_paper55.json")
     with open(json_path, "w") as f:
-        json.dump(output, f, indent=2)
-    print(f"Wrote {json_path}")
-
-    # ── cleanup ──────────────────────────────────────────────────────────
-    for p in tmpfiles:
-        cleanup(p)
-
-    print("\nDone.")
+        json.dump({"programs": results}, f, indent=2, default=str)
+    print(f"Results saved to {json_path}")
 
 
 if __name__ == "__main__":

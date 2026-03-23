@@ -12,7 +12,7 @@ Methodology:
   - Python API (SiteBuilder, CoverStatistics, SiteDiagnostics) for cover metrics
   - Measure construction time around SiteBuilder
 
-Writes macros to papers/data-paper11.tex with prefix \ppEleven.
+Writes macros to papers/data-paper11.tex with prefix \\ppEleven.
 Re-run: python3 experiments/exp11_cover_design.py
 """
 

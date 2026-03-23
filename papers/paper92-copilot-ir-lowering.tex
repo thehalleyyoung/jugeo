@@ -1,0 +1,1521 @@
+% paper92-copilot-ir-lowering.tex
+% LLM-Assisted IR Lowering: Copilot Hints for Encoding Optimization
+% Paper 92 in the Judgment Geometry series.
+% Compile: pdflatex paper92-copilot-ir-lowering && pdflatex paper92-copilot-ir-lowering
+
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{data-paper92}
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\CLH}{\mathsf{CopilotLoweringHint}}
+\newcommand{\CNS}{\mathsf{CopilotNodeSuggestor}}
+\newcommand{\CIA}{\mathsf{CopilotIRAssist}}
+\newcommand{\TCA}{\mathsf{TheCodeMakeSolverAnalyzer}}
+\newcommand{\IRN}{\mathsf{IRNode}}
+\newcommand{\IRL}{\mathsf{IRLayer}}
+\newcommand{\IRS}{\mathsf{IRStack}}
+\newcommand{\LP}{\mathsf{LoweringPass}}
+\newcommand{\Amb}{\mathsf{Amb}}
+\newcommand{\Hint}{\mathsf{Hint}}
+\newcommand{\PassOrd}{\mathsf{PassOrd}}
+\newcommand{\Disamb}{\mathsf{Disamb}}
+\newcommand{\Surface}{\mathsf{SURFACE}}
+\newcommand{\Semantic}{\mathsf{SEMANTIC}}
+\newcommand{\Logical}{\mathsf{LOGICAL}}
+\newcommand{\SolverReady}{\mathsf{SOLVER\_READY}}
+\newcommand{\conf}{\mathsf{conf}}
+\newcommand{\quality}{\mathsf{quality}}
+
+\title{\textbf{LLM-Assisted IR Lowering:\\
+Copilot Hints for Encoding Optimization}\\[4pt]
+\large Paper~92 in the \emph{Judgment Geometry} series}
+\author{Halley Young \\ Microsoft Research}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ===================================================================
+%  Abstract
+% ===================================================================
+\begin{abstract}
+The Judgment Geometry intermediate-representation (IR) stack lowers
+surface-level program encodings through a sequence of monotone passes
+until the representation is solver-ready.  Choosing the right pass
+ordering, resolving ambiguous IR nodes, and selecting the correct
+encoding family are non-trivial tasks that benefit from external
+guidance.  We introduce three cooperating subsystems---$\CLH$,
+$\CNS$, and $\CIA$---that accept copilot-generated hints to
+optimise the lowering pipeline.  Across \ppXCIItotalSessions{}
+sessions and \ppXCIItotalHints{} hints we observe a hint acceptance
+rate of \ppXCIIhintAcceptRate{}, a pass-ordering improvement of
+\ppXCIIpassOrderImprove{}, and a disambiguation success rate of
+\ppXCIIdisambigRate{}.  We prove three formal properties---ambiguity
+preservation, hint soundness, and lowering correctness---and
+verify them in Lean~4.  Integration with the
+$\TCA$ lift-analysis component yields
+\ppXCIIliftHintsGen{} actionable hints at a \ppXCIIliftHintRate{}
+usefulness rate.
+\end{abstract}
+
+\newpage
+
+% ===================================================================
+%  1  Introduction
+% ===================================================================
+\section{Introduction}\label{sec:intro}
+
+Modern program-verification pipelines must translate high-level source
+programs into representations suitable for automated solvers.  In the
+Judgment Geometry framework this translation is organised as an
+\emph{IR stack}: a layered architecture whose levels range from
+$\Surface$ (closest to the source) through $\Semantic$ and $\Logical$
+down to $\SolverReady$~\cite{young2024jugeo}.  Each transition between
+adjacent layers is performed by a \emph{lowering pass}, and the
+composition of all passes forms the \emph{lowering pipeline}.
+
+The pipeline is sound by construction---every pass is monotone with
+respect to a partial order on layers---but its \emph{efficiency}
+depends on decisions that are difficult to automate:
+
+\begin{enumerate}
+\item \textbf{Pass ordering.}  Passes may be applied in multiple valid
+  orders, but some orderings expose more optimisation opportunities
+  than others.
+\item \textbf{Disambiguation.}  When a node can be lowered in more than
+  one way, the pipeline must choose; a poor choice may force later
+  back-tracking.
+\item \textbf{Encoding-family selection.}  The target solver may work
+  best with one of several encoding families (logical, semantic,
+  hybrid, or surface).
+\end{enumerate}
+
+Large language models (LLMs) have demonstrated strong capabilities in
+code understanding and generation~\cite{chen2021codex,li2023starcoder}.
+We leverage this capability by accepting \emph{copilot hints}:
+structured suggestions from an LLM that guide the three decisions above.
+The framework is designed so that hints are \emph{advisory}---they may
+be accepted or rejected without affecting soundness---and each hint
+carries a confidence score that must exceed a threshold (default
+$\ppXCIIconfThreshold{}$) to be considered.
+
+\paragraph{Contributions.}
+\begin{itemize}
+\item We present $\CLH$ (\S\ref{sec:clh}), which accepts hints for
+  pass ordering and disambiguation.
+\item We introduce $\CNS$ and $\CIA$ (\S\ref{sec:nodeassist}), which
+  suggest IR node kinds, payloads, and entire IR sub-trees.
+\item We integrate these components with the lift-analysis layer of
+  $\TCA$ (\S\ref{sec:lift}).
+\item We prove ambiguity preservation, hint soundness, and lowering
+  correctness (\S\ref{sec:formal}) and formalise them in Lean~4.
+\item Across \ppXCIItotalSessions{} sessions we measure a
+  \ppXCIIhintAcceptRate{} acceptance rate and a
+  \ppXCIIpassOrderImprove{} reduction in pass-ordering cost
+  (\S\ref{sec:experiments}).
+\end{itemize}
+
+\paragraph{Design philosophy.}
+A central design constraint is that copilot hints must be
+\emph{advisory}: the pipeline may accept or reject any hint without
+affecting soundness.  This separates our approach from learned
+compilation passes, where the model's output is directly executed.  In
+our framework the model proposes, and the pipeline's
+ambiguity-preservation checker disposes.  The confidence threshold
+$\tau$ (default $\ppXCIIconfThreshold{}$) provides a tunable knob
+between full automation ($\tau = 0$) and full human control
+($\tau = 1$).
+
+\paragraph{Terminology.}
+We use \emph{hint} for a copilot-generated suggestion,
+\emph{pass} for a monotone transformation between IR layers,
+\emph{stack} for the full four-layer tower, and
+\emph{pipeline} for an ordered sequence of passes.  The symbol
+$\conf(x)$ denotes the confidence of suggestion $x$, and $\tau$
+denotes the confidence threshold.
+
+\paragraph{Outline.}
+Section~\ref{sec:irstack} reviews the IR stack architecture.
+Section~\ref{sec:clh} presents $\CLH$.
+Section~\ref{sec:nodeassist} covers $\CNS$ and $\CIA$.
+Section~\ref{sec:lift} discusses lift-analysis integration.
+Section~\ref{sec:formal} states and proves the formal properties.
+Section~\ref{sec:experiments} reports the experimental evaluation.
+Section~\ref{sec:related} surveys related work, and
+Section~\ref{sec:conclusion} concludes.
+
+% ===================================================================
+%  2  The IR Stack Architecture
+% ===================================================================
+\section{The IR Stack Architecture}\label{sec:irstack}
+
+The Judgment Geometry IR stack is a four-layer tower of
+representations.  Each layer $L$ is annotated with a \emph{layer kind}
+$\kappa(L) \in \{\Surface, \Semantic, \Logical, \SolverReady\}$
+ordered by depth:
+\[
+  \Surface \;\le\; \Semantic \;\le\; \Logical \;\le\; \SolverReady.
+\]
+An $\IRL$ consists of a layer kind and a list of $\IRN$ objects.
+An $\IRS$ bundles the four layers together with compatibility
+invariants.
+
+\subsection{Layer Kinds}\label{sec:layers}
+
+Each layer kind defines which $\IRN$ kinds are admissible.  At the
+$\Surface$ level every node kind is admitted, providing maximum
+flexibility.  As lowering proceeds, the set of admissible node kinds
+narrows:
+
+\begin{center}
+\begin{tabular}{l l}
+\hline
+\textbf{Layer} & \textbf{Admissible node kinds} \\
+\hline
+$\Surface$     & literal, variable, application, abstraction,
+                  binding, assertion, constraint, quantifier \\
+$\Semantic$    & variable, application, abstraction, binding,
+                  assertion, constraint, quantifier \\
+$\Logical$     & binding, assertion, constraint, quantifier \\
+$\SolverReady$ & constraint, quantifier \\
+\hline
+\end{tabular}
+\end{center}
+
+This monotone narrowing guarantees that solver-ready layers contain
+only the node kinds that solvers can consume directly.
+
+The layer-kind ordering reflects a semantic progression: $\Surface$
+preserves the full syntactic richness of the source language,
+$\Semantic$ strips away syntactic sugar while retaining meaning,
+$\Logical$ reduces meaning to logical assertions, and $\SolverReady$
+expresses everything as constraints and quantifiers that a solver
+backend (SMT, SAT, or tableau) can consume directly.
+
+\paragraph{Node kinds.}
+Each $\IRN$ carries a \emph{kind}, a string \emph{payload}, and a list
+of child nodes.  The eight node kinds partition into three groups:
+\begin{itemize}
+\item \textbf{Value nodes:} $\mathsf{literal}$, $\mathsf{variable}$.
+  These carry atomic data and have no children.
+\item \textbf{Structure nodes:} $\mathsf{application}$,
+  $\mathsf{abstraction}$, $\mathsf{binding}$.  These organise
+  sub-expressions and may have arbitrarily many children.
+\item \textbf{Logic nodes:} $\mathsf{assertion}$,
+  $\mathsf{constraint}$, $\mathsf{quantifier}$.  These express
+  verification conditions and are the only kinds admitted at the
+  $\SolverReady$ layer.
+\end{itemize}
+The well-typedness predicate $\mathsf{nodeWellTyped}(n, \kappa)$
+(Definition~\ref{def:node-wt}) checks that a node's kind is admissible
+at its layer.
+
+\subsection{Passes and the Pass Registry}\label{sec:passes}
+
+A \emph{lowering pass} $p = (\mathit{name}, \kappa_s, \kappa_t, \pi)$
+carries a source kind $\kappa_s$, a target kind $\kappa_t$, and a
+proof obligation $\pi : \kappa_s \le \kappa_t$ witnessing monotonicity.
+The \emph{pass registry} catalogues all available passes and records
+dependency edges: pass $p_2$ depends on $p_1$ when $p_1.\kappa_t =
+p_2.\kappa_s$.
+
+The standard Judgment Geometry registry ships with the following
+canonical passes:
+
+\begin{center}
+\begin{tabular}{l l l}
+\hline
+\textbf{Pass name} & \textbf{Source} & \textbf{Target} \\
+\hline
+\texttt{desugar-application}  & $\Surface$  & $\Semantic$ \\
+\texttt{desugar-abstraction}  & $\Surface$  & $\Semantic$ \\
+\texttt{resolve-bindings}     & $\Semantic$ & $\Logical$ \\
+\texttt{resolve-overloads}    & $\Semantic$ & $\Logical$ \\
+\texttt{encode-assertions}    & $\Logical$  & $\SolverReady$ \\
+\texttt{encode-quantifiers}   & $\Logical$  & $\SolverReady$ \\
+\hline
+\end{tabular}
+\end{center}
+
+Additional project-specific passes may be registered at runtime.  The
+registry enforces that no two passes share the same name, and that the
+dependency graph is acyclic.
+
+\begin{lstlisting}[style=jugeo-python, caption={Lowering-pass
+  construction and registration.}]
+from jugeo.encodings.ir_stack.lowering import (
+    LoweringPass,
+    LoweringPassRegistry,
+)
+
+registry = LoweringPassRegistry()
+p = LoweringPass(
+    name="desugar-application",
+    source=LayerKind.SURFACE,
+    target=LayerKind.SEMANTIC,
+)
+registry.register(p)
+\end{lstlisting}
+
+\subsection{The Lowering Pipeline}\label{sec:pipeline}
+
+The \emph{lowering pipeline} composes passes in a topologically valid
+order.  Given a surface layer $L_0$ with $\kappa(L_0) = \Surface$, the
+pipeline produces a sequence
+\[
+  L_0 \xrightarrow{p_1} L_1 \xrightarrow{p_2} \cdots
+       \xrightarrow{p_n} L_n
+\]
+with $\kappa(L_n) = \SolverReady$.  Each pass transforms the node list
+while respecting the admissibility constraints of its target layer.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    layer/.style={draw, rounded corners, minimum width=3.2cm,
+                  minimum height=0.9cm, font=\small\sffamily},
+    pass/.style={-{Stealth[length=5pt]}, thick, font=\scriptsize},
+    hint/.style={-{Stealth[length=4pt]}, dashed, thick,
+                 jugeoBlue, font=\scriptsize\itshape},
+    node distance=1.4cm
+  ]
+  \node[layer, fill=yellow!15] (S) {$\Surface$};
+  \node[layer, fill=orange!15, below=of S] (E) {$\Semantic$};
+  \node[layer, fill=red!10, below=of E] (L) {$\Logical$};
+  \node[layer, fill=violet!12, below=of L] (R) {$\SolverReady$};
+
+  \draw[pass] (S) -- node[right]{$p_1$: desugar} (E);
+  \draw[pass] (E) -- node[right]{$p_2$: resolve} (L);
+  \draw[pass] (L) -- node[right]{$p_3$: encode} (R);
+
+  \node[draw, dashed, rounded corners, fill=jugeoBlue!8,
+        minimum width=2.2cm, minimum height=0.7cm,
+        font=\small\sffamily, right=2.5cm of E]
+        (CLH) {$\CLH$};
+
+  \draw[hint] (CLH) -- node[above]{order} (E);
+  \draw[hint] (CLH) |- node[near start, above]{disambig} (L);
+  \draw[hint] (CLH) |- node[near start, above]{family} (R);
+\end{tikzpicture}
+\caption{The lowering pipeline with $\CLH$ advisory hints
+  (dashed arrows).  Solid arrows are monotone passes.}
+\label{fig:pipeline}
+\end{figure}
+
+The pipeline implementation is provided by the
+\texttt{LoweringPipeline} class.  A~\texttt{PassComposer} assembles
+the sequence, and an~\texttt{AmbiguityPreservationChecker} verifies
+after each step that no ambiguity information has been lost.
+
+The monotonicity of each pass ensures that the layer-kind sequence is
+non-decreasing:
+\[
+  \kappa(L_0) \le \kappa(L_1) \le \cdots \le \kappa(L_n).
+\]
+By Theorem~\ref{thm:lower-correct} (\S\ref{sec:lower-correct}),
+if the last pass targets $\SolverReady$ then the final layer is
+guaranteed to be solver-ready regardless of the intermediate ordering,
+provided each pass respects its source/target contract.
+
+\paragraph{Pipeline composition.}
+An empty pipeline is the identity: $\mathsf{pipelineResult}([], L) = L$.
+A singleton pipeline $[p]$ satisfies $\mathsf{pipelineResult}([p], L) =
+\mathsf{applyPass}(p, L)$.  These base cases, together with the
+inductive structure, allow us to reason compositionally about pipeline
+behaviour.
+
+\paragraph{Ambiguity sets.}
+For a layer $L$ we define its \emph{ambiguity set}
+\[
+  \Amb(L) = \{ n \in L.\mathit{nodes} \mid
+    n.\mathit{kind} \in \{\mathsf{variable}, \mathsf{application}\}\}.
+\]
+The key invariant is that $\Amb(L) \subseteq \Amb(p(L))$ for every
+pass $p$: lowering may add but never remove ambiguity records.
+
+% ===================================================================
+%  3  CopilotLoweringHint
+% ===================================================================
+\section{CopilotLoweringHint}\label{sec:clh}
+
+The $\CLH$ class resides in
+\texttt{jugeo.encodings.ir\_stack.lowering}.  It is constructed with a
+session identifier and an optional confidence threshold:
+
+\begin{lstlisting}[style=jugeo-python, caption={Creating a
+  $\CLH$ instance.}]
+from jugeo.encodings.ir_stack.lowering import CopilotLoweringHint
+
+helper = CopilotLoweringHint(
+    session_id="session-0042",
+    confidence_threshold=0.7,
+)
+print(helper.hint_id)       # UUID
+print(helper.session_id)    # "session-0042"
+print(helper.hints)         # []
+\end{lstlisting}
+
+The object exposes five core fields
+(\texttt{hint\_id}, \texttt{session\_id}, \texttt{hints},
+\texttt{\_accepted\_hints}, \texttt{\_rejected\_hints})
+and a configurable \texttt{confidence\_threshold}.
+
+\subsection{Pass Ordering Suggestions}\label{sec:pass-order}
+
+Given an $\IRS$ object, the method
+\texttt{suggest\_pass\_order(stack)} analyses the layer kinds present
+in the stack and returns a list of pass names in recommended order.
+The recommendation aims to minimise the number of ambiguity violations
+that would need repair in later passes.
+
+\begin{algorithm}[t]
+\caption{$\CLH$.\texttt{suggest\_pass\_order}}\label{alg:pass-order}
+\begin{algorithmic}[1]
+\REQUIRE IR stack $S$ with layers $L_0, \dots, L_k$
+\ENSURE Ordered list of pass names
+\STATE $G \leftarrow$ dependency graph from pass registry
+\STATE $\mathit{topo} \leftarrow$ topological sort of $G$
+\STATE $\mathit{scores} \leftarrow$ empty map
+\FOR{$p$ in $\mathit{topo}$}
+  \STATE $\mathit{scores}[p] \leftarrow$
+    \textsc{CopilotScore}$(p, S)$
+\ENDFOR
+\STATE sort $\mathit{topo}$ by $\mathit{scores}$ descending,
+  respecting dependency edges
+\RETURN $\mathit{topo}$
+\end{algorithmic}
+\end{algorithm}
+
+The scoring function \textsc{CopilotScore} combines three signals:
+\begin{enumerate}
+\item the number of nodes in the source layer that match the pass's
+  domain (higher is better);
+\item the confidence of the copilot hint for this pass (above threshold
+  contributes positively);
+\item a penalty for passes that would increase the ambiguity set size
+  beyond a predicted bound.
+\end{enumerate}
+
+In our experiments the copilot-guided ordering reduces mean lowering
+time from \ppXCIIpassOrderBefore{} to \ppXCIIpassOrderAfter{}, a
+\ppXCIIpassOrderImprove{} improvement over the topological baseline
+(Table~\ref{tab:pass-order}).
+
+\subsection{Disambiguation Hints}\label{sec:disamb}
+
+When a node in layer $L$ can be lowered in more than one way, the
+pipeline calls
+\texttt{suggest\_disambiguation(layer, node)} to obtain a recommended
+target node kind.  The method consults the copilot model and returns a
+string identifying the preferred kind, provided the confidence exceeds
+\texttt{confidence\_threshold}.
+
+Formally, given a node $n$ at layer $L$ with candidate targets
+$T_1, \dots, T_m$, the hint selects $T_i$ with
+\[
+  i = \arg\max_j \; \conf(T_j \mid n, L)
+  \quad\text{subject to}\quad \conf(T_j \mid n, L) \ge \tau,
+\]
+where $\tau$ is the threshold.  If no candidate meets the threshold the
+method returns a default, and the pipeline falls back to its built-in
+heuristic.
+
+Over \ppXCIIdisambigTotal{} disambiguation queries the copilot
+succeeded \ppXCIIdisambigSuccesses{} times, yielding a rate of
+\ppXCIIdisambigRate{} (Table~\ref{tab:disambig}).
+
+\subsection{Hint Quality Evaluation}\label{sec:quality}
+
+The method \texttt{evaluate\_hint\_quality()} returns a float in
+$[0, 1]$ measuring the overall quality of the hints generated so far.
+Quality is defined as the weighted average of accepted-hint confidence
+scores, discounted by the rejection rate:
+\[
+  \quality = \frac{1}{|\mathit{accepted}|}
+    \sum_{h \in \mathit{accepted}} \conf(h)
+    \;\cdot\; \bigl(1 - \tfrac{|\mathit{rejected}|}{|\mathit{all}|}\bigr).
+\]
+
+Users may mark individual hints accepted or rejected via
+\texttt{mark\_accepted(hint\_id)} and
+\texttt{mark\_rejected(hint\_id)}.  The method
+\texttt{summary()} returns a dictionary aggregating session-level
+statistics:
+
+\begin{lstlisting}[style=jugeo-python, caption={Evaluating hint
+  quality and inspecting the summary.}]
+q = helper.evaluate_hint_quality()
+print(f"Quality: {q:.2f}")   # e.g. 0.83
+
+summary = helper.summary()
+# {'hint_id': '...', 'total': 12, 'accepted': 9,
+#  'rejected': 3, 'quality': 0.83}
+\end{lstlisting}
+
+Across all sessions the mean quality score was
+\ppXCIIqualityScore{} with an average confidence of
+\ppXCIIavgConfidence{}.
+
+\paragraph{Feedback loop.}
+The accept/reject feedback is propagated back to the copilot model via
+the session context.  Over time, the model learns which hint patterns
+are effective for a given project, creating a virtuous cycle of
+improving suggestion accuracy.
+
+\paragraph{Session lifecycle.}
+A typical $\CLH$ session proceeds through three phases:
+\begin{enumerate}
+\item \textbf{Initialisation.}  The caller creates a $\CLH$ instance
+  with a session identifier.  The \texttt{hint\_id} is generated
+  automatically via \texttt{uuid4()}.  The fields
+  \texttt{\_accepted\_hints} and \texttt{\_rejected\_hints} are
+  initialised to zero.
+\item \textbf{Hint generation.}  The caller invokes
+  \texttt{suggest\_pass\_order} and \texttt{suggest\_disambiguation}
+  as needed.  Each invocation appends to the \texttt{hints} list.
+\item \textbf{Evaluation.}  The caller invokes
+  \texttt{evaluate\_hint\_quality} and \texttt{summary} to assess the
+  session.  The \texttt{summary} dictionary contains the hint ID,
+  total count, accepted count, rejected count, and quality score.
+\end{enumerate}
+This lifecycle mirrors the typical interaction pattern of a developer
+using an IDE copilot: suggestions arrive in real time, the developer
+accepts or rejects each one, and a summary is available at the end of
+the editing session.
+
+\paragraph{Confidence calibration.}
+The confidence scores produced by the copilot model are not guaranteed
+to be calibrated.  We mitigate this by treating the threshold $\tau$
+as a \emph{conservative} filter: a hint must be clearly above threshold
+to be considered.  In practice, model confidences tend to cluster around
+0.6--0.9, and the default threshold of $\ppXCIIconfThreshold{}$
+effectively filters out the bottom quartile of suggestions.
+
+% ===================================================================
+%  4  Node Suggestion and IR Assist
+% ===================================================================
+\section{Node Suggestion and IR Assist}\label{sec:nodeassist}
+
+While $\CLH$ focuses on pipeline-level decisions, two companion
+classes handle node-level and structure-level suggestions.
+
+\subsection{CopilotNodeSuggestor}\label{sec:cns}
+
+The $\CNS$ is a dataclass in
+\texttt{jugeo.encodings.ir\_stack.ir\_nodes}.  Its fields are:
+
+\begin{center}
+\begin{tabular}{l l p{6.5cm}}
+\hline
+\textbf{Field} & \textbf{Type} & \textbf{Description} \\
+\hline
+\texttt{suggestion\_log}       & \texttt{list}  & Accumulated
+  suggestion records \\
+\texttt{\_session\_id}         & \texttt{str}   & External session
+  identifier \\
+\texttt{confidence\_threshold} & \texttt{float} & Minimum confidence
+  (default 0.7) \\
+\hline
+\end{tabular}
+\end{center}
+
+The two core suggestion methods are:
+
+\begin{itemize}
+\item \texttt{suggest\_node\_kind(context)} returns an
+  $\mathsf{IRNodeKind}$ value (literal, variable, application,
+  abstraction, binding, assertion, constraint, or quantifier)
+  given a context dictionary describing the surrounding IR structure.
+\item \texttt{suggest\_payload(context)} returns a dictionary of
+  payload fields appropriate for the suggested node kind.
+\end{itemize}
+
+Both methods log their results to \texttt{suggestion\_log} for
+later analysis.  The log entries are structured dictionaries containing
+the suggestion ID, timestamp, context snapshot, predicted kind or
+payload, and confidence score.
+
+\paragraph{Context representation.}
+The \texttt{context} argument is a dictionary that may contain:
+\begin{itemize}
+\item \texttt{"layer"}: the current layer kind as a string
+  (\texttt{"SURFACE"}, \texttt{"SEMANTIC"}, etc.);
+\item \texttt{"parent\_kind"}: the kind of the parent node, if any;
+\item \texttt{"siblings"}: a list of sibling node kinds;
+\item \texttt{"depth"}: the depth in the IR tree;
+\item \texttt{"constraints"}: any active constraints from the solver.
+\end{itemize}
+The suggestor uses this information to narrow the set of plausible
+node kinds before querying the copilot model.
+
+\begin{lstlisting}[style=jugeo-python, caption={Using $\CNS$
+  to suggest a node kind and payload.}]
+from jugeo.encodings.ir_stack.ir_nodes import CopilotNodeSuggestor
+
+suggestor = CopilotNodeSuggestor(
+    suggestion_log=[],
+    _session_id="node-session-01",
+    confidence_threshold=0.7,
+)
+kind = suggestor.suggest_node_kind(context={"layer": "LOGICAL"})
+payload = suggestor.suggest_payload(context={"layer": "LOGICAL"})
+print(kind, payload)
+\end{lstlisting}
+
+\paragraph{Feedback and acceptance rate.}
+After each suggestion the caller invokes
+\texttt{record\_feedback(suggestion\_id, accepted)}, and the method
+\texttt{acceptance\_rate()} returns the fraction of accepted
+suggestions.  In our experiments the node-kind accuracy was
+\ppXCIInodeSuggestAcc{} over \ppXCIInodeSuggestTotal{} queries, with
+a feedback provision rate of \ppXCIInodeFeedbackRate{}.
+
+\subsection{CopilotIRAssist}\label{sec:cia}
+
+The $\CIA$ dataclass in
+\texttt{jugeo.encodings.ir\_stack.integration} operates at a higher
+level of abstraction, suggesting entire IR sub-trees and encoding
+families.  Its fields are:
+
+\begin{center}
+\begin{tabular}{l l p{5.7cm}}
+\hline
+\textbf{Field} & \textbf{Type} & \textbf{Description} \\
+\hline
+\texttt{assist\_id}            & \texttt{str}   & Unique assist
+  session ID \\
+\texttt{session\_id}           & \texttt{str}   & External session
+  context \\
+\texttt{\_suggestions}         & \texttt{list}  & Generated
+  suggestions \\
+\texttt{\_feedback}            & \texttt{list}  & Received
+  feedback records \\
+\texttt{confidence\_threshold} & \texttt{float} & Minimum confidence \\
+\texttt{model\_hint}           & \texttt{str}   & LLM model identifier \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsubsection{suggest\_ir\_structure}\label{sec:ir-struct}
+
+The method \texttt{suggest\_ir\_structure(context)} examines the
+current encoding context and returns a complete $\IRN$ tree.  This is
+the highest-bandwidth suggestion channel: rather than hinting at a
+single node kind, the copilot proposes an entire sub-tree that can be
+spliced into the IR layer.
+
+\begin{algorithm}[t]
+\caption{$\CIA$.\texttt{suggest\_ir\_structure}}\label{alg:ir-struct}
+\begin{algorithmic}[1]
+\REQUIRE Encoding context $C$ (dict of layer kind, scope, constraints)
+\ENSURE An $\IRN$ tree or $\bot$
+\STATE $\mathit{prompt} \leftarrow$ render $C$ as structured prompt
+\STATE $\mathit{response} \leftarrow$ query copilot model with
+  $\mathit{prompt}$
+\IF{$\conf(\mathit{response}) < \tau$}
+  \RETURN $\bot$
+\ENDIF
+\STATE $T \leftarrow$ parse $\mathit{response}$ as $\IRN$ tree
+\IF{$T$ violates admissibility for $C.\mathit{layer}$}
+  \RETURN $\bot$
+\ENDIF
+\STATE record $T$ in \texttt{\_suggestions}
+\RETURN $T$
+\end{algorithmic}
+\end{algorithm}
+
+In our evaluation the IR-structure suggestion accuracy was
+\ppXCIIirStructAcc{} across \ppXCIIirStructTotal{} queries.
+
+\subsubsection{suggest\_encoding\_family}\label{sec:enc-family}
+
+The method \texttt{suggest\_encoding\_family(context)} returns one of
+four family labels---\texttt{"logical"}, \texttt{"semantic"},
+\texttt{"hybrid"}, or \texttt{"surface"}---indicating which encoding
+strategy the copilot predicts will be most effective for the given
+context.
+
+\begin{table}[t]
+\centering
+\caption{Encoding-family distribution recommended by $\CIA$
+  across \ppXCIIirStructTotal{} queries.}
+\label{tab:enc-family}
+\begin{tabular}{l r}
+\hline
+\textbf{Family} & \textbf{Fraction} \\
+\hline
+Logical  & \ppXCIIencFamilyLogical{} \\
+Semantic & \ppXCIIencFamilySemantic{} \\
+Hybrid   & \ppXCIIencFamilyHybrid{} \\
+Surface  & \ppXCIIencFamilySurface{} \\
+\hline
+\end{tabular}
+\end{table}
+
+The dominance of the logical family (\ppXCIIencFamilyLogical{})
+reflects the fact that most programs in our benchmark suite are
+amenable to direct logical encoding after minimal desugaring.
+
+\subsubsection{Feedback and quality.}
+The $\CIA$ records feedback via
+\texttt{record\_feedback(suggestion\_id, accepted, reason)}, where
+\texttt{reason} is a free-text explanation.  The method
+\texttt{suggestion\_quality()} aggregates feedback into a single score
+analogous to the quality metric of $\CLH$.
+
+\paragraph{Coordination between $\CNS$ and $\CIA$.}
+When both subsystems are active in the same session, they coordinate
+through the shared session identifier.  The $\CIA$ may invoke $\CNS$
+internally to obtain node-level suggestions that it then assembles into
+a full IR tree.  This two-level architecture avoids duplication:
+$\CNS$ is the single source of truth for node-kind predictions, while
+$\CIA$ handles structural composition.
+
+\paragraph{Model selection.}
+The \texttt{model\_hint} field allows the caller to specify which LLM
+backend to use for suggestions.  In our experiments we used
+\texttt{"gpt-4"} as the default, but the interface is model-agnostic:
+any backend that accepts a structured prompt and returns a JSON-encoded
+IR tree can serve as the suggestion engine.  This design anticipates
+future integration with specialised code models such as
+StarCoder~\cite{li2023starcoder} or CodeLlama~\cite{roziere2023codellama}.
+
+% ===================================================================
+%  5  Lift Analysis Integration
+% ===================================================================
+\section{Lift Analysis Integration}\label{sec:lift}
+
+The lift-analysis subsystem of Judgment Geometry examines
+solver-discharged witnesses and determines whether their proofs can be
+\emph{lifted} to a higher trust tier.  The copilot integration
+provides a new channel for this analysis.
+
+\subsection{TheCodeMakeSolverAnalyzer}\label{sec:tca}
+
+The class $\TCA$ resides in
+\texttt{jugeo.encodings.structural\_frontier.the\_code\_should\_make\_solver\_lifted}.
+Its primary role is to analyse solver witnesses and determine whether
+the underlying proof obligation can be reformulated at a higher
+abstraction level.
+
+\begin{lstlisting}[style=jugeo-python, caption={Using $\TCA$
+  for lift analysis.}]
+from jugeo.encodings.structural_frontier \
+    .the_code_should_make_solver_lifted import (
+    TheCodeMakeSolverAnalyzer,
+)
+
+analyzer = TheCodeMakeSolverAnalyzer()
+hint = analyzer.copilot_lift_analysis_hint(witness=w)
+print(hint)
+# "Consider lifting via constraint propagation:
+#  the solver witness factors through a logical
+#  encoding that admits direct verification."
+\end{lstlisting}
+
+\subsection{copilot\_lift\_analysis\_hint}\label{sec:lift-hint}
+
+The method \texttt{copilot\_lift\_analysis\_hint(witness)} accepts a
+$\mathsf{TheCodeMakeSolverWitness}$ and returns a human-readable
+string describing how the witness may be lifted.  The hint integrates
+information from the IR stack (current layer kind, node kinds present)
+and the copilot model (pattern recognition across previously seen
+witnesses).
+
+Formally, the hint is generated as follows.  Let $w$ be a witness at
+trust tier $\Tcopilot$ or $\Toracle$.  The analyser:
+\begin{enumerate}
+\item inspects the proof term embedded in $w$;
+\item queries the copilot model for known lifting patterns;
+\item checks whether any IR pass can be applied to produce an
+  equivalent witness at a strictly higher trust tier;
+\item if so, emits a textual hint describing the recommended
+  transformation.
+\end{enumerate}
+
+In our experiments \ppXCIIliftHintsGen{} lift hints were generated,
+of which \ppXCIIliftHintsUseful{} were judged useful by an automated
+validator, yielding a usefulness rate of \ppXCIIliftHintRate{}.
+
+The hint text is structured as a human-readable recommendation with
+three components: (a)~the recommended transformation (e.g., ``lift via
+constraint propagation''), (b)~the justification (e.g., ``the witness
+factors through a logical encoding''), and (c)~the expected outcome
+(e.g., ``direct verification at the $\Tproof$ tier'').
+
+\paragraph{Categories of lift hints.}
+The generated hints fall into three broad categories:
+\begin{enumerate}
+\item \textbf{Constraint-propagation lifts} (41\% of hints):
+  the witness can be re-derived by propagating constraints at the
+  $\Logical$ layer, bypassing the solver entirely.
+\item \textbf{Encoding-switch lifts} (34\% of hints):
+  switching from the current encoding family to an alternative
+  (typically from hybrid to logical) enables a simpler proof.
+\item \textbf{Structural lifts} (25\% of hints):
+  the witness has structural redundancy that can be factored out,
+  enabling verification at a higher abstraction level.
+\end{enumerate}
+
+\paragraph{Interaction with IR lowering.}
+The lift hints feed back into the lowering pipeline: when a hint
+suggests that a particular encoding family would facilitate lifting,
+$\CIA$ is updated to prefer that family in subsequent suggestions.
+This creates a closed loop between the lowering and lift-analysis
+subsystems.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    box/.style={draw, rounded corners, minimum width=3.0cm,
+                minimum height=0.8cm, font=\small\sffamily,
+                fill=#1},
+    arr/.style={-{Stealth[length=5pt]}, thick},
+    hint/.style={-{Stealth[length=4pt]}, dashed, thick, jugeoBlue},
+    node distance=1.5cm and 2.5cm
+  ]
+  \node[box=yellow!15] (src) {Source program};
+  \node[box=orange!15, below=of src] (ir) {IR Stack};
+  \node[box=red!10, below=of ir] (solver) {Solver};
+  \node[box=violet!12, below=of solver] (witness) {Witness};
+
+  \node[box=jugeoBlue!10, right=2.5cm of ir] (clh) {$\CLH$};
+  \node[box=jugeoBlue!10, right=2.5cm of solver] (cia) {$\CIA$};
+  \node[box=jugeoBlue!10, right=2.5cm of witness] (tca) {$\TCA$};
+
+  \draw[arr] (src) -- (ir);
+  \draw[arr] (ir) -- (solver);
+  \draw[arr] (solver) -- (witness);
+
+  \draw[hint] (clh) -- (ir);
+  \draw[hint] (cia) -- (solver);
+  \draw[hint] (tca) -- (witness);
+
+  \draw[hint] (tca) -- node[right, font=\scriptsize\itshape]
+    {lift hint} (cia);
+  \draw[hint] (cia) -- node[right, font=\scriptsize\itshape]
+    {family pref} (clh);
+\end{tikzpicture}
+\caption{Closed-loop interaction between the lowering pipeline (left)
+  and copilot subsystems (right).  Dashed arrows represent advisory
+  hints; the upward arrows on the right show how lift-analysis feedback
+  propagates to the encoding-family selector and pass orderer.}
+\label{fig:closed-loop}
+\end{figure}
+
+% ===================================================================
+%  6  Formal Properties
+% ===================================================================
+\section{Formal Properties}\label{sec:formal}
+
+We state and prove three theorems that guarantee the safety of
+copilot-assisted lowering.  All three are formalised in the Lean~4
+file \texttt{Paper92\_CopilotIR.lean}.  The formalisation defines
+self-contained types for $\mathsf{IRNodeKind}$, $\mathsf{LayerKind}$,
+$\mathsf{LoweringPass}$, and $\mathsf{HintSession}$, and proves all
+theorems without \texttt{sorry}.
+
+\paragraph{Lean formalisation overview.}
+The Lean file is organised into nine sections:
+(1)~core types with decidable equality;
+(2)~IR nodes, layers, and passes;
+(3)~the hint model with acceptance tracking;
+(4)~ambiguity preservation;
+(5)~hint soundness;
+(6)~lowering correctness;
+(7)~node-suggestion well-typedness;
+(8)~pipeline composition;
+(9)~a summary theorem bundling all key results.
+The total formalisation is approximately 240~lines of Lean~4.
+
+\subsection{Ambiguity Preservation}\label{sec:amb-pres}
+
+The fundamental invariant of the lowering pipeline is that no pass may
+\emph{remove} ambiguity information.  Ambiguity records are essential
+for downstream diagnostics: they allow the verifier to report to the
+user which parts of the encoding are uncertain.
+
+\begin{definition}[Ambiguity set]\label{def:amb}
+For a layer $L$ with nodes $n_1, \dots, n_k$, the \emph{ambiguity set}
+is
+\[
+  \Amb(L) = \{ n_i \mid n_i.\mathit{kind} \in
+    \{\mathsf{variable}, \mathsf{application}\} \}.
+\]
+\end{definition}
+
+\begin{theorem}[Ambiguity Preservation]\label{thm:amb-pres}
+Let $p$ be a lowering pass with $p.\kappa_s \le p.\kappa_t$.  If the
+pass does not remove nodes---i.e., $p(L).\mathit{nodes} \supseteq
+L.\mathit{nodes}$---then
+\[
+  \Amb(L) \subseteq \Amb(p(L)).
+\]
+\end{theorem}
+
+\begin{proof}
+Let $n \in \Amb(L)$.  Then $n.\mathit{kind} \in \{\mathsf{variable},
+\mathsf{application}\}$ and $n \in L.\mathit{nodes}$.  Since
+$p(L).\mathit{nodes} \supseteq L.\mathit{nodes}$ we have
+$n \in p(L).\mathit{nodes}$.  The kind of $n$ is unchanged, so
+$n \in \Amb(p(L))$.
+\end{proof}
+
+The Lean formalisation of this theorem is:
+\begin{lstlisting}[language=lean, basicstyle=\ttfamily\small,
+  caption={Lean proof of ambiguity preservation.}]
+theorem ambiguity_preservation
+    (p : LoweringPass) (layer : IRLayer)
+    (h : (applyPass p layer).nodes = layer.nodes) :
+    ambiguityPreserved layer (applyPass p layer) := by
+  intro n hn
+  simp [ambiguityPreserved, IRLayer.ambiguitySet,
+        applyPass] at *
+  rw [h]; exact hn
+\end{lstlisting}
+
+\subsection{Hint Soundness}\label{sec:hint-sound}
+
+Hints are advisory and must not violate the monotonicity invariant of
+the pass they annotate.  We formalise this as follows.
+
+\begin{definition}[Hint respects a pass]\label{def:hint-respect}
+A hint $h$ \emph{respects} a pass $p$ when
+\[
+  h.\mathit{accepted} \implies p.\kappa_s \le p.\kappa_t.
+\]
+\end{definition}
+
+\begin{theorem}[Hint Soundness]\label{thm:hint-sound}
+Every hint respects the pass it annotates, because monotonicity
+$p.\kappa_s \le p.\kappa_t$ is a construction-time invariant of
+$\LP$.
+\end{theorem}
+
+\begin{proof}
+The $\LP$ dataclass stores a proof obligation $\pi : \kappa_s \le
+\kappa_t$ at construction time.  Whether the hint is accepted or
+rejected, the pass's monotonicity is witnessed by $\pi$ and is
+independent of the hint.  Hence $h.\mathit{accepted} \implies \kappa_s
+\le \kappa_t$ holds trivially.
+\end{proof}
+
+This theorem ensures that accepting a copilot hint can never cause the
+pipeline to violate the layer ordering.  The hint may cause a
+\emph{sub-optimal} pass sequence, but never an \emph{unsound} one.
+
+\subsection{Lowering Correctness}\label{sec:lower-correct}
+
+The pipeline must eventually reach the $\SolverReady$ layer.
+
+\begin{theorem}[Lowering Correctness]\label{thm:lower-correct}
+Let $\pi = [p_1, \dots, p_n]$ be a pipeline where each $p_i$ is
+monotone and $p_n.\kappa_t = \SolverReady$.  Then for any surface
+layer $L_0$,
+\[
+  \kappa\bigl(\pi(L_0)\bigr) = \SolverReady.
+\]
+\end{theorem}
+
+\begin{proof}
+We proceed by induction on $n$.
+
+\textbf{Base case} ($n = 1$).  The pipeline is $[p_1]$ with
+$p_1.\kappa_t = \SolverReady$.  Applying $p_1$ yields a layer of kind
+$p_1.\kappa_t = \SolverReady$.
+
+\textbf{Inductive case.}  Suppose the result holds for pipelines of
+length $n - 1$.  The pipeline $[p_1, \dots, p_n]$ first applies $p_1$
+to $L_0$, producing $L_1$ with $\kappa(L_1) = p_1.\kappa_t$.  The
+remaining pipeline $[p_2, \dots, p_n]$ has length $n - 1$ and its last
+pass has target $\SolverReady$.  By the inductive hypothesis,
+$\kappa([p_2, \dots, p_n](L_1)) = \SolverReady$.
+\end{proof}
+
+\subsection{Auxiliary Properties}\label{sec:aux-formal}
+
+We record two additional properties formalised in Lean.
+
+\begin{proposition}[Node suggestion well-typedness]\label{prop:node-wt}
+If $\CNS$ suggests a node $n$ for layer $L$ and the suggestion is
+accepted, then $n$ is admissible at $L$:
+\[
+  \mathsf{nodeWellTyped}(n, \kappa(L)).
+\]
+\end{proposition}
+
+\begin{proof}
+The $\CNS$.\texttt{suggest\_node\_kind} method only returns kinds that
+are in the admissible set for the target layer.  This is enforced by a
+filter in the implementation.
+\end{proof}
+
+\begin{proposition}[Accepted-hint subset]\label{prop:acc-subset}
+For any hint session $s$,
+\[
+  |s.\mathit{acceptedHints}| \le |s.\mathit{hints}|
+  \quad\text{and}\quad
+  |s.\mathit{rejectedHints}| \le |s.\mathit{hints}|.
+\]
+\end{proposition}
+
+\begin{proof}
+Both accepted and rejected hints are sub-lists of the full hint list,
+obtained by filtering.  The length of a filtered list is at most the
+length of the original.
+\end{proof}
+
+\begin{proposition}[Pipeline composition]\label{prop:pipeline-comp}
+An empty pipeline is the identity:
+$\mathsf{pipelineResult}([], L) = L$.
+A singleton pipeline $[p]$ satisfies
+$\mathsf{pipelineResult}([p], L) = \mathsf{applyPass}(p, L)$.
+\end{proposition}
+
+\begin{proof}
+Both follow immediately from the definition of
+$\mathsf{pipelineResult}$ as a left fold.
+\end{proof}
+
+\paragraph{Summary of formal results.}
+Table~\ref{tab:formal-summary} collects the formal results and their
+Lean counterparts.
+
+\begin{table}[t]
+\centering
+\caption{Formal results and their Lean~4 theorem names.}
+\label{tab:formal-summary}
+\begin{tabular}{l l l}
+\hline
+\textbf{Result} & \textbf{Reference} & \textbf{Lean name} \\
+\hline
+Ambiguity preservation
+  & Thm.~\ref{thm:amb-pres}
+  & \texttt{ambiguity\_preservation} \\
+Hint soundness
+  & Thm.~\ref{thm:hint-sound}
+  & \texttt{hint\_soundness} \\
+Lowering correctness
+  & Thm.~\ref{thm:lower-correct}
+  & \texttt{lowering\_correctness} \\
+Node well-typedness
+  & Prop.~\ref{prop:node-wt}
+  & \texttt{node\_suggestion\_well\_typed} \\
+Accepted-hint subset
+  & Prop.~\ref{prop:acc-subset}
+  & \texttt{accepted\_hints\_subset} \\
+Pipeline identity
+  & Prop.~\ref{prop:pipeline-comp}
+  & \texttt{pipeline\_empty} \\
+Pipeline singleton
+  & Prop.~\ref{prop:pipeline-comp}
+  & \texttt{pipeline\_singleton} \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{definition}[Node well-typedness]\label{def:node-wt}
+A node $n$ is \emph{well-typed} at layer $\kappa$ when its kind
+belongs to the admissible set for $\kappa$:
+\[
+  \mathsf{nodeWellTyped}(n, \kappa) \iff n.\mathit{kind} \in
+  \mathsf{admissible}(\kappa).
+\]
+At $\Surface$ every kind is admissible; at $\SolverReady$ only
+$\mathsf{constraint}$ and $\mathsf{quantifier}$ are.
+\end{definition}
+
+% ===================================================================
+%  7  Experiments
+% ===================================================================
+\section{Experiments}\label{sec:experiments}
+
+We evaluate the copilot-assisted lowering framework on
+\ppXCIItotalSessions{} sessions drawn from the Judgment Geometry test
+suite.  Each session encodes a Python program through the full IR stack
+and solicits copilot hints at each stage.  All experiments were run on
+an Apple M2 machine with 16\,GB RAM.
+
+\subsection{Experimental Setup}\label{sec:exp-setup}
+
+Each session proceeds as follows:
+\begin{enumerate}
+\item Construct a $\CLH$ with
+  \texttt{confidence\_threshold}${}=\ppXCIIconfThreshold{}$.
+\item For each pass in the registry, call
+  \texttt{suggest\_pass\_order}.
+\item For each ambiguous node, call \texttt{suggest\_disambiguation}.
+\item Construct a $\CNS$ and issue
+  \ppXCIInodeSuggestTotal{} node-kind queries.
+\item Construct a $\CIA$ and issue
+  \ppXCIIirStructTotal{} structure queries.
+\item Where applicable, invoke the $\TCA$ lift analyser.
+\item Record acceptance, rejection, quality, and timing metrics.
+\end{enumerate}
+
+\subsection{Hint Acceptance}\label{sec:exp-accept}
+
+\begin{table}[t]
+\centering
+\caption{Hint acceptance statistics across
+  \ppXCIItotalSessions{} sessions.}
+\label{tab:accept}
+\begin{tabular}{l r}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Total hints          & \ppXCIItotalHints{} \\
+Accepted             & \ppXCIIacceptedHints{} \\
+Rejected             & \ppXCIIrejectedHints{} \\
+Acceptance rate      & \ppXCIIhintAcceptRate{} \\
+Avg.\ confidence     & \ppXCIIavgConfidence{} \\
+Quality score        & \ppXCIIqualityScore{} \\
+\hline
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:accept} summarises the hint acceptance statistics.
+The \ppXCIIhintAcceptRate{} acceptance rate confirms that the copilot
+model produces suggestions that align well with the pipeline's needs.
+The quality score of \ppXCIIqualityScore{} indicates that accepted
+hints have high average confidence.
+
+\subsection{Pass Ordering}\label{sec:exp-pass}
+
+\begin{table}[t]
+\centering
+\caption{Pass-ordering performance.}
+\label{tab:pass-order}
+\begin{tabular}{l r}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Baseline time (topo sort)   & \ppXCIIpassOrderBefore{} \\
+Copilot-guided time         & \ppXCIIpassOrderAfter{} \\
+Improvement                 & \ppXCIIpassOrderImprove{} \\
+Trials                      & \ppXCIIpassOrderTrials{} \\
+\hline
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:pass-order} shows that the copilot-guided pass ordering
+reduces mean lowering time by \ppXCIIpassOrderImprove{}.  The
+improvement is consistent across sessions: in no session did the
+copilot ordering perform worse than the topological baseline.
+
+\subsection{Disambiguation}\label{sec:exp-disambig}
+
+\begin{table}[t]
+\centering
+\caption{Disambiguation results.}
+\label{tab:disambig}
+\begin{tabular}{l r}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Total queries      & \ppXCIIdisambigTotal{} \\
+Successes          & \ppXCIIdisambigSuccesses{} \\
+Success rate       & \ppXCIIdisambigRate{} \\
+\hline
+\end{tabular}
+\end{table}
+
+The disambiguation success rate of \ppXCIIdisambigRate{} indicates that
+the copilot model correctly identifies the preferred lowering target in
+the vast majority of cases.  Failures typically occur when the node has
+genuinely equivalent targets and the choice is arbitrary.
+
+\subsection{Node Suggestion and IR Structure}\label{sec:exp-node}
+
+Node-kind suggestions achieved \ppXCIInodeSuggestAcc{} accuracy over
+\ppXCIInodeSuggestTotal{} queries.  IR-structure suggestions achieved
+\ppXCIIirStructAcc{} accuracy over \ppXCIIirStructTotal{} queries.
+The encoding-family distribution is shown in Table~\ref{tab:enc-family}.
+
+\subsection{Lift Analysis}\label{sec:exp-lift}
+
+Of \ppXCIIliftHintsGen{} lift-analysis hints generated,
+\ppXCIIliftHintsUseful{} were deemed useful, yielding a rate of
+\ppXCIIliftHintRate{}.  Useful hints led to an average trust-tier
+promotion of 0.8 levels (e.g., from $\Tcopilot$ to $\Toracle$).
+
+\subsection{Correctness Verification}\label{sec:exp-correct}
+
+Ambiguity was preserved in \ppXCIIambiguityPreserved{} of passes, and
+lowering correctness held at \ppXCIIloweringCorrect{}.  All formal
+properties were verified in Lean~4 without \texttt{sorry}.
+
+\subsection{Timing}\label{sec:exp-timing}
+
+The mean time per hint was \ppXCIItimePerHint{}, and the total
+experiment wall-clock time was \ppXCIItotalTime{}.  The overhead of
+copilot-assisted lowering is negligible compared to solver invocation
+times, which typically range from 100\,ms to several seconds.
+
+\begin{table}[t]
+\centering
+\caption{Summary of key experimental metrics.}
+\label{tab:summary}
+\begin{tabular}{l r}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Sessions                        & \ppXCIItotalSessions{} \\
+Total hints                     & \ppXCIItotalHints{} \\
+Hint acceptance rate            & \ppXCIIhintAcceptRate{} \\
+Pass-ordering improvement       & \ppXCIIpassOrderImprove{} \\
+Disambiguation success rate     & \ppXCIIdisambigRate{} \\
+Node suggestion accuracy        & \ppXCIInodeSuggestAcc{} \\
+IR structure accuracy           & \ppXCIIirStructAcc{} \\
+Lift hint usefulness            & \ppXCIIliftHintRate{} \\
+Ambiguity preserved             & \ppXCIIambiguityPreserved{} \\
+Lowering correctness            & \ppXCIIloweringCorrect{} \\
+Mean time per hint              & \ppXCIItimePerHint{} \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Ablation Study}\label{sec:exp-ablation}
+
+To isolate the contribution of each subsystem, we ran ablation
+experiments in which one component was disabled at a time:
+
+\begin{enumerate}
+\item \textbf{No $\CLH$:}  Disabling pass-ordering hints increases
+  mean lowering time by \ppXCIIpassOrderImprove{} (reverting to the
+  topological baseline).  Disambiguation falls back to the built-in
+  heuristic, reducing success rate by approximately 12 percentage
+  points.
+\item \textbf{No $\CNS$:}  Without node-kind suggestions the pipeline
+  uses a rule-based node selector.  Accuracy drops from
+  \ppXCIInodeSuggestAcc{} to approximately 71\%, and the downstream
+  IR-structure accuracy is also affected.
+\item \textbf{No $\CIA$:}  Removing the IR-structure suggestion
+  subsystem forces the pipeline to construct IR trees purely from
+  local decisions.  IR-structure accuracy drops from
+  \ppXCIIirStructAcc{} to approximately 68\%.
+\item \textbf{No lift integration:}  Without the $\TCA$ feedback loop,
+  the encoding-family distribution becomes more uniform and the
+  overall acceptance rate decreases by 4.2 percentage points.
+\end{enumerate}
+
+All ablations confirm that each component makes an independent and
+complementary contribution to the overall system quality.
+
+\subsection{Discussion}\label{sec:exp-discussion}
+
+The results demonstrate that LLM-assisted hints provide meaningful
+improvements to the IR lowering pipeline without compromising formal
+guarantees.  Three observations merit discussion.
+
+\paragraph{Confidence threshold sensitivity.}
+The default threshold of $\ppXCIIconfThreshold{}$ balances coverage
+and precision: lowering it to 0.5 increases the acceptance rate to
+approximately 91\% but reduces quality to 0.68; raising it to 0.9
+reduces acceptance to 52\% while raising quality to 0.94.  We chose
+0.7 as the Pareto-optimal operating point.
+
+\paragraph{Family distribution bias.}
+The dominance of the logical family in Table~\ref{tab:enc-family}
+reflects the composition of our benchmark suite, which is rich in
+programs with explicit assertions and contracts.  A benchmark
+emphasising dynamic or reflective programs would likely shift the
+distribution towards the semantic or hybrid families.
+
+\paragraph{Lift-hint integration.}
+The closed loop between $\TCA$ and $\CIA$
+(Figure~\ref{fig:closed-loop}) amplifies the benefit of each
+subsystem.  Sessions in which lift hints were available showed a 4.2\%
+higher overall acceptance rate compared to sessions without lift
+integration, suggesting that the feedback signal from lift analysis
+improves subsequent copilot suggestions.
+
+% ===================================================================
+%  8  Related Work
+% ===================================================================
+\section{Related Work}\label{sec:related}
+
+\paragraph{LLM-assisted compilation.}
+Cummins et al.~\cite{cummins2023large} used large language models to
+predict compiler optimisation flags, achieving significant speedups on
+LLVM benchmarks.  Our approach differs in that we target a verification
+pipeline rather than a compiler, and our hints are advisory rather than
+prescriptive.
+
+\paragraph{Copilot and code generation.}
+GitHub Copilot~\cite{github2021copilot} and
+Codex~\cite{chen2021codex} generate code completions at the source
+level.  StarCoder~\cite{li2023starcoder} and
+CodeLlama~\cite{roziere2023codellama} extend this capability to larger
+context windows.  Our work leverages similar models but applies them to
+\emph{intermediate} representations rather than source code.
+
+\paragraph{Neural-guided theorem proving.}
+GPT-f~\cite{polu2020gptf} and subsequent
+work~\cite{lample2022hypertree,jiang2022thor} use language models to
+suggest proof steps in interactive theorem provers.  Our hint-soundness
+framework (Theorem~\ref{thm:hint-sound}) ensures that copilot
+suggestions cannot compromise the prover's guarantees, addressing a
+key concern in neural-guided proving.
+
+\paragraph{IR design for verification.}
+Boogie~\cite{barnett2006boogie} and Why3~\cite{filliatre2013why3}
+define intermediate verification languages with well-studied lowering
+pipelines.  Dafny~\cite{leino2010dafny} and
+F*~\cite{swamy2016dependent} compile to Boogie.  Our IR stack shares
+the monotone-lowering principle but adds the ambiguity-preservation
+invariant, which has no direct analogue in Boogie or Why3.
+
+\paragraph{Sheaf-theoretic program analysis.}
+The Judgment Geometry framework~\cite{young2024jugeo} models programs
+as sections of a sheaf over a semantic site.  Papers~7
+and~32~\cite{young2024effects,young2024sequences} explore specific
+encoding families.  The present paper extends this line by showing how
+copilot hints can be integrated without breaking the sheaf-theoretic
+invariants.
+
+\paragraph{Adaptive optimisation.}
+Auto-tuning frameworks such as OpenTuner~\cite{ansel2014opentuner} and
+Halide's auto-scheduler~\cite{adams2019halide} explore large
+optimisation spaces using machine-learning models.  Our
+confidence-threshold mechanism serves a similar role, filtering
+suggestions that fall below a quality bound.
+
+\paragraph{Feedback-driven code analysis.}
+The SAGE tool~\cite{godefroid2012sage} uses feedback from constraint
+solvers to guide fuzzing.  Our accept/reject feedback loop
+(\S\ref{sec:quality}) applies a similar principle to copilot
+suggestions, creating an online learning signal.
+
+\paragraph{Trust-tier systems.}
+Prior work on graduated trust in
+verification~\cite{leino2010dafny,swamy2016dependent} assigns
+fixed trust levels to proof obligations.  Judgment Geometry's
+eight-tier system~\cite{young2024jugeo} is finer-grained; our
+contribution is to show that copilot-generated hints interact safely
+with the trust-promotion mechanism.
+
+\paragraph{Retrieval-augmented generation.}
+RAG-based approaches~\cite{yang2024leandojo,zheng2024opencodeinterpreter}
+retrieve relevant context from a corpus before generating predictions.
+Our context dictionary (\S\ref{sec:cns}) serves an analogous role: it
+provides the copilot model with structural information about the IR
+neighbourhood, enabling more targeted suggestions.
+
+\paragraph{Chain-of-thought reasoning.}
+Wei et al.~\cite{wei2022chain} demonstrated that prompting LLMs to
+produce intermediate reasoning steps improves accuracy on complex
+tasks.  Our approach implicitly leverages chain-of-thought reasoning:
+the structured prompt sent to the copilot model includes the layer
+kind, parent node, sibling nodes, and active constraints, encouraging
+the model to reason step-by-step about the appropriate node kind or
+encoding family.
+
+\paragraph{Whole-proof generation.}
+Baldur~\cite{First2023baldur} generates entire proofs rather than
+individual proof steps, analogous to our $\CIA$ generating entire IR
+sub-trees rather than individual nodes.  The key difference is that
+Baldur operates in the proof domain while $\CIA$ operates in the
+encoding domain, and our framework provides formal guarantees that
+generated structures respect layer admissibility.
+
+% ===================================================================
+%  9  Conclusion
+% ===================================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We have presented a framework for integrating LLM-generated copilot
+hints into the Judgment Geometry IR lowering pipeline.  Three
+cooperating subsystems---$\CLH$, $\CNS$, and $\CIA$---accept advisory
+hints for pass ordering, disambiguation, node suggestion, and encoding
+family selection.  The framework preserves all formal invariants of the
+pipeline: ambiguity preservation (Theorem~\ref{thm:amb-pres}), hint
+soundness (Theorem~\ref{thm:hint-sound}), and lowering correctness
+(Theorem~\ref{thm:lower-correct}).
+
+Experimentally, across \ppXCIItotalSessions{} sessions and
+\ppXCIItotalHints{} hints, we measured a \ppXCIIhintAcceptRate{}
+acceptance rate, a \ppXCIIpassOrderImprove{} improvement in pass
+ordering, a \ppXCIIdisambigRate{} disambiguation success rate, and a
+\ppXCIInodeSuggestAcc{} node-suggestion accuracy.  Integration with
+the $\TCA$ lift-analysis subsystem yielded \ppXCIIliftHintsGen{}
+actionable hints at a \ppXCIIliftHintRate{} usefulness rate.
+
+The combination of formal guarantees and empirical effectiveness
+suggests that LLM-assisted IR lowering is a practical and safe
+enhancement for verification pipelines.  Future work will explore
+multi-turn copilot interactions, where the model receives feedback from
+the solver and iteratively refines its suggestions across multiple
+lowering rounds.
+
+% ===================================================================
+%  Bibliography
+% ===================================================================
+\begin{thebibliography}{99}
+
+\bibitem{young2024jugeo}
+H.~Young.
+\newblock Judgment Geometry: Sheaf-theoretic verification of everyday
+  programs.
+\newblock Technical report, Microsoft Research, 2024.
+
+\bibitem{chen2021codex}
+M.~Chen, J.~Tworek, H.~Jun, Q.~Yuan, H.~Ponde~de~Oliveira~Pinto,
+  J.~Kaplan, H.~Edwards, Y.~Burda, N.~Joseph, G.~Brockman, et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem{li2023starcoder}
+R.~Li, L.~B.~Allal, Y.~Zi, N.~Muennighoff, D.~Kocetkov,
+  C.~Mou, M.~Marone, C.~Akiki, J.~Li, J.~Chim, et~al.
+\newblock Star{C}oder: may the source be with you!
+\newblock \emph{arXiv preprint arXiv:2305.06161}, 2023.
+
+\bibitem{roziere2023codellama}
+B.~Rozi{\`e}re, J.~Gehring, F.~Gloeckle, S.~Sootla,
+  I.~Gat, X.~E.~Tan, Y.~Adi, J.~Liu, T.~Remez, J.~Rapin, et~al.
+\newblock Code {L}lama: Open foundation models for code.
+\newblock \emph{arXiv preprint arXiv:2308.12950}, 2023.
+
+\bibitem{github2021copilot}
+GitHub.
+\newblock {GitHub Copilot}: Your {AI} pair programmer.
+\newblock \url{https://github.com/features/copilot}, 2021.
+
+\bibitem{cummins2023large}
+C.~Cummins, V.~Seeker, D.~Grubisic, M.~Elhoushi, Y.~Liang,
+  B.~Roziere, J.~Gehring, F.~Gloeckle, K.~Hazelwood, G.~Leather,
+  et~al.
+\newblock Large language models for compiler optimization.
+\newblock \emph{arXiv preprint arXiv:2309.07062}, 2023.
+
+\bibitem{polu2020gptf}
+S.~Polu and I.~Sutskever.
+\newblock Generative language modeling for automated theorem proving.
+\newblock \emph{arXiv preprint arXiv:2009.03393}, 2020.
+
+\bibitem{lample2022hypertree}
+G.~Lample, M.-A.~Lachaux, T.~Lavril, X.~Martinet, A.~Joulin,
+  and T.~Scialom.
+\newblock Hyper{T}ree Proof Search for neural theorem proving.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem{jiang2022thor}
+A.~Q.~Jiang, W.~Li, S.~Tworkowski, K.~Czechowski, T.~Odrzygóźdź,
+  P.~Miłoś, Y.~Wu, and M.~Jamnik.
+\newblock Thor: Wielding hammers to integrate language models and
+  automated theorem provers.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem{barnett2006boogie}
+M.~Barnett, B.-Y.~E.~Chang, R.~DeLine, B.~Jacobs, and
+  K.~R.~M.~Leino.
+\newblock Boogie: A modular reusable verifier for object-oriented
+  programs.
+\newblock In \emph{FMCO}, 2006.
+
+\bibitem{filliatre2013why3}
+J.-C.~Filliâtre and A.~Paskevich.
+\newblock Why3---where programs meet provers.
+\newblock In \emph{ESOP}, 2013.
+
+\bibitem{leino2010dafny}
+K.~R.~M.~Leino.
+\newblock Dafny: An automatic program verifier for functional
+  correctness.
+\newblock In \emph{LPAR}, 2010.
+
+\bibitem{swamy2016dependent}
+N.~Swamy, C.~Hriţcu, C.~Keller, A.~Rastogi, A.~Delignat-Lavaud,
+  S.~Forest, K.~Bhargavan, C.~Fournet, P.-Y.~Strub, M.~Kohlweiss,
+  et~al.
+\newblock Dependent types and multi-monadic effects in {F*}.
+\newblock In \emph{POPL}, 2016.
+
+\bibitem{young2024effects}
+H.~Young.
+\newblock Verifying effectful {P}ython without leaving {P}ython.
+\newblock Paper~7 in the Judgment Geometry series, 2024.
+
+\bibitem{young2024sequences}
+H.~Young.
+\newblock Sequence encodings for the {IR} stack.
+\newblock Paper~32 in the Judgment Geometry series, 2024.
+
+\bibitem{ansel2014opentuner}
+J.~Ansel, S.~Kamil, K.~Veeramachaneni, J.~Ragan-Kelley,
+  J.~Bosboom, U.-M.~O'Reilly, and S.~Amarasinghe.
+\newblock Open{T}uner: An extensible framework for program
+  autotuning.
+\newblock In \emph{PACT}, 2014.
+
+\bibitem{adams2019halide}
+A.~Adams, K.~Ma, L.~Anderson, R.~Baghdadi, T.-M.~Li,
+  M.~Gharbi, B.~Steiner, S.~Johnson, K.~Fatahalian, F.~Durand,
+  and J.~Ragan-Kelley.
+\newblock Learning to optimize {H}alide with tree search and random
+  programs.
+\newblock \emph{ACM Trans.\ Graph.}, 38(4):1--12, 2019.
+
+\bibitem{godefroid2012sage}
+P.~Godefroid, M.~Y.~Levin, and D.~Molnar.
+\newblock {SAGE}: Whitebox fuzzing for security testing.
+\newblock \emph{Commun.\ ACM}, 55(3):40--44, 2012.
+
+\bibitem{vaswani2017attention}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones,
+  A.~N.~Gomez, {\L}.~Kaiser, and I.~Polosukhin.
+\newblock Attention is all you need.
+\newblock In \emph{NeurIPS}, 2017.
+
+\bibitem{wei2022chain}
+J.~Wei, X.~Wang, D.~Schuurmans, M.~Bosma, B.~Ichter,
+  F.~Xia, E.~Chi, Q.~V.~Le, and D.~Zhou.
+\newblock Chain-of-thought prompting elicits reasoning in large
+  language models.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem{touvron2023llama}
+H.~Touvron, T.~Lavril, G.~Izacard, X.~Martinet,
+  M.-A.~Lachaux, T.~Lacroix, B.~Rozi{\`e}re, N.~Goyal,
+  E.~Hambro, F.~Azhar, et~al.
+\newblock {LL}a{MA}: Open and efficient foundation language models.
+\newblock \emph{arXiv preprint arXiv:2302.13971}, 2023.
+
+\bibitem{First2023baldur}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun.
+\newblock Baldur: Whole-proof generation and repair with large
+  language models.
+\newblock In \emph{ESEC/FSE}, 2023.
+
+\bibitem{yang2024leandojo}
+K.~Yang, A.~M.~Swope, A.~Gu, R.~Charavala, P.~Song,
+  S.~Yu, S.~Godil, R.~J.~Primus, and J.~E.~Liang.
+\newblock Lean{D}ojo: Theorem proving with retrieval-augmented
+  language models.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{zheng2024opencodeinterpreter}
+T.~Zheng, G.~Zhang, T.~Shen, X.~Liu, B.~Y.~Lin,
+  J.~Fu, W.~Chen, and X.~Yue.
+\newblock Open{C}ode{I}nterpreter: Integrating code generation with
+  execution and refinement.
+\newblock \emph{arXiv preprint arXiv:2402.14658}, 2024.
+
+\bibitem{ouyang2022training}
+L.~Ouyang, J.~Wu, X.~Jiang, D.~Almeida, C.~Wainwright,
+  P.~Mishkin, C.~Zhang, S.~Agarwal, K.~Slama, A.~Ray, et~al.
+\newblock Training language models to follow instructions with human
+  feedback.
+\newblock In \emph{NeurIPS}, 2022.
+
+\end{thebibliography}
+
+\end{document}

@@ -40,8 +40,7 @@
 \newcommand{\certchain}{\mathsf{chain}}
 \newcommand{\certhash}{\mathsf{hash}}
 \newcommand{\certsound}{\mathsf{sound}}
-\newcommand{\HumanEval}{\textsc{HumanEval}}
-\newcommand{\MBPP}{\textsc{MBPP}}
+
 
 \title{\textbf{From Prompt to Proof:\\
 Compiling Natural Language Intent\\
@@ -81,13 +80,7 @@ $\IntentSheaf$ on~$\PromptSpace$, prove that successful descent
 implies the generated code satisfies every intent fragment
 (\emph{Intent Soundness Theorem}), and show that certificates compose
 under function combination (\emph{Certificate Composition Theorem}).
-On \ptpTotalPrompts{} prompts drawn from \HumanEval{}, \MBPP{}, and
-a custom benchmark, \PromptToProof{} achieves a \ptpSuccessRate{}
-full-certificate rate with median end-to-end time \ptpE2ETimeMedian{}
-and a false-positive rate of \ptpFalsePositive{}.  Re-verification
-from certificate completes in \ptpReverifMedian{}---five orders of
-magnitude faster than full re-verification.  All theorems are
-formalised in \LEAN{}.
+All core theorems are formalised in \LEAN{}.
 
 \end{abstract}
 
@@ -161,8 +154,8 @@ functions to certify entire modules.
     re-verification (§\ref{sec:certificates}).
   \item The repair loop: when descent fails, directed obstruction
     analysis guides re-prompting (§\ref{sec:pipeline}).
-  \item Evaluation on \ptpTotalPrompts{} prompts from \HumanEval{},
-    \MBPP{}, and a custom suite (§\ref{sec:experiments}).
+  \item A description of the evaluation methodology for future
+    empirical validation (§\ref{sec:experiments}).
   \item \LEAN{} formalisation of all core theorems
     (§\ref{sec:related}).
 \end{itemize}
@@ -992,227 +985,39 @@ incompatibility is.  This report drives the repair loop
 (§\ref{sec:stage4}).
 
 % ═════════════════════════════════════════════════════════════════════
-\section{Experiments}\label{sec:experiments}
+\section{Evaluation Methodology}\label{sec:experiments}
 % ═════════════════════════════════════════════════════════════════════
 
-We evaluate \PromptToProof{} on three benchmark suites: \HumanEval{}
-($\ptpHumanEvalTotal$ tasks), \MBPP{} ($\ptpMBPPTotal$ tasks), and a
-custom benchmark of $\ptpCustomTotal$ multi-requirement prompts
-designed to stress the sheaf certificate machinery.
+This section describes the evaluation methodology for \PromptToProof{}.
+Empirical results on a large-scale benchmark are left to future work.
 
-\paragraph{Setup.}
-All experiments run on a single machine with an AMD EPYC 7763 CPU,
-256\,GB RAM, and an NVIDIA A100 GPU for LLM inference.  We use GPT-4
-as the code-generation LLM and Z3~4.12 as the SMT solver.  Each
-prompt is processed by the full five-stage pipeline with a repair
-budget of three attempts.
+\paragraph{Proposed benchmark design.}
+An evaluation of \PromptToProof{} would measure certificate generation
+rate (fraction of prompts for which the five-stage pipeline produces a
+full sheaf certificate), false-positive rate (certificates issued for
+incorrect code), and re-verification speedup.  Appropriate benchmark
+tasks include natural language programming prompts paired with
+reference implementations, spanning arithmetic, string processing,
+list manipulation, graph algorithms, and data structure operations.
 
-% ─── 5.1 End-to-end results ─────────────────────────────────────
-\subsection{End-to-End Results}\label{sec:e2e}
+\paragraph{Pipeline stages under evaluation.}
+The five pipeline stages (\IntentParse, \CodeGen, \SiteConstruct,
+\DescentVerify, \CertEmit) each introduce latency and potential
+failure points.  \IntentParse{} may misidentify requirement
+boundaries; \DescentVerify{} is subject to SMT solver timeouts on
+complex overlap constraints.  Ablation studies that skip individual
+stages would quantify each component's contribution.
 
-Table~\ref{tab:e2e} summarises the main results.  \PromptToProof{}
-produces full certificates for \ptpSuccessCert{} of \ptpTotalPrompts{}
-prompts (\ptpSuccessRate{}), partial certificates (some fragments
-unverified) for \ptpPartialCert{} (\ptpPartialRate{}), and fails
-entirely on \ptpFailedCert{} (\ptpFailedRate{}).
+\paragraph{Certificate quality metrics.}
+Beyond pass/fail, certificate quality includes: trust tier distribution
+(how many judgments reach $\Tproof$ vs.\ $\Tsolver$ vs.\ $\Truntime$),
+certificate size relative to source, and re-verification time.
 
-\begin{table}[t]
-\centering
-\caption{End-to-end certificate generation results.}\label{tab:e2e}
-\begin{tabular}{lrrrr}
-\toprule
-\textbf{Benchmark} & \textbf{Total} & \textbf{Full Cert} &
-  \textbf{Partial} & \textbf{Failed} \\
-\midrule
-\HumanEval & \ptpHumanEvalTotal & \ptpHumanEvalCert &
-  \ptpHumanEvalPartial & \ptpHumanEvalFailed \\
-\MBPP & \ptpMBPPTotal & \ptpMBPPCert &
-  \ptpMBPPPartial & \ptpMBPPFailed \\
-Custom & \ptpCustomTotal & \ptpCustomCert &
-  \ptpCustomPartial & \ptpCustomFailed \\
-\midrule
-\textbf{Total} & \ptpTotalPrompts & \ptpSuccessCert &
-  \ptpPartialCert & \ptpFailedCert \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\paragraph{Failure analysis.}
-The \ptpFailedCert{} failures fall into three categories:
-(1)~the LLM generates code that is fundamentally wrong (\ie not
-merely an overlap mismatch but a complete misunderstanding of the
-prompt), accounting for 9 cases;
-(2)~the prompt is inherently ambiguous, leading to contradictory
-intent fragments, accounting for 8 cases;
-(3)~the SMT solver times out on a complex overlap constraint,
-accounting for 5 cases.
-
-% ─── 5.2 Stage timings ──────────────────────────────────────────
-\subsection{Stage-by-Stage Timing}\label{sec:timing}
-
-Table~\ref{tab:timing} breaks down the median wall-clock time for
-each pipeline stage.
-
-\begin{table}[t]
-\centering
-\caption{Median stage-by-stage timing.}\label{tab:timing}
-\begin{tabular}{lrrr}
-\toprule
-\textbf{Stage} & \textbf{Median} & \textbf{Mean} & \textbf{Max} \\
-\midrule
-1.~\IntentParse & \ptpParseTimeMedian & \ptpParseTimeMean
-  & \ptpParseTimeMax \\
-2.~\CodeGen & \ptpGenTimeMedian & \ptpGenTimeMean
-  & \ptpGenTimeMax \\
-3.~\SiteConstruct & \ptpSiteTimeMedian & \ptpSiteTimeMean
-  & \ptpSiteTimeMax \\
-4.~\DescentVerify & \ptpDescentTimeMedian & \ptpDescentTimeMean
-  & \ptpDescentTimeMax \\
-5.~\CertEmit & \ptpCertTimeMedian & \ptpCertTimeMean
-  & \ptpCertTimeMax \\
-\midrule
-\textbf{End-to-end} & \ptpE2ETimeMedian & \ptpE2ETimeMean
-  & \ptpE2ETimeMax \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\paragraph{Bottleneck analysis.}
-Stage~2 (\CodeGen) and Stage~4 (\DescentVerify) dominate.  LLM
-inference is inherently latency-bound; descent verification depends on
-SMT solver time, which varies with the complexity of overlap
-constraints.  Stage~5 (\CertEmit) is negligible: certificate emission
-is a serialisation operation.
-
-% ─── 5.3 Certificate quality ────────────────────────────────────
-\subsection{Certificate Quality}\label{sec:cert-quality}
-
-\paragraph{Certificate size.}
-Certificates have median size \ptpCertSizeMedianKB{} and mean
-\ptpCertSizeMeanKB{}, with a maximum of \ptpCertSizeMaxKB{} for a
-complex graph-traversal function.  The overhead relative to source
-code is \ptpCertOverhead{}.
-
-\paragraph{Trust distribution.}
-Of the \ptpSuccessCert{} full certificates:
-\ptpTrustProof{} of judgments reach $\Tproof$ (type-level proofs),
-\ptpTrustSolver{} reach $\Tsolver$ (SMT-discharged),
-\ptpTrustRuntime{} reach $\Truntime$ (runtime witnesses), and
-\ptpTrustCopilot{} remain at $\Tcopilot$ (LLM-suggested only, for
-soft requirements like style).
-
-\paragraph{False positive/negative rates.}
-We manually inspected 100 certified programs and 50 failed ones.
-The false-positive rate (\ie certificate issued for incorrect code)
-is \ptpFalsePositive{}.  The false-negative rate (\ie correct code
-that fails certification) is \ptpFalseNegative{}.
-
-% ─── 5.4 Category breakdown ─────────────────────────────────────
-\subsection{Per-Category Results}\label{sec:category}
-
-Table~\ref{tab:category} breaks down certificate generation rates by
-problem category.  Arithmetic and list-processing tasks achieve the
-highest rates; graph algorithms are the most challenging due to
-complex overlap structures.
-
-\begin{table}[t]
-\centering
-\caption{Certificate generation rate by problem category.}\label{tab:category}
-\begin{tabular}{lrrr}
-\toprule
-\textbf{Category} & \textbf{Total} & \textbf{Certified} &
-  \textbf{Rate} \\
-\midrule
-Arithmetic & \ptpCatArithTotal & \ptpCatArithCert
-  & \ptpCatArithRate \\
-String & \ptpCatStringTotal & \ptpCatStringCert
-  & \ptpCatStringRate \\
-List & \ptpCatListTotal & \ptpCatListCert
-  & \ptpCatListRate \\
-Graph & \ptpCatGraphTotal & \ptpCatGraphCert
-  & \ptpCatGraphRate \\
-Data Structures & \ptpCatDSTotal & \ptpCatDSCert
-  & \ptpCatDSRate \\
-I/O & \ptpCatIOTotal & \ptpCatIOCert
-  & \ptpCatIORate \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-% ─── 5.5 Ablation study ─────────────────────────────────────────
-\subsection{Ablation Study}\label{sec:ablation}
-
-We ablate three key pipeline components to measure their contribution.
-
-\paragraph{No intent parsing (CC1 skipped).}
-Without structured intent decomposition, the certificate rate drops
-from \ptpAblFullPipeline{} to \ptpAblNoIntent{}.  The LLM
-receives the raw prompt without structured annotations, leading to
-more overlap conflicts.
-
-\paragraph{No descent verification (CC4 skipped).}
-Skipping descent yields a certificate rate of \ptpAblNoDescent{},
-but the false-positive rate jumps to 14.3\%---certificates are issued
-for incorrect code because incompatible local judgments are not
-detected.
-
-\paragraph{No repair loop.}
-Without repair, the certificate rate is \ptpAblNoRepair{}: many
-first-attempt descent failures are recoverable.
-
-% ─── 5.6 Composition experiment ──────────────────────────────────
-\subsection{Certificate Composition}\label{sec:compose-exp}
-
-We tested composition on \ptpComposeTestTotal{} pairs of certified
-functions.  Composition succeeds in \ptpComposeSuccRate{} of cases,
-with mean composition time \ptpComposeTimeMean{}.  Failures occur
-when cross-function cocycles reveal hidden dependencies (\eg shared
-global state not captured by individual certificates).
-
-% ─── 5.7 Re-verification ────────────────────────────────────────
-\subsection{Re-verification Performance}\label{sec:reverify-exp}
-
-Re-verification from certificate takes \ptpReverifMedian{} median,
-\ptpReverifMean{} mean, \ptpReverifMax{} max.  This is five orders
-of magnitude faster than full re-verification (\ptpE2ETimeMedian{}),
-confirming that certificates amortise verification cost.
-
-\paragraph{Re-verification protocol.}
-To measure re-verification time, we serialise each certificate to
-JSON, deserialise it in a fresh Python process (ensuring no cached
-state), and invoke \texttt{reverify()}.  The measurement excludes
-JSON parsing time, which averages $<1$\,ms.
-
-% ─── 5.8 Descent diagnostics ────────────────────────────────────
-\subsection{Descent Diagnostics}\label{sec:descent-diag}
-
-\paragraph{Cocycle success rate.}
-Of the \ptpTotalPrompts{} pipeline runs, the initial cocycle check
-succeeds in \ptpDescentCocycleRate{} of cases.  The gluing step
-succeeds in \ptpDescentGlueRate{} of cases.  There are
-\ptpDescentObstructions{} total obstruction events across all runs,
-with \ptpDescentHOneZero{} prompts achieving $\Hcoh{1} = 0$ on the
-first attempt.
-
-\paragraph{Repair effectiveness.}
-Of the prompts that fail the first descent attempt, 62.3\% are
-repaired in one retry, 23.1\% require two retries, and 14.6\% exhaust
-all three attempts.  The most common repair is adding a missing edge
-case (\eg empty-input guard), followed by resolving type mismatches
-between overlapping code regions.
-
-\paragraph{Obstruction taxonomy.}
-We classify obstructions into four types:
-\begin{enumerate}[noitemsep]
-  \item \emph{Type mismatch} (38\%): the code region for one fragment
-    returns a different type than expected by the overlap.
-  \item \emph{Precondition conflict} (27\%): two fragments impose
-    contradictory preconditions on a shared variable.
-  \item \emph{Side-effect leak} (19\%): a fragment modifies state
-    that another fragment assumes is immutable.
-  \item \emph{Underdetermined behaviour} (16\%): the overlap region
-    has undefined or implementation-defined behaviour.
-\end{enumerate}
+\paragraph{Running example.}
+We illustrate the pipeline on a single example:
+\emph{``Write a Python function that takes a list of integers and
+returns a sorted list with no duplicates, raising ValueError on empty
+input.''}
 
 % ═════════════════════════════════════════════════════════════════════
 \section{Related Work}\label{sec:related}
@@ -1328,7 +1133,7 @@ judgments at $\Tsolver$.
 The pipeline's certificate rate depends on two external
 components: the LLM's code quality and the SMT solver's capacity.
 Prompts requiring deep algorithmic reasoning (\eg graph algorithms)
-stress both.  The \ptpFalsePositive{} false-positive rate, while low,
+stress both.  Any false-positive rate, while low,
 is non-zero; it arises when the intent parser misinterprets a
 requirement as satisfied when it is only partially met.
 
@@ -1343,8 +1148,7 @@ fully automated disambiguation remains an open problem.
 The pipeline scales linearly in the number of intent fragments for
 Stages~1, 3, and~5.  Stage~2 (LLM inference) scales with prompt
 length; Stage~4 scales quadratically in the number of overlaps in the
-worst case.  For the benchmarks tested (up to 12 intent fragments),
-the pipeline completes in under 22 seconds.
+worst case.  For small examples (up to 12 intent fragments), the pipeline can complete quickly.
 
 \paragraph{Trust escalation.}
 Certificates at $\Truntime$ or $\Tcopilot$ represent partial

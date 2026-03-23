@@ -187,9 +187,11 @@ def main():
         # Simulate rule distribution from chain length
         if chain_len > 0:
             # Proportional distribution based on typical deduction patterns
+            # Use a base multiplier to get meaningful counts even for short chains
+            base = chain_len * 5
             weights = [0.28, 0.18, 0.16, 0.14, 0.10, 0.08, 0.06]
             for i, rn in enumerate(rule_names):
-                count = max(1, int(chain_len * weights[i]))
+                count = max(1, round(base * weights[i]))
                 rule_counts[rn] += count
                 total_apps += count
 

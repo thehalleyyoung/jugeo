@@ -1,0 +1,1504 @@
+% paper88-copilot-evidence-channels.tex — The Copilot Evidence Channel:
+%   Trust-Calibrated LLM Contributions
+%   Paper 88 of the Judgment Geometry series.
+% Compile: pdflatex paper88-copilot-evidence-channels
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{data-paper88}
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\CopCh}{\mathsf{CopilotChannel}}
+\newcommand{\EvCh}{\mathsf{EvidenceChannel}}
+\newcommand{\CopAdapt}{\mathsf{CopilotChannelAdapter}}
+\newcommand{\CopGate}{\mathsf{CopilotTrustGateway}}
+\newcommand{\QRec}{\mathsf{CopilotQueryRecord}}
+\newcommand{\TrustCeil}{\mathsf{COPILOT\_SUGGESTED}}
+\newcommand{\enforce}{\mathrm{enforce}}
+\newcommand{\promote}{\mathrm{promote}}
+\newcommand{\corrob}{\mathrm{corrob}}
+\newcommand{\audit}{\mathrm{audit}}
+\newcommand{\queryLLM}{\texttt{query\_llm}}
+\newcommand{\rateCheck}{\texttt{rate\_limit\_check}}
+\newcommand{\buildResp}{\texttt{build\_evidence\_response}}
+\newcommand{\fmtPrompt}{\texttt{format\_copilot\_prompt}}
+\newcommand{\trustFloor}{\texttt{default\_trust\_floor}}
+\newcommand{\trustReport}{\texttt{trust\_report}}
+\newcommand{\enforceCeil}{\texttt{enforce\_ceiling}}
+\newcommand{\processQ}{\texttt{process\_query}}
+\newcommand{\auditSum}{\texttt{audit\_summary}}
+\newcommand{\toDict}{\texttt{to\_dict}}
+\newcommand{\canHandle}{\texttt{can\_handle}}
+\newcommand{\channelId}{\texttt{channel\_id}}
+
+\title{\textbf{The Copilot Evidence Channel:\\
+Trust-Calibrated LLM Contributions}}
+
+\author{%
+  JuGeo Research Group
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+Large language models (LLMs) can supply useful \emph{evidence} for
+program verification---suggested invariants, contract summaries,
+complexity bounds---but their outputs carry no intrinsic soundness
+guarantee.  We present the \emph{Copilot evidence channel}, a
+first-class integration of LLM-generated evidence into the
+Judgment Geometry framework with a hard trust ceiling that prevents
+LLM suggestions from silently inflating the trust level of a judgment.
+The design centres on four components:
+(i)~the $\EvCh$ enum, which classifies evidence sources into
+    $\mathsf{SOLVER}$, $\mathsf{RUNTIME}$, $\mathsf{ORACLE}$,
+    $\mathsf{COPILOT}$, $\mathsf{FORMAL\_PROOF}$, $\mathsf{HUMAN}$,
+    and $\mathsf{COMPOSED}$;
+(ii)~the $\CopCh$ class, which wraps \queryLLM{} calls behind
+    rate limiting and a configurable timeout;
+(iii)~the $\CopGate$ trust gateway, which enforces the ceiling
+    $\TrustCeil$ and blocks every promotion attempt that lacks
+    independent corroboration; and
+(iv)~the $\CopAdapt$ adapter, which routes queries to
+    heterogeneous model back-ends while tracking per-model token
+    budgets.
+We prove three formal properties---\emph{trust-ceiling enforcement},
+\emph{no-silent-promotion}, and \emph{audit completeness}---and
+verify them in \LEAN.
+Experiments on \ppLXXXVIIItotalQueries{} queries across
+\ppLXXXVIIIadapterCount{} model adapters confirm that the ceiling
+holds in \ppLXXXVIIIceilingHeldPct{} of routed evidence,
+rate limiting rejects \ppLXXXVIIIrateLimitHitPct{} of burst traffic,
+and the audit log is \ppLXXXVIIIauditComplete{} complete.
+The full pipeline is implemented in the \JuGeo{} \Python{} library
+and formalized in \LEAN.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+The integration of large language models into software-engineering
+tool-chains has accelerated rapidly.  Code-completion engines such
+as GitHub Copilot, Amazon CodeWhisperer, and open-weight alternatives
+generate code, docstrings, and even candidate specifications.  From
+the perspective of program verification, these outputs are a new
+\emph{evidence source}: an LLM can propose a loop invariant in
+milliseconds that might otherwise require manual annotation or
+expensive synthesis.
+
+Yet LLM outputs are probabilistic.  A suggested invariant may be
+syntactically valid but semantically wrong; a proposed contract may
+omit a critical precondition.  If such evidence is silently treated
+as ground truth, the trust label attached to a judgment becomes
+misleading.  The fundamental design question is therefore:
+
+\begin{quote}
+\emph{How can an evidence architecture incorporate LLM contributions
+without allowing them to inflate trust beyond what is warranted?}
+\end{quote}
+
+Judgment Geometry addresses this by treating every evidence source
+as a \emph{channel} with a well-defined \emph{trust floor} and,
+for non-mechanical channels, a \emph{trust ceiling}.  The
+$\mathsf{COPILOT}$ channel sits below $\mathsf{RUNTIME}$ and
+$\mathsf{SOLVER}$ in the trust lattice; its ceiling is
+$\TrustCeil$.  Evidence that enters through this channel
+\emph{cannot} promote a judgment past that ceiling unless an
+independent mechanical channel (\eg a solver or runtime check)
+corroborates the claim.
+
+This paper makes the following contributions:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Channel taxonomy.}
+  We define the $\EvCh$ enum and characterize each channel by
+  its trust floor, whether it is mechanical, and whether it
+  requires corroboration (\S\ref{sec:arch}).
+
+\item \textbf{CopilotChannel implementation.}
+  We describe the $\CopCh$ class---\queryLLM, \rateCheck,
+  \buildResp, and \fmtPrompt---and its integration into the
+  evidence pipeline (\S\ref{sec:copilot}).
+
+\item \textbf{Trust gateway and mixed-evidence routing.}
+  We present $\CopGate$ and $\CopAdapt$, which enforce the
+  ceiling, route queries to model back-ends, and maintain a
+  complete audit trail via $\QRec$ records (\S\ref{sec:gateway}).
+
+\item \textbf{Formal guarantees.}
+  We state and prove three theorems---trust-ceiling enforcement,
+  no-silent-promotion, and audit completeness---and formalize
+  them in \LEAN{} (\S\ref{sec:formal}).
+
+\item \textbf{Empirical evaluation.}
+  We exercise the pipeline on \ppLXXXVIIItotalQueries{} queries,
+  confirming that the ceiling holds universally, rate limiting
+  behaves as specified, and corroboration lifts
+  \ppLXXXVIIIcorrobRate{} of Copilot evidence to higher tiers
+  (\S\ref{sec:experiments}).
+\end{enumerate}
+
+\paragraph{Notation.}
+We write $\mathsf{X}$ for identifiers that correspond directly to
+Python classes or enum values (\eg $\CopCh$, $\EvCh$).
+Trust tiers are rendered in small-caps sans-serif:
+$\Tcontra \tleq \Tunver \tleq \Tcopilot \tleq \Toracle \tleq
+ \Truntime \tleq \Tsolver \tleq \Tproof$.
+We use $\enforce(t,c)$ for the ceiling-enforcement function that
+clamps tier $t$ to ceiling $c$.
+
+\paragraph{Paper outline.}
+Section~\ref{sec:arch} defines the evidence-channel taxonomy.
+Section~\ref{sec:copilot} presents the $\CopCh$ implementation.
+Section~\ref{sec:gateway} describes the trust gateway and
+mixed-evidence routing.
+Section~\ref{sec:formal} states and proves the formal properties.
+Section~\ref{sec:experiments} reports experimental results.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Evidence Channel Architecture}
+\label{sec:arch}
+
+\subsection{The \texorpdfstring{$\EvCh$}{EvidenceChannel} Enum}
+\label{sec:arch:enum}
+
+Every piece of evidence entering the Judgment Geometry pipeline is
+tagged with the channel through which it was produced.  The
+$\EvCh$ enum captures the seven channel kinds currently supported:
+
+\begin{lstlisting}[style=jugeo-python,caption={The \texttt{EvidenceChannel} enum.},label=lst:evidencechannel]
+class EvidenceChannel(Enum):
+    SOLVER       = auto()
+    RUNTIME      = auto()
+    ORACLE       = auto()
+    COPILOT      = auto()
+    FORMAL_PROOF = auto()
+    HUMAN        = auto()
+    COMPOSED     = auto()
+
+    def default_trust_floor(self) -> TrustTier:
+        """Lowest trust tier this channel can produce."""
+        ...
+
+    @property
+    def is_mechanical(self) -> bool:
+        """True if the channel requires no human in the loop."""
+        ...
+
+    @property
+    def requires_corroboration(self) -> bool:
+        """True if evidence must be independently confirmed."""
+        ...
+
+    def default_query_families(self) -> list[str]:
+        """Query families this channel can serve."""
+        ...
+\end{lstlisting}
+
+The enum provides four key methods:
+
+\begin{itemize}[leftmargin=2em]
+\item \trustFloor{} returns the lowest trust tier a channel is
+  authorized to assign.  For $\mathsf{COPILOT}$ this is
+  $\Tcopilot$; for $\mathsf{SOLVER}$ it is $\Tsolver$.
+
+\item \texttt{is\_mechanical} distinguishes channels that produce
+  evidence algorithmically ($\mathsf{SOLVER}$, $\mathsf{RUNTIME}$,
+  $\mathsf{COPILOT}$, $\mathsf{FORMAL\_PROOF}$) from those that
+  involve human judgment ($\mathsf{ORACLE}$, $\mathsf{HUMAN}$,
+  $\mathsf{COMPOSED}$).
+
+\item \texttt{requires\_corroboration} is \texttt{True} for
+  $\mathsf{COPILOT}$, $\mathsf{ORACLE}$, $\mathsf{HUMAN}$, and
+  $\mathsf{COMPOSED}$---channels whose evidence alone is
+  insufficient to raise trust above their floor.
+
+\item \texttt{default\_query\_families} lists the kinds of queries
+  a channel can answer (\eg invariant suggestion, complexity
+  estimation).
+\end{itemize}
+
+\subsection{Channel Taxonomy}
+\label{sec:arch:taxonomy}
+
+Table~\ref{tab:channels} summarizes the seven channels along three
+axes: trust floor, mechanicality, and corroboration requirement.
+
+\begin{table}[ht]
+\centering
+\caption{Evidence channel taxonomy.}
+\label{tab:channels}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Channel} & \textbf{Trust Floor} &
+  \textbf{Mechanical?} & \textbf{Corrob.?} \\
+\midrule
+$\mathsf{SOLVER}$       & $\Tsolver$  & \checkmark & --- \\
+$\mathsf{RUNTIME}$      & $\Truntime$ & \checkmark & --- \\
+$\mathsf{ORACLE}$       & $\Toracle$  & ---        & \checkmark \\
+$\mathsf{COPILOT}$      & $\Tcopilot$ & \checkmark & \checkmark \\
+$\mathsf{FORMAL\_PROOF}$& $\Tproof$   & \checkmark & --- \\
+$\mathsf{HUMAN}$        & $\Tunver$   & ---        & \checkmark \\
+$\mathsf{COMPOSED}$     & $\Tunver$   & ---        & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The $\mathsf{COPILOT}$ channel is the \emph{only} channel that is
+both mechanical and requires corroboration.  This reflects the
+nature of LLM inference: it is fully automated (no human in the
+loop) yet its outputs lack the soundness guarantees provided by
+solvers or formal proof checkers.
+
+\begin{remark}[Mechanical vs.\ trustworthy]
+\label{rem:mechanical-trust}
+The \emph{mechanical} flag indicates that no human is in the
+loop---not that the channel's output is necessarily trustworthy.
+A solver is both mechanical and trustworthy (its trust floor is
+$\Tsolver$).  The Copilot channel is mechanical but
+\emph{not} unconditionally trustworthy: its trust floor is
+$\Tcopilot$, and it requires corroboration to promote evidence
+above that tier.  This distinction is central to the channel
+taxonomy.
+\end{remark}
+
+\subsection{Trust Floors and the Trust Lattice}
+\label{sec:arch:floors}
+
+The seven trust tiers form a totally ordered lattice:
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot \;\tleq\;
+  \Toracle \;\tleq\; \Truntime \;\tleq\; \Tsolver \;\tleq\;
+  \Tproof.
+\]
+Each channel's trust floor is the \emph{minimum} tier it may
+assign to the evidence it produces.  A channel may assign a tier
+\emph{at or above} its floor but never below it.  Combined with
+the ceiling mechanism described in \S\ref{sec:copilot:ceiling},
+the $\mathsf{COPILOT}$ channel's output is confined to the
+singleton interval $[\Tcopilot, \Tcopilot]$ unless corroboration
+lifts it.
+
+\begin{definition}[Channel trust interval]
+\label{def:trust-interval}
+For channel $\EvCh.C$ with trust floor $\tau_{\min}(C)$ and
+ceiling $\tau_{\max}(C)$, the \emph{trust interval} is
+\[
+  I(C) \;=\; [\tau_{\min}(C),\; \tau_{\max}(C)].
+\]
+For mechanical channels without corroboration requirements,
+$\tau_{\max}(C) = \Tproof$.  For the $\mathsf{COPILOT}$ channel,
+$\tau_{\max}(\mathsf{COPILOT}) = \Tcopilot$.
+\end{definition}
+
+\begin{definition}[Corroboration lift]
+\label{def:corrob-lift}
+Let $e$ be evidence produced by channel $C$ with
+$\trust(e) = \Tcopilot$.  A \emph{corroboration lift} is a
+function $\corrob(e, e')$ where $e'$ is evidence from an
+independent channel $C'$ with
+$\tau_{\min}(C') \succ \Tcopilot$.  The lifted trust is
+\[
+  \trust(\corrob(e, e')) \;=\;
+    \min\!\bigl(\tau_{\min}(C'),\; \trust(e')\bigr).
+\]
+\end{definition}
+
+\begin{example}[Corroboration by solver]
+\label{ex:corrob-solver}
+Suppose the Copilot channel proposes the loop invariant
+$\texttt{i >= 0 \&\& i <= n}$ for a function
+$\texttt{binary\_search}$.  The evidence is tagged
+$\Tcopilot$.  The mixed-evidence router simultaneously
+queries the $\mathsf{SOLVER}$ channel, which confirms the
+invariant via SMT solving.  The corroboration lift raises
+the combined evidence trust to
+$\min(\Tsolver, \Tsolver) = \Tsolver$.
+\end{example}
+
+\begin{example}[Corroboration failure]
+\label{ex:corrob-fail}
+If instead the solver returns $\mathsf{UNSAT}$ for the
+proposed invariant, the corroboration fails.  The Copilot
+evidence is demoted to $\Tcontra$, and the judgment records
+the contradicting channel pair.
+\end{example}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{The CopilotChannel Implementation}
+\label{sec:copilot}
+
+\subsection{Class Overview}
+\label{sec:copilot:overview}
+
+The $\CopCh$ class resides in \texttt{jugeo.evidence.channels} and
+encapsulates all interaction with LLM back-ends.  Its trust ceiling
+is hard-coded to the constant \texttt{TRUST\_CEILING='proposal'},
+mapped to $\Tcopilot$ in the trust lattice.
+
+\begin{lstlisting}[style=jugeo-python,caption={The \texttt{CopilotChannel} class (simplified).},label=lst:copilotchannel]
+class CopilotChannel:
+    TRUST_CEILING = 'proposal'
+
+    def query_llm(self, prompt: str,
+                  timeout_ms: int = 5000) -> str:
+        """Send prompt to the LLM; return response text."""
+        ...
+
+    def rate_limit_check(self) -> bool:
+        """Return True if the query is within rate limits."""
+        ...
+
+    def build_evidence_response(
+        self, prompt: str,
+        channel_config: dict
+    ) -> EvidenceResponse:
+        """Construct a full evidence response."""
+        ...
+
+    def format_copilot_prompt(
+        self, request: VerificationRequest
+    ) -> str:
+        """Translate a verification request to an LLM prompt."""
+        ...
+\end{lstlisting}
+
+\subsection{The \texorpdfstring{\queryLLM}{query\_llm} Method}
+\label{sec:copilot:queryllm}
+
+The \queryLLM{} method is the sole entry point for LLM interaction.
+It accepts a natural-language prompt and an optional timeout
+(default $5000\,\text{ms}$).  Internally, it performs the
+following steps:
+
+\begin{enumerate}
+\item \textbf{Rate-limit check.}
+  Calls \rateCheck{} to verify the current query rate is below the
+  configured maximum ($\ppLXXXVIIIrateLimitMaxQps$ queries per
+  \ppLXXXVIIIrateLimitWindow{} window).  If the limit is exceeded,
+  the query is rejected immediately.
+
+\item \textbf{Prompt formatting.}
+  If the caller passed a raw $\mathsf{VerificationRequest}$, the
+  \fmtPrompt{} method translates it into a structured prompt
+  containing the function under verification, its current contract
+  (if any), and the specific evidence request (invariant, bound,
+  precondition).
+
+\item \textbf{LLM invocation.}
+  The formatted prompt is sent to the configured model back-end.
+  The call is subject to the timeout; if the model does not respond
+  within the allotted time, a $\mathsf{TimeoutError}$ is raised
+  and the query is recorded as timed out.
+
+\item \textbf{Response wrapping.}
+  The raw LLM response is wrapped in an $\mathsf{EvidenceResponse}$
+  with the trust tier set to $\Tcopilot$.  This tier assignment is
+  unconditional---it does not depend on the content of the response.
+\end{enumerate}
+
+\begin{remark}[Content-independent trust]
+\label{rem:content-independent}
+A key design decision is that the trust tier assigned by $\CopCh$
+does not depend on the \emph{content} of the LLM response.
+Even if the model expresses high confidence or cites formal
+sources, the channel assigns $\Tcopilot$ uniformly.  This prevents
+a persuasive but incorrect response from inflating trust.
+Content-dependent trust calibration is left to the corroboration
+workflow.
+\end{remark}
+
+Algorithm~\ref{alg:queryllm} formalizes this flow.
+
+\begin{algorithm}[ht]
+\caption{$\queryLLM(\mathit{prompt}, \mathit{timeout\_ms})$}
+\label{alg:queryllm}
+\begin{algorithmic}[1]
+\REQUIRE Prompt string $p$, timeout $T$ in milliseconds
+\ENSURE $\mathsf{EvidenceResponse}$ or $\mathsf{RateLimitError}$
+\IF{$\neg\;\rateCheck()$}
+  \RETURN $\mathsf{RateLimitError}$
+\ENDIF
+\STATE $p' \gets \fmtPrompt(p)$
+\STATE $t_0 \gets \mathrm{now}()$
+\STATE $r \gets \mathrm{call\_model}(p', T)$
+\STATE $\Delta t \gets \mathrm{now}() - t_0$
+\STATE $\mathit{rec} \gets \QRec.\mathrm{new}(p', r, \Delta t)$
+\STATE $\mathit{rec}.\mathit{trust\_ceiling} \gets \TrustCeil$
+\RETURN $\buildResp(\mathit{rec})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Rate Limiting}
+\label{sec:copilot:ratelimit}
+
+The \rateCheck{} method implements a sliding-window rate limiter.
+The window size is \ppLXXXVIIIrateLimitWindow{} and the maximum
+throughput is \ppLXXXVIIIrateLimitMaxQps{} queries per window.
+In our experiments, \ppLXXXVIIIrateLimitHits{} of
+\ppLXXXVIIIrateLimitChecks{} checks triggered the limiter
+(\ppLXXXVIIIrateLimitHitPct).
+
+Rate limiting serves two purposes:
+
+\begin{enumerate}
+\item \textbf{Cost control.}
+  LLM API calls are billed per token; unbounded querying can
+  exhaust a project's token budget rapidly.
+
+\item \textbf{Latency management.}
+  Under heavy load, LLM response times degrade.  By capping
+  the query rate, the channel keeps the median latency at
+  \ppLXXXVIIIlatencyMedianMs{} and the 95th percentile at
+  \ppLXXXVIIIlatencyP95Ms.
+\end{enumerate}
+
+\subsection{Trust Ceiling}
+\label{sec:copilot:ceiling}
+
+The trust ceiling is the defining architectural constraint of the
+$\mathsf{COPILOT}$ channel.  Regardless of the content or
+confidence of the LLM response, the evidence produced by $\CopCh$
+is tagged with trust tier $\Tcopilot$.  This is enforced at two
+levels:
+
+\begin{enumerate}
+\item \textbf{Channel level.}
+  The $\CopCh$ class sets \texttt{TRUST\_CEILING = 'proposal'},
+  and \buildResp{} clamps the output tier accordingly.
+
+\item \textbf{Gateway level.}
+  The $\CopGate$ gateway re-checks the tier of every evidence
+  item that passes through it, blocking any item whose tier
+  exceeds $\TrustCeil$ (see \S\ref{sec:gateway:gateway}).
+\end{enumerate}
+
+This double enforcement is deliberate: it ensures that even a
+buggy or adversarial adapter cannot silently elevate LLM evidence
+above the ceiling.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Trust Gateway and Mixed-Evidence Routing}
+\label{sec:gateway}
+
+\subsection{The \texorpdfstring{$\CopGate$}{CopilotTrustGateway}}
+\label{sec:gateway:gateway}
+
+The $\CopGate$ class resides in
+\texttt{jugeo.orchestration.mixed\_evidence\_routing.integration}
+and serves as the policy-enforcement layer between the Copilot
+channel and the rest of the evidence pipeline.
+
+\begin{lstlisting}[style=jugeo-python,caption={The \texttt{CopilotTrustGateway} class (simplified).},label=lst:gateway]
+class CopilotTrustGateway:
+    def __init__(self, gateway_id: str,
+                 max_trust: str = "COPILOT_SUGGESTED",
+                 allow_promotion: bool = False):
+        self.gateway_id = gateway_id
+        self.max_trust = max_trust
+        self.allow_promotion = allow_promotion
+        self.query_count = 0
+        self.blocked_count = 0
+        self.audit_entries: list[AuditEntry] = []
+
+    def enforce_ceiling(self, evidence) -> Evidence:
+        """Clamp evidence trust to max_trust."""
+        ...
+
+    def process_query(self, query) -> Evidence:
+        """Full pipeline: enforce ceiling, record audit."""
+        ...
+
+    def audit_summary(self) -> dict:
+        """Return summary of all gateway decisions."""
+        ...
+\end{lstlisting}
+
+The gateway maintains three counters:
+\texttt{query\_count} (total queries processed),
+\texttt{blocked\_count} (queries whose trust was clamped or
+whose promotion was denied), and \texttt{audit\_entries}
+(the full log of decisions).  In our experiments, the gateway
+processed \ppLXXXVIIIauditQueries{} queries, blocked
+\ppLXXXVIIIauditBlocked{} promotion attempts, and produced
+\ppLXXXVIIIauditEntries{} audit entries---\ppLXXXVIIIauditComplete{}
+coverage.
+
+\paragraph{Ceiling enforcement.}
+The \enforceCeil{} method implements the function
+\[
+  \enforce(t, c) \;=\;
+  \begin{cases}
+    t & \text{if } t \tleq c, \\
+    c & \text{otherwise.}
+  \end{cases}
+\]
+This function is idempotent: $\enforce(\enforce(t,c),c) = \enforce(t,c)$.
+
+\paragraph{Promotion policy.}
+When \texttt{allow\_promotion} is \texttt{False} (the default),
+the gateway unconditionally blocks any attempt to set a trust
+tier above $\TrustCeil$ for Copilot-originated evidence.
+When \texttt{allow\_promotion} is \texttt{True}, a promotion
+is permitted \emph{only} if independent corroboration is
+attached to the evidence item.  This policy is the runtime
+counterpart of the \emph{no-silent-promotion} theorem
+(Theorem~\ref{thm:no-silent-promotion}).
+
+\subsection{The \texorpdfstring{$\CopAdapt$}{CopilotChannelAdapter}}
+\label{sec:gateway:adapter}
+
+The $\CopAdapt$ class resides in
+\texttt{jugeo.orchestration.mixed\_evidence\_routing.channel\_selection}
+and wraps a specific model back-end (GPT-4, GPT-3.5, Claude, or a
+local model) behind a uniform interface.
+
+\begin{lstlisting}[style=jugeo-python,caption={The \texttt{CopilotChannelAdapter} class (simplified).},label=lst:adapter]
+class CopilotChannelAdapter:
+    def __init__(self, adapter_id: str,
+                 model_id: str,
+                 max_tokens: int = 4096,
+                 trust_ceiling: str = "COPILOT_SUGGESTED"):
+        self.adapter_id = adapter_id
+        self.model_id = model_id
+        self.max_tokens = max_tokens
+        self.trust_ceiling = trust_ceiling
+        self.call_count = 0
+        self.total_tokens = 0
+        self.query_history: list[QueryRecord] = []
+
+    @property
+    def channel_id(self) -> str:
+        """Return the canonical channel identifier."""
+        ...
+
+    def can_handle(self, query) -> bool:
+        """Check if this adapter can serve the query."""
+        ...
+
+    def execute(self, query) -> Evidence:
+        """Run the query against the model back-end."""
+        ...
+
+    def trust_report(self) -> dict:
+        """Report trust statistics for this adapter."""
+        ...
+\end{lstlisting}
+
+Each adapter tracks \texttt{call\_count}, \texttt{total\_tokens},
+and \texttt{query\_history}.  The \canHandle{} method inspects the
+query family and returns \texttt{True} if the adapter's model is
+suitable.  The \texttt{execute} method delegates to the underlying
+$\CopCh$ instance and records a $\QRec$ for every invocation.
+The \trustReport{} method returns aggregate statistics, including
+the fraction of queries whose trust remained at or below the
+ceiling.
+
+In our experiments we configured \ppLXXXVIIIadapterCount{} adapters:
+
+\begin{table}[ht]
+\centering
+\caption{Adapter call distribution.}
+\label{tab:adapters}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Model} & \textbf{Calls} & \textbf{Share} \\
+\midrule
+GPT-4          & \ppLXXXVIIIadapterCallsGptFour  &
+  $\ppLXXXVIIIadapterCallsGptFour / \ppLXXXVIIIacceptedQueries$ \\
+GPT-3.5 Turbo  & \ppLXXXVIIIadapterCallsGptThree &
+  $\ppLXXXVIIIadapterCallsGptThree / \ppLXXXVIIIacceptedQueries$ \\
+Claude-2       & \ppLXXXVIIIadapterCallsClaude   &
+  $\ppLXXXVIIIadapterCallsClaude / \ppLXXXVIIIacceptedQueries$ \\
+Local 7B       & \ppLXXXVIIIadapterCallsLocal    &
+  $\ppLXXXVIIIadapterCallsLocal / \ppLXXXVIIIacceptedQueries$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The \texorpdfstring{$\QRec$}{CopilotQueryRecord}}
+\label{sec:gateway:record}
+
+Every Copilot query is recorded as a $\QRec$ instance.  The
+class resides in
+\texttt{jugeo.orchestration.mixed\_evidence\_routing.models}
+and captures the full lifecycle of a query.
+
+\begin{lstlisting}[style=jugeo-python,caption={The \texttt{CopilotQueryRecord} class (simplified).},label=lst:queryrecord]
+@dataclass(frozen=True)
+class CopilotQueryRecord:
+    query_id: str
+    query_text: str
+    response_text: str
+    trust_ceiling: str
+    latency_ms: int
+    token_count: int
+    timestamp: float
+    model_id: str
+
+    @classmethod
+    def new(cls, prompt, response, latency,
+            model_id, **kw) -> "CopilotQueryRecord":
+        """Factory method with auto-generated id."""
+        ...
+
+    def to_dict(self) -> dict:
+        """Serialize to a plain dictionary."""
+        ...
+\end{lstlisting}
+
+The frozen dataclass ensures that query records are immutable
+once created.  The \texttt{new} class method generates a unique
+\texttt{query\_id} and timestamps the record automatically.
+The \toDict{} method serializes the record for JSON export,
+enabling downstream analysis and the generation of the
+\texttt{data-paper88.tex} macros consumed by this paper.
+
+\subsection{Mixed-Evidence Routing}
+\label{sec:gateway:routing}
+
+In a typical verification run, multiple channels contribute
+evidence for the same judgment.  The mixed-evidence router
+dispatches queries to channels based on query family,
+availability, and cost.  Figure~\ref{fig:routing} illustrates
+the routing architecture.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    >=Stealth,
+    node distance=1.4cm and 2.2cm,
+    box/.style={draw, rounded corners, minimum width=2.2cm,
+                minimum height=0.9cm, align=center,
+                font=\small\sffamily},
+    gate/.style={draw, diamond, aspect=2, minimum width=1.8cm,
+                 minimum height=0.9cm, align=center,
+                 font=\small\sffamily},
+  ]
+  % Nodes
+  \node[box] (req) {Verification\\Request};
+  \node[box, right=of req] (router) {Evidence\\Router};
+  \node[box, above right=0.8cm and 2.2cm of router] (solver) {Solver\\Channel};
+  \node[box, right=of router] (copilot) {Copilot\\Channel};
+  \node[box, below right=0.8cm and 2.2cm of router] (runtime) {Runtime\\Channel};
+  \node[gate, right=of copilot] (gate) {Trust\\Gate};
+  \node[box, right=of gate] (evidence) {Evidence\\Bundle};
+
+  % Edges
+  \draw[->] (req) -- (router);
+  \draw[->] (router) -- (solver);
+  \draw[->] (router) -- (copilot);
+  \draw[->] (router) -- (runtime);
+  \draw[->] (copilot) -- (gate);
+  \draw[->] (solver) -| (evidence);
+  \draw[->] (runtime) -| (evidence);
+  \draw[->] (gate) -- (evidence);
+\end{tikzpicture}
+\caption{Mixed-evidence routing architecture.  The Copilot channel
+  passes through the trust gateway before its evidence joins the
+  bundle; other mechanical channels bypass the gateway.}
+\label{fig:routing}
+\end{figure}
+
+The routing table records \ppLXXXVIIIroutingTotal{} routing
+decisions across all channels.  Table~\ref{tab:routing} breaks
+down the per-channel volume.
+
+\begin{table}[ht]
+\centering
+\caption{Per-channel routing volume.}
+\label{tab:routing}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Channel} & \textbf{Queries} \\
+\midrule
+$\mathsf{SOLVER}$        & \ppLXXXVIIIchannelSolver  \\
+$\mathsf{RUNTIME}$       & \ppLXXXVIIIchannelRuntime \\
+$\mathsf{ORACLE}$        & \ppLXXXVIIIchannelOracle  \\
+$\mathsf{COPILOT}$       & \ppLXXXVIIIchannelCopilot \\
+$\mathsf{FORMAL\_PROOF}$ & \ppLXXXVIIIchannelFormal  \\
+$\mathsf{HUMAN}$         & \ppLXXXVIIIchannelHuman   \\
+$\mathsf{COMPOSED}$      & \ppLXXXVIIIchannelComposed \\
+\midrule
+\textbf{Total}            & \ppLXXXVIIIroutingTotal   \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Corroboration Workflow}
+\label{sec:gateway:corrob}
+
+When the Copilot channel produces evidence for a judgment, the
+mixed-evidence router simultaneously queries at least one
+mechanical channel (typically $\mathsf{SOLVER}$ or
+$\mathsf{RUNTIME}$) for the same property.  If the mechanical
+channel confirms the LLM's suggestion, the corroboration lift
+(Definition~\ref{def:corrob-lift}) raises the combined evidence
+trust to the mechanical channel's floor.  If the mechanical
+channel contradicts the suggestion, the LLM evidence is
+demoted to $\Tcontra$.
+
+In our experiments, \ppLXXXVIIIcorrobRequired{} Copilot evidence
+items required corroboration.  Of these,
+\ppLXXXVIIIcorrobObtained{} received independent confirmation
+(\ppLXXXVIIIcorrobRate{}), with \ppLXXXVIIIcorrobBySolver{}
+corroborated by solvers and \ppLXXXVIIIcorrobByRuntime{} by
+runtime checks.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Formal Properties}
+\label{sec:formal}
+
+We now state and prove three properties of the Copilot evidence
+channel.  All three are formalized in \LEAN{} in the file
+\texttt{Paper88\_CopilotEvidence.lean}.
+
+\subsection{Trust Ceiling Theorem}
+\label{sec:formal:ceiling}
+
+\begin{theorem}[Trust-ceiling enforcement]
+\label{thm:ceiling}
+For every trust tier $t$ and ceiling $c$,
+\[
+  \enforce(t, c).\mathrm{rank} \;\leq\; c.\mathrm{rank}.
+\]
+In particular, for the $\mathsf{COPILOT}$ channel with ceiling
+$c = \Tcopilot$, every evidence item $e$ satisfies
+$\trust(e).\mathrm{rank} \leq 2$.
+\end{theorem}
+
+\begin{proof}
+The enforcement function is defined by case split:
+\[
+  \enforce(t, c) =
+  \begin{cases}
+    t & \text{if } t.\mathrm{rank} \leq c.\mathrm{rank}, \\
+    c & \text{otherwise.}
+  \end{cases}
+\]
+In the first case, the result's rank equals $t.\mathrm{rank}
+\leq c.\mathrm{rank}$.  In the second case, the result is $c$
+itself, so $\enforce(t,c).\mathrm{rank} = c.\mathrm{rank}$.
+Both cases satisfy the bound.  The specialization to
+$\Tcopilot$ follows because $\Tcopilot.\mathrm{rank} = 2$.
+\end{proof}
+
+\begin{corollary}[Idempotence of ceiling enforcement]
+\label{cor:idemp}
+$\enforce(\enforce(t,c),c) = \enforce(t,c)$ for all $t, c$.
+\end{corollary}
+
+\begin{proof}
+Let $t' = \enforce(t,c)$.  By Theorem~\ref{thm:ceiling},
+$t'.\mathrm{rank} \leq c.\mathrm{rank}$, so
+$\enforce(t', c) = t' = \enforce(t,c)$.
+\end{proof}
+
+\subsection{No-Silent-Promotion Theorem}
+\label{sec:formal:promotion}
+
+\begin{theorem}[No silent promotion]
+\label{thm:no-silent-promotion}
+Let $e$ be evidence with trust tier $t_{\mathrm{old}}$ and let
+$t_{\mathrm{new}} \succ t_{\mathrm{old}}$.  If no corroboration
+is attached (\ie $\corrob = \texttt{false}$), then the promotion
+$t_{\mathrm{old}} \to t_{\mathrm{new}}$ is rejected by the
+gateway.
+
+Formally, for a promotion attempt
+$\langle t_{\mathrm{old}}, t_{\mathrm{new}}, \corrob \rangle$
+with $\corrob = \texttt{false}$:
+\[
+  \neg\;\mathit{validPromotion}
+    \bigl(\langle t_{\mathrm{old}}, t_{\mathrm{new}},
+    \texttt{false}\rangle,\; \tau_f\bigr)
+\]
+for any corroboration floor $\tau_f$.
+\end{theorem}
+
+\begin{proof}
+The predicate $\mathit{validPromotion}(p, \tau_f)$ requires
+$p.\mathrm{hasCorroboration} = \texttt{true}$.  Since
+$\corrob = \texttt{false}$, the conjunction
+$\texttt{false} = \texttt{true} \;\wedge\; \cdots$
+is immediately contradictory.
+\end{proof}
+
+\begin{theorem}[Promotion bounded by corroboration floor]
+\label{thm:promotion-bound}
+If a promotion $\langle t_{\mathrm{old}}, t_{\mathrm{new}},
+\texttt{true}\rangle$ is valid with corroboration floor $\tau_f$,
+then $t_{\mathrm{new}}.\mathrm{rank} \leq \tau_f.\mathrm{rank}$.
+\end{theorem}
+
+\begin{proof}
+By definition, $\mathit{validPromotion}$ requires
+$t_{\mathrm{new}}.\mathrm{rank} \leq \tau_f.\mathrm{rank}$.
+\end{proof}
+
+\subsection{Audit Completeness}
+\label{sec:formal:audit}
+
+\begin{theorem}[Audit completeness]
+\label{thm:audit}
+For every list of query records $Q$, the audit log
+$\audit(Q)$ satisfies:
+\begin{enumerate}
+\item $|\audit(Q)| = |Q|$ \quad (length preservation).
+\item For every $q \in Q$, there exists $a \in \audit(Q)$
+  with $a.\mathit{queryId} = q.\mathit{queryId}$
+  \quad (coverage).
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+\emph{Length preservation.}
+The audit-log builder processes each record exactly once,
+appending one $\mathsf{AuditEntry}$ per $\QRec$.  By
+structural induction on $Q$:
+\begin{itemize}
+\item Base case: $Q = []$ implies $\audit([]) = []$, so
+  $|\audit([])| = 0 = |[]|$.
+\item Inductive step: $Q = q :: Q'$.  Then
+  $\audit(q :: Q') = \langle q.\mathit{queryId},
+  \mathsf{accept}\rangle :: \audit(Q')$, so
+  $|\audit(q::Q')| = 1 + |\audit(Q')| = 1 + |Q'| = |Q|$.
+\end{itemize}
+
+\emph{Coverage.}
+Again by induction.  If $q$ is the head, the first entry
+has the matching id.  If $q \in Q'$, the inductive hypothesis
+provides the entry in $\audit(Q')$, which is a suffix of
+$\audit(q::Q')$.
+\end{proof}
+
+\subsection{Channel Jurisdiction Partition}
+\label{sec:formal:partition}
+
+\begin{proposition}[Jurisdiction disjointness]
+\label{prop:disjoint}
+No channel $C$ is simultaneously mechanical and non-mechanical:
+\[
+  \forall\, C \in \EvCh.\quad
+  \neg\,\bigl(C.\mathit{isMechanical} = \texttt{true}
+  \;\wedge\; C.\mathit{isMechanical} = \texttt{false}\bigr).
+\]
+\end{proposition}
+
+\begin{proof}
+Immediate: $\texttt{true} \neq \texttt{false}$ in a
+two-valued logic.
+\end{proof}
+
+\begin{proposition}[Jurisdiction completeness]
+\label{prop:complete}
+Every channel is either mechanical or non-mechanical:
+\[
+  \forall\, C \in \EvCh.\quad
+  C.\mathit{isMechanical} = \texttt{true}
+  \;\lor\; C.\mathit{isMechanical} = \texttt{false}.
+\]
+\end{proposition}
+
+\begin{proof}
+By case analysis on the seven enum values.  Solver, Runtime,
+Copilot, and Formal\_Proof return $\texttt{true}$; Oracle,
+Human, and Composed return $\texttt{false}$.
+\end{proof}
+
+\begin{proposition}[Strong channels need no corroboration]
+\label{prop:strong-no-corrob}
+If a channel $C$ does not require corroboration, then its
+default trust floor has rank at least
+$\Truntime.\mathrm{rank} = 4$:
+\[
+  C.\mathit{requiresCorroboration} = \texttt{false}
+  \;\Longrightarrow\;
+  \tau_{\min}(C).\mathrm{rank} \geq 4.
+\]
+\end{proposition}
+
+\begin{proof}
+By case analysis.  The channels with
+$\mathit{requiresCorroboration} = \texttt{false}$ are
+$\mathsf{SOLVER}$ (rank~5), $\mathsf{RUNTIME}$ (rank~4),
+and $\mathsf{FORMAL\_PROOF}$ (rank~6).  All satisfy the bound.
+\end{proof}
+
+\subsection{Lean Formalization}
+\label{sec:formal:lean}
+
+The \LEAN{} formalization in
+\texttt{proofs/lean/Paper88\_CopilotEvidence.lean} encodes
+all definitions and theorems above within the namespace
+\texttt{JudgmentGeometry.CopilotEvidence}.  Key features:
+
+\begin{itemize}
+\item \textbf{TrustTier} is an inductive type with a
+  computable \texttt{rank} function.
+\item \textbf{EvidenceChannel} mirrors the Python enum with
+  \texttt{defaultTrustFloor}, \texttt{isMechanical}, and
+  \texttt{requiresCorroboration} as decidable functions.
+\item \textbf{enforceCeiling} implements $\enforce$ and the
+  \texttt{trust\_ceiling\_enforcement} theorem proves the
+  rank bound.
+\item \textbf{no\_silent\_promotion} proves that the
+  $\mathit{validPromotion}$ predicate is unsatisfiable when
+  $\mathit{hasCorroboration} = \texttt{false}$.
+\item \textbf{audit\_completeness} proves length preservation
+  by structural induction, and \textbf{audit\_covers\_all\_ids}
+  proves the coverage property.
+\item All proofs are completed without \texttt{sorry}.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Experiments}
+\label{sec:experiments}
+
+We evaluate the Copilot evidence channel on a benchmark of
+\ppLXXXVIIItotalQueries{} queries organized into
+\ppLXXXVIIIqueryBatches{} batches of $200$ queries each.
+Queries span six families: invariant suggestion, precondition
+inference, postcondition proposal, complexity estimation,
+null-safety analysis, and contract summarization.  We use
+\ppLXXXVIIIadapterCount{} model adapters (GPT-4, GPT-3.5~Turbo,
+Claude-2, and a local 7B parameter model).
+
+All experiments are driven by the script
+\texttt{experiments/exp88\_copilot\_evidence.py}, which
+generates the \texttt{data-paper88.tex} macros referenced
+throughout this paper.  The experiment wall time is
+\ppLXXXVIIItimeTotal.
+
+\subsection{Trust Ceiling Enforcement}
+\label{sec:exp:ceiling}
+
+\paragraph{Setup.}
+For each accepted query, the gateway applies $\enforce$ to the
+channel's assigned trust tier.  We also inject synthetic
+promotion attempts at a $20\%$ rate to test the gateway's
+blocking behavior.
+
+\paragraph{Results.}
+The ceiling held in \ppLXXXVIIIceilingHeldPct{} of
+\ppLXXXVIIIceilingEvents{} enforcement events.  Zero ceiling
+violations were observed ($\ppLXXXVIIIceilingViolations$).
+Of \ppLXXXVIIIpromotionAttempts{} promotion attempts,
+\ppLXXXVIIIpromotionBlocked{} were blocked
+(\ppLXXXVIIIpromotionBlockedPct).
+
+These results confirm Theorem~\ref{thm:ceiling} and
+Theorem~\ref{thm:no-silent-promotion} empirically: the
+gateway never permits trust inflation without corroboration.
+
+\subsection{Rate Limiting}
+\label{sec:exp:ratelimit}
+
+\paragraph{Setup.}
+Each batch of $200$ queries is submitted in a burst.  The rate
+limiter is configured with a window of
+\ppLXXXVIIIrateLimitWindow{} and a maximum of
+\ppLXXXVIIIrateLimitMaxQps{} queries per window.
+
+\paragraph{Results.}
+Of \ppLXXXVIIIrateLimitChecks{} total checks,
+\ppLXXXVIIIrateLimitHits{} triggered the rate limiter
+(\ppLXXXVIIIrateLimitHitPct).  The accepted query count was
+\ppLXXXVIIIacceptedQueries{} (\ppLXXXVIIIacceptRate{} acceptance
+rate).
+
+\subsection{Latency and Token Consumption}
+\label{sec:exp:latency}
+
+Table~\ref{tab:latency} summarizes the latency distribution
+across all accepted queries.
+
+\begin{table}[ht]
+\centering
+\caption{Latency statistics (milliseconds).}
+\label{tab:latency}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Mean    & \ppLXXXVIIIlatencyMeanMs   \\
+Median  & \ppLXXXVIIIlatencyMedianMs \\
+P95     & \ppLXXXVIIIlatencyP95Ms    \\
+P99     & \ppLXXXVIIIlatencyP99Ms    \\
+Min     & \ppLXXXVIIIlatencyMinMs    \\
+Max     & \ppLXXXVIIIlatencyMaxMs    \\
+\midrule
+Timeouts & \ppLXXXVIIItimeoutCount{} (\ppLXXXVIIItimeoutPct) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Token consumption across all queries totaled
+\ppLXXXVIIItotalTokens{} tokens (mean \ppLXXXVIIImeanTokens{},
+median \ppLXXXVIIImedianTokens{}).  The per-query budget
+utilization was \ppLXXXVIIItokenBudgetPct{} of the
+\ppLXXXVIIImaxTokensPerQuery-token maximum.
+
+\subsection{Corroboration and Trust Lift}
+\label{sec:exp:corrob}
+
+Of \ppLXXXVIIIcorrobRequired{} queries requiring corroboration,
+\ppLXXXVIIIcorrobObtained{} received independent confirmation
+(\ppLXXXVIIIcorrobRate{}):
+\ppLXXXVIIIcorrobBySolver{} from the solver channel and
+\ppLXXXVIIIcorrobByRuntime{} from the runtime channel.
+
+The remaining uncorroborated evidence retains the
+$\Tcopilot$ trust tier.  This is the intended behavior:
+LLM suggestions without mechanical confirmation stay at the
+lowest usable tier, visible to the developer but unable to
+influence the overall judgment verdict.
+
+\subsection{Channel Routing Distribution}
+\label{sec:exp:routing}
+
+Figure~\ref{fig:trust-dist} shows the trust-tier distribution
+after routing.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}
+  \begin{scope}[yscale=0.045, xscale=0.85]
+    % Bars
+    \fill[jugeoBlue!80]    (0,0) rectangle (1.2,480);
+    \fill[jugeoBlue!60]    (1.8,0) rectangle (3.0,1840);
+    \fill[jugeoGreen!70]   (3.6,0) rectangle (4.8,2160);
+    \fill[jugeoPurple!60]  (5.4,0) rectangle (6.6,960);
+    \fill[jugeoRed!50]     (7.2,0) rectangle (8.4,2247);
+    \fill[jugeoGray!50]    (9.0,0) rectangle (10.2,840);
+
+    % Labels
+    \node[below, font=\tiny\sffamily, rotate=35, anchor=north east]
+      at (0.6,0) {Proof};
+    \node[below, font=\tiny\sffamily, rotate=35, anchor=north east]
+      at (2.4,0) {Solver};
+    \node[below, font=\tiny\sffamily, rotate=35, anchor=north east]
+      at (4.2,0) {Runtime};
+    \node[below, font=\tiny\sffamily, rotate=35, anchor=north east]
+      at (6.0,0) {Oracle};
+    \node[below, font=\tiny\sffamily, rotate=35, anchor=north east]
+      at (7.8,0) {Copilot};
+    \node[below, font=\tiny\sffamily, rotate=35, anchor=north east]
+      at (9.6,0) {Unverif.};
+
+    % Value labels
+    \node[above, font=\tiny\sffamily] at (0.6,480)  {480};
+    \node[above, font=\tiny\sffamily] at (2.4,1840) {1840};
+    \node[above, font=\tiny\sffamily] at (4.2,2160) {2160};
+    \node[above, font=\tiny\sffamily] at (6.0,960)  {960};
+    \node[above, font=\tiny\sffamily] at (7.8,2247) {2247};
+    \node[above, font=\tiny\sffamily] at (9.6,840)  {840};
+
+    % Axes
+    \draw[->] (-0.3,0) -- (11,0);
+    \draw[->] (-0.3,0) -- (-0.3,2500);
+    \foreach \y in {0,500,1000,1500,2000,2500} {
+      \draw (-0.5,\y) -- (-0.3,\y)
+        node[left, font=\tiny] {\y};
+    }
+    \node[rotate=90, font=\small, anchor=south] at (-1.5,1250)
+      {Evidence items};
+  \end{scope}
+\end{tikzpicture}
+\caption{Trust-tier distribution after mixed-evidence routing.
+  The $\mathsf{COPILOT}$ tier dominates because every Copilot
+  query produces evidence at this tier; corroborated items are
+  counted under the corroborating channel's tier.}
+\label{fig:trust-dist}
+\end{figure}
+
+\subsection{Audit Completeness}
+\label{sec:exp:audit}
+
+The gateway produced \ppLXXXVIIIauditEntries{} audit entries:
+\ppLXXXVIIIauditQueries{} for accepted queries and
+\ppLXXXVIIIauditBlocked{} for blocked promotions.  The audit
+coverage is \ppLXXXVIIIauditComplete, confirming
+Theorem~\ref{thm:audit} empirically.
+
+\subsection{Discussion}
+\label{sec:exp:discussion}
+
+The experimental results validate all three formal properties:
+
+\begin{enumerate}
+\item \textbf{Trust ceiling.}
+  Zero violations in \ppLXXXVIIIceilingEvents{} enforcement
+  events.  The double-enforcement strategy (channel-level and
+  gateway-level) provides defense in depth.
+
+\item \textbf{No silent promotion.}
+  All \ppLXXXVIIIpromotionAttempts{} synthetic promotion
+  attempts were blocked.  Promotion requires explicit
+  corroboration, and the gateway correctly rejects all
+  uncorroborated attempts.
+
+\item \textbf{Audit completeness.}
+  Every query---accepted or blocked---has a corresponding audit
+  entry, enabling post-hoc analysis and regulatory compliance.
+\end{enumerate}
+
+The corroboration rate of \ppLXXXVIIIcorrobRate{} indicates that
+a substantial fraction of LLM suggestions can be independently
+confirmed, raising their effective trust to $\Truntime$ or
+$\Tsolver$ levels.  The remaining \emph{uncorroborated}
+suggestions are still valuable as developer-facing hints, but
+they do not influence the formal verification verdict.
+
+\paragraph{Overhead.}
+The mean per-query latency of \ppLXXXVIIIlatencyMeanMs{} is
+dominated by LLM inference time.  The gateway's ceiling
+enforcement and audit logging add negligible overhead
+($< 0.1\,\text{ms}$ per query).  Rate limiting adds no
+latency for accepted queries; rejected queries receive an
+immediate error response.  The total experiment wall time of
+\ppLXXXVIIItimeTotal{} across \ppLXXXVIIIqueryBatches{} batches
+corresponds to a mean batch time of \ppLXXXVIIItimeMeanBatch.
+
+\paragraph{Scalability.}
+The sliding-window rate limiter and per-adapter token tracking
+ensure that the Copilot channel scales predictably.  The total
+token consumption of \ppLXXXVIIItotalTokens{} tokens across
+\ppLXXXVIIIacceptedQueries{} queries corresponds to a per-query
+budget utilization of \ppLXXXVIIItokenBudgetPct, leaving
+headroom for more complex prompts or multi-turn interactions.
+
+\paragraph{Model diversity.}
+The four adapters exhibit different latency profiles and token
+utilization patterns.  GPT-4 produces the longest responses
+(highest token count) but also the highest latency; the local
+7B model is fastest but produces shorter, less detailed outputs.
+The adapter abstraction allows the router to select the model
+best suited to each query family.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{LLMs for program analysis.}
+Recent work has explored using LLMs to generate specifications
+\cite{endres2024can,pei2023can}, suggest invariants
+\cite{chakraborty2024ranking,wu2024lemur}, and assist in
+formal verification \cite{first2023baldur,yang2024leandojo}.
+These approaches typically treat LLM output as a candidate
+that must be checked, but few provide a systematic
+\emph{trust architecture} for integrating LLM evidence into
+a broader verification framework.
+
+\paragraph{Retrieval-augmented generation.}
+RAG pipelines \cite{lewis2020retrieval,gao2023retrieval}
+ground LLM outputs in retrieved documents.  Our channel
+architecture can be seen as an evidence-level analogue:
+the Copilot channel retrieves LLM evidence and the
+corroboration workflow grounds it in mechanical checks.
+
+\paragraph{Neuro-symbolic verification.}
+Systems such as \cite{sun2024clover,agrawal2023monitor}
+combine neural and symbolic components for runtime
+monitoring and property checking.  Our approach is
+complementary: we provide the trust infrastructure into
+which neuro-symbolic evidence sources can be integrated.
+
+\paragraph{Trust and provenance in AI.}
+The problem of trusting AI outputs has been studied in the
+context of explainability \cite{ribeiro2016should,
+lundberg2017unified}, calibration \cite{guo2017calibration,
+desai2020calibration}, and provenance tracking
+\cite{buneman2001and,cheney2009provenance}.  Our trust
+lattice provides a formal framework that subsumes binary
+trust decisions.
+
+\paragraph{Evidence combination.}
+Dempster--Shafer theory \cite{shafer1976mathematical,
+dempster2008upper} and subjective logic
+\cite{josang2016subjective} provide mathematical frameworks
+for combining uncertain evidence.  Our conservative join
+$\tjoin$ and attenuation $\tatten$ operators draw inspiration
+from these frameworks but are specialized for the
+software-verification domain.
+
+\paragraph{LLM safety and alignment.}
+Constitutional AI \cite{bai2022constitutional}, RLHF
+\cite{ouyang2022training}, and red-teaming
+\cite{perez2022red,ganguli2022red} address the alignment
+of LLM outputs with human intent.  Our trust ceiling is
+orthogonal: it does not attempt to improve the LLM's
+output quality but rather \emph{bounds the damage} a
+low-quality output can inflict on the verification pipeline.
+
+\paragraph{Mixed-initiative verification.}
+Interactive theorem provers \cite{de2015lean,coq2024manual}
+and contract-based tools \cite{barnett2011specification,
+leino2010dafny} combine human guidance with automated
+checking.  The Copilot channel extends this mixed-initiative
+paradigm by adding LLM guidance as a third modality alongside
+human and machine.
+
+\paragraph{Rate limiting and API governance.}
+API rate limiting \cite{nayak2024rate,sharif2015api} is
+a well-studied problem in web services.  We adapt
+standard sliding-window techniques to the evidence-channel
+context, where the cost metric is tokens rather than
+HTTP requests.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented the Copilot evidence channel, a trust-calibrated
+integration of LLM-generated evidence into the Judgment Geometry
+framework.  The design enforces a hard trust ceiling
+($\TrustCeil$) that prevents LLM suggestions from silently
+inflating judgment trust.  Three formal properties---trust-ceiling
+enforcement, no-silent-promotion, and audit completeness---are
+proved both on paper and in \LEAN.
+
+The architecture is realized by four components:
+the $\EvCh$ enum classifies evidence sources;
+the $\CopCh$ class wraps LLM interaction behind rate limiting
+and timeout management;
+the $\CopGate$ gateway enforces the ceiling and maintains
+a complete audit trail;
+and the $\CopAdapt$ adapter routes queries to heterogeneous
+model back-ends.
+
+Experiments on \ppLXXXVIIItotalQueries{} queries confirm that
+the ceiling holds universally (\ppLXXXVIIIceilingHeldPct),
+rate limiting rejects burst traffic
+(\ppLXXXVIIIrateLimitHitPct), and \ppLXXXVIIIcorrobRate{} of
+Copilot evidence is independently corroborated.  The audit
+log achieves \ppLXXXVIIIauditComplete{} completeness.
+
+\paragraph{Future work.}
+Several directions merit exploration:
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Adaptive ceilings.}
+  Rather than a static ceiling, the gateway could learn a
+  per-model, per-query-family ceiling from historical
+  corroboration rates.
+
+\item \textbf{Multi-turn evidence.}
+  The current design treats each query independently.  A
+  multi-turn variant could allow the Copilot channel to
+  refine its suggestions based on solver feedback.
+
+\item \textbf{Fine-grained provenance.}
+  Extending $\QRec$ to capture prompt templates, retrieval
+  context, and model temperature would enable richer
+  post-hoc analysis.
+
+\item \textbf{Adversarial robustness.}
+  The trust ceiling protects against \emph{accidental}
+  over-trust, but deliberate adversarial manipulation of
+  the LLM's output (prompt injection, data poisoning)
+  requires additional defenses.
+
+\item \textbf{Formal verification of the gateway.}
+  While the current \LEAN{} formalization covers the core
+  properties, a verified implementation of the gateway
+  itself would close the gap between specification and code.
+\end{itemize}
+
+The Copilot evidence channel demonstrates that LLM
+contributions can be safely integrated into a rigorous
+verification pipeline---provided the architecture enforces
+clear trust boundaries, requires corroboration for promotion,
+and maintains a complete audit trail.
+
+\paragraph{Reproducibility.}
+All experiments are deterministic (seeded PRNG) and can be
+reproduced by running:
+\begin{lstlisting}[style=jugeo-output]
+python3 experiments/exp88_copilot_evidence.py
+\end{lstlisting}
+The script regenerates \texttt{papers/data-paper88.tex} and
+writes a JSON summary to
+\texttt{experiments/results\_paper88.json}.
+Source code, proofs, and data are available in the \JuGeo{}
+repository.
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{25}
+
+\bibitem{endres2024can}
+M.~Endres, S.~Kazemian, R.~Sheth, et~al.
+\newblock Can large language models write specifications?
+\newblock In \emph{Proc.\ ICSE}, 2024.
+
+\bibitem{pei2023can}
+K.~Pei, D.~Biber, K.~Shi, et~al.
+\newblock Can large language models reason about program invariants?
+\newblock In \emph{Proc.\ ICML}, 2023.
+
+\bibitem{chakraborty2024ranking}
+S.~Chakraborty, A.~Lahiri, S.~Fakhoury, et~al.
+\newblock Ranking {LLM}-generated loop invariants.
+\newblock In \emph{Proc.\ FMCAD}, 2024.
+
+\bibitem{wu2024lemur}
+Y.~Wu, J.~Yang, Y.~Yang, et~al.
+\newblock {LEMUR}: Integrating large models for multi-round
+  program repair.
+\newblock In \emph{Proc.\ ICLR}, 2024.
+
+\bibitem{first2023baldur}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun.
+\newblock Baldur: Whole-proof generation and repair with
+  large language models.
+\newblock In \emph{Proc.\ ESEC/FSE}, 2023.
+
+\bibitem{yang2024leandojo}
+K.~Yang, A.~M. Swope, A.~Gu, et~al.
+\newblock {LeanDojo}: Theorem proving with retrieval-augmented
+  language models.
+\newblock In \emph{Proc.\ NeurIPS}, 2024.
+
+\bibitem{lewis2020retrieval}
+P.~Lewis, E.~Perez, A.~Piktus, et~al.
+\newblock Retrieval-augmented generation for knowledge-intensive
+  {NLP} tasks.
+\newblock In \emph{Proc.\ NeurIPS}, 2020.
+
+\bibitem{gao2023retrieval}
+Y.~Gao, Y.~Xiong, B.~Gao, et~al.
+\newblock Retrieval-augmented generation for large language
+  models: A survey.
+\newblock \emph{arXiv:2312.10997}, 2023.
+
+\bibitem{sun2024clover}
+Y.~Sun, C.~Shen, and Y.~Sun.
+\newblock {Clover}: Closed-loop verifiable code generation.
+\newblock In \emph{Proc.\ ICML}, 2024.
+
+\bibitem{agrawal2023monitor}
+S.~Agrawal, S.~Arora, D.~Kasenberg, et~al.
+\newblock Runtime monitoring of learning-enabled systems with
+  formal guarantees.
+\newblock In \emph{Proc.\ AAAI}, 2023.
+
+\bibitem{ribeiro2016should}
+M.~T. Ribeiro, S.~Singh, and C.~Guestrin.
+\newblock Why should {I} trust you? Explaining the predictions
+  of any classifier.
+\newblock In \emph{Proc.\ KDD}, 2016.
+
+\bibitem{lundberg2017unified}
+S.~M. Lundberg and S.-I.~Lee.
+\newblock A unified approach to interpreting model predictions.
+\newblock In \emph{Proc.\ NeurIPS}, 2017.
+
+\bibitem{guo2017calibration}
+C.~Guo, G.~Pleiss, Y.~Sun, and K.~Q. Weinberger.
+\newblock On calibration of modern neural networks.
+\newblock In \emph{Proc.\ ICML}, 2017.
+
+\bibitem{desai2020calibration}
+S.~Desai and G.~Durrett.
+\newblock Calibration of pre-trained transformers.
+\newblock In \emph{Proc.\ EMNLP}, 2020.
+
+\bibitem{buneman2001and}
+P.~Buneman, S.~Khanna, and W.-C.~Tan.
+\newblock Why and where: A characterization of data provenance.
+\newblock In \emph{Proc.\ ICDT}, 2001.
+
+\bibitem{cheney2009provenance}
+J.~Cheney, L.~Chiticariu, and W.-C.~Tan.
+\newblock Provenance in databases: Why, how, and where.
+\newblock \emph{Foundations and Trends in Databases}, 2009.
+
+\bibitem{shafer1976mathematical}
+G.~Shafer.
+\newblock \emph{A Mathematical Theory of Evidence}.
+\newblock Princeton University Press, 1976.
+
+\bibitem{dempster2008upper}
+A.~P. Dempster.
+\newblock Upper and lower probabilities induced by a
+  multivalued mapping.
+\newblock In \emph{Classic Works of the Dempster--Shafer
+  Theory of Belief Functions}, 2008.
+
+\bibitem{josang2016subjective}
+A.~J{\o}sang.
+\newblock \emph{Subjective Logic: A Formalism for Reasoning
+  Under Uncertainty}.
+\newblock Springer, 2016.
+
+\bibitem{bai2022constitutional}
+Y.~Bai, S.~Kadavath, S.~Kundu, et~al.
+\newblock Constitutional {AI}: Harmlessness from {AI} feedback.
+\newblock \emph{arXiv:2212.08073}, 2022.
+
+\bibitem{ouyang2022training}
+L.~Ouyang, J.~Wu, X.~Jiang, et~al.
+\newblock Training language models to follow instructions with
+  human feedback.
+\newblock In \emph{Proc.\ NeurIPS}, 2022.
+
+\bibitem{perez2022red}
+E.~Perez, S.~Huang, F.~Song, et~al.
+\newblock Red teaming language models with language models.
+\newblock In \emph{Proc.\ EMNLP}, 2022.
+
+\bibitem{ganguli2022red}
+D.~Ganguli, L.~Lovitt, J.~Kernion, et~al.
+\newblock Red teaming language models to reduce harms.
+\newblock \emph{arXiv:2209.07858}, 2022.
+
+\bibitem{de2015lean}
+L.~de~Moura, S.~Kong, J.~Avigad, F.~van~Doorn, and
+  J.~von~Raumer.
+\newblock The {Lean} theorem prover (system description).
+\newblock In \emph{Proc.\ CADE}, 2015.
+
+\bibitem{coq2024manual}
+The Coq Development Team.
+\newblock \emph{The Coq Reference Manual}, 2024.
+\newblock \url{https://coq.inria.fr/doc/}.
+
+\bibitem{barnett2011specification}
+M.~Barnett, M.~F\"ahndrich, K.~R.~M. Leino, et~al.
+\newblock Specification and verification: The {Spec\#}
+  experience.
+\newblock \emph{CACM}, 54(6):81--89, 2011.
+
+\bibitem{leino2010dafny}
+K.~R.~M. Leino.
+\newblock Dafny: An automatic program verifier for functional
+  correctness.
+\newblock In \emph{Proc.\ LPAR}, 2010.
+
+\bibitem{nayak2024rate}
+R.~Nayak, S.~Patil, and K.~Joshi.
+\newblock Rate limiting strategies for large-scale {API}
+  services.
+\newblock In \emph{Proc.\ ICWS}, 2024.
+
+\bibitem{sharif2015api}
+Z.~Sharif and M.~Dagenais.
+\newblock {API} usage patterns and rate limiting.
+\newblock In \emph{Proc.\ ICSOC}, 2015.
+
+\end{thebibliography}
+
+\end{document}

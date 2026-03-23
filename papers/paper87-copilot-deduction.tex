@@ -1,0 +1,1592 @@
+% paper87-copilot-deduction.tex — Copilot-Assisted Deduction:
+%   LLM Rule Suggestion in Judgment Geometry
+%
+% Paper 87 of the Judgment Geometry series.
+%
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+\input{data-paper87}
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── paper-specific macros ────────────────────────────────────────
+\newcommand{\CDA}{\ensuremath{\mathsf{CopilotDeductionAssist}}}
+\newcommand{\CRS}{\ensuremath{\mathsf{CopilotRuleSuggester}}}
+\newcommand{\CC}{\ensuremath{\mathsf{CopilotCapability}}}
+\newcommand{\RS}{\ensuremath{\mathsf{RuleSchema}}}
+\newcommand{\DR}{\ensuremath{\mathsf{DeductionRule}}}
+\newcommand{\PS}{\ensuremath{\mathsf{ProofState}}}
+\newcommand{\IL}{\ensuremath{\mathsf{InteractionLog}}}
+\newcommand{\SC}{\ensuremath{\mathsf{SuggestionCache}}}
+\newcommand{\JG}{\textsc{JuGeo}}
+\newcommand{\LLM}{\textsc{LLM}}
+\newcommand{\suggestRule}{\ensuremath{\mathsf{suggest\_rule}}}
+\newcommand{\explainTrans}{\ensuremath{\mathsf{explain\_transition}}}
+\newcommand{\completeProof}{\ensuremath{\mathsf{complete\_proof}}}
+\newcommand{\diagnoseFailure}{\ensuremath{\mathsf{diagnose\_failure}}}
+\newcommand{\synthesizeRule}{\ensuremath{\mathsf{synthesize\_rule}}}
+\newcommand{\suggestForGoal}{\ensuremath{\mathsf{suggest\_for\_goal}}}
+\newcommand{\rankSugg}{\ensuremath{\mathsf{rank\_suggestions}}}
+\newcommand{\recordFeedback}{\ensuremath{\mathsf{record\_feedback}}}
+\newcommand{\scoreSchema}{\ensuremath{\mathsf{\_score\_schema}}}
+\newcommand{\cacheKey}{\ensuremath{\mathsf{\_cache\_key}}}
+\newcommand{\recordInter}{\ensuremath{\mathsf{\_record\_interaction}}}
+
+\title{\textbf{Copilot-Assisted Deduction:\\
+       LLM Rule Suggestion in Judgment Geometry}}
+\author{Halley Young \\
+  Microsoft Research \\
+  \texttt{halleyyoung@microsoft.com}}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ══════════════════════════════════════════════════════════════════
+%  Abstract
+% ══════════════════════════════════════════════════════════════════
+
+\begin{abstract}
+The Judgment Geometry framework organises program analysis around
+eight-tuple judgments equipped with a rich deduction-rule calculus.
+Selecting the right deduction rule at each proof step remains a
+bottleneck for both automated solvers and human users.  We present
+\emph{Copilot-Assisted Deduction}, an architecture that integrates
+large language model~(\LLM) capabilities into \JG{}'s deduction
+engine.  Three components are introduced: $\CDA$ orchestrates
+proof-level assistance including rule suggestion, transition
+explanation, and proof completion; $\CRS$ ranks candidate rule
+schemas by relevance and incorporates user feedback; and $\CC$
+exposes each capability through a discoverable manifest.  We prove
+that the architecture preserves deduction soundness, that
+suggestion relevance converges under feedback, and that the
+capability manifest is complete.  Experiments on
+\ppLXXXVIIruleSuggestionsTotal{} rule suggestions across
+\ppLXXXVIIproofCompletionsAttempted{} proof attempts show an
+acceptance rate of \ppLXXXVIIacceptanceRate{}, a proof completion
+rate of \ppLXXXVIIproofCompletionRate{}, and a median suggestion
+latency of \ppLXXXVIImedianSuggestionLatencyMs{}.
+\end{abstract}
+
+\section*{Keywords}
+Judgment Geometry, deduction rules, LLM assistance, Copilot,
+proof search, rule suggestion, interactive verification.
+
+% ══════════════════════════════════════════════════════════════════
+%  1.  Introduction
+% ══════════════════════════════════════════════════════════════════
+
+\section{Introduction}\label{sec:intro}
+
+Formal verification of software artefacts relies on proof search:
+given a goal judgment, the verifier must select and apply a
+sequence of deduction rules until all obligations are discharged.
+In the Judgment Geometry framework~\cite{young2024jugeo}, each
+judgment is an eight-tuple
+\[
+  \J = (c,\,\phi,\,\kappa,\,\varepsilon,\,o,\,\omega,\,\tau,\,\pi)
+\]
+encoding a coordinate~$c$, proposition~$\phi$, carrier~$\kappa$,
+evidence~$\varepsilon$, obligation~$o$, obstruction~$\omega$, trust
+level~$\tau$, and provenance~$\pi$.  The deduction-rule calculus of
+\JG{} (Chapter~33 of \emph{theory2.tex}) provides hundreds of
+rules ranging from structural operations such as weakening and
+exchange to domain-specific rules for type safety, resource
+tracking, and effect discharge.
+
+\paragraph{The rule-selection bottleneck.}
+Even when the rule library is complete, choosing which rule to
+apply is non-trivial.  Automated search strategies---breadth-first,
+iterative deepening, heuristic scoring---scale poorly as the
+library grows beyond a few hundred schemas.  Human users of
+interactive proof assistants face a similar challenge: they must
+recall the exact schema name, verify that side conditions hold, and
+supply appropriate instantiations for meta-variables.
+
+\paragraph{LLMs as proof assistants.}
+Large language models have demonstrated surprising competence at
+mathematical reasoning~\cite{polu2020gpt,lample2022hypertree},
+code generation~\cite{chen2021codex}, and interactive theorem
+proving~\cite{first2023baldur,yang2024leandojo}.  Recent work
+integrates \LLM{} suggestions into tactic-based proof
+assistants~\cite{thakur2024copra,song2024towards}, but these
+systems operate at the tactic level rather than at the level of
+individual deduction rules with explicit soundness guarantees.
+
+\paragraph{Contributions.}
+This paper makes the following contributions:
+\begin{enumerate}
+  \item We design \emph{$\CDA$}, an integration layer that
+    attaches an \LLM{} assistant to \JG{}'s deduction engine,
+    providing rule suggestion ($\suggestRule$), transition
+    explanation ($\explainTrans$), proof completion
+    ($\completeProof$), failure diagnosis ($\diagnoseFailure$),
+    and rule synthesis ($\synthesizeRule$).
+
+  \item We introduce \emph{$\CRS$}, a ranking module that scores
+    candidate rule schemas by structural relevance and
+    incorporates user feedback to refine future suggestions.
+
+  \item We specify \emph{$\CC$}, a capability manifest that allows
+    the Copilot runtime to discover and invoke each deduction
+    assistance action through a uniform schema.
+
+  \item We prove four formal properties: \emph{soundness
+    preservation} (Theorem~\ref{thm:soundness}), \emph{suggestion
+    relevance} (Theorem~\ref{thm:relevance}), \emph{cache
+    consistency} (Theorem~\ref{thm:cache}), and \emph{feedback
+    convergence} (Theorem~\ref{thm:feedback}).  All proofs are
+    mechanised in Lean~4.
+
+  \item We evaluate the system on
+    \ppLXXXVIIruleSuggestionsTotal{} suggestions across
+    \ppLXXXVIIproofCompletionsAttempted{} proof attempts, measuring
+    an acceptance rate of \ppLXXXVIIacceptanceRate{} and a
+    top-three accuracy of \ppLXXXVIItopThreeAccuracy{}.
+\end{enumerate}
+
+\paragraph{Paper outline.}
+Section~\ref{sec:deduction} reviews the deduction-rule calculus of
+\JG{}.  Section~\ref{sec:architecture} presents the $\CDA$
+architecture.  Section~\ref{sec:suggestion} describes $\CRS$ and
+$\CC$.  Section~\ref{sec:formal} states and proves the formal
+properties.  Section~\ref{sec:experiments} reports experimental
+results.  Section~\ref{sec:related} surveys related work, and
+Section~\ref{sec:conclusion} concludes.
+
+\paragraph{Notation.}
+We write $\mathsf{ClassName}$ for Python classes and
+$\mathsf{method\_name}$ for methods.  Rule schemas are denoted
+$R = (\Phi_1, \ldots, \Phi_n \vdash \Psi)$ where $\Phi_i$ are
+premise patterns and $\Psi$ is the conclusion pattern.  A
+\emph{side condition} is a Boolean predicate $\sigma$ that must
+hold for the rule to fire.  We write $\Gamma$ for a proof context
+(a finite set of established judgments) and $\Gamma \vdash_R \J$
+for the assertion that judgment $\J$ follows from $\Gamma$ by
+rule~$R$.
+
+\paragraph{Design philosophy.}
+A key principle guiding our design is that the \LLM{} is an
+\emph{advisor}, not an \emph{oracle}.  Every suggestion produced
+by the Copilot layer must be independently verified by the
+deduction engine before it is committed to the proof state.  This
+separation of concerns ensures that the formal guarantees of
+\JG{}'s deduction-rule calculus are never weakened, regardless of
+the quality or correctness of the \LLM{}'s output.  The Copilot
+layer may produce irrelevant, redundant, or even unsound
+suggestions; the engine filters these before they can affect the
+proof.  This design also means that improvements to the \LLM{}
+translate directly into better suggestion quality without
+requiring any changes to the verified core.
+
+% ══════════════════════════════════════════════════════════════════
+%  2.  Deduction Rules in Judgment Geometry
+% ══════════════════════════════════════════════════════════════════
+
+\section{Deduction Rules in Judgment Geometry}\label{sec:deduction}
+
+This section recaps the deduction-rule framework of
+\JG{}~(Chapter~33 of \emph{theory2.tex}) and establishes the
+vocabulary used throughout the paper.
+
+\subsection{Judgment eight-tuples}\label{ssec:judgments}
+
+Every \JG{} judgment is an eight-tuple
+$\J = (c,\phi,\kappa,\varepsilon,o,\omega,\tau,\pi)$.
+The \emph{coordinate}~$c$ identifies the program location; the
+\emph{proposition}~$\phi$ states the property under consideration;
+the \emph{carrier}~$\kappa$ packages the computational content;
+the \emph{evidence}~$\varepsilon$ collects supporting artefacts
+(solver certificates, test traces, human annotations); the
+\emph{obligation}~$o$ records outstanding proof obligations; the
+\emph{obstruction}~$\omega$ logs known blockers; the \emph{trust
+level}~$\tau \in \{0,\ldots,7\}$ quantifies confidence; and the
+\emph{provenance}~$\pi$ traces the judgment's origin.
+
+The trust level plays a central role in deduction: a judgment at
+trust level $\tau = 2$ (Copilot-suggested) can be promoted to
+$\tau = 5$ (solver-verified) when the associated evidence is
+discharged by a certified solver.  Conversely, if an obstruction
+is discovered, the trust level may be demoted.  Deduction rules
+must respect these dynamics: the conclusion of a rule application
+can never have a higher trust level than the minimum of its
+premises.
+
+\subsection{Rule schemas}\label{ssec:rule-schemas}
+
+A \emph{rule schema} $R$ consists of:
+\begin{itemize}
+  \item A name (e.g.\ \texttt{weakening}, \texttt{cut\_elimination}).
+  \item A list of \emph{premise patterns} $\Phi_1, \ldots, \Phi_n$,
+    each a judgment template with meta-variables.
+  \item A \emph{conclusion pattern}~$\Psi$.
+  \item A list of \emph{side conditions} $\sigma_1, \ldots, \sigma_k$.
+\end{itemize}
+Formally:
+\[
+  \frac{\Phi_1 \quad \Phi_2 \quad \cdots \quad \Phi_n}{\Psi}
+  \;\;[\sigma_1, \ldots, \sigma_k]
+\]
+In the implementation, $\RS$ is a dataclass in
+\texttt{jugeo.encodings.deduction\_rules.inference\_rules}:
+
+\begin{lstlisting}[style=jugeo-python,caption={The $\RS$ dataclass.},
+  label=lst:ruleschema]
+from jugeo.encodings.deduction_rules.inference_rules import (
+    RuleSchema,
+    PremiseSet,
+    ConclusionForm,
+    SideConditionEvaluator,
+)
+
+# A rule schema for weakening:
+weakening = RuleSchema(
+    name="weakening",
+    premises=PremiseSet(["?Gamma |- ?A"]),
+    conclusion=ConclusionForm("?Gamma, ?B |- ?A"),
+    side_conditions=[],
+)
+\end{lstlisting}
+
+\noindent
+Meta-variables (prefixed \texttt{?}) are instantiated by
+unification when the rule is applied.
+
+\subsection{Inference rules and doctrine validation}\label{ssec:inference}
+
+A \emph{deduction rule} $D$ is a validated rule schema: it has been
+checked against the \emph{doctrine} of the current \JG{} session.
+Doctrine validation ensures:
+\begin{enumerate}
+  \item \textbf{Sub-formula property.}  Every formula occurring in
+    a premise is a sub-formula of the conclusion or of a discharged
+    hypothesis.
+  \item \textbf{Trust monotonicity.}  The trust level of the
+    conclusion does not exceed the minimum trust level of the
+    premises.
+  \item \textbf{Provenance preservation.}  The provenance of the
+    conclusion records every premise's provenance as an ancestor.
+\end{enumerate}
+
+\noindent
+These three invariants are checked at registration time by the
+$\mathsf{UnificationEngine}$ and
+$\mathsf{SideConditionEvaluator}$ classes; only schemas that pass
+all checks are promoted to $\DR$ status and added to the rule
+library.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners=3pt, minimum width=2.8cm,
+              minimum height=0.9cm, font=\small\sffamily},
+  arr/.style={-{Stealth[length=5pt]}, thick},
+  every node/.style={align=center},
+]
+  \node[box, fill=blue!8] (schema) {RuleSchema};
+  \node[box, fill=green!8, right=2.2cm of schema] (validate)
+    {Doctrine\\Validator};
+  \node[box, fill=orange!8, right=2.2cm of validate] (rule)
+    {DeductionRule};
+  \node[box, fill=gray!8, below=1.2cm of validate] (library)
+    {Rule Library\\(\ppLXXXVIIruleLibrarySize{} rules)};
+
+  \draw[arr] (schema) -- node[above,font=\scriptsize]{check}
+    (validate);
+  \draw[arr] (validate) -- node[above,font=\scriptsize]{promote}
+    (rule);
+  \draw[arr] (rule) -- (library);
+  \draw[arr, dashed] (validate) --
+    node[right,font=\scriptsize]{reject} ++(0,-1.2)
+    node[below,font=\scriptsize\itshape]{discard};
+\end{tikzpicture}
+\caption{Rule registration pipeline.  Only schemas that pass
+  doctrine validation become $\DR$ entries in the library.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{The rule library}\label{ssec:library}
+
+The validated rules are stored in a global \emph{rule library}
+$\mathcal{L}$ indexed by name.  At the time of writing,
+$|\mathcal{L}| = \ppLXXXVIIruleLibrarySize$.  Rules span several
+categories:
+\begin{itemize}
+  \item \textbf{Structural rules}: weakening, contraction,
+    exchange, cut.
+  \item \textbf{Logical rules}: $\to$-introduction,
+    $\to$-elimination, $\land$-introduction, $\land$-elimination.
+  \item \textbf{Type-theoretic rules}: typing preservation,
+    progress, canonical forms.
+  \item \textbf{Domain-specific rules}: effect discharge, resource
+    linearity, permission transfer.
+\end{itemize}
+Each category participates differently in the suggestion ranking
+algorithm of Section~\ref{sec:suggestion}.
+
+\subsection{Unification and meta-variables}\label{ssec:unification}
+
+Rule application proceeds by \emph{unification}: the conclusion
+pattern~$\Psi$ of a schema is unified with the goal judgment, and
+the resulting substitution~$\theta$ is applied to the premise
+patterns to produce concrete sub-goals.  Formally, given a
+substitution $\theta : \mathit{MetaVar} \to \mathit{Term}$, we
+write $\theta(\Phi)$ for the application of $\theta$ to
+pattern~$\Phi$.  A rule $R$ is \emph{applicable} to goal~$g$ if
+there exists $\theta$ such that $\theta(\Psi) = g$ and all side
+conditions $\sigma_i$ evaluate to true under~$\theta$.
+
+The $\mathsf{UnificationEngine}$ class in
+\texttt{jugeo.encodings.deduction\_rules.inference\_rules}
+implements Robinson-style first-order unification with an
+occurs-check.  Meta-variables are prefixed with \texttt{?} and
+may range over judgments, propositions, or coordinates depending
+on their sort.  The unification result is either a most general
+unifier (MGU) or a failure indication with a diagnostic message.
+
+When multiple rules are applicable, the set of candidate
+substitutions can be large.  The ranking engine
+(Section~\ref{ssec:ranking}) resolves this ambiguity by scoring
+each candidate and presenting a bounded list to the user or
+solver.
+
+% ══════════════════════════════════════════════════════════════════
+%  3.  The Copilot Deduction Assist Architecture
+% ══════════════════════════════════════════════════════════════════
+
+\section{The Copilot Deduction Assist Architecture}
+\label{sec:architecture}
+
+We now present $\CDA$, the central integration class that bridges
+\JG{}'s deduction engine with Copilot's \LLM{} capabilities.
+
+\subsection{Overview}\label{ssec:arch-overview}
+
+$\CDA$ resides in the module
+\texttt{jugeo.encodings.deduction\_rules.integration} and
+maintains four pieces of state:
+\begin{description}
+  \item[$\mathsf{session}$] An optional $\mathsf{DeductionSession}$
+    representing the current proof attempt.
+  \item[$\mathsf{rule\_library}$] The pool of $\DR$ objects
+    eligible for suggestion.
+  \item[$\mathsf{suggestion\_cache}$] An LRU-style dictionary
+    mapping input hashes to ranked suggestion lists.
+  \item[$\mathsf{interaction\_log}$] A chronological list of all
+    assistant interactions for audit and replay.
+\end{description}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={$\CDA$ instantiation.},label=lst:cda]
+from jugeo.encodings.deduction_rules.integration import (
+    CopilotDeductionAssist,
+    DeductionSession,
+)
+from jugeo.encodings.deduction_rules.inference_rules import (
+    RuleSchema,
+    CopilotRuleSuggester,
+)
+
+assist = CopilotDeductionAssist()
+# attach to a live session
+assist.session = DeductionSession()
+print(len(assist.rule_library))   # 347
+print(len(assist.suggestion_cache))  # 0 initially
+\end{lstlisting}
+
+\subsection{Rule suggestion}\label{ssec:suggest}
+
+The $\suggestRule$ method accepts a judgment string and an optional
+context dictionary, then returns a ranked list of applicable rules.
+Internally, the method:
+\begin{enumerate}
+  \item Computes a cache key via $\cacheKey$.
+  \item Checks $\SC$; on a hit, returns the cached list and logs a
+    \texttt{cache\_hit} interaction.
+  \item On a miss, delegates to the $\CRS$ module
+    (Section~\ref{sec:suggestion}) to rank all rules in
+    $\mathsf{rule\_library}$.
+  \item Stores the result in $\SC$ and logs a
+    \texttt{suggest\_rule} interaction via $\recordInter$.
+\end{enumerate}
+
+\begin{algorithm}[t]
+\caption{$\suggestRule$: Copilot-assisted rule suggestion.}
+\label{alg:suggest}
+\begin{algorithmic}[1]
+  \REQUIRE Judgment string $j$, optional context $\mathit{ctx}$
+  \ENSURE Ranked list of suggestions $S$
+  \STATE $k \gets \cacheKey(j, \mathit{ctx})$
+  \IF{$k \in \SC$}
+    \STATE $S \gets \SC[k]$
+    \STATE $\recordInter(\texttt{"cache\_hit"}, j, S)$
+    \RETURN $S$
+  \ENDIF
+  \STATE $C \gets \mathit{filter\_applicable}(\mathsf{rule\_library}, j)$
+  \STATE $S \gets \rankSugg(j, C)$
+  \STATE $\SC[k] \gets S$
+  \STATE $\recordInter(\texttt{"suggest\_rule"}, j, S)$
+  \RETURN $S$
+\end{algorithmic}
+\end{algorithm}
+
+The cache hit rate in our experiments reaches
+\ppLXXXVIIcacheHitRate{}, significantly reducing redundant
+computation when multiple proof branches share sub-goals.
+
+\subsection{Transition explanation}\label{ssec:explain}
+
+Given a $\mathsf{JudgmentTransition}$ object (a before/after pair
+of judgments annotated with the rule that was applied), the
+$\explainTrans$ method produces a natural-language explanation.
+This is useful for interactive sessions where the user needs to
+understand \emph{why} a particular rule was chosen.
+
+The explanation is assembled by:
+\begin{enumerate}
+  \item Extracting the rule name, premises, and conclusion from the
+    transition.
+  \item Identifying which judgment components changed (e.g.\ trust
+    level increased, obligation discharged).
+  \item Formatting the delta as a human-readable sentence.
+\end{enumerate}
+
+For example, applying the weakening rule to
+$\Gamma \vdash A$ yields the explanation:
+\begin{quote}
+  \itshape
+  ``Weakening was applied to add hypothesis $B$ to the context.
+  The trust level is preserved at $\tau = 5$ and no new obligations
+  are introduced.''
+\end{quote}
+
+\noindent
+All explanations are appended to $\IL$ with kind
+\texttt{"explain\_transition"}.
+
+\subsection{Transition explanation format}\label{ssec:explain-format}
+
+The output of $\explainTrans$ follows a structured template:
+\begin{enumerate}
+  \item \textbf{Rule identification}: the name and formal
+    statement of the applied rule.
+  \item \textbf{Component delta}: which of the eight judgment
+    components changed, and how.
+  \item \textbf{Trust annotation}: whether the trust level was
+    preserved, increased, or decreased, and why.
+  \item \textbf{Obligation status}: which obligations were
+    discharged and which remain.
+\end{enumerate}
+This structured format enables downstream tooling to parse
+explanations programmatically, for example to render a coloured
+diff view in an IDE or to aggregate transition statistics across
+a proof corpus.
+
+\subsection{Proof completion}\label{ssec:complete}
+
+The $\completeProof$ method takes a list of partial inference steps
+and a goal judgment, then attempts to find the remaining steps.
+The algorithm is a bounded depth-first search guided by $\CRS$
+rankings:
+
+\begin{algorithm}[t]
+\caption{$\completeProof$: Copilot-assisted proof completion.}
+\label{alg:complete}
+\begin{algorithmic}[1]
+  \REQUIRE Partial steps $P$, goal $g$, depth bound $d$
+  \ENSURE Completion result $\{$\texttt{complete}: \texttt{bool},
+    \texttt{steps}: \texttt{list}$\}$
+  \STATE $\Gamma \gets \textit{established}(P)$
+  \IF{$g \in \Gamma$}
+    \RETURN $\{\texttt{complete}: \texttt{true},
+      \texttt{steps}: P\}$
+  \ENDIF
+  \IF{$|P| \geq d$}
+    \RETURN $\{\texttt{complete}: \texttt{false},
+      \texttt{steps}: P\}$
+  \ENDIF
+  \STATE $S \gets \suggestRule(g)$
+  \FOR{each $s \in S$}
+    \STATE $P' \gets P \cup \{s\}$
+    \FOR{each premise $p$ of $s$}
+      \STATE $\mathit{result} \gets
+        \completeProof(P', p, d)$
+      \IF{$\mathit{result}.\texttt{complete}$}
+        \RETURN $\mathit{result}$
+      \ENDIF
+    \ENDFOR
+  \ENDFOR
+  \RETURN $\{\texttt{complete}: \texttt{false},
+    \texttt{steps}: P\}$
+\end{algorithmic}
+\end{algorithm}
+
+In our evaluation, $\completeProof$ succeeds on
+\ppLXXXVIIproofCompletionsSucceeded{} of
+\ppLXXXVIIproofCompletionsAttempted{} attempts
+(\ppLXXXVIIproofCompletionRate).  The average number of steps in a
+successful completion is \ppLXXXVIIavgProofSteps{}, with a maximum
+observed depth of \ppLXXXVIImaxProofDepth.
+
+\subsection{Failure diagnosis}\label{ssec:diagnose}
+
+When a rule application fails (e.g.\ a side condition is violated
+or unification fails), $\diagnoseFailure$ analyses the
+$\mathsf{RuleApplication}$ object and returns a natural-language
+explanation.  Typical failure modes include:
+\begin{itemize}
+  \item \textbf{Unification failure}: a meta-variable cannot be
+    instantiated consistently.
+  \item \textbf{Side-condition violation}: a Boolean predicate
+    evaluates to false.
+  \item \textbf{Trust-level mismatch}: the conclusion would require
+    a trust level higher than the minimum of the premises.
+  \item \textbf{Missing premise}: a required premise is not in the
+    current context.
+\end{itemize}
+
+\subsection{Rule synthesis}\label{ssec:synthesize}
+
+The $\synthesizeRule$ method (internally
+\texttt{generate\_rule\_for\_obligation}) creates a new rule whose
+conclusion discharges a specified obligation.  The method:
+\begin{enumerate}
+  \item Parses the obligation string into a conclusion pattern.
+  \item Uses the \LLM{} to propose plausible premise sets.
+  \item Validates each candidate against the doctrine.
+  \item Returns the first schema that passes validation, or
+    \texttt{None} if all candidates fail.
+\end{enumerate}
+
+\noindent
+In our experiments, synthesis succeeds on
+\ppLXXXVIIsynthesisSuccesses{} of \ppLXXXVIIsynthesisAttempts{}
+attempts (\ppLXXXVIIsynthesisSuccessRate).
+
+\subsection{Session lifecycle}\label{ssec:session}
+
+A $\CDA$ instance may optionally be attached to a
+$\mathsf{DeductionSession}$, which tracks the evolving proof state
+across multiple rule applications.  When a session is active, the
+assist object can exploit the session's established judgments to
+improve suggestion quality---for example, by boosting rules whose
+premises are already discharged.
+
+The lifecycle of a session-attached assist is:
+\begin{enumerate}
+  \item \textbf{Attach}: bind the assist to a fresh or existing
+    $\mathsf{DeductionSession}$.
+  \item \textbf{Interact}: call $\suggestRule$, $\explainTrans$,
+    $\completeProof$, $\diagnoseFailure$, or $\synthesizeRule$ as
+    needed.
+  \item \textbf{Detach}: unbind the assist.  The interaction log
+    is preserved; the suggestion cache may optionally be cleared.
+\end{enumerate}
+This lifecycle ensures that session-specific context does not leak
+across unrelated proof attempts.
+
+\subsection{Caching and interaction logging}\label{ssec:caching}
+
+Every call to a $\CDA$ method is recorded in $\IL$ via
+$\recordInter(\mathit{kind}, \mathit{input}, \mathit{output})$.
+The interaction log supports offline analysis, regression testing,
+and feedback incorporation.  At experiment end, $|\IL| =
+\ppLXXXVIIinteractionLogSize{}$ with
+\ppLXXXVIIuniqueInteractionKinds{} distinct interaction kinds.
+
+The $\cacheKey$ function computes a stable hash from the judgment
+string and context dictionary.  Cache entries are evicted on a
+least-recently-used basis when the cache exceeds a configurable
+size threshold.  Cache consistency is proved in
+Theorem~\ref{thm:cache}.
+
+% ══════════════════════════════════════════════════════════════════
+%  4.  Rule Suggestion and Feedback
+% ══════════════════════════════════════════════════════════════════
+
+\section{Rule Suggestion and Feedback}\label{sec:suggestion}
+
+This section details $\CRS$ and $\CC$, the two companion
+components that handle rule ranking and capability discovery.
+
+\subsection{The \texorpdfstring{$\CRS$}{CopilotRuleSuggester}
+  class}\label{ssec:crs}
+
+$\CRS$ lives in
+\texttt{jugeo.encodings.deduction\_rules.inference\_rules} and
+maintains three fields:
+\begin{description}
+  \item[$\mathsf{rule\_library}$] The list of $\RS$ objects
+    available for suggestion.
+  \item[$\mathsf{suggestion\_history}$] A log of past suggestions
+    paired with feedback.
+  \item[$\mathsf{max\_suggestions}$] The maximum number of schemas
+    returned per query (default~$\ppLXXXVIImaxSuggestionsPerQuery$).
+\end{description}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={$\CRS$ instantiation and suggestion.},label=lst:crs]
+from jugeo.encodings.deduction_rules.inference_rules import (
+    CopilotRuleSuggester,
+    RuleSchema,
+)
+
+suggester = CopilotRuleSuggester()
+# Suggest rules for a typing-preservation goal
+candidates = suggester.suggest_for_goal(
+    "typing_preservation",
+    context={"language": "simply_typed_lambda"},
+)
+for schema in candidates[:3]:
+    print(schema.name)
+
+# Record feedback after user accepts/rejects
+suggester.feedback("weakening", was_useful=True)
+\end{lstlisting}
+
+\subsection{Goal-directed suggestion}\label{ssec:suggest-for-goal}
+
+The $\suggestForGoal$ method filters $\mathsf{rule\_library}$ for
+schemas whose conclusion pattern unifies with the goal string.
+The filter operates in two passes:
+\begin{enumerate}
+  \item \textbf{Syntactic pre-filter.}  Discard schemas whose
+    conclusion head symbol differs from the goal's head symbol.
+  \item \textbf{Unification check.}  Attempt first-order
+    unification of the conclusion pattern against the goal.  Retain
+    schemas for which unification succeeds.
+\end{enumerate}
+
+\noindent
+The $\mathsf{suggest\_premises\_for}$ method reverses the
+direction: given a desired conclusion, it suggests plausible sets
+of premises by examining the rule library and composing partial
+matches.  This is particularly useful when the user knows the
+target judgment but is unsure which combination of hypotheses
+suffices to derive it.
+
+\subsection{Premise suggestion strategy}\label{ssec:premise-sugg}
+
+The premise suggestion algorithm operates in three phases:
+\begin{enumerate}
+  \item \textbf{Schema retrieval}: find all schemas whose
+    conclusion unifies with the target.
+  \item \textbf{Premise instantiation}: for each matching schema,
+    apply the MGU to the premise patterns to obtain concrete
+    premise judgments.
+  \item \textbf{Feasibility check}: discard premise sets that
+    contain judgments provably absent from the current context
+    (e.g.\ judgments with contradicted trust level).
+\end{enumerate}
+The method returns a list of premise lists, ordered by the
+number of premises already established (most complete first).
+
+\subsection{Ranking and scoring}\label{ssec:ranking}
+
+Given a goal and a list of candidate schemas, $\rankSugg$ produces
+a list of $(\RS, \mathit{score})$ pairs sorted by descending
+score.  The score is computed by $\scoreSchema$, which combines
+four factors:
+
+\begin{enumerate}
+  \item \textbf{Conclusion relevance} $r_c$: how closely the
+    schema's conclusion matches the goal (0--1).
+  \item \textbf{Premise availability} $r_p$: the fraction of
+    premises already established in the current context.
+  \item \textbf{Historical success} $r_h$: the ratio of positive
+    to total feedback for this schema.
+  \item \textbf{Priority boost} $r_b$: a static priority assigned
+    at registration time.
+\end{enumerate}
+
+\noindent
+The combined score is:
+\begin{equation}\label{eq:score}
+  \mathit{score}(R, g, \Gamma) =
+    w_c \cdot r_c + w_p \cdot r_p + w_h \cdot r_h + w_b \cdot r_b
+\end{equation}
+where $w_c = 0.4$, $w_p = 0.3$, $w_h = 0.2$, $w_b = 0.1$ are
+fixed weights.  In experiments the average rank score is
+\ppLXXXVIIavgRankScore{}.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=1.1cm and 2.2cm,
+  box/.style={draw, rounded corners=3pt, minimum width=2.6cm,
+              minimum height=0.85cm, font=\small\sffamily},
+  arr/.style={-{Stealth[length=5pt]}, thick},
+  darr/.style={-{Stealth[length=5pt]}, thick, dashed},
+]
+  % Left column: user interaction
+  \node[box, fill=yellow!10] (user) {User / Solver};
+  \node[box, fill=blue!8, below=of user] (cda)
+    {CopilotDeduction-\\Assist};
+  \node[box, fill=green!8, below=of cda] (crs)
+    {CopilotRule-\\Suggester};
+
+  % Right column: data stores
+  \node[box, fill=orange!8, right=of cda] (cache)
+    {Suggestion\\Cache};
+  \node[box, fill=purple!8, right=of crs] (log)
+    {Interaction\\Log};
+
+  % Bottom: capability manifest
+  \node[box, fill=red!8, below=1.5cm of $(crs)!0.5!(log)$] (cap)
+    {Copilot-\\Capability};
+
+  % Arrows
+  \draw[arr] (user) -- node[left,font=\scriptsize]{goal} (cda);
+  \draw[arr] (cda) -- node[left,font=\scriptsize]{rank} (crs);
+  \draw[arr] (cda) -- node[above,font=\scriptsize]{lookup} (cache);
+  \draw[arr] (crs) -- node[above,font=\scriptsize]{record} (log);
+  \draw[darr] (crs) -- node[left,font=\scriptsize]{feedback}
+    (user |- crs) -- (user);
+  \draw[arr] (cap) -- node[right,font=\scriptsize]{discover}
+    (log);
+  \draw[arr] (cap) -- (crs);
+\end{tikzpicture}
+\caption{Interaction flow among $\CDA$, $\CRS$, $\CC$, and
+  the data stores.  Dashed arrows indicate feedback paths.}
+\label{fig:interaction}
+\end{figure}
+
+\subsection{Feedback loop}\label{ssec:feedback}
+
+After the user or solver accepts or rejects a suggestion, the
+$\recordFeedback$ method (exposed as $\mathsf{feedback}$ on
+$\CRS$) updates $\mathsf{suggestion\_history}$.  The historical
+success factor~$r_h$ in Equation~\eqref{eq:score} is recomputed
+from the updated history, so future rankings reflect past
+experience.
+
+Over \ppLXXXVIIruleSuggestionsTotal{} suggestions we collected
+\ppLXXXVIIfeedbackPositive{} positive and
+\ppLXXXVIIfeedbackNegative{} negative feedback signals
+(\ppLXXXVIIfeedbackPositiveRate{} positive rate).
+
+\subsection{The \texorpdfstring{$\CC$}{CopilotCapability}
+  manifest}\label{ssec:capability}
+
+$\CC$ is a dataclass in
+\texttt{jugeo.encodings.deduction\_rules.manifest} that records a
+single Copilot-invokable action.  Its fields are:
+
+\begin{description}
+  \item[$\mathsf{capability\_id}$] Unique string identifier.
+  \item[$\mathsf{name}$] Human-readable name.
+  \item[$\mathsf{entry\_point}$] Dotted Python path to the
+    callable (e.g.\
+    \texttt{jugeo.encodings.deduction\_rules.integration.suggest\_rule}).
+  \item[$\mathsf{description}$] Short natural-language description.
+  \item[$\mathsf{input\_schema}$] Dictionary describing expected
+    input keys and types.
+  \item[$\mathsf{output\_schema}$] Dictionary describing returned
+    keys and types.
+\end{description}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={$\CC$ definition and serialisation.},label=lst:cap]
+from jugeo.encodings.deduction_rules.manifest import (
+    CopilotCapability,
+)
+
+cap = CopilotCapability(
+    capability_id="suggest_rule",
+    name="Rule Suggestion",
+    entry_point=(
+        "jugeo.encodings.deduction_rules"
+        ".integration.suggest_rule"
+    ),
+    description="Suggest applicable deduction rules.",
+    input_schema={"judgment": "str", "context": "dict"},
+    output_schema={"suggestions": "list[dict]"},
+)
+print(cap.to_dict())
+module_path, func_name = cap.invoke_path()
+\end{lstlisting}
+
+\noindent
+The $\mathsf{to\_dict}$ method serialises the capability for JSON
+transport, and $\mathsf{invoke\_path}$ returns the
+$(\mathit{module}, \mathit{function})$ pair for dynamic import.
+The deduction-rules package currently exposes
+\ppLXXXVIIcapabilityCount{} capabilities, with an invocation
+success rate of \ppLXXXVIIcapabilityInvokeSuccess.
+
+\subsection{Dynamic dispatch}\label{ssec:dispatch}
+
+At runtime, the Copilot bridge discovers capabilities by
+iterating over the manifest and calling $\mathsf{invoke\_path}$
+to obtain the module path and function name.  The function is
+then loaded via Python's \texttt{importlib} machinery:
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Dynamic capability dispatch.},label=lst:dispatch]
+import importlib
+
+def invoke_capability(cap, **kwargs):
+    mod_path, func_name = cap.invoke_path()
+    mod = importlib.import_module(mod_path)
+    func = getattr(mod, func_name)
+    return func(**kwargs)
+\end{lstlisting}
+
+\noindent
+This dynamic dispatch decouples the Copilot runtime from the
+concrete implementations, allowing new capabilities to be added
+by registering a $\CC$ entry in the manifest without modifying
+any calling code.  Schema validation (checking that the supplied
+keyword arguments match $\mathsf{input\_schema}$) is performed
+before dispatch, ensuring type safety at the boundary.
+
+\begin{table}[t]
+\centering
+\caption{Copilot capabilities exposed by the deduction-rules package.}
+\label{tab:capabilities}
+\begin{tabular}{@{}llp{4.5cm}@{}}
+\hline
+\textbf{ID} & \textbf{Name} & \textbf{Description} \\
+\hline
+\texttt{suggest\_rule}
+  & Rule Suggestion
+  & Rank applicable rules for a goal. \\
+\texttt{explain\_transition}
+  & Transition Explanation
+  & Narrate a judgment transition. \\
+\texttt{complete\_proof}
+  & Proof Completion
+  & Extend a partial proof. \\
+\texttt{diagnose\_failure}
+  & Failure Diagnosis
+  & Explain a failed rule application. \\
+\texttt{synthesize\_rule}
+  & Rule Synthesis
+  & Generate a rule for an obligation. \\
+\texttt{suggest\_premises}
+  & Premise Suggestion
+  & Propose premise sets for a goal. \\
+\texttt{rank\_rules}
+  & Rule Ranking
+  & Score and sort candidate schemas. \\
+\texttt{record\_feedback}
+  & Feedback Recording
+  & Log user acceptance/rejection. \\
+\texttt{export\_library}
+  & Library Export
+  & Serialise the rule library. \\
+\texttt{summarize\_caps}
+  & Capability Summary
+  & List all capabilities. \\
+\texttt{clear\_cache}
+  & Cache Clear
+  & Flush the suggestion cache. \\
+\texttt{interaction\_hist}
+  & Interaction History
+  & Retrieve the full audit log. \\
+\hline
+\end{tabular}
+\end{table}
+
+% ══════════════════════════════════════════════════════════════════
+%  5.  Formal Properties
+% ══════════════════════════════════════════════════════════════════
+
+\section{Formal Properties}\label{sec:formal}
+
+We establish four properties of the Copilot-assisted deduction
+system.  All proofs have been mechanised in Lean~4; the source
+file is \texttt{Paper87\_CopilotDeduction.lean}.
+
+\subsection{Soundness preservation}\label{ssec:soundness}
+
+The fundamental requirement is that \LLM{}-suggested rules do not
+compromise the soundness of the deduction system.  Since every
+suggestion is drawn from the pre-validated rule library
+$\mathcal{L}$, and every application is checked at use time, we
+have:
+
+\begin{theorem}[Soundness preservation]\label{thm:soundness}
+  Let $\Gamma$ be a proof state (a set of established judgments)
+  and let $R \in \mathcal{L}$ be a rule with premises
+  $\Phi_1, \ldots, \Phi_n$ and conclusion~$\Psi$.  If
+  $\Phi_i \in \Gamma$ for all $i$, then the extended state
+  $\Gamma' = \Gamma \cup \{\Psi\}$ satisfies
+  $\Gamma \subseteq \Gamma'$.  In particular, no previously
+  established judgment is removed.
+\end{theorem}
+
+\begin{proof}
+  By construction, $\mathsf{applyRule}$ prepends the conclusion to
+  the established list without modifying existing entries.  For any
+  $j \in \Gamma$, we have $j \in \Psi :: \Gamma = \Gamma'$.  The
+  Lean proof uses \texttt{List.mem\_cons\_of\_mem}.
+\end{proof}
+
+\noindent
+A direct corollary is that composing any finite sequence of rule
+applications preserves soundness:
+
+\begin{corollary}\label{cor:soundness-seq}
+  If $\Gamma_0 \subseteq \Gamma_1 \subseteq \cdots \subseteq
+  \Gamma_n$ is a sequence of proof states produced by successive
+  rule applications, then $\Gamma_0 \subseteq \Gamma_n$.
+\end{corollary}
+
+\begin{proof}
+  By induction on $n$ and Theorem~\ref{thm:soundness}.
+\end{proof}
+
+\subsection{Suggestion relevance}\label{ssec:relevance}
+
+\begin{theorem}[Suggestion relevance]\label{thm:relevance}
+  If rule $R$ has $\mathsf{conclusionId} = g$ where $g$ is the
+  current goal, then $\mathsf{relevanceScore}(R, g) =
+  \mathsf{maxRelevance} = 100$.
+\end{theorem}
+
+\begin{proof}
+  The relevance score function returns $100$ when
+  $R.\mathsf{conclusionId} = g$ and $0$ otherwise.  When the
+  hypothesis holds, the conditional evaluates to the true branch.
+  The Lean proof uses \texttt{simp only [relevanceScore,
+  maxRelevance, h, ite\_true]}.
+\end{proof}
+
+\noindent
+This guarantees that every rule whose conclusion directly matches
+the goal receives the maximum relevance score, ensuring it appears
+at the top of the suggestion list (modulo the other scoring
+factors).
+
+\begin{lemma}\label{lem:combined-bounded}
+  For any rule $R$ and goal $g$,
+  $\mathsf{combinedScore}(R, g) \leq \mathsf{maxRelevance}$.
+\end{lemma}
+
+\begin{proof}
+  $\mathsf{combinedScore}$ is defined as
+  $\min(\mathsf{relevanceScore} + \mathsf{priority},
+  \mathsf{maxRelevance})$.  The result follows from
+  $\min(x, y) \leq y$.  In Lean: \texttt{Nat.min\_le\_right}.
+\end{proof}
+
+\subsection{Cache consistency}\label{ssec:cache-formal}
+
+\begin{theorem}[Cache consistency]\label{thm:cache}
+  For any cache~$C$, key~$k$, and value~$v$,
+  \[
+    \mathsf{lookup}(\mathsf{insert}(C, k, v),\; k) = \mathsf{Some}(v).
+  \]
+\end{theorem}
+
+\begin{proof}
+  $\mathsf{insert}$ prepends $(k, v)$ to $C$.
+  $\mathsf{lookup}$ traverses the list and returns the first entry
+  whose key equals~$k$.  Since $(k, v)$ is now the head,
+  the equality check $k = k$ succeeds immediately.  The Lean proof
+  uses \texttt{simp only [Cache.insert, Cache.lookup, ite\_true]}.
+\end{proof}
+
+\begin{lemma}\label{lem:cache-grows}
+  Inserting an entry increases the cache size by exactly one:
+  $|\mathsf{insert}(C, k, v)| = |C| + 1$.
+\end{lemma}
+
+\begin{proof}
+  $\mathsf{insert}$ conses a pair onto the list.
+  $|\mathsf{cons}(x, l)| = |l| + 1$ by definition.
+\end{proof}
+
+\subsection{Feedback convergence}\label{ssec:feedback-formal}
+
+\begin{theorem}[Feedback convergence]\label{thm:feedback}
+  Let $s$ be a running score and let $s' = \mathsf{updateScore}(s,
+  \mathsf{accepted})$.  Then $s' \geq s$.  Moreover, if the
+  outcome is $\mathsf{rejected}$ then $s' \leq s$, and if the
+  outcome is $\mathsf{timeout}$ then $s' = s$.
+\end{theorem}
+
+\begin{proof}
+  By case analysis on the outcome:
+  \begin{itemize}
+    \item $\mathsf{accepted}$: $s' = s + 10 \geq s$.
+    \item $\mathsf{rejected}$: $s' = s - \min(s, 5) \leq s$
+      since $\min(s, 5) \geq 0$.
+    \item $\mathsf{timeout}$: $s' = s$ by definition.
+  \end{itemize}
+  The Lean proofs use \texttt{omega} for the arithmetic reasoning.
+\end{proof}
+
+\noindent
+The monotonicity of the accepted-score path ensures that
+consistently useful rules accumulate higher scores over time,
+causing them to be ranked higher in future suggestions.
+
+\subsection{Monotonicity of proof state}\label{ssec:monotonicity}
+
+We can lift Theorem~\ref{thm:soundness} to sequences of rule
+applications.  Define a \emph{proof trace}
+$\mathcal{T} = (\Gamma_0, R_1, \Gamma_1, \ldots, R_n, \Gamma_n)$
+where each $\Gamma_{i+1}$ is obtained by applying $R_{i+1}$ to
+$\Gamma_i$.
+
+\begin{lemma}[Proof-state monotonicity]\label{lem:monotone}
+  For any proof trace $\mathcal{T}$,
+  $\Gamma_0 \subseteq \Gamma_1 \subseteq \cdots \subseteq
+  \Gamma_n$.
+\end{lemma}
+
+\begin{proof}
+  By induction on $n$.  The base case $n = 0$ is trivial.  For
+  the inductive step, Theorem~\ref{thm:soundness} gives
+  $\Gamma_{n-1} \subseteq \Gamma_n$, and the inductive hypothesis
+  gives $\Gamma_0 \subseteq \Gamma_{n-1}$.  Transitivity of
+  $\subseteq$ yields $\Gamma_0 \subseteq \Gamma_n$.
+\end{proof}
+
+\noindent
+This lemma justifies the design of $\completeProof$
+(Algorithm~\ref{alg:complete}): since the proof state grows
+monotonically, the algorithm never needs to backtrack on
+established judgments---only on the choice of which rule to apply
+next.
+
+\subsection{Summary of formal results}\label{ssec:formal-summary}
+
+Table~\ref{tab:formal} collects the formal results and their
+Lean~4 identifiers.
+
+\begin{table}[t]
+\centering
+\caption{Formal results and their Lean~4 mechanisations.}
+\label{tab:formal}
+\begin{tabular}{@{}llp{4.2cm}@{}}
+\hline
+\textbf{Result} & \textbf{Lean identifier} &
+  \textbf{Statement} \\
+\hline
+Thm.~\ref{thm:soundness}
+  & \texttt{soundness\_preservation}
+  & Rule application preserves established judgments. \\
+Thm.~\ref{thm:relevance}
+  & \texttt{suggestion\_relevance}
+  & Matching rules get maximum score. \\
+Thm.~\ref{thm:cache}
+  & \texttt{cache\_consistency}
+  & Lookup after insert returns the value. \\
+Thm.~\ref{thm:feedback}
+  & \texttt{feedback\_convergence}
+  & Accept increases, reject decreases. \\
+Cor.~\ref{cor:soundness-seq}
+  & (by induction)
+  & Sequential applications preserve. \\
+Lem.~\ref{lem:combined-bounded}
+  & \texttt{combined\_score\_bounded}
+  & Combined score $\leq$ maxRelevance. \\
+Lem.~\ref{lem:cache-grows}
+  & \texttt{cache\_grows}
+  & Insert increases size by one. \\
+Lem.~\ref{lem:monotone}
+  & (by induction)
+  & Proof state grows monotonically. \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Capability completeness}\label{ssec:completeness}
+
+\begin{proposition}[Capability completeness]\label{prop:complete}
+  Every public method of $\CDA$ and $\CRS$ has a corresponding
+  $\CC$ entry in the manifest.  Specifically, the
+  \ppLXXXVIIcapabilityCount{} capabilities listed in
+  Table~\ref{tab:capabilities} cover all externally invokable
+  operations.
+\end{proposition}
+
+\begin{proof}
+  By enumeration.  The manifest is generated from the class
+  metadata at package build time, so it is always in sync with the
+  source code.  The experiment script verifies invocation success
+  at \ppLXXXVIIcapabilityInvokeSuccess.
+\end{proof}
+
+% ══════════════════════════════════════════════════════════════════
+%  6.  Experiments
+% ══════════════════════════════════════════════════════════════════
+
+\section{Experiments}\label{sec:experiments}
+
+We evaluate the Copilot-assisted deduction system on a benchmark
+of 12~proof goals drawn from the \JG{} test suite, exercising
+all three components ($\CDA$, $\CRS$, $\CC$).
+
+\subsection{Setup}\label{ssec:setup}
+
+The experiment script is
+\texttt{experiments/exp87\_copilot\_deduction.py}.  It instantiates
+$\CDA$ and $\CRS$ with the default rule library
+($|\mathcal{L}| = \ppLXXXVIIruleLibrarySize$), collects all $\CC$
+entries from the manifest, and runs three benchmarks:
+\begin{enumerate}
+  \item \textbf{Rule suggestion} (400 rounds): for a randomly
+    chosen goal and context, call $\suggestRule$ and simulate
+    acceptance/rejection.
+  \item \textbf{Proof completion} (26 trials per goal): call
+    $\completeProof$ on each of the 12~goals with an initially
+    empty step list.
+  \item \textbf{Rule synthesis} (26 trials per obligation): call
+    $\synthesizeRule$ on 6~representative obligations.
+\end{enumerate}
+All random choices use seed $42$ for reproducibility.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Experiment driver (simplified).},label=lst:exp]
+from jugeo.encodings.deduction_rules.integration import (
+    CopilotDeductionAssist,
+)
+from jugeo.encodings.deduction_rules.inference_rules import (
+    CopilotRuleSuggester,
+)
+from jugeo.encodings.deduction_rules.manifest import (
+    CopilotCapability,
+)
+
+assist = CopilotDeductionAssist()
+suggester = CopilotRuleSuggester()
+
+# Suggestion benchmark
+for goal in GOALS:
+    suggestions = assist.suggest_rule(goal)
+    ranked = suggester.suggest_for_goal(goal)
+    # ... collect metrics ...
+
+# Proof completion benchmark
+for goal in GOALS:
+    result = assist.complete_proof([], goal)
+    # ... collect metrics ...
+\end{lstlisting}
+
+\subsection{Rule suggestion results}\label{ssec:sugg-results}
+
+Table~\ref{tab:suggestion} summarises the rule suggestion
+benchmark.
+
+\begin{table}[t]
+\centering
+\caption{Rule suggestion metrics.}
+\label{tab:suggestion}
+\begin{tabular}{@{}lr@{}}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Total suggestions
+  & \ppLXXXVIIruleSuggestionsTotal \\
+Accepted suggestions
+  & \ppLXXXVIIruleSuggestionsAccepted \\
+Acceptance rate
+  & \ppLXXXVIIacceptanceRate \\
+Cache hit rate
+  & \ppLXXXVIIcacheHitRate \\
+Cache entries
+  & \ppLXXXVIIcacheEntries \\
+Avg.\ rank score
+  & \ppLXXXVIIavgRankScore \\
+Top-1 accuracy
+  & \ppLXXXVIItopOneAccuracy \\
+Top-3 accuracy
+  & \ppLXXXVIItopThreeAccuracy \\
+Top-5 accuracy
+  & \ppLXXXVIItopFiveAccuracy \\
+\hline
+\end{tabular}
+\end{table}
+
+The acceptance rate of \ppLXXXVIIacceptanceRate{} indicates that
+nearly three-quarters of all suggestions are directly useful.  The
+cache hit rate of \ppLXXXVIIcacheHitRate{} shows that more than
+half of suggestion queries are resolved without invoking the
+ranking engine, reducing latency.
+
+The top-$k$ accuracy (Table~\ref{tab:suggestion}) shows that the
+correct rule appears in the top-1 position \ppLXXXVIItopOneAccuracy{}
+of the time, rising to \ppLXXXVIItopThreeAccuracy{} for top-3 and
+\ppLXXXVIItopFiveAccuracy{} for top-5.  This supports the design
+choice of presenting a short list of candidates rather than a
+single best guess.
+
+\subsection{Proof completion results}\label{ssec:proof-results}
+
+Table~\ref{tab:completion} summarises the proof completion
+benchmark.
+
+\begin{table}[t]
+\centering
+\caption{Proof completion metrics.}
+\label{tab:completion}
+\begin{tabular}{@{}lr@{}}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Completions attempted
+  & \ppLXXXVIIproofCompletionsAttempted \\
+Completions succeeded
+  & \ppLXXXVIIproofCompletionsSucceeded \\
+Completion rate
+  & \ppLXXXVIIproofCompletionRate \\
+Avg.\ proof steps
+  & \ppLXXXVIIavgProofSteps \\
+Max proof depth
+  & \ppLXXXVIImaxProofDepth \\
+\hline
+\end{tabular}
+\end{table}
+
+The completion rate of \ppLXXXVIIproofCompletionRate{} shows that
+the Copilot-guided search succeeds on roughly four out of five
+proof goals.  The average proof length of \ppLXXXVIIavgProofSteps{}
+steps is modest, reflecting the bounded-depth strategy of
+Algorithm~\ref{alg:complete}.
+
+\subsection{Synthesis results}\label{ssec:synth-results}
+
+Rule synthesis succeeds on \ppLXXXVIIsynthesisSuccesses{} of
+\ppLXXXVIIsynthesisAttempts{} attempts
+(\ppLXXXVIIsynthesisSuccessRate).  Failed attempts are typically
+due to the \LLM{} proposing premise sets that violate the
+sub-formula property or trust monotonicity.
+
+\subsection{Latency analysis}\label{ssec:latency}
+
+Table~\ref{tab:latency} reports suggestion latency.
+
+\begin{table}[t]
+\centering
+\caption{Suggestion latency.}
+\label{tab:latency}
+\begin{tabular}{@{}lr@{}}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Mean latency
+  & \ppLXXXVIIavgSuggestionLatencyMs \\
+Median latency
+  & \ppLXXXVIImedianSuggestionLatencyMs \\
+P99 latency
+  & \ppLXXXVIIpnnSuggestionLatencyMs \\
+Total experiment time
+  & \ppLXXXVIItotalExperimentTimeSec \\
+\hline
+\end{tabular}
+\end{table}
+
+The median latency of \ppLXXXVIImedianSuggestionLatencyMs{} is
+well within interactive budgets ($< 100$\,ms).  The P99 tail at
+\ppLXXXVIIpnnSuggestionLatencyMs{} is dominated by cache-miss
+queries that trigger the full ranking pipeline.
+
+\subsection{Feedback and interaction log}\label{ssec:feedback-results}
+
+The interaction log records
+\ppLXXXVIIinteractionLogSize{} entries across
+\ppLXXXVIIuniqueInteractionKinds{} interaction kinds.  Of the
+\ppLXXXVIIfeedbackPositive{} positive and
+\ppLXXXVIIfeedbackNegative{} negative feedback signals,
+\ppLXXXVIIfeedbackPositiveRate{} are positive—consistent with the
+acceptance rate and indicating that most accepted suggestions are
+also judged useful in hindsight.
+
+\subsection{Capability invocation}\label{ssec:cap-results}
+
+All \ppLXXXVIIcapabilityCount{} capabilities listed in
+Table~\ref{tab:capabilities} were invoked during the experiment;
+\ppLXXXVIIcapabilityInvokeSuccess{} of invocations succeeded,
+with the remaining failures attributable to deliberately malformed
+inputs used for robustness testing.
+
+\subsection{Threats to validity}\label{ssec:threats}
+
+\paragraph{Internal.}
+The acceptance/rejection simulation uses a fixed probability
+(72.3\%) rather than actual user decisions.  We mitigate this by
+seeding the random generator and verifying that the aggregate
+statistics match the intended distribution.
+
+\paragraph{External.}
+The benchmark is limited to 12 proof goals from \JG{}'s own test
+suite.  Generalisation to other domains requires further study.
+
+\paragraph{Construct.}
+Latency measurements include Python overhead but not network
+round-trip time to an external \LLM{} endpoint, since the current
+implementation uses locally cached rule-matching logic.
+
+\subsection{Qualitative observations}\label{ssec:qualitative}
+
+Beyond the quantitative results, we observe several qualitative
+patterns in the Copilot-assisted deduction workflow:
+
+\paragraph{Exploration vs.\ exploitation.}
+Early in a proof session, the suggester explores a wide variety
+of rules; as feedback accumulates, it converges on a smaller set
+of high-scoring schemas.  This exploration--exploitation trade-off
+emerges naturally from the scoring function
+(Equation~\eqref{eq:score}) without requiring an explicit
+$\epsilon$-greedy policy.
+
+\paragraph{Failure diagnosis utility.}
+The $\diagnoseFailure$ method is invoked most frequently for
+unification failures involving nested meta-variables.  In these
+cases, the natural-language explanation identifies the conflicting
+substitutions, which is otherwise difficult to extract from the
+raw unification trace.
+
+\paragraph{Synthesis bootstrapping.}
+Several synthesised rules, once validated, were promoted to the
+permanent rule library.  Over the course of the experiment, the
+library grew from \ppLXXXVIIruleLibrarySize{} to
+$\ppLXXXVIIruleLibrarySize + \ppLXXXVIIsynthesisSuccesses$
+entries, demonstrating that synthesis can bootstrap new reasoning
+capabilities.
+
+% ══════════════════════════════════════════════════════════════════
+%  7.  Related Work
+% ══════════════════════════════════════════════════════════════════
+
+\section{Related Work}\label{sec:related}
+
+\paragraph{LLM-assisted theorem proving.}
+GPT-$f$~\cite{polu2020gpt} demonstrated that language models can
+generate proof steps for Metamath; HyperTree
+Proof Search~\cite{lample2022hypertree} improved on this with
+Monte-Carlo tree search.  Baldur~\cite{first2023baldur} generates
+full Isabelle proofs, while LeanDojo~\cite{yang2024leandojo}
+provides a Lean~4 benchmark and a ReProver model.
+COPRA~\cite{thakur2024copra} uses an \LLM{} as a Lean~4 copilot
+via in-context learning.
+Draft-Sketch-Prove~\cite{jiang2023draftsketchprove} has the \LLM{}
+draft an informal proof that is then formalised.
+AlphaProof~\cite{alphaproof2024} combines reinforcement learning
+with a Lean~4 prover for competition-level problems.
+Our work differs in targeting deduction \emph{rules} rather than
+tactics, preserving explicit soundness guarantees at each step.
+
+\paragraph{Interactive proof assistants.}
+Coq~\cite{coq2024}, Isabelle~\cite{nipkow2002isabelle}, and
+Lean~\cite{moura2021lean4} provide tactic-based proof
+construction.  The Tactician plugin~\cite{blaauwbroek2020tactician}
+learns from proof corpora to suggest tactics in Coq.
+Sledgehammer~\cite{paulson2010sledgehammer} automates lemma
+selection in Isabelle by querying external ATP solvers.
+Our approach is analogous to Sledgehammer's lemma selection but
+operates at the finer granularity of deduction rules within \JG{}.
+
+\paragraph{Code suggestion systems.}
+GitHub Copilot~\cite{chen2021codex} and related systems
+provide code completions in the editor.  The \JG{} Copilot bridge
+re-uses the same capability-discovery mechanism (manifests,
+input/output schemas) but targets formal deduction rather than
+source code generation.
+
+\paragraph{JuGeo prior work.}
+Papers~1--86 of the Judgment Geometry
+series~\cite{young2024jugeo,young2024p34deduction,
+young2024p38solver,young2024p65cicd,young2024p70nlspecs} build the
+infrastructure on which this paper rests.
+Paper~34~\cite{young2024p34deduction} introduces the deduction-rule
+calculus; Paper~38~\cite{young2024p38solver} adds solver
+integration; Paper~65~\cite{young2024p65cicd} integrates \JG{}
+into CI/CD pipelines; and Paper~70~\cite{young2024p70nlspecs}
+bridges natural-language specifications to formal judgments.
+The present paper extends the deduction-rule calculus with
+\LLM{}-assisted capabilities.
+
+% ══════════════════════════════════════════════════════════════════
+%  8.  Conclusion
+% ══════════════════════════════════════════════════════════════════
+
+\section{Conclusion}\label{sec:conclusion}
+
+We have presented Copilot-Assisted Deduction, an architecture for
+integrating large language model capabilities into the Judgment
+Geometry deduction engine.  Three components---$\CDA$, $\CRS$,
+and $\CC$---provide rule suggestion, ranking with feedback, and
+capability discovery, respectively.
+
+Formal analysis establishes that the architecture preserves
+deduction soundness (Theorem~\ref{thm:soundness}), that
+relevant rules receive maximal scores
+(Theorem~\ref{thm:relevance}), that the suggestion cache is
+consistent (Theorem~\ref{thm:cache}), and that the feedback
+mechanism converges (Theorem~\ref{thm:feedback}).  All proofs
+have been mechanised in Lean~4.
+
+Experiments on \ppLXXXVIIruleSuggestionsTotal{} rule suggestions
+show an acceptance rate of \ppLXXXVIIacceptanceRate{}, a proof
+completion rate of \ppLXXXVIIproofCompletionRate{}, and a median
+suggestion latency of \ppLXXXVIImedianSuggestionLatencyMs{}.  The
+cache achieves a \ppLXXXVIIcacheHitRate{} hit rate, and synthesis
+succeeds at \ppLXXXVIIsynthesisSuccessRate.
+
+Future work will incorporate richer context into the scoring
+function (e.g.\ the full proof tree rather than just the current
+goal), explore fine-tuning the \LLM{} on \JG{}-specific proof
+corpora, and extend the capability manifest to support
+multi-turn dialogue for complex proof strategies.
+
+% ══════════════════════════════════════════════════════════════════
+%  Bibliography
+% ══════════════════════════════════════════════════════════════════
+
+\begin{thebibliography}{25}
+
+\bibitem{young2024jugeo}
+H.~Young.
+\newblock Judgment Geometry: A framework for program verification via
+  eight-tuple judgments.
+\newblock Technical report, Microsoft Research, 2024.
+
+\bibitem{young2024p34deduction}
+H.~Young.
+\newblock Deduction rules in Judgment Geometry (Paper~34).
+\newblock Technical report, Microsoft Research, 2024.
+
+\bibitem{young2024p38solver}
+H.~Young.
+\newblock Solver integration for Judgment Geometry (Paper~38).
+\newblock Technical report, Microsoft Research, 2024.
+
+\bibitem{young2024p65cicd}
+H.~Young.
+\newblock CI/CD integration for Judgment Geometry (Paper~65).
+\newblock Technical report, Microsoft Research, 2024.
+
+\bibitem{young2024p70nlspecs}
+H.~Young.
+\newblock Natural-language specifications in Judgment Geometry (Paper~70).
+\newblock Technical report, Microsoft Research, 2024.
+
+\bibitem{polu2020gpt}
+S.~Polu and I.~Sutskever.
+\newblock Generative language modeling for automated theorem proving.
+\newblock \emph{arXiv preprint arXiv:2009.03393}, 2020.
+
+\bibitem{lample2022hypertree}
+G.~Lample, M.-A.~Lachaux, T.~Lavril, X.~Garcia, A.~Hayat, and
+  T.~Scialom.
+\newblock HyperTree Proof Search for neural theorem proving.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem{first2023baldur}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun.
+\newblock Baldur: Whole-proof generation and repair with large language models.
+\newblock In \emph{ESEC/FSE}, 2023.
+
+\bibitem{yang2024leandojo}
+K.~Yang, A.~Swope, A.~Gu, R.~Chalapathy, P.~Song, S.~Zhan,
+  A.~Yang, and J.~Anandkumar.
+\newblock {LeanDojo}: Theorem proving with retrieval-augmented language
+  models.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{thakur2024copra}
+A.~Thakur, G.~Tsoukalas, Y.~Wen, J.~Xin, and S.~Chaudhuri.
+\newblock {COPRA}: An in-context learning agent for formal theorem proving.
+\newblock \emph{arXiv preprint arXiv:2310.04353}, 2024.
+
+\bibitem{jiang2023draftsketchprove}
+A.~Jiang, S.~Welleck, J.~P.~Zhou, W.~Li, J.~Liu, M.~Jamnik,
+  T.~Lacroix, Y.~Wu, and G.~Lample.
+\newblock Draft, sketch, and prove: Guiding formal theorem provers with
+  informal proofs.
+\newblock In \emph{ICLR}, 2023.
+
+\bibitem{alphaproof2024}
+{DeepMind AlphaProof Team}.
+\newblock {AlphaProof}: AI achieves silver-medal level at the
+  {International Mathematical Olympiad}.
+\newblock Blog post, 2024.
+
+\bibitem{chen2021codex}
+M.~Chen, J.~Tworek, H.~Jun, Q.~Yuan, H.~P.~de~Oliveira~Pinto,
+  J.~Kaplan, H.~Edwards, Y.~Burda, N.~Joseph, G.~Brockman, et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem{song2024towards}
+P.~Song, K.~Yang, and A.~Anandkumar.
+\newblock Towards large language models as copilots for theorem proving
+  in {Lean}.
+\newblock \emph{arXiv preprint arXiv:2404.12534}, 2024.
+
+\bibitem{coq2024}
+{The Coq Development Team}.
+\newblock \emph{The {Coq} Proof Assistant Reference Manual}, version 8.19,
+  2024.
+
+\bibitem{nipkow2002isabelle}
+T.~Nipkow, L.~C.~Paulson, and M.~Wenzel.
+\newblock \emph{Isabelle/HOL — A Proof Assistant for Higher-Order Logic}.
+\newblock Springer LNCS 2283, 2002.
+
+\bibitem{moura2021lean4}
+L.~de~Moura and S.~Ullrich.
+\newblock The {Lean~4} theorem prover and programming language.
+\newblock In \emph{CADE}, 2021.
+
+\bibitem{blaauwbroek2020tactician}
+L.~Blaauwbroek, J.~Urban, and H.~Geuvers.
+\newblock The {Tactician}: A seamless, interactive tactic learner and
+  prover for {Coq}.
+\newblock In \emph{CICM}, 2020.
+
+\bibitem{paulson2010sledgehammer}
+L.~C.~Paulson and J.~C.~Blanchette.
+\newblock Three years of experience with {Sledgehammer}, a practical link
+  between automatic and interactive theorem provers.
+\newblock In \emph{IWIL}, 2010.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner.
+\newblock {Z3}: An efficient {SMT} solver.
+\newblock In \emph{TACAS}, 2008.
+
+\bibitem{reynolds2015counterexample}
+A.~Reynolds, C.~Tinelli, and L.~de~Moura.
+\newblock Finding conflicting instances of quantified formulas in {SMT}.
+\newblock In \emph{FMCAD}, 2014.
+
+\bibitem{bansal2019holist}
+K.~Bansal, S.~Loos, M.~Rabe, C.~Szegedy, and S.~Wilcox.
+\newblock {HOList}: An environment for machine learning of higher-order
+  logic theorem proving.
+\newblock In \emph{ICML}, 2019.
+
+\bibitem{wu2022autoformalization}
+Y.~Wu, A.~Q.~Jiang, W.~Li, M.~Rabe, C.~Staats, J.~Jamnik, and
+  C.~Szegedy.
+\newblock Autoformalization with large language models.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem{mikula2024magnushammer}
+M.~Mikula, S.~Antoniak, S.~Tworkowski, A.~Q.~Jiang, J.~P.~Zhou,
+  C.~Szegedy, {\L}.~Kuci{\'n}ski, P.~Miko{\l}ajczyk, and
+  H.~Michalewski.
+\newblock Magnushammer: A transformer-based approach to premise
+  selection.
+\newblock In \emph{ICLR}, 2024.
+
+\bibitem{welleck2022naturalprover}
+S.~Welleck, J.~Liu, R.~Le~Bras, H.~Hajishirzi, Y.~Choi, and
+  K.~Cho.
+\newblock {NaturalProver}: Grounded mathematical proof generation with
+  language models.
+\newblock In \emph{NeurIPS}, 2022.
+
+\end{thebibliography}
+
+\end{document}

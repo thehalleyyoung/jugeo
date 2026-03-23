@@ -104,7 +104,8 @@ theorem zero_false_positives (trust : ReviewTrust)
     (htrust : ReviewTrust.solver ≤ trust) :
     reviewSeverity trust numObstructions = .pass := by
   subst hobs
-  cases trust <;> simp [reviewSeverity] <;> (show ReviewTrust.solver.toNat ≤ _ at htrust; simp [ReviewTrust.toNat] at htrust)
+  have : trust.toNat ≥ 5 := htrust
+  cases trust <;> simp_all [reviewSeverity, ReviewTrust.toNat]
 
 /-- Obstructions always produce CRITICAL severity. -/
 theorem obstructions_critical (trust : ReviewTrust) (n : Nat) (hn : n > 0) :

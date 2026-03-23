@@ -11,7 +11,7 @@ Methodology:
   - jugeo evaluate → coverage, trust, cover quality, sheaf check
   - CyclicSystemCoordinator.run_full_cycle → cycle metrics (phases, convergence)
 
-Writes macros to papers/data-paper12.tex with prefix \ppTwelve.
+Writes macros to papers/data-paper12.tex with prefix \\ppTwelve.
 Re-run: python3 experiments/exp12_inhabitant_fleets.py
 """
 

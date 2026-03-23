@@ -122,24 +122,30 @@ theorem authority_bound (chain : List SecTrust) (t : SecTrust) (ht : t ∈ chain
     chainAuthority chain ≤ t := by
   induction chain with
   | nil => exact absurd ht (List.not_mem_nil _)
-  | cons a rest ih =>
+  | cons hd rest ih =>
     simp only [chainAuthority]
-    cases ht with
-    | head => -- t = a
-      show (SecTrust.meet a (chainAuthority rest)).toNat ≤ a.toNat
-      unfold SecTrust.meet; split <;> omega
-    | tail _ hmem =>
-      show (SecTrust.meet a (chainAuthority rest)).toNat ≤ t.toNat
-      have hih := ih hmem
-      unfold SecTrust.meet; split
-      · exact Nat.le_trans (by assumption) hih
-      · exact hih
+    have hmeet_le_hd : (SecTrust.meet hd (chainAuthority rest)).toNat ≤ hd.toNat := by
+      simp only [SecTrust.meet]
+      split
+      · exact Nat.le_refl _
+      · rename_i h; exact Nat.le_of_lt (Nat.lt_of_not_le h)
+    have hmeet_le_rest : (SecTrust.meet hd (chainAuthority rest)).toNat ≤ (chainAuthority rest).toNat := by
+      simp only [SecTrust.meet]
+      split
+      · assumption
+      · exact Nat.le_refl _
+    rcases List.mem_cons.mp ht with rfl | hmem
+    · exact hmeet_le_hd
+    · exact Nat.le_trans hmeet_le_rest (ih hmem)
 
 /-- Extending a chain can only decrease authority. -/
 theorem authority_monotone_extend (chain : List SecTrust) (t : SecTrust) :
     chainAuthority (t :: chain) ≤ chainAuthority chain := by
-  show (SecTrust.meet t (chainAuthority chain)).toNat ≤ (chainAuthority chain).toNat
-  unfold SecTrust.meet; split <;> omega
+  simp only [chainAuthority, SecTrust.meet]
+  show (if t.toNat ≤ (chainAuthority chain).toNat then t else chainAuthority chain).toNat ≤ _
+  split
+  · assumption
+  · exact Nat.le_refl _
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 4  Security Compatibility
