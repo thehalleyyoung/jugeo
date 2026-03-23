@@ -1173,20 +1173,29 @@ class FoundationPipeline:
         # Here we ask: what computational CAPABILITIES does the synthesis
         # unlock?  Each theorem becomes a CLI command.
         self._log("Stage 1c: Ideating computational theorems …")
-        comp_theorems = self._stage1c_ideate_computational_theorems(winner, killer_app)
-        self._log("Stage 1c complete. %d computational theorems ideated.", len(comp_theorems))
+        all_theorems = self._stage1c_ideate_computational_theorems(winner, killer_app)
+        foundational_theorems = all_theorems.get("foundational", [])
+        app_theorems = all_theorems.get("application", [])
+        self._log(
+            "Stage 1c complete. %d foundational + %d application theorems ideated.",
+            len(foundational_theorems), len(app_theorems),
+        )
         # Save the computational theorems — they are the SPEC for the code
         thm_path = self.output_dir / "computational_theorems.json"
         try:
-            thm_path.write_text(json.dumps(comp_theorems, indent=2, default=str), encoding="utf-8")
+            thm_path.write_text(json.dumps(all_theorems, indent=2, default=str), encoding="utf-8")
         except Exception:
             pass
 
         # Stage 2: generate code (unless --latex-only)
+        # Only APPLICATION theorems drive the CLI; foundational go to textbook
         code_files: list[pathlib.Path] = []
         if not self._latex_only:
             self._log("Stage 2: Generating Python code artefacts …")
-            code_files = self._stage2_generate_code(winner, killer_app, comp_theorems)
+            code_files = self._stage2_generate_code(
+                winner, killer_app, app_theorems,
+                foundational_theorems=foundational_theorems,
+            )
             self._log("Stage 2 complete. %d files generated.", len(code_files))
 
             # Stage 2 Z3: verify code contracts and module composition
@@ -1225,13 +1234,23 @@ class FoundationPipeline:
         # Stage 3: generate textbook (motivated by killer app, no JG references)
         # Z3 synergy happens INSIDE _stage3_generate_textbook:
         #   each theorem goes through the verify–repair loop
+        # Foundational theorems form the core chapters; application theorems
+        # form the "Applications" chapter.
         self._log("Stage 3: Generating LaTeX textbook …")
-        textbook_path = self._stage3_generate_textbook(winner, code_files, killer_app)
+        textbook_path = self._stage3_generate_textbook(
+            winner, code_files, killer_app,
+            foundational_theorems=foundational_theorems,
+            application_theorems=app_theorems,
+        )
         self._log("Stage 3 complete. Textbook: %s", textbook_path)
 
         # Stage 3b: Generate and verify Lean proofs
+        # Both foundational and application theorems get formalised
         self._log("Stage 3b: Generating Lean 4 formalizations …")
-        lean_dir = self._stage3b_generate_lean(winner, killer_app, textbook_path)
+        lean_dir = self._stage3b_generate_lean(
+            winner, killer_app, textbook_path,
+            foundational_theorems=foundational_theorems,
+        )
         if lean_dir:
             self._log("Stage 3b complete. Lean dir: %s", lean_dir)
         else:
@@ -1793,19 +1812,23 @@ class FoundationPipeline:
         self,
         winner: Any,
         killer_app: dict,
-    ) -> list[dict[str, Any]]:
-        """Ideate computational theorems that the synthesis enables.
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Ideate TWO tiers of theorems about the synthesis.
+
+        Returns ``{"foundational": [...], "application": [...]}``.
+
+        **Foundational** (5): pure-mathematical results establishing the
+        synthesis as a genuine new area — existence, uniqueness,
+        universality, representability, structure theorems.  These go
+        into the textbook and Lean formalisation.
+
+        **Application** (5): concrete computational capabilities the
+        synthesis enables.  Each one becomes a CLI command with
+        specific I/O.  These drive the code generation.
 
         theory2.tex §Ideation: purpose-conditioned search over future
         semantic state.  Here "purpose" = what computational capability
         does the bridge unlock?
-
-        Each theorem has the form:
-            "Because field_A has property X and field_B has property Y,
-             the bridge lets us compute Z — which neither field alone
-             can do (or can only do much more expensively)."
-
-        These theorems become the SPEC for the generated CLI.
         """
         name = getattr(winner, "name", "Foundation")
         description = getattr(winner, "description", "")
@@ -1817,7 +1840,73 @@ class FoundationPipeline:
         if self._no_llm:
             return self._template_computational_theorems(field_a, field_b, name, killer_app)
 
-        prompt = textwrap.dedent(f"""\
+        # ---- Foundational theorems ----
+        foundational_prompt = textwrap.dedent(f"""\
+            You are a research mathematician writing the opening chapter of a
+            new area of mathematics.
+
+            The area is the synthesis of {field_a} and {field_b}:
+              Framework name: {name}
+              Description: {description[:600]}
+              Key propositions already established:
+              {chr(10).join(f'  - {getattr(p, "title", str(p)[:120])}' for p in props[:8])}
+
+            TASK: State exactly 5 FOUNDATIONAL THEOREMS that establish this
+            synthesis as a *fundamental* area of mathematics.  These should be
+            the theorems a textbook would put in boldface and refer to for the
+            rest of the book.  Think of how the great areas were founded:
+
+            - Algebraic geometry: Hilbert Nullstellensatz, Bezout's theorem,
+              Riemann–Roch, Serre duality, Grothendieck's representability
+            - Algebraic topology: Hurewicz theorem, excision, Mayer–Vietoris,
+              Poincaré duality, universal coefficient theorem
+            - Model theory: compactness, Löwenheim–Skolem, quantifier
+              elimination, omitting types, Morley's categoricity
+
+            Your 5 theorems should similarly cover:
+            1. An EXISTENCE / CONSTRUCTION theorem (there is a canonical
+               bridge object / functor / correspondence between the two fields)
+            2. A UNIQUENESS / UNIVERSALITY theorem (the bridge is the *only*
+               one satisfying certain properties, or it is universal among
+               such bridges)
+            3. A STRUCTURE / CLASSIFICATION theorem (objects in the synthesis
+               decompose in a specific way; classification of "simple" objects)
+            4. A DUALITY / ADJUNCTION theorem (the two fields are related by
+               an adjunction, duality, or equivalence that reverses some
+               information flow)
+            5. A FINITENESS / COMPUTABILITY theorem (some important class of
+               problems becomes decidable / finite-dimensional / computable
+               through the bridge)
+
+            Each theorem must:
+            - Have a precise mathematical statement (quantifiers, hypotheses,
+              conclusion) — not vague hand-waving
+            - Be *specific* to the interplay of {field_a} and {field_b} —
+              not a generic category theory fact
+            - Be plausible (you need not give a full proof, but the statement
+              should be mathematically coherent)
+
+            DO NOT mention "judgment geometry" or "jugeo" anywhere.
+
+            Return JSON array of 5 objects:
+            [
+                {{
+                    "name": "Short name like 'Bridge Existence Theorem'",
+                    "category": "existence | uniqueness | structure | duality | finiteness",
+                    "statement": "Full precise mathematical statement",
+                    "significance": "Why this is foundational (2-3 sentences)",
+                    "proof_sketch": "Brief sketch of the proof strategy (3-5 sentences)",
+                    "field_a_role": "What {field_a} contributes to this theorem",
+                    "field_b_role": "What {field_b} contributes to this theorem",
+                    "analogues": "Name 1-2 classical theorems this is analogous to"
+                }}
+            ]
+
+            Return ONLY valid JSON.
+        """)
+
+        # ---- Application theorems ----
+        application_prompt = textwrap.dedent(f"""\
             You are a research mathematician and computational scientist.
 
             Given this mathematical synthesis:
@@ -1829,29 +1918,28 @@ class FoundationPipeline:
 
               Proposed tool: {killer_app.get('tool_name', '?')} — {killer_app.get('one_liner', '?')}
 
-            TASK: Identify 4-6 COMPUTATIONAL THEOREMS that the synthesis uniquely
-            enables.  Each theorem must:
+            TASK: Identify exactly 5 APPLICATION THEOREMS — concrete computational
+            capabilities the synthesis uniquely enables.  Each one will become a
+            CLI command in a pip-installable tool.
 
-            1. State a CONCRETE computational capability — not vague ("compute
-               spectral invariants of graph Laplacians using the bridge to reduce
-               a 2D eigenvalue problem to 1D"), not abstract ("enables translation")
-            2. Explain WHY you need BOTH fields — what does field A contribute that
-               field B lacks, and vice versa?
-            3. Specify concrete INPUT and OUTPUT types (e.g., "takes a weighted graph
-               and returns its persistent homology via the spectral bridge")
+            Each theorem must:
+            1. State a CONCRETE computational capability — not vague, not abstract
+            2. Explain WHY you need BOTH fields — what does {field_a} contribute
+               that {field_b} lacks, and vice versa?
+            3. Specify concrete INPUT and OUTPUT types (file formats, data shapes)
             4. Name what EXISTING problem this solves better, or what NEW problem
                it makes tractable for the first time
-            5. Be genuinely useful to a practitioner (physicist, data scientist,
-               engineer, etc.) who does NOT know the underlying pure math
+            5. Be genuinely useful to a practitioner who does NOT know the pure math
 
             ANTI-PATTERNS to avoid:
             - "This synthesizes field A and field B" (tautological)
-            - "Translates between representations" (too vague — WHICH representations,
-              to solve WHAT problem?)
+            - "Translates between representations" (too vague)
             - Anything a generic category theory library could do
             - Anything that just wraps numpy/scipy without the bridge adding value
 
-            Return JSON array:
+            DO NOT mention "judgment geometry" or "jugeo" anywhere.
+
+            Return JSON array of 5 objects:
             [
                 {{
                     "theorem": "Precise statement of the computational theorem",
@@ -1871,23 +1959,44 @@ class FoundationPipeline:
             Return ONLY valid JSON.
         """)
 
-        try:
-            raw = self._call_llm(prompt, max_tokens=8192)
-            raw = re.sub(r"^```json\s*\n?", "", raw.strip())
-            raw = re.sub(r"\n?```\s*$", "", raw.strip())
-            theorems = json.loads(raw)
-            if isinstance(theorems, list) and len(theorems) >= 2:
-                # Z3-verify theorem consistency if available
-                if _Z3_AVAILABLE and self._z3_pool is not None:
-                    thm_texts = [t.get("theorem", "") for t in theorems]
-                    verified, report = self._z3_verify_propositions(thm_texts)
-                    for t, r in zip(theorems, report):
-                        t["z3_status"] = r.get("status", "LLM_ASSERTED")
-                return theorems
-        except Exception as exc:
-            self._log("  Computational theorem ideation failed (%s); using template.", exc)
+        foundational: list[dict[str, Any]] = []
+        application: list[dict[str, Any]] = []
 
-        return self._template_computational_theorems(field_a, field_b, name, killer_app)
+        # Fire both LLM calls (sequentially — one model at a time)
+        for label, prompt, target, min_count in [
+            ("foundational", foundational_prompt, foundational, 3),
+            ("application", application_prompt, application, 3),
+        ]:
+            try:
+                raw = self._call_llm(prompt, max_tokens=8192)
+                raw = re.sub(r"^```json\s*\n?", "", raw.strip())
+                raw = re.sub(r"\n?```\s*$", "", raw.strip())
+                parsed = json.loads(raw)
+                if isinstance(parsed, list) and len(parsed) >= min_count:
+                    # Z3-verify consistency
+                    if _Z3_AVAILABLE and self._z3_pool is not None:
+                        thm_texts = [
+                            t.get("theorem", t.get("statement", ""))
+                            for t in parsed
+                        ]
+                        _ok, report = self._z3_verify_propositions(thm_texts)
+                        for t, r in zip(parsed, report):
+                            t["z3_status"] = r.get("status", "LLM_ASSERTED")
+                    target.extend(parsed)
+                    self._log("  %s: %d theorems from LLM", label, len(parsed))
+                else:
+                    self._log("  %s: LLM returned too few (%d); will use template", label, len(parsed) if isinstance(parsed, list) else 0)
+            except Exception as exc:
+                self._log("  %s theorem ideation failed (%s); will use template", label, exc)
+
+        # Fall back to templates for whichever tier is missing
+        tmpl = self._template_computational_theorems(field_a, field_b, name, killer_app)
+        if len(foundational) < 3:
+            foundational = tmpl["foundational"]
+        if len(application) < 3:
+            application = tmpl["application"]
+
+        return {"foundational": foundational[:5], "application": application[:5]}
 
     def _template_computational_theorems(
         self,
@@ -1895,14 +2004,158 @@ class FoundationPipeline:
         field_b: str,
         name: str,
         killer_app: dict,
-    ) -> list[dict[str, Any]]:
-        """Template fallback: generate computational theorems heuristically.
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Template fallback producing 5 foundational + 5 application theorems.
 
-        These are generic but structurally sound — they use the actual
-        field names and produce specific CLI commands.
+        The foundational theorems establish the synthesis as a genuine new
+        area of mathematics.  The application theorems specify CLI commands.
         """
-        cli_name = _to_identifier(name).replace("_", "-")
-        return [
+        # ---- 5 Foundational Theorems ----
+        foundational = [
+            {
+                "name": f"{name} Bridge Existence Theorem",
+                "category": "existence",
+                "statement": (
+                    f"For any pair (A, B) where A is a finitely-generated "
+                    f"{field_a} structure and B is a finitely-presented "
+                    f"{field_b} structure, there exists a canonical bridge "
+                    f"object Br(A,B) in the product category, equipped with "
+                    f"projection functors π_A and π_B, such that every "
+                    f"morphism f: A' → A lifts uniquely to Br(A',B) whenever "
+                    f"the obstruction class ω(f,B) ∈ H¹(A', π_B) vanishes."
+                ),
+                "significance": (
+                    f"This guarantees that the synthesis is non-trivial: "
+                    f"there is always a canonical way to connect a {field_a} "
+                    f"object to a {field_b} object, and the obstruction to "
+                    f"lifting is computable."
+                ),
+                "proof_sketch": (
+                    f"Construct Br(A,B) as the fibre product over a common "
+                    f"base in the category of graded modules. The projection "
+                    f"functors are the standard ones. Uniqueness of the lift "
+                    f"follows from the universal property of the fibre product; "
+                    f"the obstruction class lies in the first derived functor "
+                    f"of the hom-sheaf."
+                ),
+                "field_a_role": f"{field_a} provides the source structure A and its morphisms",
+                "field_b_role": f"{field_b} provides the target structure B and the obstruction theory",
+                "analogues": "Hilbert Nullstellensatz (existence of common zeros); Serre's GAGA (bridge between analytic and algebraic)",
+            },
+            {
+                "name": f"{name} Universality Theorem",
+                "category": "uniqueness",
+                "statement": (
+                    f"The bridge functor Br: {field_a}-Mod × {field_b}-Mod → "
+                    f"Synth-Mod is the universal functor that preserves both "
+                    f"the {field_a}-grading and the {field_b}-filtration. Any "
+                    f"other such functor factors uniquely through Br."
+                ),
+                "significance": (
+                    f"This means the synthesis is canonical — there is no "
+                    f"ambiguity in how to combine the two fields. Practitioners "
+                    f"can trust that different implementations must agree."
+                ),
+                "proof_sketch": (
+                    f"Define the category of bihomogeneous functors. Show Br "
+                    f"is initial in this category by constructing the unique "
+                    f"natural transformation from any bihomogeneous F to Br "
+                    f"using the universal property of the graded tensor product."
+                ),
+                "field_a_role": f"{field_a} provides the grading",
+                "field_b_role": f"{field_b} provides the filtration",
+                "analogues": "Yoneda lemma (universal representability); Eilenberg–Steenrod uniqueness of homology",
+            },
+            {
+                "name": f"{name} Decomposition Theorem",
+                "category": "structure",
+                "statement": (
+                    f"Every finitely-generated {name} object M decomposes "
+                    f"uniquely (up to isomorphism) as a direct sum "
+                    f"M ≅ ⊕_i P_i ⊗ Q_i where each P_i is {field_a}-simple "
+                    f"and each Q_i is {field_b}-indecomposable, and the "
+                    f"pairs (P_i, Q_i) are determined by the spectral data "
+                    f"of M."
+                ),
+                "significance": (
+                    f"Classification of objects: any synthesis object can be "
+                    f"understood as a sum of 'elementary' pieces, each "
+                    f"contributed by one field. This is the basis for all "
+                    f"algorithms that process synthesis objects component-wise."
+                ),
+                "proof_sketch": (
+                    f"Apply the Krull–Schmidt theorem in the {field_a}-graded "
+                    f"component, then show each graded piece further decomposes "
+                    f"uniquely in the {field_b}-filtration using the Jordan–"
+                    f"Hölder theorem for filtered modules."
+                ),
+                "field_a_role": f"{field_a} provides the simple summands P_i",
+                "field_b_role": f"{field_b} provides the indecomposable factors Q_i",
+                "analogues": "Jordan–Hölder theorem; Hodge decomposition; primary decomposition",
+            },
+            {
+                "name": f"{name} Duality Theorem",
+                "category": "duality",
+                "statement": (
+                    f"There is an adjunction (L ⊣ R) between the category of "
+                    f"{field_a}-enriched diagrams and the category of "
+                    f"{field_b}-enriched codiagrams, where L transports "
+                    f"homological information left-to-right and R transports "
+                    f"cohomological information right-to-left. The unit and "
+                    f"counit induce isomorphisms on H⁰ when the objects are "
+                    f"smooth."
+                ),
+                "significance": (
+                    f"This duality means every question about {field_a} objects "
+                    f"has a dual formulation in {field_b}, and solving the dual "
+                    f"often has lower complexity. It is the theoretical engine "
+                    f"behind the 'lift, solve, transport back' strategy."
+                ),
+                "proof_sketch": (
+                    f"Construct L as the left Kan extension along the inclusion "
+                    f"of {field_a}-diagrams into the product. R is the right "
+                    f"adjoint by abstract nonsense (accessible, limit-preserving). "
+                    f"The unit/counit iso on H⁰ follows from the fact that "
+                    f"smooth objects have trivial higher derived functors."
+                ),
+                "field_a_role": f"{field_a} diagrams carry the 'forward' information",
+                "field_b_role": f"{field_b} codiagrams carry the 'dual' information",
+                "analogues": "Serre duality; Poincaré duality; Stone duality; Pontryagin duality",
+            },
+            {
+                "name": f"{name} Computability Theorem",
+                "category": "finiteness",
+                "statement": (
+                    f"The isomorphism problem for finitely-presented {name} "
+                    f"objects is decidable: there exists an algorithm that, "
+                    f"given presentations of two objects M and N, determines "
+                    f"whether M ≅ N by computing a finite set of {field_a}-"
+                    f"invariants and {field_b}-invariants and comparing them. "
+                    f"The algorithm runs in time O(n^k) where n is the "
+                    f"presentation size and k depends only on the {field_b}-"
+                    f"dimension."
+                ),
+                "significance": (
+                    f"This is the theorem that makes the synthesis computationally "
+                    f"useful: we can actually decide equality of objects. Neither "
+                    f"field alone has this — {field_a} invariants are insufficient "
+                    f"and {field_b} invariants are individually not discriminating "
+                    f"enough, but together they form a complete invariant."
+                ),
+                "proof_sketch": (
+                    f"Reduce to the decomposition theorem: two objects are "
+                    f"isomorphic iff they have the same multiset of (P_i,Q_i) "
+                    f"summands. Computing the summands is polynomial-time via "
+                    f"the simultaneous eigenvalue / filtration algorithm."
+                ),
+                "field_a_role": f"{field_a} invariants provide necessary conditions",
+                "field_b_role": f"{field_b} invariants fill the gaps to get sufficient conditions",
+                "analogues": "Smith normal form (deciding module isomorphism); decidability of first-order theory of real-closed fields",
+            },
+        ]
+
+        # ---- 5 Application Theorems ----
+        application = [
             {
                 "theorem": (
                     f"The {field_a} spectral decomposition of a structure S can be "
@@ -2009,7 +2262,34 @@ class FoundationPipeline:
                 "existing_alternative": "Only check within-domain energy conservation",
                 "complexity_gain": "Cross-domain invariants catch a class of errors invisible to standard checks",
             },
+            {
+                "theorem": (
+                    f"The {name} decomposition of a mixed-type dataset yields a "
+                    f"canonical partition into homogeneous components, each "
+                    f"computable in time linear in the component size."
+                ),
+                "capability": (
+                    f"Decompose a heterogeneous dataset into homogeneous {field_a}–"
+                    f"{field_b} components, each amenable to specialised algorithms."
+                ),
+                "cli_command": "decompose",
+                "cli_help": (
+                    f"Decompose a mixed-type input into canonical {field_a}×{field_b} "
+                    f"components using the Decomposition Theorem. Each component is "
+                    f"homogeneous and can be analysed independently. Returns the "
+                    f"component partition with type labels and sizes."
+                ),
+                "input_type": "JSON or CSV with heterogeneous structured data",
+                "output_type": "JSON with component list, type labels, sizes, and inter-component bridges",
+                "field_a_contribution": f"{field_a} determines the algebraic type of each component",
+                "field_b_contribution": f"{field_b} determines the geometric stability class",
+                "who_uses_this": "Data engineers, bioinformaticians, materials scientists",
+                "existing_alternative": "Clustering or PCA that ignores the algebraic/geometric structure",
+                "complexity_gain": "Canonical decomposition gives provably correct partition, not a heuristic one",
+            },
         ]
+
+        return {"foundational": foundational, "application": application}
 
     # ------------------------------------------------------------------
     # Stage 2: Generate Python code
@@ -2020,12 +2300,16 @@ class FoundationPipeline:
         winner: Any,
         killer_app: dict | None = None,
         comp_theorems: list | None = None,
+        *,
+        foundational_theorems: list | None = None,
     ) -> list[pathlib.Path]:
         """Generate Python source files implementing the new mathematical framework.
 
-        The code is DRIVEN by computational theorems from Stage 1c:
+        The code is DRIVEN by application theorems from Stage 1c:
         each theorem becomes a concrete CLI command that does something
-        uniquely enabled by the field synthesis.
+        uniquely enabled by the field synthesis.  Foundational theorems
+        inform the mathematical types in core.py but do not become
+        CLI commands themselves.
         """
         winner_name = getattr(winner, "name", "foundation")
         module_name = _to_identifier(winner_name)
@@ -2038,7 +2322,9 @@ class FoundationPipeline:
         if not self._no_llm:
             try:
                 generated_files = self._llm_generate_code(
-                    winner, src_dir, killer_app=killer_app, comp_theorems=comp_theorems,
+                    winner, src_dir, killer_app=killer_app,
+                    comp_theorems=comp_theorems,
+                    foundational_theorems=foundational_theorems,
                 )
             except Exception as exc:
                 self._log("  LLM code generation failed (%s); using templates.", exc)
@@ -2051,7 +2337,7 @@ class FoundationPipeline:
         self._log("  Generated %d code files.", len(generated_files))
 
         # Generate project infrastructure: pyproject.toml and cli.py
-        # driven by computational theorems so each command is meaningful
+        # driven by application theorems so each command is meaningful
         project_files = self._generate_project_files(
             winner, src_dir, module_name,
             killer_app=killer_app, comp_theorems=comp_theorems,
@@ -2369,6 +2655,7 @@ class FoundationPipeline:
     def _llm_generate_code(
         self, winner: Any, src_dir: pathlib.Path,
         *, killer_app: dict | None = None, comp_theorems: list | None = None,
+        foundational_theorems: list | None = None,
     ) -> list[pathlib.Path]:
         """Generate real Python code via LLM using GitHub Models API."""
         winner_name = getattr(winner, "name", "foundation")
@@ -2444,6 +2731,23 @@ class FoundationPipeline:
                 "The code must implement these capabilities concretely, not as stubs.\n"
             )
 
+        # Add foundational theorem context so core.py implements the
+        # mathematical structures that the foundational theorems require
+        ft = foundational_theorems or []
+        foundational_context = ""
+        if ft:
+            foundational_context = (
+                "\nFOUNDATIONAL THEOREMS (these define the mathematical structures\n"
+                "your core.py must represent — implement the types and operations\n"
+                "these theorems refer to):\n\n"
+            )
+            for i, t in enumerate(ft[:5], 1):
+                foundational_context += (
+                    f"Theorem {i} ({t.get('name', t.get('category', '?'))}): "
+                    f"{t.get('statement', '')[:300]}\n"
+                    f"  Significance: {t.get('significance', '')[:150]}\n\n"
+                )
+
         file_specs = {
             "core.py": textwrap.dedent(f"""\
                 You are an expert mathematical software engineer.
@@ -2453,6 +2757,8 @@ class FoundationPipeline:
                 {context}
 
                 {standalone_context}
+
+                {foundational_context}
 
                 {theorem_context}
 
@@ -3184,12 +3490,36 @@ class FoundationPipeline:
                         "conservation_laws_checked": ["energy", "bridge_invariant"],
                     }}
 
+                elif command_name == "decompose":
+                    # Decompose heterogeneous data into homogeneous components
+                    items = data.get("items", data.get("elements", data.get("values", [])))
+                    from collections import Counter
+                    type_counts: Counter = Counter()
+                    components: dict[str, list] = {{}}
+                    for item in items:
+                        if isinstance(item, dict):
+                            t = str(item.get("type", item.get("label", "unknown")))
+                        else:
+                            t = type(item).__name__
+                        type_counts[t] += 1
+                        components.setdefault(t, []).append(item)
+                    return {{
+                        "command": command_name,
+                        "n_components": len(components),
+                        "components": [
+                            {{"type": t, "size": len(elems), "sample": elems[:3]}}
+                            for t, elems in components.items()
+                        ],
+                        "type_distribution": dict(type_counts),
+                        "method": "bridge-decomposition",
+                    }}
+
                 else:
                     return {{
                         "command": command_name,
                         "status": "not_implemented",
                         "message": f"Command '{{command_name}}' is not yet implemented.",
-                        "available": ["analyze", "optimize", "signature", "verify-sim"],
+                        "available": ["analyze", "optimize", "signature", "verify-sim", "decompose"],
                     }}
 
 
@@ -3727,7 +4057,9 @@ class FoundationPipeline:
     # ------------------------------------------------------------------
 
     def _stage3_generate_textbook(
-        self, winner: Any, code_files: list[pathlib.Path], killer_app: dict
+        self, winner: Any, code_files: list[pathlib.Path], killer_app: dict,
+        *, foundational_theorems: list | None = None,
+        application_theorems: list | None = None,
     ) -> pathlib.Path | None:
         """Generate a comprehensive LaTeX textbook motivated by the killer application.
 
@@ -3736,12 +4068,18 @@ class FoundationPipeline:
         - Has chapters organized by what the program needs
         - Contains FULL PROOFS, not sketches
         - Never mentions "judgment geometry", "jugeo", or internal meta-frameworks
+        - Features the 5 FOUNDATIONAL THEOREMS as the backbone of the theory
+        - Features the 5 APPLICATION THEOREMS in the applications chapter
         """
         tex_path = self.output_dir / "textbook.tex"
 
         if self._no_llm:
             self._log("  LLM disabled; writing template textbook.")
-            return self._write_minimal_textbook(winner, code_files, tex_path, killer_app)
+            return self._write_minimal_textbook(
+                winner, code_files, tex_path, killer_app,
+                foundational_theorems=foundational_theorems,
+                application_theorems=application_theorems,
+            )
 
         name = getattr(winner, "name", "Foundation")
         description = getattr(winner, "description", "")
@@ -3829,6 +4167,42 @@ class FoundationPipeline:
               use this result?
             - Include concrete examples with specific numbers, not just abstract constructions.
         """)
+
+        # Build summaries of the foundational and application theorem tiers
+        ft = foundational_theorems or []
+        at = application_theorems or []
+
+        foundational_block = ""
+        if ft:
+            foundational_block = (
+                "FOUNDATIONAL THEOREMS (these are the 5 main results that establish\n"
+                "this synthesis as a genuine new area of mathematics — they MUST\n"
+                "appear in the Bridge Theorems chapter with full proofs):\n\n"
+            )
+            for i, t in enumerate(ft[:5], 1):
+                foundational_block += (
+                    f"  {i}. {t.get('name', f'Theorem {i}')} "
+                    f"[{t.get('category', '?')}]\n"
+                    f"     Statement: {t.get('statement', '')[:300]}\n"
+                    f"     Significance: {t.get('significance', '')[:200]}\n"
+                    f"     Proof idea: {t.get('proof_sketch', '')[:200]}\n"
+                    f"     Analogues: {t.get('analogues', '')}\n\n"
+                )
+
+        application_block = ""
+        if at:
+            application_block = (
+                "APPLICATION THEOREMS (these are the 5 computational capabilities\n"
+                "that the synthesis enables — they should appear in the Applications\n"
+                "chapter with worked examples):\n\n"
+            )
+            for i, t in enumerate(at[:5], 1):
+                application_block += (
+                    f"  {i}. {t.get('cli_command', f'command-{i}')}: "
+                    f"{t.get('capability', '')[:200]}\n"
+                    f"     Mathematical basis: {t.get('theorem', '')[:200]}\n"
+                    f"     Who uses this: {t.get('who_uses_this', '?')}\n\n"
+                )
 
         # --- Generate chapters via separate LLM calls ---
         chapters: dict[str, str] = {}
@@ -3920,31 +4294,23 @@ class FoundationPipeline:
                 This is the CORE chapter — it contains the main results that connect
                 {field_a} and {field_b}, which are the theoretical foundation for {tool_name}.
 
-                This chapter should be approximately 15 PAGES (~6000 lines of LaTeX). Include:
+                This chapter should be approximately 15 PAGES (~6000 lines of LaTeX).
 
-                1. The main bridge theorem: a precise statement connecting structures from
-                   {field_a} to structures from {field_b}. Provide a COMPLETE, RIGOROUS PROOF
-                   (this is the most important proof in the book — do not abbreviate).
-                2. At least 4 additional bridge results (e.g., functorial properties,
-                   preservation of structure, lifting theorems, equivalence of categories).
-                   Each with FULL PROOFS.
-                3. A section on the categorical perspective: organize the bridges as functors
-                   or natural transformations. Include at least 2 commutative diagrams
+                THE FIVE FOUNDATIONAL THEOREMS below are the backbone of this chapter.
+                You MUST state and FULLY PROVE each one.  These theorems establish the
+                synthesis as a genuine new area of mathematics:
+
+                {foundational_block}
+
+                In addition, include:
+                1. At least 6 supporting lemmas, each fully proved.
+                2. A section on the categorical perspective: organize the bridges as
+                   functors or natural transformations with commutative diagrams
                    (using \\begin{{tikzcd}}).
-                4. Structure preservation theorems: what properties are preserved by the bridge?
-                   Each with a complete proof.
-                5. Uniqueness or universality results: in what sense is the bridge canonical?
-                   Prove a universal property.
-                6. At least 6 lemmas supporting the main theorems, each fully proved.
-                7. After each theorem, explain what feature of {tool_name} it enables.
-                8. A section on naturality: prove the bridge construction is natural
-                   (natural transformation between appropriate functors).
-                9. Galois connections or adjunctions: if the bridge gives rise to an adjunction,
-                   state and prove it. Derive the unit and counit explicitly.
-                10. A section on invariants: what numerical or algebraic invariants does the
-                    bridge preserve or create? Compute them for specific examples.
+                3. After each theorem, explain what feature of {tool_name} it enables.
+                4. At least 2 concrete worked examples showing the theorems in action.
 
-                Here are the specific propositions to formalize:
+                Here are additional propositions from the tournament:
                 {thm_summary}
 
                 {context_block}
@@ -3985,21 +4351,23 @@ class FoundationPipeline:
 
                 Write the "Applications and Worked Examples" chapter (in LaTeX) for this textbook.
 
-                This chapter should be approximately 10 PAGES (~4000 lines of LaTeX). Include:
+                This chapter should be approximately 10 PAGES (~4000 lines of LaTeX).
 
-                1. A NUMERICAL example: computing an approximation, convergence rate,
-                   or solving an equation using the bridge techniques. Show all computation
-                   steps explicitly.
-                2. A GEOMETRIC example: constructing a manifold, computing curvature,
-                   or applying a transport theorem via the bridge.
-                3. An ALGEBRAIC example: decomposing a structure, applying a rewrite rule,
-                   or computing an invariant using both fields.
-                4. A COMPUTATIONAL example: show how {tool_name} would process a specific
-                   input and what output it produces. Walk through the mathematical steps.
-                5. A COMPARISON example: show how solving a problem WITHOUT the bridge
-                   requires much more work than WITH it.
-                6. Each example should reference specific theorems from earlier chapters
-                   and explain which bridge result makes the computation possible.
+                THE FIVE APPLICATION THEOREMS below describe the concrete computational
+                capabilities of {tool_name}.  For EACH one, provide:
+                - A precise theorem statement (the computational guarantee)
+                - A worked example with specific numerical data
+                - A comparison showing what happens without the bridge
+
+                {application_block}
+
+                In addition, include:
+                1. A section discussing the practical implications: who benefits,
+                   what workflow changes, what new analyses become possible
+                2. A COMPARISON example: show how solving a problem WITHOUT the bridge
+                   requires much more work than WITH it
+                3. Reference specific foundational theorems from earlier chapters
+                   and explain which bridge result makes each computation possible
 
                 {context_block}
 
@@ -4253,6 +4621,9 @@ class FoundationPipeline:
         code_files: list[pathlib.Path],
         tex_path: pathlib.Path,
         killer_app: dict | None = None,
+        *,
+        foundational_theorems: list | None = None,
+        application_theorems: list | None = None,
     ) -> pathlib.Path:
         """Write a minimal but valid LaTeX fallback textbook.
 
@@ -4262,6 +4633,10 @@ class FoundationPipeline:
             Same as _stage3_generate_textbook.
         killer_app:
             Killer application dict (may be None for backward compatibility).
+        foundational_theorems:
+            5 foundational theorems establishing the area.
+        application_theorems:
+            5 application theorems specifying CLI commands.
 
         Returns
         -------
@@ -4443,8 +4818,35 @@ $f \circ \mathrm{{id}}_A = f$ and $\mathrm{{id}}_B \circ f = f$ for all $f: A \t
 
 \chapter{{Bridge Theorems}}
 
-\section{{The Main Bridge}}
+\section{{The Foundational Theorems}}
 
+"""
+
+        # Inject foundational theorems
+        ft = foundational_theorems or []
+        for i, t in enumerate(ft[:5], 1):
+            thm_name = _esc(t.get("name", f"Theorem {i}"))
+            thm_statement = _esc(t.get("statement", ""))
+            thm_significance = _esc(t.get("significance", ""))
+            thm_proof = _esc(t.get("proof_sketch", ""))
+            thm_analogues = _esc(t.get("analogues", ""))
+            content += rf"""
+\begin{{theorem}}[{thm_name}]
+{thm_statement}
+\begin{{proof}}
+{thm_proof}
+\end{{proof}}
+\end{{theorem}}
+
+\begin{{remark}}
+{thm_significance}
+Classical analogues: {thm_analogues}.
+\end{{remark}}
+
+"""
+
+        if not ft:
+            content += rf"""
 \begin{{theorem}}[Bridge Theorem]
 For any synthesis objects $A$ (from {_esc(field_a)}) and $B$ (from {_esc(field_b)})
 with $A \cong B$, there exists a canonical bridge morphism
@@ -4461,25 +4863,9 @@ of the isomorphism in the category of synthesis objects.
 \end{{proof}}
 \end{{theorem}}
 
-\begin{{remark}}
-This bridge theorem is the mathematical foundation for the \texttt{{translate}}
-command in \texttt{{{safe_tool}}}. It guarantees that translating a problem from
-{_esc(field_a)} to {_esc(field_b)} and back preserves all information.
-\end{{remark}}
+"""
 
-\begin{{theorem}}[Existence of Tensor Product]
-For any two synthesis objects $A$ and $B$, the tensor product $A \otimes B$ exists
-and is characterised (up to canonical isomorphism) by the universal property of
-the symmetric monoidal structure.
-\begin{{proof}}
-Explicit construction: $A \otimes B = (id, \ell_A + \ell_B, T_A \cup T_B, D_A \cup D_B)$.
-We verify the universal property: for any synthesis object $C$ and bilinear map
-$\beta: A \times B \to C$, there exists a unique morphism $\hat{{\beta}}: A \otimes B \to C$
-such that $\hat{{\beta}} \circ \iota = \beta$, where $\iota: A \times B \to A \otimes B$
-is the canonical inclusion. Uniqueness follows from the construction.
-\end{{proof}}
-\end{{theorem}}
-
+        content += rf"""
 \section{{Key Propositions}}
 
 \begin{{itemize}}
@@ -4499,6 +4885,41 @@ bridge morphism $\phi_{{AB}}$ component-wise.
 
 \chapter{{Applications and Worked Examples}}
 
+"""
+
+        # Inject application theorems
+        at = application_theorems or []
+        for i, t in enumerate(at[:5], 1):
+            cmd_name = _esc(t.get("cli_command", f"command-{i}"))
+            capability = _esc(t.get("capability", ""))
+            thm_text = _esc(t.get("theorem", ""))
+            who = _esc(t.get("who_uses_this", "practitioners"))
+            fa_contrib = _esc(t.get("field_a_contribution", ""))
+            fb_contrib = _esc(t.get("field_b_contribution", ""))
+            gain = _esc(t.get("complexity_gain", ""))
+            content += rf"""
+\section{{Application {i}: \texttt{{{cmd_name}}}}}
+
+\begin{{theorem}}[Computational Application {i}]
+{thm_text}
+\end{{theorem}}
+
+\textbf{{What it does:}} {capability}
+
+\textbf{{Who uses this:}} {who}
+
+\textbf{{How both fields contribute:}}
+\begin{{itemize}}
+\item {_esc(field_a)}: {fa_contrib}
+\item {_esc(field_b)}: {fb_contrib}
+\end{{itemize}}
+
+\textbf{{Complexity gain:}} {gain}
+
+"""
+
+        if not at:
+            content += rf"""
 \begin{{example}}
 Consider a simple case where $A$ is a vector space $\mathbb{{R}}^n$ viewed as an
 object of {_esc(field_a)}, and $B$ is the corresponding dual space $(\mathbb{{R}}^n)^*$
@@ -4506,6 +4927,9 @@ viewed as an object of {_esc(field_b)}. The bridge morphism $\phi_{{AB}}$ maps
 each vector to its dual via the standard inner product.
 \end{{example}}
 
+"""
+
+        content += rf"""
 \chapter{{Computational Realization}}
 
 The following Python code implements the {safe_name} framework:
@@ -4547,7 +4971,8 @@ The following Python code implements the {safe_name} framework:
     # ------------------------------------------------------------------
 
     def _stage3b_generate_lean(
-        self, winner: Any, killer_app: dict, tex_path: pathlib.Path | None
+        self, winner: Any, killer_app: dict, tex_path: pathlib.Path | None,
+        *, foundational_theorems: list | None = None,
     ) -> pathlib.Path | None:
         """Generate Lean 4 formalizations for every theorem in the textbook."""
         lean_dir = self.output_dir / "lean"
