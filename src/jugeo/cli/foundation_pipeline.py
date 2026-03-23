@@ -1842,41 +1842,46 @@ class FoundationPipeline:
 
         # ---- Foundational theorems ----
         foundational_prompt = textwrap.dedent(f"""\
-            You are a research mathematician writing the opening chapter of a
-            new area of mathematics.
+            You are a research mathematician who has just discovered a deep
+            connection between {field_a} and {field_b}.
 
-            The area is the synthesis of {field_a} and {field_b}:
+            The synthesis:
               Framework name: {name}
               Description: {description[:600]}
               Key propositions already established:
               {chr(10).join(f'  - {getattr(p, "title", str(p)[:120])}' for p in props[:8])}
 
-            TASK: State exactly 5 FOUNDATIONAL THEOREMS that establish this
-            synthesis as a *fundamental* area of mathematics.  These should be
-            the theorems a textbook would put in boldface and refer to for the
-            rest of the book.  Think of how the great areas were founded:
+            TASK: Discover the 5 FOUNDATIONAL THEOREMS of this new area.
 
-            - Algebraic geometry: Hilbert Nullstellensatz, Bezout's theorem,
-              Riemann–Roch, Serre duality, Grothendieck's representability
-            - Algebraic topology: Hurewicz theorem, excision, Mayer–Vietoris,
-              Poincaré duality, universal coefficient theorem
-            - Model theory: compactness, Löwenheim–Skolem, quantifier
-              elimination, omitting types, Morley's categoricity
+            You are NOT filling in a template.  You are doing original
+            mathematical thinking about what the *actual* deep structure of
+            the {field_a}–{field_b} interaction is.
 
-            Your 5 theorems should similarly cover:
-            1. An EXISTENCE / CONSTRUCTION theorem (there is a canonical
-               bridge object / functor / correspondence between the two fields)
-            2. A UNIQUENESS / UNIVERSALITY theorem (the bridge is the *only*
-               one satisfying certain properties, or it is universal among
-               such bridges)
-            3. A STRUCTURE / CLASSIFICATION theorem (objects in the synthesis
-               decompose in a specific way; classification of "simple" objects)
-            4. A DUALITY / ADJUNCTION theorem (the two fields are related by
-               an adjunction, duality, or equivalence that reverses some
-               information flow)
-            5. A FINITENESS / COMPUTABILITY theorem (some important class of
-               problems becomes decidable / finite-dimensional / computable
-               through the bridge)
+            Ask yourself:
+            - What is the most surprising non-obvious fact about how {field_a}
+              and {field_b} interact?
+            - What structure in {field_a} secretly encodes information about
+              {field_b}, or vice versa?
+            - What classical open problem in either field does the bridge
+              shed new light on?
+            - What new invariant, construction, or obstruction does the
+              synthesis reveal that neither field has alone?
+            - What is the "Nullstellensatz" of this area — the single
+              result that would convince a skeptic this is a real field?
+
+            For inspiration, recall how foundational theorems work in
+            established areas — they are NEVER generic ("there exists a
+            bridge").  They are always *specific*:
+            - Nullstellensatz: maximal ideals of k[x₁,…,xₙ] are exactly
+              the vanishing loci of points
+            - Hurewicz: π₁(X) abelianized is H₁(X;Z)
+            - Compactness: a theory has a model iff every finite subset does
+            - Noether: every differentiable symmetry yields a conserved quantity
+            - Gelfand: commutative C*-algebras are exactly C(X) for compact X
+
+            YOUR theorems must be similarly specific to the *content* of
+            {field_a} and {field_b} — referencing their actual objects,
+            operations, and structures by name.
 
             Each theorem must:
             - Have a precise mathematical statement (quantifiers, hypotheses,
@@ -1885,20 +1890,25 @@ class FoundationPipeline:
               not a generic category theory fact
             - Be plausible (you need not give a full proof, but the statement
               should be mathematically coherent)
+            - Be named after its *content*, not its role (not "Bridge Existence
+              Theorem" but e.g. "Spectral Characterization of Cut-Elimination")
 
             DO NOT mention "judgment geometry" or "jugeo" anywhere.
+            DO NOT use generic names like "Bridge Existence Theorem" or
+            "Universality Theorem".  Name each theorem after what it
+            actually *says*.
 
             Return JSON array of 5 objects:
             [
                 {{
-                    "name": "Short name like 'Bridge Existence Theorem'",
-                    "category": "existence | uniqueness | structure | duality | finiteness",
-                    "statement": "Full precise mathematical statement",
-                    "significance": "Why this is foundational (2-3 sentences)",
+                    "name": "A content-based name (e.g. 'Spectral Characterization of Cut-Elimination')",
+                    "category": "a short tag you choose — whatever fits",
+                    "statement": "Full precise mathematical statement using actual terminology from {field_a} and {field_b}",
+                    "significance": "Why this is foundational — what does it unlock? (2-3 sentences)",
                     "proof_sketch": "Brief sketch of the proof strategy (3-5 sentences)",
                     "field_a_role": "What {field_a} contributes to this theorem",
                     "field_b_role": "What {field_b} contributes to this theorem",
-                    "analogues": "Name 1-2 classical theorems this is analogous to"
+                    "analogues": "Name 1-2 classical theorems this is most analogous to"
                 }}
             ]
 
@@ -2007,152 +2017,381 @@ class FoundationPipeline:
     ) -> dict[str, list[dict[str, Any]]]:
         """Template fallback producing 5 foundational + 5 application theorems.
 
-        The foundational theorems establish the synthesis as a genuine new
-        area of mathematics.  The application theorems specify CLI commands.
+        With --no-llm this is the best we can do.  The foundational
+        theorems use the field names to *sketch* plausible results; the
+        real discovery happens via the LLM prompt.
         """
-        # ---- 5 Foundational Theorems ----
-        foundational = [
-            {
-                "name": f"{name} Bridge Existence Theorem",
-                "category": "existence",
-                "statement": (
-                    f"For any pair (A, B) where A is a finitely-generated "
-                    f"{field_a} structure and B is a finitely-presented "
-                    f"{field_b} structure, there exists a canonical bridge "
-                    f"object Br(A,B) in the product category, equipped with "
-                    f"projection functors π_A and π_B, such that every "
-                    f"morphism f: A' → A lifts uniquely to Br(A',B) whenever "
-                    f"the obstruction class ω(f,B) ∈ H¹(A', π_B) vanishes."
-                ),
-                "significance": (
-                    f"This guarantees that the synthesis is non-trivial: "
-                    f"there is always a canonical way to connect a {field_a} "
-                    f"object to a {field_b} object, and the obstruction to "
-                    f"lifting is computable."
-                ),
-                "proof_sketch": (
-                    f"Construct Br(A,B) as the fibre product over a common "
-                    f"base in the category of graded modules. The projection "
-                    f"functors are the standard ones. Uniqueness of the lift "
-                    f"follows from the universal property of the fibre product; "
-                    f"the obstruction class lies in the first derived functor "
-                    f"of the hom-sheaf."
-                ),
-                "field_a_role": f"{field_a} provides the source structure A and its morphisms",
-                "field_b_role": f"{field_b} provides the target structure B and the obstruction theory",
-                "analogues": "Hilbert Nullstellensatz (existence of common zeros); Serre's GAGA (bridge between analytic and algebraic)",
-            },
-            {
-                "name": f"{name} Universality Theorem",
-                "category": "uniqueness",
-                "statement": (
-                    f"The bridge functor Br: {field_a}-Mod × {field_b}-Mod → "
-                    f"Synth-Mod is the universal functor that preserves both "
-                    f"the {field_a}-grading and the {field_b}-filtration. Any "
-                    f"other such functor factors uniquely through Br."
-                ),
-                "significance": (
-                    f"This means the synthesis is canonical — there is no "
-                    f"ambiguity in how to combine the two fields. Practitioners "
-                    f"can trust that different implementations must agree."
-                ),
-                "proof_sketch": (
-                    f"Define the category of bihomogeneous functors. Show Br "
-                    f"is initial in this category by constructing the unique "
-                    f"natural transformation from any bihomogeneous F to Br "
-                    f"using the universal property of the graded tensor product."
-                ),
-                "field_a_role": f"{field_a} provides the grading",
-                "field_b_role": f"{field_b} provides the filtration",
-                "analogues": "Yoneda lemma (universal representability); Eilenberg–Steenrod uniqueness of homology",
-            },
-            {
-                "name": f"{name} Decomposition Theorem",
-                "category": "structure",
-                "statement": (
-                    f"Every finitely-generated {name} object M decomposes "
-                    f"uniquely (up to isomorphism) as a direct sum "
-                    f"M ≅ ⊕_i P_i ⊗ Q_i where each P_i is {field_a}-simple "
-                    f"and each Q_i is {field_b}-indecomposable, and the "
-                    f"pairs (P_i, Q_i) are determined by the spectral data "
-                    f"of M."
-                ),
-                "significance": (
-                    f"Classification of objects: any synthesis object can be "
-                    f"understood as a sum of 'elementary' pieces, each "
-                    f"contributed by one field. This is the basis for all "
-                    f"algorithms that process synthesis objects component-wise."
-                ),
-                "proof_sketch": (
-                    f"Apply the Krull–Schmidt theorem in the {field_a}-graded "
-                    f"component, then show each graded piece further decomposes "
-                    f"uniquely in the {field_b}-filtration using the Jordan–"
-                    f"Hölder theorem for filtered modules."
-                ),
-                "field_a_role": f"{field_a} provides the simple summands P_i",
-                "field_b_role": f"{field_b} provides the indecomposable factors Q_i",
-                "analogues": "Jordan–Hölder theorem; Hodge decomposition; primary decomposition",
-            },
-            {
-                "name": f"{name} Duality Theorem",
-                "category": "duality",
-                "statement": (
-                    f"There is an adjunction (L ⊣ R) between the category of "
-                    f"{field_a}-enriched diagrams and the category of "
-                    f"{field_b}-enriched codiagrams, where L transports "
-                    f"homological information left-to-right and R transports "
-                    f"cohomological information right-to-left. The unit and "
-                    f"counit induce isomorphisms on H⁰ when the objects are "
-                    f"smooth."
-                ),
-                "significance": (
-                    f"This duality means every question about {field_a} objects "
-                    f"has a dual formulation in {field_b}, and solving the dual "
-                    f"often has lower complexity. It is the theoretical engine "
-                    f"behind the 'lift, solve, transport back' strategy."
-                ),
-                "proof_sketch": (
-                    f"Construct L as the left Kan extension along the inclusion "
-                    f"of {field_a}-diagrams into the product. R is the right "
-                    f"adjoint by abstract nonsense (accessible, limit-preserving). "
-                    f"The unit/counit iso on H⁰ follows from the fact that "
-                    f"smooth objects have trivial higher derived functors."
-                ),
-                "field_a_role": f"{field_a} diagrams carry the 'forward' information",
-                "field_b_role": f"{field_b} codiagrams carry the 'dual' information",
-                "analogues": "Serre duality; Poincaré duality; Stone duality; Pontryagin duality",
-            },
-            {
-                "name": f"{name} Computability Theorem",
-                "category": "finiteness",
-                "statement": (
-                    f"The isomorphism problem for finitely-presented {name} "
-                    f"objects is decidable: there exists an algorithm that, "
-                    f"given presentations of two objects M and N, determines "
-                    f"whether M ≅ N by computing a finite set of {field_a}-"
-                    f"invariants and {field_b}-invariants and comparing them. "
-                    f"The algorithm runs in time O(n^k) where n is the "
-                    f"presentation size and k depends only on the {field_b}-"
-                    f"dimension."
-                ),
-                "significance": (
-                    f"This is the theorem that makes the synthesis computationally "
-                    f"useful: we can actually decide equality of objects. Neither "
-                    f"field alone has this — {field_a} invariants are insufficient "
-                    f"and {field_b} invariants are individually not discriminating "
-                    f"enough, but together they form a complete invariant."
-                ),
-                "proof_sketch": (
-                    f"Reduce to the decomposition theorem: two objects are "
-                    f"isomorphic iff they have the same multiset of (P_i,Q_i) "
-                    f"summands. Computing the summands is polynomial-time via "
-                    f"the simultaneous eigenvalue / filtration algorithm."
-                ),
-                "field_a_role": f"{field_a} invariants provide necessary conditions",
-                "field_b_role": f"{field_b} invariants fill the gaps to get sufficient conditions",
-                "analogues": "Smith normal form (deciding module isomorphism); decidability of first-order theory of real-closed fields",
-            },
-        ]
+        # Use a simple hash of the field pair to rotate among several
+        # theorem-shape families so the same 5 don't appear every time
+        _h = hash((field_a, field_b)) % 3
+
+        # Build 5 foundational theorems that at least reference the fields
+        # by name and mention plausible interactions
+        if _h == 0:
+            foundational = [
+                {
+                    "name": f"Representation Theorem for {field_a}–{field_b} Pairs",
+                    "category": "representation",
+                    "statement": (
+                        f"Every {field_a} object A that admits a compatible "
+                        f"{field_b} structure is representable: there exists a "
+                        f"universal {field_b} object U(A) and a natural bijection "
+                        f"Hom(B, U(A)) ≅ Struct(A, B) for every {field_b} object B, "
+                        f"where Struct(A, B) is the set of compatible structures."
+                    ),
+                    "significance": (
+                        f"This tells us that {field_b} structures on a {field_a} "
+                        f"object are controlled by a single universal object. It "
+                        f"reduces infinite-dimensional classification to computing "
+                        f"maps into one classifying object."
+                    ),
+                    "proof_sketch": (
+                        f"Show the functor B ↦ Struct(A, B) preserves limits and "
+                        f"satisfies the solution-set condition. Apply the adjoint "
+                        f"functor theorem to obtain U(A)."
+                    ),
+                    "field_a_role": f"{field_a} provides the base object A",
+                    "field_b_role": f"{field_b} provides the representing object U(A)",
+                    "analogues": "Gelfand–Naimark (C*-algebras ↔ compact spaces); Brown representability",
+                },
+                {
+                    "name": f"Invariant Transfer between {field_a} and {field_b}",
+                    "category": "transfer",
+                    "statement": (
+                        f"Let I_A be a complete invariant for {field_a} isomorphism "
+                        f"classes and I_B a complete invariant for {field_b}. Then "
+                        f"the pair (I_A, I_B) restricted to the joint category is "
+                        f"redundant: there is a polynomial-time computable map "
+                        f"T: Im(I_A) → Im(I_B) such that I_B = T(I_A) for all "
+                        f"objects admitting both structures."
+                    ),
+                    "significance": (
+                        f"One set of invariants determines the other. This means "
+                        f"whichever invariant is cheaper to compute suffices."
+                    ),
+                    "proof_sketch": (
+                        f"Construct T explicitly using the bridge functor. Show "
+                        f"injectivity by the decomposition into simple factors."
+                    ),
+                    "field_a_role": f"{field_a} provides invariant I_A",
+                    "field_b_role": f"{field_b} provides invariant I_B",
+                    "analogues": "Tannaka–Krein reconstruction; GAGA correspondence",
+                },
+                {
+                    "name": f"Finiteness of the {field_a}–{field_b} Obstruction",
+                    "category": "finiteness",
+                    "statement": (
+                        f"For a finitely-presented {field_a} object A, the obstruction "
+                        f"group Obs(A) ⊂ Ext¹ that controls whether A admits a "
+                        f"compatible {field_b} structure is finitely generated, and "
+                        f"its rank equals the number of independent {field_b} "
+                        f"constraints that A fails to satisfy."
+                    ),
+                    "significance": (
+                        f"Obstructions are finite and computable — we can enumerate "
+                        f"exactly what prevents compatibility, not just detect it."
+                    ),
+                    "proof_sketch": (
+                        f"Filter the Ext spectral sequence by {field_b}-degree; each "
+                        f"graded piece is finitely generated because A is finitely "
+                        f"presented."
+                    ),
+                    "field_a_role": f"{field_a} provides the presented object",
+                    "field_b_role": f"{field_b} provides the compatibility constraints",
+                    "analogues": "Hilbert syzygy theorem; finite generation of class groups",
+                },
+                {
+                    "name": f"Spectral Sequence Collapse for {name}",
+                    "category": "computational",
+                    "statement": (
+                        f"The {field_a}–{field_b} spectral sequence E_r^{{p,q}} "
+                        f"collapses at the E_2 page whenever the {field_a} object "
+                        f"has finite projective dimension. In this case the "
+                        f"associated graded of the {field_b} filtration is "
+                        f"computable in O(n²) where n is the {field_a} dimension."
+                    ),
+                    "significance": (
+                        f"Spectral sequence collapse means the algebraic "
+                        f"relationship is much simpler than the general case — "
+                        f"higher-order interactions vanish."
+                    ),
+                    "proof_sketch": (
+                        f"Finite projective dimension implies the complex is "
+                        f"bounded, so E_r stabilises. The collapse follows from "
+                        f"dimension counting."
+                    ),
+                    "field_a_role": f"{field_a} provides the projective dimension bound",
+                    "field_b_role": f"{field_b} provides the filtration grading",
+                    "analogues": "Hodge–de Rham spectral sequence collapse for Kähler manifolds",
+                },
+                {
+                    "name": f"Duality Pairing for {field_a}–{field_b} Objects",
+                    "category": "duality",
+                    "statement": (
+                        f"There is a non-degenerate pairing ⟨·,·⟩: K₀({field_a}) "
+                        f"× K₀({field_b}) → ℤ that is compatible with the bridge "
+                        f"functor: ⟨[A], [B]⟩ = χ(Br(A,B)) where χ is the Euler "
+                        f"characteristic. This pairing detects isomorphism."
+                    ),
+                    "significance": (
+                        f"A numerical invariant (the Euler pairing) captures all "
+                        f"the information about bridge compatibility. This is "
+                        f"computable and can be checked in linear time."
+                    ),
+                    "proof_sketch": (
+                        f"Non-degeneracy follows from the decomposition theorem: "
+                        f"distinct simple pairs give distinct values of the pairing."
+                    ),
+                    "field_a_role": f"{field_a} contributes K₀ classes of its objects",
+                    "field_b_role": f"{field_b} contributes K₀ classes of its objects",
+                    "analogues": "Serre duality pairing; intersection pairing in algebraic geometry",
+                },
+            ]
+        elif _h == 1:
+            foundational = [
+                {
+                    "name": f"Completeness of {field_a} Semantics for {field_b} Syntax",
+                    "category": "completeness",
+                    "statement": (
+                        f"A sentence φ in the language of {field_b} is provable "
+                        f"if and only if it is satisfied in every {field_a} model. "
+                        f"Moreover, every consistent {field_b} theory has a "
+                        f"{field_a} model of cardinality at most |φ|."
+                    ),
+                    "significance": (
+                        f"This is the Gödel-completeness-style result for the "
+                        f"synthesis: semantic truth in {field_a} exactly coincides "
+                        f"with syntactic provability in {field_b}."
+                    ),
+                    "proof_sketch": (
+                        f"Henkin construction: extend the theory to a maximally "
+                        f"consistent one, then build the {field_a} model from "
+                        f"equivalence classes of terms."
+                    ),
+                    "field_a_role": f"{field_a} provides the semantic models",
+                    "field_b_role": f"{field_b} provides the formal proof system",
+                    "analogues": "Gödel completeness theorem; Kripke completeness for modal logic",
+                },
+                {
+                    "name": f"Preservation of Compactness under {name} Translation",
+                    "category": "compactness",
+                    "statement": (
+                        f"If a {field_a} property P holds for every finite sub-"
+                        f"structure, then it holds for the full structure after "
+                        f"translation to {field_b}. Equivalently, the bridge "
+                        f"preserves the finite-model property."
+                    ),
+                    "significance": (
+                        f"Finitistic reasoning in {field_a} transfers faithfully "
+                        f"to {field_b}. This is what makes numerical algorithms "
+                        f"on finite approximations correct."
+                    ),
+                    "proof_sketch": (
+                        f"Express P as a directed colimit of finite conditions. "
+                        f"Show the bridge functor preserves directed colimits "
+                        f"(it is finitary)."
+                    ),
+                    "field_a_role": f"{field_a} provides the compact structures",
+                    "field_b_role": f"{field_b} provides the target for faithful translation",
+                    "analogues": "Compactness theorem in model theory; Tychonoff's theorem",
+                },
+                {
+                    "name": f"Definability of {field_b} Operations in {field_a}",
+                    "category": "definability",
+                    "statement": (
+                        f"Every {field_b} operation of arity ≤ n is uniformly "
+                        f"definable by a formula in the first-order theory of "
+                        f"{field_a} objects. The defining formula has quantifier "
+                        f"depth at most 2n + 1."
+                    ),
+                    "significance": (
+                        f"This means {field_a} is expressive enough to capture "
+                        f"all finite {field_b} operations — nothing is lost "
+                        f"in translation."
+                    ),
+                    "proof_sketch": (
+                        f"Induction on arity. Base case: constants are definable "
+                        f"by closed terms. Inductive step: use the bridge functor "
+                        f"to encode the operation graph as a definable relation."
+                    ),
+                    "field_a_role": f"{field_a} provides the defining formulas",
+                    "field_b_role": f"{field_b} provides the operations to be defined",
+                    "analogues": "Beth definability theorem; Craig interpolation",
+                },
+                {
+                    "name": f"Dimension Formula for {name} Objects",
+                    "category": "dimension",
+                    "statement": (
+                        f"For a {name} object M, dim(M) = dim_A(M) + dim_B(M) "
+                        f"− dim(M_{{overlap}}) where dim_A is the {field_a} "
+                        f"dimension, dim_B is the {field_b} dimension, and "
+                        f"M_{{overlap}} is the maximal sub-object lying in both."
+                    ),
+                    "significance": (
+                        f"An inclusion–exclusion formula for dimension. This is "
+                        f"the key to all complexity estimates: you can compute "
+                        f"the synthesis dimension from the two field dimensions."
+                    ),
+                    "proof_sketch": (
+                        f"Apply the Mayer–Vietoris sequence to the cover "
+                        f"{{M_A, M_B}} and read off dimensions from the long "
+                        f"exact sequence."
+                    ),
+                    "field_a_role": f"{field_a} contributes dim_A",
+                    "field_b_role": f"{field_b} contributes dim_B",
+                    "analogues": "Mayer–Vietoris; inclusion–exclusion principle",
+                },
+                {
+                    "name": f"Normal Form Theorem for {name}",
+                    "category": "normal_form",
+                    "statement": (
+                        f"Every {name} expression can be reduced to a normal form "
+                        f"consisting of alternating {field_a} and {field_b} blocks, "
+                        f"where each block is in {field_a}-normal (resp. "
+                        f"{field_b}-normal) form. The number of blocks is bounded "
+                        f"by the quantifier rank."
+                    ),
+                    "significance": (
+                        f"Normal forms give a canonical representation and make "
+                        f"equality decidable. The alternation depth is a "
+                        f"meaningful complexity measure for the synthesis."
+                    ),
+                    "proof_sketch": (
+                        f"Repeated application of the interchange law (from the "
+                        f"bridge adjunction) pushes all {field_a} operations to "
+                        f"even positions and {field_b} to odd. Each block is then "
+                        f"normalised separately."
+                    ),
+                    "field_a_role": f"{field_a} provides the even-position blocks",
+                    "field_b_role": f"{field_b} provides the odd-position blocks",
+                    "analogues": "Prenex normal form; Church–Rosser theorem; Jordan normal form",
+                },
+            ]
+        else:
+            foundational = [
+                {
+                    "name": f"Embedding of {field_a} into {field_b} via Nerve Construction",
+                    "category": "embedding",
+                    "statement": (
+                        f"There is a fully faithful functor N: {field_a}-Cat → "
+                        f"{field_b}-SSet (simplicial sets enriched over {field_b}) "
+                        f"that preserves finite limits and has a left adjoint. "
+                        f"The essential image consists precisely of those "
+                        f"simplicial objects satisfying the Segal condition."
+                    ),
+                    "significance": (
+                        f"{field_a} embeds fully faithfully into a {field_b} "
+                        f"world — all {field_a} information is preserved, and "
+                        f"the Segal condition characterises exactly what comes "
+                        f"from {field_a}."
+                    ),
+                    "proof_sketch": (
+                        f"Construct N as the nerve of the enrichment. Full "
+                        f"faithfulness is the Segal condition. The left adjoint "
+                        f"is the geometric realization."
+                    ),
+                    "field_a_role": f"{field_a} provides the source categories",
+                    "field_b_role": f"{field_b} provides the simplicial enrichment",
+                    "analogues": "Nerve theorem; Dold–Kan correspondence",
+                },
+                {
+                    "name": f"Fixed-Point Theorem for {field_a}–{field_b} Endofunctors",
+                    "category": "fixed_point",
+                    "statement": (
+                        f"Every continuous endofunctor F on the category of "
+                        f"{name} objects has an initial algebra μF, which is "
+                        f"a colimit of the chain 0 → F(0) → F²(0) → ⋯ . "
+                        f"Moreover, μF decomposes as a pair (μF_A, μF_B) where "
+                        f"μF_A solves the {field_a} recursion and μF_B solves "
+                        f"the {field_b} recursion."
+                    ),
+                    "significance": (
+                        f"Recursive definitions in the synthesis split into "
+                        f"two independent recursions. This is the foundation "
+                        f"for all iterative algorithms."
+                    ),
+                    "proof_sketch": (
+                        f"The category of {name} objects is locally presentable, "
+                        f"so Adámek's theorem applies. The decomposition follows "
+                        f"from the bridge functor preserving colimits."
+                    ),
+                    "field_a_role": f"{field_a} contributes the recursion μF_A",
+                    "field_b_role": f"{field_b} contributes the recursion μF_B",
+                    "analogues": "Knaster–Tarski; Adámek's initial algebra theorem; Banach fixed-point",
+                },
+                {
+                    "name": f"Galois Correspondence for {name} Subobjects",
+                    "category": "galois",
+                    "statement": (
+                        f"The lattice of {field_a}-subobjects and the lattice of "
+                        f"{field_b}-quotients of a {name} object M are anti-"
+                        f"isomorphic via the bridge adjunction. Closed subobjects "
+                        f"on one side correspond to open quotients on the other."
+                    ),
+                    "significance": (
+                        f"A Galois-type correspondence: understanding subobjects "
+                        f"in one field is equivalent to understanding quotients "
+                        f"in the other. This duality is the engine behind many "
+                        f"algorithms."
+                    ),
+                    "proof_sketch": (
+                        f"The bridge adjunction restricts to an equivalence between "
+                        f"closed subobjects and open quotients by general theory "
+                        f"of Galois connections on lattices."
+                    ),
+                    "field_a_role": f"{field_a} provides the subobject lattice",
+                    "field_b_role": f"{field_b} provides the quotient lattice",
+                    "analogues": "Fundamental theorem of Galois theory; Stone duality",
+                },
+                {
+                    "name": f"Morita Equivalence Criterion for {name}",
+                    "category": "equivalence",
+                    "statement": (
+                        f"Two {name} objects M and N are Morita-equivalent (have "
+                        f"equivalent module categories) if and only if their "
+                        f"{field_a}-cores are isomorphic and their {field_b}-"
+                        f"envelopes have the same rank."
+                    ),
+                    "significance": (
+                        f"Morita equivalence is coarser than isomorphism but "
+                        f"preserves all 'interesting' properties. This criterion "
+                        f"reduces it to two computable invariants."
+                    ),
+                    "proof_sketch": (
+                        f"Necessity: Morita-equivalent objects have equivalent "
+                        f"module categories, so their cores are isomorphic. "
+                        f"Sufficiency: construct an explicit Morita bimodule from "
+                        f"the core isomorphism and the envelope data."
+                    ),
+                    "field_a_role": f"{field_a} provides the core invariant",
+                    "field_b_role": f"{field_b} provides the envelope rank",
+                    "analogues": "Morita's theorem for rings; Wedderburn–Artin theorem",
+                },
+                {
+                    "name": f"Effective Bounds on {field_a}–{field_b} Translation Complexity",
+                    "category": "complexity",
+                    "statement": (
+                        f"Translating an n-element {field_a} structure to its "
+                        f"{field_b} counterpart via the bridge takes Θ(n log n) "
+                        f"time and O(n) space. The inverse translation has the "
+                        f"same bounds. No algorithm can do better than Ω(n log n) "
+                        f"in the comparison model."
+                    ),
+                    "significance": (
+                        f"Tight complexity bounds: the bridge is near-linear and "
+                        f"this is optimal. Practitioners know exactly what to "
+                        f"expect."
+                    ),
+                    "proof_sketch": (
+                        f"Upper bound: the bridge functor sorts by {field_b}-type, "
+                        f"which is a comparison sort. Lower bound: reduction from "
+                        f"element distinctness."
+                    ),
+                    "field_a_role": f"{field_a} provides the source data",
+                    "field_b_role": f"{field_b} provides the target representation",
+                    "analogues": "Comparison sorting lower bound; Ω(n log n) for convex hull",
+                },
+            ]
 
         # ---- 5 Application Theorems ----
         application = [
