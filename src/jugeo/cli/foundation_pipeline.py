@@ -3061,6 +3061,16 @@ class FoundationPipeline:
             core_path.write_text(core_code, encoding="utf-8")
             files.insert(0, core_path)
 
+        # Ensure operations.py exists — critical for CLI (run_command dispatcher)
+        ops_path = src_dir / "operations.py"
+        if not ops_path.exists():
+            self._log("    operations.py missing from LLM output; using template fallback.")
+            template_files = self._template_generate_code(winner, src_dir)
+            for tf in template_files:
+                if tf.name == "operations.py":
+                    files.append(tf)
+                    break
+
         # Write __init__.py
         module_name = src_dir.name
         init_code = textwrap.dedent(f'''\
@@ -3109,7 +3119,10 @@ class FoundationPipeline:
             "\n"
             "# Propositions encoded as structural invariants\n"
         )
-        body += props_block + "\n\n"
+        # Turn the props block into Python comments (it has indented "- Prop" lines)
+        for line in props_block.strip().split("\n"):
+            body += f"# {line.strip()}\n"
+        body += "\n"
         body += (
             'T = TypeVar("T")\n'
             'U = TypeVar("U")\n'

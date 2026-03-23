@@ -209,36 +209,20 @@ theorem gap_in_gaps (required available : List String) (k : String)
     (hgap : isGap required available k) :
     k ∈ (required.filter (fun r => !available.contains r)) := by
   obtain ⟨hmem, hna⟩ := hgap
-  simp only [List.mem_filter]
-  refine ⟨hmem, ?_⟩
-  cases hc : available.contains k with
-  | false => rfl
-  | true =>
-    exfalso; apply hna
-    simp only [List.contains, List.any_eq_true] at hc
-    obtain ⟨x, hxmem, hxbeq⟩ := hc
-    have := eq_of_beq hxbeq
-    subst this; exact hxmem
+  exact List.mem_filter.mpr ⟨hmem, by simp_all⟩
 
 /-- If there are no gaps, the statement is fully covered. -/
 theorem no_gaps_fully_covered (required available : List String)
     (hno : required.filter (fun r => !available.contains r) = []) :
     fullyCovered required available := by
   intro k hk
-  by_contra hna
-  have : k ∈ required.filter (fun r => !available.contains r) := by
-    simp only [List.mem_filter]
-    refine ⟨hk, ?_⟩
-    cases hc : available.contains k with
-    | false => rfl
-    | true =>
-      exfalso; apply hna
-      simp only [List.contains, List.any_eq_true] at hc
-      obtain ⟨x, hxmem, hxbeq⟩ := hc
-      have := eq_of_beq hxbeq
-      subst this; exact hxmem
-  rw [hno] at this
-  exact absurd this (List.not_mem_nil k)
+  by_cases hna : k ∈ available
+  · exact hna
+  · exfalso
+    have : k ∈ required.filter (fun r => !available.contains r) := by
+      exact List.mem_filter.mpr ⟨hk, by simp_all⟩
+    rw [hno] at this
+    exact absurd this (List.not_mem_nil k)
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 5  Trust Tiers
@@ -488,10 +472,10 @@ theorem soundness_leq_lit (m n : Int)
     ∃ assign : List (String × Int),
       AffineSystem.satisfiedBy (encodeExpr (.leq (.litInt m) (.litInt n))) assign = true := by
   simp [evalBool, evalInt] at h
-  use []
-  simp [encodeExpr, AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
-        evalLHS, List.foldl, evalInt]
-  omega
+  exact ⟨[], by
+    simp [encodeExpr, AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
+          evalLHS, List.foldl, evalInt]
+    omega⟩
 
 /-- Soundness for literal equality. -/
 theorem soundness_eq_lit (m n : Int)
@@ -499,10 +483,10 @@ theorem soundness_eq_lit (m n : Int)
     ∃ assign : List (String × Int),
       AffineSystem.satisfiedBy (encodeExpr (.eq (.litInt m) (.litInt n))) assign = true := by
   simp [evalBool, evalInt] at h
-  use []
-  simp [encodeExpr, AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
-        evalLHS, List.foldl, evalInt]
-  omega
+  exact ⟨[], by
+    simp [encodeExpr, AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
+          evalLHS, List.foldl, evalInt]
+    omega⟩
 
 /-- Completeness for concrete literal leq:
     if the encoding is satisfiable (trivial assignment), then evalBool holds. -/
@@ -517,17 +501,16 @@ theorem completeness_leq_lit (m n : Int)
 /-- Main soundness theorem for the literal fragment:
     encoding satisfiable ↔ Python condition holds. -/
 theorem soundness_iff_leq (m n : Int) :
-    (∃ assign, AffineSystem.satisfiedBy (encodeExpr (.leq (.litInt m) (.litInt n))) assign
-     = true) ↔
+    AffineSystem.satisfiedBy (encodeExpr (.leq (.litInt m) (.litInt n))) []
+     = true ↔
     evalBool (.leq (.litInt m) (.litInt n)) [] = true := by
   constructor
-  · intro ⟨_, h⟩
-    simp [AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
-          evalLHS, List.foldl, encodeExpr, evalInt] at h
-    simp [evalBool, evalInt]
-    omega
+  · exact completeness_leq_lit m n
   · intro h
-    exact soundness_leq_lit m n h
+    simp [evalBool, evalInt] at h
+    simp [encodeExpr, AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
+          evalLHS, List.foldl, evalInt]
+    omega
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 9  Trust Tier Bounds

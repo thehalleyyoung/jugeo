@@ -19,6 +19,45 @@
 namespace JudgmentGeometry.BudgetAllocation
 
 -- ════════════════════════════════════════════════════════════════════
+-- § 0  Helper Lemmas
+-- ════════════════════════════════════════════════════════════════════
+
+private theorem nat_div_add_le {a b c : Nat} (hc : c > 0) :
+    a / c + b / c ≤ (a + b) / c := by
+  rw [Nat.le_div_iff_mul_le hc]
+  calc (a / c + b / c) * c
+      = a / c * c + b / c * c := Nat.add_mul _ _ _
+    _ ≤ a + b := Nat.add_le_add (Nat.div_mul_le_self a c) (Nat.div_mul_le_self b c)
+
+private theorem list_div_sum_le (l : List Nat) (c : Nat) (hc : c > 0) :
+    (l.map (· / c)).sum ≤ l.sum / c := by
+  induction l with
+  | nil => simp
+  | cons x xs ih =>
+    simp [List.sum_cons]
+    calc x / c + (xs.map (· / c)).sum
+        ≤ x / c + xs.sum / c := Nat.add_le_add_left ih _
+      _ ≤ (x + xs.sum) / c := nat_div_add_le hc
+
+private theorem list_mul_sum (B : Nat) (l : List Nat) :
+    (l.map (B * ·)).sum = B * l.sum := by
+  induction l with
+  | nil => simp
+  | cons x xs ih => simp [List.sum_cons, ih, Nat.left_distrib]
+
+private theorem list_map_zero_sum (l : List Nat) :
+    (l.map (fun (_ : Nat) => (0 : Nat))).sum = 0 := by
+  induction l with
+  | nil => rfl
+  | cons _ _ ih => simp [List.sum_cons, ih]
+
+private theorem list_sum_append (a b : List Nat) :
+    (a ++ b).sum = a.sum + b.sum := by
+  induction a with
+  | nil => simp
+  | cons x xs ih => simp [List.sum_cons, ih, Nat.add_assoc]
+
+-- ════════════════════════════════════════════════════════════════════
 -- § 1  Budget Dimensions
 -- ════════════════════════════════════════════════════════════════════
 
@@ -43,44 +82,36 @@ theorem budget_dimension_card :
 /-- A budget channel: an immutable allocation record with utilization tracking. -/
 structure BudgetChannel where
   name      : String
-  priority  : Float
-  allocated : Float
-  spent     : Float
+  priority  : Nat
+  allocated : Nat
+  spent     : Nat
   /-- Invariant: spent never exceeds allocated. -/
   inv       : spent ≤ allocated
   deriving Repr
 
 /-- Remaining budget on a channel (non-negative by invariant). -/
-def BudgetChannel.remaining (ch : BudgetChannel) : Float :=
+def BudgetChannel.remaining (ch : BudgetChannel) : Nat :=
   ch.allocated - ch.spent
 
 /-- Remaining budget is always non-negative. -/
 theorem BudgetChannel.remaining_nonneg (ch : BudgetChannel) :
-    ch.remaining ≥ 0 := by
-  unfold BudgetChannel.remaining
-  linarith [ch.inv]
+    ch.remaining ≥ 0 := Nat.zero_le _
 
-/-- Utilization: fraction of allocated budget that has been spent.
-    The implementation clamps to [0,1]; here we record the math. -/
-def BudgetChannel.utilization (ch : BudgetChannel) : Float :=
-  if ch.allocated = 0 then 0 else ch.spent / ch.allocated
+/-- Utilization as a percentage (0–100) of allocated budget that has been spent.
+    Returns 0 when allocated = 0. -/
+def BudgetChannel.utilization (ch : BudgetChannel) : Nat :=
+  if ch.allocated = 0 then 0 else ch.spent * 100 / ch.allocated
 
-/-- For a well-formed channel with allocated > 0, utilization ≤ 1. -/
+/-- For a well-formed channel with allocated > 0, utilization ≤ 100. -/
 theorem BudgetChannel.utilization_le_one (ch : BudgetChannel)
-    (ha : ch.allocated > 0) : ch.utilization ≤ 1 := by
+    (ha : ch.allocated > 0) : ch.utilization ≤ 100 := by
   unfold BudgetChannel.utilization
-  simp [ne_of_gt ha]
-  apply div_le_one_of_le ch.inv (le_of_lt ha)
+  rw [if_neg (by omega : ¬ch.allocated = 0)]
+  exact Nat.div_le_of_le_mul (Nat.mul_le_mul_right 100 ch.inv)
 
 /-- Utilization is non-negative. -/
 theorem BudgetChannel.utilization_nonneg (ch : BudgetChannel) :
-    0 ≤ ch.utilization := by
-  unfold BudgetChannel.utilization
-  split
-  · exact le_refl _
-  · apply div_nonneg
-    · linarith [ch.inv, ch.remaining_nonneg]
-    · exact le_of_lt (by push_neg at *; assumption)
+    0 ≤ ch.utilization := Nat.zero_le _
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 3  Budget Policy
@@ -96,7 +127,7 @@ inductive BudgetPolicy
 
 /-- ADAPTIVE subsumes FIXED (equal ROI scores) and GREEDY (winner-take-all ROI). -/
 theorem adaptive_most_general :
-    ∀ (p : BudgetPolicy), True := fun _ => trivial
+    ∀ (_ : BudgetPolicy), True := fun _ => trivial
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 4  Simplified Budget Allocator Model
@@ -150,9 +181,11 @@ theorem proportional_alloc_ge_demand (B OPT d : Nat)
     (hOPT : OPT > 0) (hB : B ≥ OPT) :
     proportional_alloc B OPT d ≥ d := by
   unfold proportional_alloc
-  simp [Nat.pos_iff_ne_zero.mp hOPT]
-  calc d = OPT * d / OPT := by rw [Nat.mul_div_cancel_left _ hOPT]
-    _ ≤ B * d / OPT := Nat.div_le_div_right (Nat.mul_le_mul_right d hB)
+  rw [if_neg (by omega : ¬OPT = 0)]
+  show d ≤ B * d / OPT
+  rw [Nat.le_div_iff_mul_le hOPT]
+  calc d * OPT ≤ d * B := Nat.mul_le_mul_left d hB
+    _ = B * d := Nat.mul_comm d B
 
 /-- Proportional allocation is tight: Σ B × d_i / OPT = B
     when OPT = Σ d_i and we use exact (non-integer) arithmetic. -/
@@ -161,32 +194,25 @@ theorem proportional_tight_sum (B : Nat) (demands : List Nat) :
     -- Every channel i gets exactly B * d_i / OPT (in real arithmetic).
     -- Over naturals: Σ (B * d_i / OPT) ≤ B.
     (demands.map (proportional_alloc B demands.sum)).sum ≤ B := by
-  induction demands with
-  | nil => simp [proportional_alloc]
-  | cons d ds ih =>
-    simp [List.map_cons, List.sum_cons, proportional_alloc]
-    split
-    · simp
-    · rename_i h
-      have hsum : ds.sum < ds.sum + d + 1 := by omega
-      calc (B * d / (d + ds.sum)) + (ds.map (proportional_alloc B (d + ds.sum))).sum
-          ≤ (B * d / (d + ds.sum)) + B := by
-            apply Nat.add_le_add_left
-            calc (ds.map (proportional_alloc B (d + ds.sum))).sum
-                ≤ (ds.map (proportional_alloc B ds.sum)).sum := by
-                  apply List.sum_le_sum
-                  intro x hx
-                  simp [proportional_alloc]
-                  split
-                  · omega
-                  · apply Nat.div_le_div_left
-                    · apply Nat.mul_le_mul_left; omega
-                    · omega
-              _ ≤ B := ih
-        _ ≤ B := by
-            apply Nat.add_le_of_le_sub
-            · apply Nat.div_le_self
-            · rfl
+  simp only
+  by_cases hS : demands.sum = 0
+  · have : demands.map (proportional_alloc B demands.sum) = demands.map (fun _ => 0) := by
+      congr 1; ext d; simp [proportional_alloc, hS]
+    rw [this, list_map_zero_sum]
+    exact Nat.zero_le B
+  · have hpos : demands.sum > 0 := Nat.pos_of_ne_zero hS
+    have heq : demands.map (proportional_alloc B demands.sum) =
+               demands.map (fun d => B * d / demands.sum) := by
+      congr 1; ext d; simp [proportional_alloc, hS]
+    rw [heq]
+    have hmap : demands.map (fun d => B * d / demands.sum) =
+                (demands.map (B * ·)).map (· / demands.sum) := by
+      rw [List.map_map]; rfl
+    rw [hmap]
+    calc ((demands.map (B * ·)).map (· / demands.sum)).sum
+        ≤ (demands.map (B * ·)).sum / demands.sum := list_div_sum_le _ _ hpos
+      _ = B * demands.sum / demands.sum := by rw [list_mul_sum]
+      _ = B := Nat.mul_div_cancel B hpos
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 7  Priority Ordering
@@ -209,7 +235,7 @@ theorem priority_trans {c1 c2 c3 : PriorityChannel}
 
 /-- Priority ordering is reflexive. -/
 theorem priority_refl (c : PriorityChannel) : c.higherPriority c :=
-  le_refl _
+  Nat.le_refl _
 
 /-- Priority ordering is total. -/
 theorem priority_total (c1 c2 : PriorityChannel) :
@@ -270,26 +296,27 @@ theorem nominal_lifecycle :
 /-- Sum of the first k powers of 2: ∑_{i=0}^{k-1} 2^i = 2^k − 1.
     Using List.range and natural subtraction. -/
 theorem geom_sum_eq (k : Nat) :
-    (List.range k).map (2 ^ ·) |>.sum = 2 ^ k - 1 := by
+    ((List.range k).map (2 ^ ·)).sum = 2 ^ k - 1 := by
   induction k with
   | zero => simp
   | succ k ih =>
-    rw [List.range_succ, List.map_append, List.sum_append, ih]
+    rw [List.range_succ, List.map_append, list_sum_append, ih]
     simp [List.map, List.sum]
+    rw [Nat.pow_succ]
     omega
 
 /-- The geometric series satisfies: ∑_{i=0}^{k-1} 2^i ≤ 2^k. -/
 theorem geom_sum_le_pow (k : Nat) :
-    (List.range k).map (2 ^ ·) |>.sum ≤ 2 ^ k := by
+    ((List.range k).map (2 ^ ·)).sum ≤ 2 ^ k := by
   rw [geom_sum_eq]
-  omega
+  exact Nat.sub_le _ _
 
 /-- Key doubling inequality: 2^k = 2 × 2^(k−1) for k ≥ 1. -/
 theorem two_pow_succ (k : Nat) (hk : k ≥ 1) :
     2 ^ k = 2 * 2 ^ (k - 1) := by
   cases k with
   | zero => omega
-  | succ k' => simp [pow_succ, Nat.mul_comm]
+  | succ k' => simp [Nat.pow_succ, Nat.mul_comm]
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 10  The 2-Competitive Theorem
@@ -325,11 +352,8 @@ theorem doubling_budget_two_competitive
     (hhi : OPT ≤ 2 ^ k * eps) :       -- round k succeeds
     2 ^ k * eps ≤ 2 * OPT := by
   have hk1 : k = (k - 1) + 1 := by omega
-  rw [hk1, pow_succ]
-  -- Goal: 2 * 2^(k−1) * eps ≤ 2 * OPT
-  -- This follows from hlo: 2^(k−1) * eps < OPT ↔ 2^(k−1) * eps + 1 ≤ OPT
-  -- so 2 * (2^(k−1) * eps) ≤ 2 * (OPT − 1) = 2 * OPT − 2 ≤ 2 * OPT
-  nlinarith
+  rw [hk1, Nat.pow_succ, Nat.mul_comm (2 ^ (k - 1)) 2, Nat.mul_assoc]
+  exact Nat.mul_le_mul_left 2 (Nat.le_of_lt hlo)
 
 /-- Corollary: the doubling strategy's ALG is strictly less than 2 × OPT
     whenever OPT is achieved exactly (not a power of 2 × eps). -/
@@ -378,39 +402,19 @@ theorem proportional_feasibility_strong
 -- ════════════════════════════════════════════════════════════════════
 
 /-- In the proportional rebalance, each channel's new allocation is
-    B × (score_i / total_score).  The sum of new allocations = B
+    B × (score_i / total_score).  The sum of new allocations ≤ B
     (conservation), proved over integer weights. -/
 theorem rebalance_sum_eq_total
     (B : Nat) (scores : List Nat) (hS : scores.sum > 0) :
     (scores.map (fun s => B * s / scores.sum)).sum ≤ B := by
-  induction scores with
-  | nil => simp
-  | cons s rest ih =>
-    simp [List.map_cons, List.sum_cons]
-    split
-    · simp
-    · rename_i h
-      have hpos : s + rest.sum > 0 := by omega
-      have hrec : (rest.map (fun x => B * x / (s + rest.sum))).sum ≤ B := by
-        calc (rest.map (fun x => B * x / (s + rest.sum))).sum
-            ≤ (rest.map (fun x => B * x / rest.sum)).sum := by
-              apply List.sum_le_sum
-              intro x _
-              apply Nat.div_le_div_left
-              · apply Nat.mul_le_mul_left; omega
-              · omega
-          _ ≤ B := by
-              apply ih
-              intro h0
-              have : s + rest.sum = s := by omega
-              omega
-      calc B * s / (s + rest.sum) +
-              (rest.map (fun x => B * x / (s + rest.sum))).sum
-          ≤ B * s / (s + rest.sum) + B := Nat.add_le_add_left hrec _
-        _ ≤ B := by
-            apply Nat.add_le_of_le_sub
-            · exact Nat.div_le_self _ _
-            · rfl
+  have hmap : scores.map (fun s => B * s / scores.sum) =
+              (scores.map (B * ·)).map (· / scores.sum) := by
+    rw [List.map_map]; rfl
+  rw [hmap]
+  calc ((scores.map (B * ·)).map (· / scores.sum)).sum
+      ≤ (scores.map (B * ·)).sum / scores.sum := list_div_sum_le _ _ hS
+    _ = B * scores.sum / scores.sum := by rw [list_mul_sum]
+    _ = B := Nat.mul_div_cancel B hS
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 13  Summary: Main Results
@@ -420,7 +424,7 @@ theorem rebalance_sum_eq_total
   Summary of Paper 16 formalized results:
 
   1. `BudgetChannel.remaining_nonneg`    — remaining budget ≥ 0
-  2. `BudgetChannel.utilization_le_one`  — utilization ∈ [0,1]
+  2. `BudgetChannel.utilization_le_one`  — utilization ≤ 100 (percentage)
   3. `proportional_alloc_ge_demand`      — proportional ≥ demand when B ≥ OPT
   4. `proportional_tight_sum`            — ∑ proportional_alloc ≤ B
   5. `priority_trans`, `priority_total`  — priority ordering is a total preorder
