@@ -10,6 +10,36 @@ import subprocess, json, os, tempfile, time, statistics
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 
+
+def count_source_lines(code):
+    """Count actual source lines: skip empty lines and the wrapping def/class line."""
+    lines = code.strip().splitlines()
+    count = 0
+    first_def_seen = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Skip the first def/class line (the wrapping declaration)
+        if not first_def_seen and (stripped.startswith("def ") or stripped.startswith("class ")):
+            first_def_seen = True
+            continue
+        count += 1
+    return count
+
+
+def categorize_size(n_lines):
+    """Categorize by source line count."""
+    if n_lines <= 10:
+        return "Tiny"
+    elif n_lines <= 25:
+        return "Small"
+    elif n_lines <= 60:
+        return "Medium"
+    else:
+        return "Large"
+
+
 PROGRAMS = [
     {"id": "gcd", "code": """
 def gcd(a, b):
@@ -159,9 +189,19 @@ def main():
         "no_descent": 0,
         "no_trust": 0,
     }
+    # Per-size-category tracking
+    size_categories = {"Tiny": {"count": 0, "verified": 0},
+                       "Small": {"count": 0, "verified": 0},
+                       "Medium": {"count": 0, "verified": 0},
+                       "Large": {"count": 0, "verified": 0}}
 
     for prog in PROGRAMS:
         tmp = write_temp(prog["code"])
+
+        # Categorize program by source line count
+        n_lines = count_source_lines(prog["code"])
+        cat = categorize_size(n_lines)
+        size_categories[cat]["count"] += 1
 
         # Full system run
         desc = run_jugeo("descend", tmp)
@@ -177,6 +217,9 @@ def main():
         verdict = desc.get("verdict", "unknown")
         full_ok = 1 if verdict == "verified" else 0
         full_success += full_ok
+
+        if full_ok:
+            size_categories[cat]["verified"] += 1
 
         # Cyclic coordinator metrics
         coord = CyclicSystemCoordinator.create(prog["id"])
@@ -201,7 +244,7 @@ def main():
         ablation["no_trust"] += trust_ok
 
         cleanup(tmp)
-        print(f"  {prog['id']:15s}  full={full_ok}  -smt={smt_ok}  "
+        print(f"  {prog['id']:15s}  lines={n_lines:2d}  cat={cat:6s}  full={full_ok}  -smt={smt_ok}  "
               f"-desc={desc_ok}  -trust={trust_ok}  coords={n_coords}")
 
     total = len(PROGRAMS)
@@ -211,6 +254,11 @@ def main():
     print(f"  -SMT:          {ablation['no_smt']}/{total}")
     print(f"  -Descent:      {ablation['no_descent']}/{total}")
     print(f"  -Trust:        {ablation['no_trust']}/{total}")
+    print("\nPER-SIZE VERIFICATION")
+    for cat in ("Tiny", "Small", "Medium", "Large"):
+        info = size_categories[cat]
+        rate = (100.0 * info["verified"] / info["count"]) if info["count"] > 0 else 0.0
+        print(f"  {cat:8s}  {info['verified']}/{info['count']}  ({rate:.1f}%)")
 
     # Generate LaTeX macros
     P = "ppXXXVI"
@@ -229,6 +277,14 @@ def main():
     m("FullSuccess", f"{full_success}/{total}")
     m("TotalPrograms", total)
 
+    # Per-size-category macros
+    for cat in ("Tiny", "Small", "Medium", "Large"):
+        info = size_categories[cat]
+        rate = (100.0 * info["verified"] / info["count"]) if info["count"] > 0 else 0.0
+        m(f"{cat}Count", info["count"])
+        m(f"{cat}Verified", info["verified"])
+        m(f"{cat}Rate", f"{rate:.1f}\\%")
+
     tex_path = os.path.join(ROOT, "papers", "data-paper36.tex")
     with open(tex_path, "w") as f:
         f.write("\n".join(tex) + "\n")
@@ -236,7 +292,12 @@ def main():
 
     json_path = os.path.join(os.path.dirname(__file__), "results_paper36.json")
     with open(json_path, "w") as f:
-        json.dump({"full": full_success, "ablation": ablation, "total": total}, f, indent=2)
+        json.dump({
+            "full": full_success,
+            "ablation": ablation,
+            "total": total,
+            "size_categories": {k: v for k, v in size_categories.items()},
+        }, f, indent=2)
     print(f"Wrote {json_path}")
 
 

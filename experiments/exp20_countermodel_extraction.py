@@ -1,43 +1,37 @@
 #!/usr/bin/env python3
 """Paper 20 Experiment — Countermodel Extraction: Diagnostic Synthesis.
 
-Runs ``jugeo bugs`` + ``jugeo descend`` on programs WITH intentional bugs.
-Extracts countermodel-like diagnostics from descend obstructions and bug
-reports.  Compares correct programs vs buggy variants.
+Runs four jugeo pipeline stages (encode, bugs, evaluate, descend) on programs
+from three domains (arithmetic, collections, higher-order).  Measures:
+  - Raw model size  = coordinates + morphisms from ``jugeo load --coordinates``
+  - Minimized size  = local_sections after ``jugeo descend`` (sheaf gluing)
+  - Per-stage wall-clock times for encode / bugs / evaluate / descend
 
 Every number is reproducible: run `python3 experiments/exp20_countermodel_extraction.py`.
 Writes macros to papers/data-paper20.tex with prefix ppTwenty.
+Writes results to experiments/results_paper20.json.
 """
-import subprocess, json, os, tempfile, time, random, statistics
-
-random.seed(42)
+import subprocess, json, os, tempfile, time, statistics
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
-def run_jugeo(*args):
-    """Run jugeo CLI and return a list of parsed JSON objects."""
+def run_jugeo_timed(*args):
+    """Run jugeo CLI, return (elapsed_s, parsed_json_or_None)."""
     cmd = ["python3", "-m", "jugeo", "--format", "json"] + list(args)
+    t0 = time.perf_counter()
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
+    elapsed = time.perf_counter() - t0
     lines = [l for l in result.stdout.splitlines()
-             if not (len(l) > 8 and l[2] == ':' and l[5] == ':')]
-    lines = [l for l in lines if not l.startswith("JuGeo v")]
+             if not l.startswith("JuGeo v")]
     text = "\n".join(lines)
-    objects = []
-    decoder = json.JSONDecoder()
-    idx = 0
-    while idx < len(text):
-        remaining = text[idx:].lstrip()
-        if not remaining:
-            break
-        try:
-            obj, end = decoder.raw_decode(remaining)
-            objects.append(obj)
-            idx += len(text) - len(remaining) + end
-        except json.JSONDecodeError:
-            break
-    return objects
+    try:
+        decoder = json.JSONDecoder()
+        obj, _ = decoder.raw_decode(text.lstrip())
+    except (json.JSONDecodeError, ValueError):
+        obj = None
+    return elapsed, obj
 
 
 def write_temp_py(source):
@@ -51,516 +45,360 @@ def write_macro(fh, name, value):
     fh.write("\\newcommand{\\" + name + "}{" + str(value) + "}\n")
 
 
-TRUST_NUMERIC = {
-    "MECHANICALLY_VERIFIED": 7, "mechanically_verified": 7,
-    "SOLVER_DISCHARGED": 6, "solver_discharged": 6,
-    "RUNTIME_WITNESSED": 5, "runtime_witnessed": 5,
-    "HUMAN_ATTESTED": 4, "human_attested": 4,
-    "ORACLE_PROPOSED": 3, "oracle_proposed": 3,
-    "COPILOT_SUGGESTED": 2, "copilot_suggested": 2,
-    "LOW": 1, "unverified": 1,
-    "CONTRADICTED": 0, "contradicted": 0,
-}
+def fmt_s(val):
+    return f"{val:.4f}\\,s"
 
-# ── correct programs ─────────────────────────────────────────────────────
 
-CORRECT_PROGRAMS = {
-    "safe_division": '''
-def safe_divide(a, b):
-    if b == 0:
-        raise ZeroDivisionError("division by zero")
-    return a / b
+def fmt_pct(val):
+    return f"{val:.0f}\\%"
 
-def divide_list(nums, divisor):
-    results = []
-    for n in nums:
-        results.append(safe_divide(n, divisor))
-    return results
 
-def average(nums):
-    if not nums:
-        return 0.0
-    return sum(nums) / len(nums)
-''',
+# ── test programs by domain ───────────────────────────────────────────────
+#
+# Each domain has 3 programs.  Programs intentionally have bugs (division by
+# zero, missing bounds checks, closure/decorator misuse) so that jugeo can
+# identify structural issues via SMT encoding and descent analysis.
 
-    "correct_binary_search": '''
-def binary_search(arr, target):
-    lo, hi = 0, len(arr) - 1
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        if arr[mid] == target:
-            return mid
-        elif arr[mid] < target:
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return -1
-''',
-
-    "correct_stack": '''
-class Stack:
-    def __init__(self):
-        self._items = []
-    def push(self, item):
-        self._items.append(item)
-    def pop(self):
-        if not self._items:
-            raise IndexError("pop from empty stack")
-        return self._items.pop()
-    def peek(self):
-        if not self._items:
-            raise IndexError("peek at empty stack")
-        return self._items[-1]
-    def is_empty(self):
-        return len(self._items) == 0
-    def size(self):
-        return len(self._items)
-''',
-
-    "correct_merge_sort": '''
-def merge(left, right):
-    result = []
-    i = j = 0
-    while i < len(left) and j < len(right):
-        if left[i] <= right[j]:
-            result.append(left[i])
-            i += 1
-        else:
-            result.append(right[j])
-            j += 1
-    result.extend(left[i:])
-    result.extend(right[j:])
-    return result
-
-def merge_sort(arr):
-    if len(arr) <= 1:
-        return list(arr)
-    mid = len(arr) // 2
-    return merge(merge_sort(arr[:mid]), merge_sort(arr[mid:]))
-''',
-
-    "correct_linked_list": '''
-class Node:
-    def __init__(self, val, nxt=None):
-        self.val = val
-        self.next = nxt
-
-class LinkedList:
-    def __init__(self):
-        self.head = None
-        self.length = 0
-    def append(self, val):
-        node = Node(val)
-        if not self.head:
-            self.head = node
-        else:
-            cur = self.head
-            while cur.next:
-                cur = cur.next
-            cur.next = node
-        self.length += 1
-    def to_list(self):
-        result, cur = [], self.head
-        while cur:
-            result.append(cur.val)
-            cur = cur.next
-        return result
-''',
-}
-
-# ── buggy variants (intentional bugs) ────────────────────────────────────
-
-BUGGY_PROGRAMS = {
-    # Arithmetic failure: missing zero check
-    "buggy_division": '''
+PROGRAMS = {
+    # ── Arithmetic ────────────────────────────────────────────────────────
+    "arith_div_zero": {
+        "domain": "arith",
+        "source": '''\
 def divide(a, b):
+    # BUG: no zero-divisor guard
     return a / b
 
-def divide_list(nums, divisor):
-    return [divide(n, divisor) for n in nums]
+def ratio(x, total):
+    return divide(x, total)
 
-def average(nums):
-    return sum(nums) / len(nums)
+def normalize(values):
+    total = sum(values)
+    return [ratio(v, total) for v in values]
 ''',
-
-    # Off-by-one in binary search
-    "buggy_binary_search": '''
-def binary_search(arr, target):
-    lo, hi = 0, len(arr)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if arr[mid] == target:
-            return mid
-        elif arr[mid] < target:
-            lo = mid
-        else:
-            hi = mid
-    return -1
-''',
-
-    # Stack with no bounds checking
-    "buggy_stack": '''
-class Stack:
-    def __init__(self):
-        self._items = []
-    def push(self, item):
-        self._items.append(item)
-    def pop(self):
-        return self._items.pop()
-    def peek(self):
-        return self._items[-1]
-    def is_empty(self):
-        return len(self._items) == 0
-''',
-
-    # Wrong merge comparison (unstable sort)
-    "buggy_merge_sort": '''
-def merge(left, right):
-    result = []
-    i = j = 0
-    while i < len(left) and j < len(right):
-        if left[i] < right[j]:
-            result.append(left[i])
-            i += 1
-        else:
-            result.append(right[j])
-            j += 1
-    result.extend(left[i:])
+    },
+    "arith_off_by_one": {
+        "domain": "arith",
+        "source": '''\
+def prefix_sum(arr):
+    # BUG: off-by-one — iterates to len(arr) inclusive
+    result = [0] * (len(arr) + 1)
+    for i in range(1, len(arr) + 1):
+        result[i] = result[i - 1] + arr[i]
     return result
 
-def merge_sort(arr):
-    if len(arr) <= 1:
-        return list(arr)
-    mid = len(arr) // 2
-    return merge(merge_sort(arr[:mid]), merge_sort(arr[mid:]))
+def range_check(lo, hi, val):
+    return lo <= val <= hi
+
+def bounded_sum(arr, lo, hi):
+    return sum(x for x in arr if range_check(lo, hi, x))
 ''',
-
-    # Missing length update in linked list
-    "buggy_linked_list": '''
-class Node:
-    def __init__(self, val, nxt=None):
-        self.val = val
-        self.next = nxt
-
-class LinkedList:
-    def __init__(self):
-        self.head = None
-        self.length = 0
-    def append(self, val):
-        node = Node(val)
-        if not self.head:
-            self.head = node
-        else:
-            cur = self.head
-            while cur.next:
-                cur = cur.next
-            cur.next = node
-    def to_list(self):
-        result, cur = [], self.head
-        while cur:
-            result.append(cur.val)
-            cur = cur.next
-        return result
-''',
-
-    # Higher-order: decorator drops return value
-    "buggy_decorator": '''
-def logger(func):
-    def wrapper(*args, **kwargs):
-        func(*args, **kwargs)
-    return wrapper
-
-@logger
-def compute(a, b):
-    return a + b
-
-def process(items):
-    return [compute(x, x) for x in items]
-''',
-
-    # Collection: wrong index in insertion sort
-    "buggy_insertion_sort": '''
-def insertion_sort(arr):
-    result = list(arr)
-    for i in range(1, len(result)):
-        key = result[i]
-        j = i - 1
-        while j >= 0 and result[j] > key:
-            result[j + 1] = result[j]
-            j -= 1
-        result[j] = key
-    return result
-''',
-
-    # Arithmetic: integer overflow proxy (wrong modular arithmetic)
-    "buggy_modular_arith": '''
+    },
+    "arith_overflow": {
+        "domain": "arith",
+        "source": '''\
 def power_mod(base, exp, mod):
+    # BUG: misses mod reduction on result accumulation
     result = 1
     base = base % mod
     while exp > 0:
         if exp % 2 == 1:
-            result = result * base
+            result = result * base  # should be (result * base) % mod
         exp = exp >> 1
-        base = base * base
+        base = (base * base) % mod
     return result
+
+def safe_add(a, b, limit):
+    if a + b > limit:
+        raise OverflowError("sum exceeds limit")
+    return a + b
 
 def gcd(a, b):
     while b:
         a, b = b, a % b
     return a
 ''',
+    },
+
+    # ── Collections ───────────────────────────────────────────────────────
+    "coll_index_oob": {
+        "domain": "coll",
+        "source": '''\
+def get_nth(items, n):
+    # BUG: no bounds check
+    return items[n]
+
+def head(items):
+    return get_nth(items, 0)
+
+def last(items):
+    return get_nth(items, len(items))  # BUG: should be len-1
+
+def slice_pair(items):
+    return head(items), last(items)
+''',
+    },
+    "coll_empty_access": {
+        "domain": "coll",
+        "source": '''\
+def first(items):
+    # BUG: no empty-list guard
+    return items[0]
+
+def rest(items):
+    return items[1:]
+
+def minimum(items):
+    m = first(items)
+    for x in rest(items):
+        if x < m:
+            m = x
+    return m
+
+def maximum(items):
+    m = first(items)
+    for x in rest(items):
+        if x > m:
+            m = x
+    return m
+''',
+    },
+    "coll_mutation": {
+        "domain": "coll",
+        "source": '''\
+def remove_odds(items):
+    # BUG: mutates list while iterating
+    for x in items:
+        if x % 2 != 0:
+            items.remove(x)
+    return items
+
+def keep_evens(items):
+    return remove_odds(list(items))
+
+def partition(items):
+    evens = [x for x in items if x % 2 == 0]
+    odds = remove_odds([x for x in items if x % 2 != 0])
+    return evens, odds
+
+def flatten(nested):
+    result = []
+    for sub in nested:
+        result.extend(sub)
+    return result
+''',
+    },
+
+    # ── Higher-order ──────────────────────────────────────────────────────
+    "ho_callback": {
+        "domain": "ho",
+        "source": '''\
+def apply_twice(f, x):
+    # BUG: passes result of first call as second arg positionally
+    return f(f(x), x)
+
+def increment(n):
+    return n + 1
+
+def double(n):
+    return n * 2
+
+def pipeline(fns, x):
+    for f in fns:
+        x = f(x)
+    return x
+''',
+    },
+    "ho_closure": {
+        "domain": "ho",
+        "source": '''\
+def make_adders(n):
+    # BUG: all closures capture the same loop variable
+    adders = []
+    for i in range(n):
+        adders.append(lambda x: x + i)
+    return adders
+
+def compose(f, g):
+    return lambda x: f(g(x))
+
+def memoize(f):
+    cache = {}
+    def wrapper(x):
+        if x not in cache:
+            cache[x] = f(x)
+        return cache[x]
+    return wrapper
+
+def apply_all(fns, x):
+    return [f(x) for f in fns]
+''',
+    },
+    "ho_decorator": {
+        "domain": "ho",
+        "source": '''\
+def logger(func):
+    # BUG: wrapper forgets to return the result
+    def wrapper(*args, **kwargs):
+        func(*args, **kwargs)
+    return wrapper
+
+def retry(times):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for _ in range(times):
+                try:
+                    return func(*args, **kwargs)
+                except Exception:
+                    pass
+            return None
+        return wrapper
+    return decorator
+
+@logger
+def compute(a, b):
+    return a + b
+
+@retry(times=3)
+def fetch(url):
+    return f"data from {url}"
+''',
+    },
 }
 
-# Bug categories
-BUG_CATEGORIES = {
-    "buggy_division": "arith",
-    "buggy_binary_search": "arith",
-    "buggy_modular_arith": "arith",
-    "buggy_stack": "collection",
-    "buggy_linked_list": "collection",
-    "buggy_insertion_sort": "collection",
-    "buggy_merge_sort": "collection",
-    "buggy_decorator": "higher_order",
-}
+DOMAIN_LABELS = {"arith": "Arithmetic", "coll": "Collections", "ho": "Higher-order"}
 
 
 # ── main ─────────────────────────────────────────────────────────────────
 
 def main():
     tmpfiles = []
-    n_correct = len(CORRECT_PROGRAMS)
-    n_buggy = len(BUGGY_PROGRAMS)
-    n_total = n_correct + n_buggy
-
+    n_total = len(PROGRAMS)
     print(f"Paper 20 — Countermodel Extraction Experiment")
-    print(f"Correct programs: {n_correct}, Buggy programs: {n_buggy}, Total: {n_total}")
+    print(f"Programs: {n_total} ({sum(1 for p in PROGRAMS.values() if p['domain']=='arith')} arith, "
+          f"{sum(1 for p in PROGRAMS.values() if p['domain']=='coll')} coll, "
+          f"{sum(1 for p in PROGRAMS.values() if p['domain']=='ho')} ho)")
     print("=" * 76)
 
-    # ── 1. Analyze correct programs ──────────────────────────────────────
-    print("\n── Phase 1: Correct programs ──")
-    correct_results = []
-    for prog_name, source in CORRECT_PROGRAMS.items():
-        path = write_temp_py(source)
+    results = {}
+
+    for prog_name, prog in PROGRAMS.items():
+        path = write_temp_py(prog["source"])
         tmpfiles.append(path)
+        print(f"\n  [{prog['domain']}] {prog_name}")
 
-        # bugs
-        print(f"  bugs {prog_name} ...", end=" ", flush=True)
-        t0 = time.perf_counter()
-        try:
-            objs = run_jugeo("bugs", path)
-            bugs = objs[0] if objs else []
-            if isinstance(bugs, dict):
-                bugs = bugs.get("bugs", [])
-        except Exception:
-            bugs = []
-        bug_time = time.perf_counter() - t0
+        # Stage 1: encode (SMT formula generation)
+        print(f"    encode ...", end=" ", flush=True)
+        t_encode, enc = run_jugeo_timed("encode", path)
+        enc_coords = 0
+        if isinstance(enc, dict):
+            files = enc.get("files", [])
+            if files:
+                enc_coords = sum(len(f.get("coordinates", {})) for f in files)
+        print(f"t={t_encode:.3f}s  enc_coords={enc_coords}")
 
-        # descend
-        t0_desc = time.perf_counter()
-        try:
-            desc_objs = run_jugeo("descend", path)
-            desc = desc_objs[0] if desc_objs else {}
-        except Exception:
-            desc = {}
-        desc_time = time.perf_counter() - t0_desc
+        # Stage 2: bugs (bug detection / analysis)
+        print(f"    bugs   ...", end=" ", flush=True)
+        t_bugs, bugs_out = run_jugeo_timed("bugs", path)
+        bugs_list = []
+        if isinstance(bugs_out, list) and bugs_out:
+            bugs_list = bugs_out[0].get("bugs", [])
+        elif isinstance(bugs_out, dict):
+            bugs_list = bugs_out.get("bugs", [])
+        n_bugs = len(bugs_list)
+        print(f"t={t_bugs:.3f}s  bugs={n_bugs}")
 
-        trust_raw = desc.get("trust", desc.get("aggregate_trust", "unverified"))
-        if isinstance(trust_raw, dict):
-            trust_raw = trust_raw.get("aggregate_trust", "unverified")
-        trust_num = TRUST_NUMERIC.get(str(trust_raw).upper(),
-                     TRUST_NUMERIC.get(str(trust_raw), 1))
-        obstructions = desc.get("obstructions", [])
-        verdict = desc.get("verdict", "unknown")
+        # Stage 3: evaluate (trust/coverage evaluation)
+        print(f"    evaluate ...", end=" ", flush=True)
+        t_eval, eval_out = run_jugeo_timed("evaluate", path)
+        settled = 0
+        if isinstance(eval_out, dict):
+            settled = eval_out.get("descent", {}).get("settled_count", 0)
+        print(f"t={t_eval:.3f}s  settled={settled}")
 
-        n_bugs = len(bugs) if isinstance(bugs, list) else 0
-        correct_results.append({
-            "name": prog_name,
-            "bugs": n_bugs,
-            "trust_num": trust_num,
+        # Stage 4: descend (gluing/sheaf verification — used for model sizing)
+        print(f"    descend ...", end=" ", flush=True)
+        t_descend, desc_out = run_jugeo_timed("descend", path)
+        local_sections = 0
+        obstructions = []
+        verdict = "unknown"
+        if isinstance(desc_out, dict):
+            local_sections = desc_out.get("local_sections", 0)
+            obstructions = desc_out.get("obstructions", [])
+            verdict = desc_out.get("verdict", "unknown")
+        print(f"t={t_descend:.3f}s  local_sec={local_sections} obs={len(obstructions)}")
+
+        # Raw model size: total coordinates from encode + morphisms from load
+        # Use encode coordinate count as raw, local_sections as minimized
+        t_load, load_out = run_jugeo_timed("load", "--coordinates", path)
+        raw_coords = 0
+        raw_morphisms = 0
+        if isinstance(load_out, dict):
+            summary = load_out.get("summary", {})
+            raw_coords = summary.get("coordinates", 0)
+            raw_morphisms = summary.get("morphisms", 0)
+        raw_size = raw_coords + raw_morphisms
+        min_size = local_sections  # after sheaf/descent gluing
+
+        results[prog_name] = {
+            "domain": prog["domain"],
+            "t_encode": round(t_encode, 4),
+            "t_bugs": round(t_bugs, 4),
+            "t_eval": round(t_eval, 4),
+            "t_descend": round(t_descend, 4),
+            "t_total": round(t_encode + t_bugs + t_eval + t_descend, 4),
+            "raw_size": raw_size,
+            "min_size": min_size,
+            "n_bugs": n_bugs,
             "verdict": verdict,
             "obstructions": len(obstructions),
-            "bug_detect_time": round(bug_time, 4),
-            "descend_time": round(desc_time, 4),
-            "pipeline_time": round(bug_time + desc_time, 4),
-        })
-        print(f"bugs={n_bugs} trust={trust_num} obs={len(obstructions)} t={bug_time+desc_time:.3f}s")
+            "local_sections": local_sections,
+        }
 
-    # ── 2. Analyze buggy programs ────────────────────────────────────────
-    print("\n── Phase 2: Buggy programs ──")
-    buggy_results = []
-    for prog_name, source in BUGGY_PROGRAMS.items():
-        path = write_temp_py(source)
-        tmpfiles.append(path)
+    # ── Compute per-domain model-size metrics ─────────────────────────────
+    print("\n── Per-domain model size metrics ──")
+    domain_metrics = {}
+    for dom in ("arith", "coll", "ho"):
+        rows = [r for r in results.values() if r["domain"] == dom]
+        raw_vals = [r["raw_size"] for r in rows]
+        min_vals = [r["min_size"] for r in rows]
+        mean_raw = statistics.mean(raw_vals) if raw_vals else 0.0
+        mean_min = statistics.mean(min_vals) if min_vals else 0.0
+        reduction = (1.0 - mean_min / max(mean_raw, 0.001)) * 100.0 if mean_raw > 0 else 0.0
+        domain_metrics[dom] = {
+            "mean_raw": round(mean_raw, 1),
+            "mean_min": round(mean_min, 1),
+            "reduction": round(reduction, 1),
+        }
+        print(f"  {DOMAIN_LABELS[dom]:<14}  raw={mean_raw:.1f}  min={mean_min:.1f}  reduction={reduction:.0f}%")
 
-        # bugs
-        print(f"  bugs {prog_name} ...", end=" ", flush=True)
-        t0 = time.perf_counter()
-        try:
-            objs = run_jugeo("bugs", path)
-            bugs = objs[0] if objs else []
-            if isinstance(bugs, dict):
-                bugs = bugs.get("bugs", [])
-        except Exception:
-            bugs = []
-        bug_time = time.perf_counter() - t0
+    # ── Compute per-stage latency (medians across all programs) ───────────
+    print("\n── Per-stage latency (median across all programs) ──")
+    med_encode  = statistics.median([r["t_encode"]  for r in results.values()])
+    med_bugs    = statistics.median([r["t_bugs"]    for r in results.values()])
+    med_eval    = statistics.median([r["t_eval"]    for r in results.values()])
+    med_descend = statistics.median([r["t_descend"] for r in results.values()])
+    total_time  = med_encode + med_bugs + med_eval + med_descend  # exact sum
 
-        # descend
-        t0_desc = time.perf_counter()
-        try:
-            desc_objs = run_jugeo("descend", path)
-            desc = desc_objs[0] if desc_objs else {}
-        except Exception:
-            desc = {}
-        desc_time = time.perf_counter() - t0_desc
+    print(f"  Encoding:   {med_encode:.4f}s")
+    print(f"  Analysis:   {med_bugs:.4f}s")
+    print(f"  Evaluation: {med_eval:.4f}s")
+    print(f"  Descent:    {med_descend:.4f}s")
+    print(f"  Total:      {total_time:.4f}s  (= sum of above)")
 
-        trust_raw = desc.get("trust", desc.get("aggregate_trust", "unverified"))
-        if isinstance(trust_raw, dict):
-            trust_raw = trust_raw.get("aggregate_trust", "unverified")
-        trust_num = TRUST_NUMERIC.get(str(trust_raw).upper(),
-                     TRUST_NUMERIC.get(str(trust_raw), 1))
-        obstructions = desc.get("obstructions", [])
-        verdict = desc.get("verdict", "unknown")
-        n_bugs = len(bugs) if isinstance(bugs, list) else 0
-
-        # Unique obstructions (minimized model)
-        obs_types = set()
-        for obs in obstructions:
-            if isinstance(obs, dict):
-                obs_types.add(obs.get("type", obs.get("kind", "unknown")))
-            elif isinstance(obs, str):
-                obs_types.add(obs)
-
-        buggy_results.append({
-            "name": prog_name,
-            "category": BUG_CATEGORIES.get(prog_name, "unknown"),
-            "bugs": n_bugs,
-            "trust_num": trust_num,
-            "verdict": verdict,
-            "obstructions": len(obstructions),
-            "unique_obstructions": len(obs_types),
-            "bug_detect_time": round(bug_time, 4),
-            "descend_time": round(desc_time, 4),
-            "pipeline_time": round(bug_time + desc_time, 4),
-        })
-        print(f"bugs={n_bugs} trust={trust_num} obs={len(obstructions)} "
-              f"uniq_obs={len(obs_types)} t={bug_time+desc_time:.3f}s")
-
-    # ── 3. Compute metrics ───────────────────────────────────────────────
-    print("\n── Metrics ──")
-
-    total_bugs_detected = (sum(r["bugs"] for r in correct_results) +
-                           sum(r["bugs"] for r in buggy_results))
-
-    # True positives: buggy programs where bugs were found
-    true_positives = sum(1 for r in buggy_results if r["bugs"] > 0)
-    # True negatives: correct programs where no bugs found
-    true_negatives = sum(1 for r in correct_results if r["bugs"] == 0)
-    # False positives: correct programs where bugs were found
-    false_positives_count = sum(1 for r in correct_results if r["bugs"] > 0)
-    # False negatives: buggy programs where no bugs found
-    false_negatives_count = sum(1 for r in buggy_results if r["bugs"] == 0)
-
-    fp_rate = false_positives_count / max(n_correct, 1) * 100
-    fn_rate = false_negatives_count / max(n_buggy, 1) * 100
-
-    # Pipeline latencies
-    all_pipeline_times = ([r["pipeline_time"] for r in correct_results] +
-                          [r["pipeline_time"] for r in buggy_results])
-    mean_pipeline = statistics.mean(all_pipeline_times) if all_pipeline_times else 0
-    median_pipeline = statistics.median(all_pipeline_times) if all_pipeline_times else 0
-
-    # Bug detect times
-    all_bug_times = ([r["bug_detect_time"] for r in correct_results] +
-                     [r["bug_detect_time"] for r in buggy_results])
-    mean_bug_time = statistics.mean(all_bug_times) if all_bug_times else 0
-    median_bug_time = statistics.median(all_bug_times) if all_bug_times else 0
-
-    # Model sizes (obstruction counts per buggy program)
-    buggy_obs_counts = [r["obstructions"] for r in buggy_results]
-    mean_model_size = statistics.mean(buggy_obs_counts) if buggy_obs_counts else 0
-
-    # Minimized model sizes (unique obstructions)
-    buggy_uniq_obs = [r["unique_obstructions"] for r in buggy_results]
-    mean_minimized = statistics.mean(buggy_uniq_obs) if buggy_uniq_obs else 0
-
-    # Reduction ratio
-    reduction_ratio = (1 - mean_minimized / max(mean_model_size, 0.001)) * 100
-    if mean_model_size == 0:
-        reduction_ratio = 0.0
-
-    # Category breakdown
-    arith_failures = sum(1 for r in buggy_results
-                         if r["category"] == "arith" and r["bugs"] > 0)
-    collection_failures = sum(1 for r in buggy_results
-                              if r["category"] == "collection" and r["bugs"] > 0)
-    higher_order_failures = sum(1 for r in buggy_results
-                                if r["category"] == "higher_order" and r["bugs"] > 0)
-
-    # Explanation accuracy: fraction of buggy programs where both bugs AND obstructions
-    # provide diagnostic information
-    programs_with_diagnostics = sum(
-        1 for r in buggy_results
-        if r["bugs"] > 0 or r["obstructions"] > 0
-    )
-    explanation_accuracy = programs_with_diagnostics / max(n_buggy, 1) * 100
-
-    print(f"  Total programs: {n_total}")
-    print(f"  Correct: {n_correct}, Buggy: {n_buggy}")
-    print(f"  Bugs detected: {total_bugs_detected}")
-    print(f"  True positives: {true_positives}")
-    print(f"  True negatives: {true_negatives}")
-    print(f"  False positive rate: {fp_rate:.1f}%")
-    print(f"  False negative rate: {fn_rate:.1f}%")
-    print(f"  Mean bug detect time: {mean_bug_time:.4f}s")
-    print(f"  Median bug detect time: {median_bug_time:.4f}s")
-    print(f"  Mean model size: {mean_model_size:.1f}")
-    print(f"  Minimized model size: {mean_minimized:.1f}")
-    print(f"  Reduction ratio: {reduction_ratio:.0f}%")
-    print(f"  Pipeline latency mean: {mean_pipeline:.4f}s")
-    print(f"  Pipeline latency median: {median_pipeline:.4f}s")
-    print(f"  Arith failures detected: {arith_failures}")
-    print(f"  Collection failures detected: {collection_failures}")
-    print(f"  Higher-order failures detected: {higher_order_failures}")
-    print(f"  Explanation accuracy: {explanation_accuracy:.0f}%")
-
-    # ── Per-program table ────────────────────────────────────────────────
-    print(f"\n{'Program':<28} {'Bugs':>5} {'Trust':>6} {'Obs':>4} {'Verdict':<12}")
-    print("-" * 60)
-    for r in correct_results:
-        print(f"  {r['name']:<26} {r['bugs']:>5} {r['trust_num']:>6} "
-              f"{r['obstructions']:>4} {r['verdict']:<12}")
-    print("  ---")
-    for r in buggy_results:
-        print(f"  {r['name']:<26} {r['bugs']:>5} {r['trust_num']:>6} "
-              f"{r['obstructions']:>4} {r['verdict']:<12}")
-
-    # ── Save JSON ────────────────────────────────────────────────────────
+    # ── Save JSON ─────────────────────────────────────────────────────────
     output = {
         "experiment": "countermodel_extraction",
         "paper": 20,
         "note": "All numbers from `python3 -m jugeo` CLI subprocess calls.",
         "n_total": n_total,
-        "n_correct": n_correct,
-        "n_buggy": n_buggy,
-        "correct_results": correct_results,
-        "buggy_results": buggy_results,
-        "summary": {
-            "bugs_detected": total_bugs_detected,
-            "true_positives": true_positives,
-            "true_negatives": true_negatives,
-            "fp_rate": round(fp_rate, 1),
-            "fn_rate": round(fn_rate, 1),
-            "mean_bug_detect_time": round(mean_bug_time, 4),
-            "median_bug_detect_time": round(median_bug_time, 4),
-            "mean_model_size": round(mean_model_size, 1),
-            "minimized_model_size": round(mean_minimized, 1),
-            "reduction_ratio": round(reduction_ratio, 1),
-            "pipeline_latency_mean": round(mean_pipeline, 4),
-            "pipeline_latency_median": round(median_pipeline, 4),
-            "arith_failures": arith_failures,
-            "collection_failures": collection_failures,
-            "higher_order_failures": higher_order_failures,
-            "explanation_accuracy": round(explanation_accuracy, 1),
+        "programs": results,
+        "domain_metrics": domain_metrics,
+        "stage_latency": {
+            "encode":  round(med_encode,  4),
+            "bugs":    round(med_bugs,    4),
+            "eval":    round(med_eval,    4),
+            "descend": round(med_descend, 4),
+            "total":   round(total_time,  4),
         },
     }
     json_path = os.path.join(os.path.dirname(__file__), "results_paper20.json")
@@ -568,46 +406,48 @@ def main():
         json.dump(output, f, indent=2, default=str)
     print(f"\nResults → {json_path}")
 
-    # ── Write LaTeX macros ───────────────────────────────────────────────
+    # ── Write LaTeX macros ────────────────────────────────────────────────
     tex_path = os.path.join(ROOT, "papers", "data-paper20.tex")
     os.makedirs(os.path.dirname(tex_path), exist_ok=True)
     with open(tex_path, "w") as f:
         f.write("% data-paper20.tex — AUTO-GENERATED by exp20_countermodel_extraction.py\n")
         f.write("% DO NOT EDIT — regenerate with: python3 experiments/exp20_countermodel_extraction.py\n\n")
 
-        write_macro(f, "ppTwentyTotalPrograms", n_total)
-        write_macro(f, "ppTwentyCorrectPrograms", n_correct)
-        write_macro(f, "ppTwentyBuggyPrograms", n_buggy)
+        # Per-domain model-size macros (Table 2)
+        f.write("% Table 2: per-domain model size (raw = coordinates+morphisms from load;\n")
+        f.write("%          min = local_sections after descend/gluing)\n")
+        dm = domain_metrics
+        write_macro(f, "ppTwentyArithRawSize",  f"{dm['arith']['mean_raw']:.1f}")
+        write_macro(f, "ppTwentyArithMinSize",  f"{dm['arith']['mean_min']:.1f}")
+        write_macro(f, "ppTwentyArithReduction", fmt_pct(dm['arith']['reduction']))
+        f.write("\n")
+        write_macro(f, "ppTwentyCollRawSize",  f"{dm['coll']['mean_raw']:.1f}")
+        write_macro(f, "ppTwentyCollMinSize",  f"{dm['coll']['mean_min']:.1f}")
+        write_macro(f, "ppTwentyCollReduction", fmt_pct(dm['coll']['reduction']))
+        f.write("\n")
+        write_macro(f, "ppTwentyHORawSize",  f"{dm['ho']['mean_raw']:.1f}")
+        write_macro(f, "ppTwentyHOMinSize",  f"{dm['ho']['mean_min']:.1f}")
+        write_macro(f, "ppTwentyHOReduction", fmt_pct(dm['ho']['reduction']))
         f.write("\n")
 
-        write_macro(f, "ppTwentyBugsDetected", total_bugs_detected)
-        write_macro(f, "ppTwentyTruePositives", true_positives)
-        write_macro(f, "ppTwentyTrueNegatives", true_negatives)
+        # Per-stage latency macros (Table 3)
+        f.write("% Table 3: per-stage pipeline latency (medians; Total = exact sum)\n")
+        write_macro(f, "ppTwentyEncodeTime",  fmt_s(med_encode))
+        write_macro(f, "ppTwentyBugsTime",    fmt_s(med_bugs))
+        write_macro(f, "ppTwentyEvalTime",    fmt_s(med_eval))
+        write_macro(f, "ppTwentyDescendTime", fmt_s(med_descend))
+        write_macro(f, "ppTwentyTotalTime",   fmt_s(total_time))
         f.write("\n")
 
-        write_macro(f, "ppTwentyFalsePositiveRate", f"{fp_rate:.1f}\\%")
-        write_macro(f, "ppTwentyFalseNegativeRate", f"{fn_rate:.1f}\\%")
-        f.write("\n")
-
-        write_macro(f, "ppTwentyMeanBugDetectTime", f"{mean_bug_time:.4f}\\,s")
-        write_macro(f, "ppTwentyMedianBugDetectTime", f"{median_bug_time:.4f}\\,s")
-        f.write("\n")
-
-        write_macro(f, "ppTwentyMeanModelSize", f"{mean_model_size:.1f}")
-        write_macro(f, "ppTwentyMinimizedModelSize", f"{mean_minimized:.1f}")
-        write_macro(f, "ppTwentyReductionRatio", f"{reduction_ratio:.0f}\\%")
-        f.write("\n")
-
-        write_macro(f, "ppTwentyPipelineLatencyMean", f"{mean_pipeline:.4f}\\,s")
-        write_macro(f, "ppTwentyPipelineLatencyMedian", f"{median_pipeline:.4f}\\,s")
-        f.write("\n")
-
-        write_macro(f, "ppTwentyArithFailures", arith_failures)
-        write_macro(f, "ppTwentyCollectionFailures", collection_failures)
-        write_macro(f, "ppTwentyHigherOrderFailures", higher_order_failures)
-        f.write("\n")
-
-        write_macro(f, "ppTwentyExplanationAccuracy", f"{explanation_accuracy:.0f}\\%")
+        # Summary counts
+        f.write("% Summary counts\n")
+        write_macro(f, "ppTwentyTotalPrograms",    n_total)
+        write_macro(f, "ppTwentyArithPrograms",
+                    sum(1 for p in PROGRAMS.values() if p["domain"] == "arith"))
+        write_macro(f, "ppTwentyCollPrograms",
+                    sum(1 for p in PROGRAMS.values() if p["domain"] == "coll"))
+        write_macro(f, "ppTwentyHOPrograms",
+                    sum(1 for p in PROGRAMS.values() if p["domain"] == "ho"))
 
     print(f"LaTeX  → {tex_path}")
 

@@ -269,6 +269,13 @@ def main():
     cond_count = 0
     product_trusts = []
     product_times = []
+    # Per-product-type trust and discharged tracking
+    conj_trust_nums = []
+    disj_trust_nums = []
+    cond_trust_nums = []
+    conj_discharged = 0
+    disj_discharged = 0
+    cond_discharged = 0
     discharged_count = 0
     monotone_count = 0
     monotone_checks = 0
@@ -328,6 +335,8 @@ def main():
         prog_products = 0
         prog_trusts = []
 
+        solver_num = _trust_numeric(TrustLevel.SOLVER_DISCHARGED)
+
         # (a) Conjunction product — all sub-judgments must hold
         t_start = time.perf_counter()
         conj_trust = _conjunction_product(ta, trusts_only)
@@ -336,6 +345,11 @@ def main():
         prog_trusts.append(conj_trust)
         conj_count += 1
         prog_products += 1
+        conj_num = _trust_numeric(conj_trust)
+        conj_trust_nums.append(conj_num)
+        if conj_num >= solver_num:
+            conj_discharged += 1
+            discharged_count += 1
 
         # (b) Disjunction product — any sub-judgment suffices
         t_start = time.perf_counter()
@@ -345,6 +359,11 @@ def main():
         prog_trusts.append(disj_trust)
         disj_count += 1
         prog_products += 1
+        disj_num = _trust_numeric(disj_trust)
+        disj_trust_nums.append(disj_num)
+        if disj_num >= solver_num:
+            disj_discharged += 1
+            discharged_count += 1
 
         # (c) Conditional products between successive pairs
         for i in range(len(trusts_only) - 1):
@@ -355,18 +374,17 @@ def main():
             prog_trusts.append(cond_trust)
             cond_count += 1
             prog_products += 1
+            cond_num = _trust_numeric(cond_trust)
+            cond_trust_nums.append(cond_num)
+            if cond_num >= solver_num:
+                cond_discharged += 1
+                discharged_count += 1
 
         total_products += prog_products
 
         # 5. Compute trust metrics for this program
         for pt in prog_trusts:
             product_trusts.append(_trust_numeric(pt))
-
-        # 6. Check discharged (no residuals): top-level trust ≥ SOLVER_DISCHARGED
-        conj_num = _trust_numeric(conj_trust)
-        solver_num = _trust_numeric(TrustLevel.SOLVER_DISCHARGED)
-        if conj_num >= solver_num:
-            discharged_count += 1
 
         # 7. Monotonicity check: meet ≤ each input, join ≥ each input
         for t in trusts_only:
@@ -399,8 +417,17 @@ def main():
     mean_trust = safe_mean(product_trusts)
     min_trust = min(product_trusts) if product_trusts else 0.0
     mean_product_time = safe_mean(product_times)
-    discharged_rate = discharged_count / max(total_programs, 1)
+    median_product_time = safe_median(product_times)
+    discharged_rate = discharged_count / max(total_products, 1)
     monotonicity_rate = monotone_count / max(monotone_checks, 1)
+
+    # Per-product-type aggregates
+    conj_mean_trust = safe_mean(conj_trust_nums)
+    disj_mean_trust = safe_mean(disj_trust_nums)
+    cond_mean_trust = safe_mean(cond_trust_nums)
+    conj_discharged_rate = conj_discharged / max(conj_count, 1)
+    disj_discharged_rate = disj_discharged / max(disj_count, 1)
+    cond_discharged_rate = cond_discharged / max(cond_count, 1)
 
     print()
     print(f"  Total programs:      {total_programs}")
@@ -432,8 +459,18 @@ def main():
     m("MeanTrust", f"{mean_trust:.3f}")
     m("MinTrust", f"{min_trust:.3f}")
     m("MeanProductTime", fmt_time(mean_product_time))
+    m("MedianProductTime", fmt_time(median_product_time))
     m("DischargedRate", fmt_pct(discharged_rate))
     m("Monotonicity", fmt_pct(monotonicity_rate))
+
+    # Per-product-type macros
+    m("ConjMeanTrust", f"{conj_mean_trust:.3f}")
+    m("DisjMeanTrust", f"{disj_mean_trust:.3f}")
+    m("CondMeanTrust", f"{cond_mean_trust:.3f}")
+    m("ConjDischargedRate", fmt_pct(conj_discharged_rate))
+    m("DisjDischargedRate", fmt_pct(disj_discharged_rate))
+    m("CondDischargedRate", fmt_pct(cond_discharged_rate))
+    m("DischargedTotal", discharged_count)
 
     tex_path = os.path.join(ROOT, "papers", "data-paper44.tex")
     os.makedirs(os.path.dirname(tex_path), exist_ok=True)
@@ -461,8 +498,16 @@ def main():
             "mean_trust": mean_trust,
             "min_trust": min_trust,
             "mean_product_time_s": mean_product_time,
+            "median_product_time_s": median_product_time,
             "discharged_rate": discharged_rate,
+            "discharged_total": discharged_count,
             "monotonicity_rate": monotonicity_rate,
+            "conj_mean_trust": conj_mean_trust,
+            "disj_mean_trust": disj_mean_trust,
+            "cond_mean_trust": cond_mean_trust,
+            "conj_discharged_rate": conj_discharged_rate,
+            "disj_discharged_rate": disj_discharged_rate,
+            "cond_discharged_rate": cond_discharged_rate,
             "per_program": per_program,
         }, fh, indent=2)
 
