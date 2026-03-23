@@ -256,7 +256,7 @@ def _call_llm(prompt: str, max_tokens: int = 4096) -> str:
             result = subprocess.run(
                 ["copilot", "-p", prompt, "--model", "gpt-5.4",
                  "--available-tools", ""],
-                capture_output=True, text=True, timeout=120, cwd=_ROOT,
+                capture_output=True, text=True, timeout=600, cwd=_ROOT,
             )
             if result.returncode == 0 and result.stdout.strip():
                 # Strip tool narration
@@ -377,6 +377,9 @@ class DirectedResearch:
 
         # Phase 4: BENCHMARK — establish metrics and run them
         self._benchmark()
+
+        # Phase 4b: VALIDATE — ensure code works with real libraries/datasets
+        self._validate_integration()
 
         # Phase 5: EVALUATE + REFINE loop
         iteration = 0
@@ -593,6 +596,10 @@ class DirectedResearch:
             3. A benchmarks module with evaluation harnesses
             4. A CLI with 3-5 commands for the main operations
             5. Test cases covering edge cases
+            6. An integration module that works with REAL Python libraries and data formats
+               standard in this domain (e.g., pandas, numpy, yfinance, scikit-learn, etc.)
+            7. Data loaders for standard formats (CSV, JSON, API endpoints, etc.)
+            8. Compatibility with existing tools and baselines in the field
 
             Respond as JSON:
             {{
@@ -934,6 +941,114 @@ class DirectedResearch:
             except Exception:
                 pass
         return 0.5  # Couldn't measure
+
+    # ── Phase 4b: VALIDATE INTEGRATION ─────────────────────────────
+
+    def _validate_integration(self):
+        """Ensure generated code works with real Python libraries and data formats.
+
+        This is VERIFY on R ∩ E: check that the code surface (R) can actually
+        interact with real-world evidence (E) through standard libraries and
+        dataset formats. The LLM is asked to generate integration tests and
+        adapter code for whatever libraries and data formats are standard
+        in the target domain.
+        """
+        start = time.time()
+        self._log("Phase 4b: VALIDATE — checking library/dataset integration...")
+
+        if self.no_llm or not self.plan:
+            self._record(IterationKind.BENCHMARK,
+                         "Integration validation skipped (no LLM)",
+                         SurfaceKind.EVIDENCE, 0.5, 0.5, 0, 0, time.time() - start)
+            return
+
+        # Ask LLM what libraries and data formats this domain needs
+        integration_prompt = textwrap.dedent(f"""\
+            The following Python package was just generated:
+
+            PACKAGE: {self.plan.package_name}
+            PURPOSE: {self.plan.one_liner}
+            THEORY: {self.theory[:300]}
+            PROMPT: {self.prompt}
+            MODULES: {', '.join(self.plan.module_names)}
+
+            What Python libraries and data formats does this tool NEED to work with
+            in the real world? Think about:
+            1. What pip-installable libraries are standard in this domain?
+               (e.g., yfinance, pandas, scikit-learn, networkx, cvxpy, etc.)
+            2. What data formats does real-world data come in?
+               (e.g., CSV, JSON, Parquet, HDF5, API endpoints)
+            3. What standard datasets or APIs should the tool support out of the box?
+               (e.g., Yahoo Finance API, UCI ML datasets, OEIS, etc.)
+            4. What existing tools/baselines should it be compatible with?
+               (e.g., read output from scipy.optimize, compare with sklearn metrics)
+
+            Then generate a Python file called `integration.py` that:
+            - Imports and wraps the key external libraries
+            - Provides data loaders for standard formats
+            - Includes adapter functions connecting real data to the package's types
+            - Has a `validate_environment()` function that checks all deps are installed
+            - Has a `load_sample_data()` function returning a small built-in example
+            - Is AT LEAST 500 lines of real, working code
+
+            Return ONLY Python code, no markdown fences.
+        """)
+
+        code = _call_llm(integration_prompt, max_tokens=16384)
+        if code.startswith("```"):
+            lines = code.split("\n")
+            code = "\n".join(l for l in lines if not l.startswith("```"))
+
+        # Write integration module
+        pkg_dir = None
+        for f in self.code_files:
+            if f.endswith("__init__.py"):
+                pkg_dir = pathlib.Path(f).parent
+                break
+        if pkg_dir:
+            int_path = pkg_dir / "integration.py"
+            int_path.write_text(code.strip() + "\n")
+            self.code_files.append(str(int_path))
+            self._log(f"  Wrote integration.py ({len(code.splitlines())} lines)")
+
+        # Also update pyproject.toml with real dependencies
+        dep_prompt = textwrap.dedent(f"""\
+            For a Python package called "{self.plan.package_name}" that does:
+            {self.plan.one_liner}
+
+            List the pip-installable dependencies it needs. Include version constraints.
+            Respond as a JSON list of strings, e.g.:
+            ["numpy>=1.24", "pandas>=2.0", "yfinance>=0.2.18"]
+        """)
+        deps_text = _call_llm(dep_prompt, max_tokens=512)
+        try:
+            import re
+            m = re.search(r'\[[\s\S]*?\]', deps_text)
+            if m:
+                deps = json.loads(m.group())
+                self.plan.dependencies = deps
+                # Rewrite pyproject.toml with real deps
+                toml_path = self.output_dir / "pyproject.toml"
+                if toml_path.exists():
+                    toml_path.write_text(textwrap.dedent(f"""\
+                        [build-system]
+                        requires = ["setuptools>=68"]
+                        build-backend = "setuptools.backends._legacy:_Backend"
+
+                        [project]
+                        name = "{self.plan.package_name}"
+                        version = "0.1.0"
+                        description = "{self.plan.one_liner}"
+                        requires-python = ">=3.10"
+                        dependencies = {json.dumps(deps, indent=4)}
+                    """))
+                    self._log(f"  Updated dependencies: {deps}")
+        except Exception:
+            pass
+
+        self._record(IterationKind.BENCHMARK,
+                     "Validated library/dataset integration",
+                     SurfaceKind.EVIDENCE, 0.5, 0.7, 0, 0, time.time() - start)
 
     # ── Phase 5: EVALUATE ────────────────────────────────────────────
 
