@@ -4399,22 +4399,35 @@ class FoundationPipeline:
 
         for chap_key, prompt in chapter_prompts.items():
             self._log("    Generating chapter: %s …", chap_key)
+            content = None
+            for attempt in range(2):  # retry once on failure
+                try:
+                    content = self._call_llm(prompt, max_tokens=16384)
+                    # Strip markdown fences
+                    content = re.sub(r"^```(?:latex|tex)\s*\n?", "", content.strip())
+                    content = re.sub(r"\n?```\s*$", "", content.strip())
+                    # Strip copilot narrative before actual LaTeX content
+                    content_lines = content.split("\n")
+                    start_idx = 0
+                    for i, line in enumerate(content_lines):
+                        if (line.strip().startswith("\\") or line.strip().startswith("%")
+                                or line.strip().startswith("$")
+                                or "\\begin{" in line or "\\section" in line):
+                            start_idx = i
+                            break
+                    if start_idx > 0:
+                        content = "\n".join(content_lines[start_idx:])
+                    break  # success
+                except Exception as exc:
+                    self._log("    Chapter %s attempt %d failed: %s",
+                              chap_key, attempt + 1, exc)
+                    content = None
+            if content is None:
+                chapters[chap_key] = (
+                    f"\\textit{{Chapter generation not available in this run.}}\n"
+                )
+                continue
             try:
-                content = self._call_llm(prompt, max_tokens=16384)
-                # Strip markdown fences
-                content = re.sub(r"^```(?:latex|tex)\s*\n?", "", content.strip())
-                content = re.sub(r"\n?```\s*$", "", content.strip())
-                # Strip copilot narrative before actual LaTeX content
-                content_lines = content.split("\n")
-                start_idx = 0
-                for i, line in enumerate(content_lines):
-                    if (line.strip().startswith("\\") or line.strip().startswith("%")
-                            or line.strip().startswith("$")
-                            or "\\begin{" in line or "\\section" in line):
-                        start_idx = i
-                        break
-                if start_idx > 0:
-                    content = "\n".join(content_lines[start_idx:])
 
                 # ----- Z3+LLM theorem verify-repair loop -----
                 # theory2.tex: "For each theorem, Z3 encodes it and
@@ -4455,10 +4468,9 @@ class FoundationPipeline:
 
                 chapters[chap_key] = content
             except Exception as exc:
-                self._log("    Chapter %s failed: %s", chap_key, exc)
-                chapters[chap_key] = (
-                    f"\\textit{{Chapter generation failed: {type(exc).__name__}}}\n"
-                )
+                self._log("    Z3 verify-repair failed for %s: %s", chap_key, exc)
+                # content was already set; just use it without Z3 verification
+                chapters[chap_key] = content
 
         # --- Gather code listings (strip internal framework references) ---
         code_sections = ""

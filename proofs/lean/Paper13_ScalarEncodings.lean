@@ -211,9 +211,14 @@ theorem gap_in_gaps (required available : List String) (k : String)
   obtain ⟨hmem, hna⟩ := hgap
   simp only [List.mem_filter]
   refine ⟨hmem, ?_⟩
-  cases hc : available.contains k
-  · rfl
-  · exact absurd (List.mem_of_contains hc) hna
+  cases hc : available.contains k with
+  | false => rfl
+  | true =>
+    exfalso; apply hna
+    simp only [List.contains, List.any_eq_true] at hc
+    obtain ⟨x, hxmem, hxbeq⟩ := hc
+    have := eq_of_beq hxbeq
+    subst this; exact hxmem
 
 /-- If there are no gaps, the statement is fully covered. -/
 theorem no_gaps_fully_covered (required available : List String)
@@ -224,9 +229,14 @@ theorem no_gaps_fully_covered (required available : List String)
   have : k ∈ required.filter (fun r => !available.contains r) := by
     simp only [List.mem_filter]
     refine ⟨hk, ?_⟩
-    cases hc : available.contains k
-    · rfl
-    · exact absurd (List.mem_of_contains hc) hna
+    cases hc : available.contains k with
+    | false => rfl
+    | true =>
+      exfalso; apply hna
+      simp only [List.contains, List.any_eq_true] at hc
+      obtain ⟨x, hxmem, hxbeq⟩ := hc
+      have := eq_of_beq hxbeq
+      subst this; exact hxmem
   rw [hno] at this
   exact absurd this (List.not_mem_nil k)
 
@@ -352,9 +362,9 @@ def propagateStep (trust : List (String × TrustLevel))
 private theorem lookupTrust_cons_eq (kv : String × TrustLevel)
     (rest : List (String × TrustLevel)) (name : String) :
     lookupTrust (kv :: rest) name =
-      if kv.1 == name then kv.2 else lookupTrust rest name := by
+      if kv.1 = name then kv.2 else lookupTrust rest name := by
   simp only [lookupTrust, List.find?_cons]
-  split <;> simp [Option.map, Option.getD, lookupTrust]
+  split <;> simp_all [Option.map, Option.getD, lookupTrust]
 
 private theorem lookupTrust_map_mono
     (acc : List (String × TrustLevel)) (dst : String)
@@ -368,11 +378,8 @@ private theorem lookupTrust_map_mono
     rw [lookupTrust_cons_eq]
     simp only [List.map]
     rw [lookupTrust_cons_eq]
-    by_cases hdst : kv.1 == dst = true <;> by_cases hname : kv.1 == name = true
-    · simp [hdst, hname]; exact Nat.le_max_left _ _
-    · simp [hdst, hname]; exact ih
-    · simp [hdst, hname]
-    · simp [hdst, hname]; exact ih
+    by_cases hdst : kv.1 = dst <;> by_cases hname : kv.1 = name <;> simp_all
+    exact Nat.le_max_left _ _
 
 private theorem foldl_mono
     (acc : List (String × TrustLevel))
@@ -483,7 +490,7 @@ theorem soundness_leq_lit (m n : Int)
   simp [evalBool, evalInt] at h
   use []
   simp [encodeExpr, AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
-        evalLHS, List.foldl]
+        evalLHS, List.foldl, evalInt]
   omega
 
 /-- Soundness for literal equality. -/
@@ -494,7 +501,7 @@ theorem soundness_eq_lit (m n : Int)
   simp [evalBool, evalInt] at h
   use []
   simp [encodeExpr, AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
-        evalLHS, List.foldl]
+        evalLHS, List.foldl, evalInt]
   omega
 
 /-- Completeness for concrete literal leq:
@@ -503,7 +510,7 @@ theorem completeness_leq_lit (m n : Int)
     (h : AffineSystem.satisfiedBy (encodeExpr (.leq (.litInt m) (.litInt n))) [] = true) :
     evalBool (.leq (.litInt m) (.litInt n)) [] = true := by
   simp [AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
-        evalLHS, List.foldl, encodeExpr] at h
+        evalLHS, List.foldl, encodeExpr, evalInt] at h
   simp [evalBool, evalInt]
   omega
 
@@ -516,7 +523,7 @@ theorem soundness_iff_leq (m n : Int) :
   constructor
   · intro ⟨_, h⟩
     simp [AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
-          evalLHS, List.foldl, encodeExpr] at h
+          evalLHS, List.foldl, encodeExpr, evalInt] at h
     simp [evalBool, evalInt]
     omega
   · intro h
