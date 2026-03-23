@@ -401,7 +401,9 @@ def measure_program(name, source):
         local_sections = desc_data.get("local_sections", 0)
 
         bugs_data = bugs_objs[0] if bugs_objs else {}
-        bugs_found = bugs_data.get("count", 0)
+        if isinstance(bugs_data, list):
+            bugs_data = bugs_data[0] if bugs_data else {}
+        bugs_found = bugs_data.get("count", 0) if isinstance(bugs_data, dict) else 0
 
         load_data = load_objs[0] if load_objs else {}
         summary = load_data.get("summary", {})

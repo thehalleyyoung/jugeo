@@ -323,8 +323,10 @@ def measure_program(name, source):
         obstructions = len(desc_data.get("obstructions", []))
 
         bugs_data = bugs_objs[0] if bugs_objs else {}
-        bugs_found = bugs_data.get("count", 0)
-        obs_count = bugs_data.get("obstruction_count", 0)
+        if isinstance(bugs_data, list):
+            bugs_data = bugs_data[0] if bugs_data else {}
+        bugs_found = bugs_data.get("count", 0) if isinstance(bugs_data, dict) else 0
+        obs_count = bugs_data.get("obstruction_count", 0) if isinstance(bugs_data, dict) else 0
 
         return {
             "name": name,

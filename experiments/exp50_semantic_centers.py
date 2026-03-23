@@ -393,6 +393,8 @@ def main():
     m("AlphaStepsFull", f"{agg['alpha']['mean_steps_full']:.1f}")
 
     m("CenterTime", fmt_time(agg["center"]["mean_time"]))
+    m("CenterStepsHalf", f"{agg['center']['mean_steps_half']:.1f}")
+    m("CenterStepsFull", f"{agg['center']['mean_steps_full']:.1f}")
 
     m("Speedup", f"{speedup:.2f}\\times")
 

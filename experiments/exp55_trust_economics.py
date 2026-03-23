@@ -310,8 +310,11 @@ def measure_program(name, source):
         sheaf_pass = 0
         yields = []
         for lev in levels:
-            if ta.is_admissible(lev):
-                admissible_count += 1
+            try:
+                if ta.is_admissible({"level": lev.name, "evidence": "test"}):
+                    admissible_count += 1
+            except Exception:
+                pass
             ops_count += 1
             try:
                 y = ta.theorem_yield(lev)
@@ -323,7 +326,8 @@ def measure_program(name, source):
                 ta.compose(levels[i], levels[j])
                 ops_count += 1
         try:
-            sheaf_result = ta.sheaf_condition_check(levels[:3])
+            assignment = {f"coord_{i}": levels[i % len(levels)] for i in range(3)}
+            sheaf_result = ta.sheaf_condition_check(None, assignment)
             sheaf_pass = 1 if sheaf_result else 0
         except Exception:
             sheaf_pass = 0
