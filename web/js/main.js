@@ -420,6 +420,64 @@ function initNavScroll() {
   }, { passive: true });
 }
 
+// --- Cycle Diagram Animation ---
+function initCycleAnimation() {
+  const diagram = document.getElementById('cycle-diagram');
+  if (!diagram) return;
+
+  // Animate edge labels on hover proximity
+  const nodes = diagram.querySelectorAll('.cycle-node');
+  nodes.forEach(node => {
+    node.addEventListener('mouseenter', () => {
+      node.style.zIndex = '10';
+    });
+    node.addEventListener('mouseleave', () => {
+      node.style.zIndex = '5';
+    });
+  });
+
+  // Subtle floating particle effect around the center
+  const centerGlow = diagram.querySelector('.cycle-center-glow');
+  if (centerGlow) {
+    let t = 0;
+    function animateGlow() {
+      t += 0.015;
+      const offsetX = Math.sin(t * 1.3) * 8;
+      const offsetY = Math.cos(t * 0.9) * 6;
+      centerGlow.style.transform =
+        `translate(calc(-50% + ${offsetX}px), calc(-50% + ${offsetY}px))`;
+      requestAnimationFrame(animateGlow);
+    }
+    animateGlow();
+  }
+
+  // Animate edge labels with subtle fade pulse
+  const labels = diagram.querySelectorAll('.cycle-edge-label');
+  labels.forEach((label, i) => {
+    let lt = i * 2.1;
+    function pulseLabel() {
+      lt += 0.02;
+      const opacity = 0.5 + Math.sin(lt) * 0.3;
+      label.style.opacity = opacity;
+      requestAnimationFrame(pulseLabel);
+    }
+    pulseLabel();
+  });
+
+  // Pulsing glow on SVG edges
+  const edges = diagram.querySelectorAll('.cycle-edge');
+  edges.forEach((edge, i) => {
+    let et = i * 2.1;
+    function pulseEdge() {
+      et += 0.012;
+      const op = 0.25 + Math.sin(et) * 0.15;
+      edge.style.opacity = op;
+      requestAnimationFrame(pulseEdge);
+    }
+    pulseEdge();
+  });
+}
+
 // --- Initialize everything ---
 document.addEventListener('DOMContentLoaded', () => {
   initTheme();
@@ -436,4 +494,5 @@ document.addEventListener('DOMContentLoaded', () => {
   initSyntaxHighlight();
   initCounters();
   initNavScroll();
+  initCycleAnimation();
 });
