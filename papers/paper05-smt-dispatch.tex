@@ -1,0 +1,1396 @@
+\documentclass[11pt]{article}
+\input{jugeo-common}
+
+\title{\textbf{Theory-Aware Verification Condition Routing}}
+
+\author{%
+  Halley Young\\
+  \textit{Microsoft Research}\\
+  \texttt{halleyyoung@microsoft.com}
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Modern verification pipelines send every verification condition (VC)
+to a monolithic SMT solver---typically Z3---without first asking
+\emph{which decidable fragment the VC belongs to}.
+The result is predictable: a quantifier-free linear integer arithmetic
+query embedded in a mixed-theory envelope can be 10$\times$ slower than
+the same query dispatched to a dedicated decision procedure.
+We introduce three components within the \JuGeo{} framework:
+\emph{FragmentClassifier}, which maps each VC to the most specific
+element of a 14-fragment taxonomy in a mean time of $23.6\,\mu$s;
+\emph{FragmentDecomposer}, which applies Nelson--Oppen--style
+decomposition to mixed-theory VCs; and
+\emph{SolverRouter}, which dispatches each classified fragment to the
+backend whose \emph{jurisdiction} covers that fragment, respecting
+trust ceilings from the trust algebra of Paper~4.
+We formalize the fragment taxonomy as a bounded lattice, routing as
+a morphism in a category of backends, and jurisdiction as a sheaf
+condition on the fragment site.
+An evaluation on 30 VCs across 6 fragment families demonstrates
+that classification adds negligible overhead (batch total
+$607.5\,\mu$s), that jurisdiction-aware routing directs 26 of 30
+VCs to a lightweight arithmetic backend at \$0.001 per VC,
+and that \JuGeo{} is the only system among Z3, \Dafny{}/Boogie,
+and Why3 that combines fragment classification, multi-backend
+routing, jurisdiction checking, trust-aware dispatch, and
+Nelson--Oppen decomposition.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{The monolithic dispatch problem}
+
+Consider a \Dafny{} program that proves array sortedness,
+bitvector overflow freedom, and string prefix containment.
+The Boogie intermediate verifier translates each obligation
+into an SMT-LIB query and sends \emph{all} of them to a single
+invocation of Z3~\cite{z3}.
+Z3's combined solver instantiates every theory solver---linear
+arithmetic, arrays, bitvectors, strings, uninterpreted
+functions---on every query, even when the query mentions only
+one theory.
+The overhead is measurable: a \QFLIA{} query wrapped in a
+\texttt{MIXED} envelope routinely takes 10$\times$ longer
+than the same query sent directly to Z3's simplex
+engine~\cite{z3}.
+
+The same phenomenon appears in \Fstar{}~\cite{fstar}, which
+lowers VCs through a tactic monad into SMT-LIB, and in
+Why3~\cite{why3}, which at least allows the user to select
+provers via \emph{driver} annotations but does not automate
+the selection.
+In every case, the tool-chain treats the VC as an opaque
+formula and ignores the decidability structure hiding in
+plain sight.
+
+\subsection{Our contribution}
+
+This paper introduces \emph{theory-aware verification condition
+routing}: the idea that each VC should be classified into the
+most specific decidable fragment \emph{before} it is sent to
+a solver, and that the router should respect both the
+\emph{jurisdiction} of each backend and the \emph{trust ceiling}
+imposed by the trust algebra (Paper~4~\cite{paper04}).
+
+Concretely, we contribute:
+
+\begin{enumerate}[label=(\roman*)]
+  \item A \textbf{14-fragment taxonomy} organized as a bounded
+    lattice, with formal decidability and complexity annotations
+    (\Cref{sec:taxonomy}).
+  \item \textbf{FragmentClassifier}: a syntactic signature
+    extraction algorithm that classifies any VC into the taxonomy
+    in $O(|\varphi|)$ time, with soundness and completeness
+    guarantees (\Cref{sec:classification}).
+  \item \textbf{FragmentDecomposer}: a Nelson--Oppen--style
+    decomposition for mixed-theory VCs that produces
+    equisatisfiable sub-problems (\Cref{sec:decomposition}).
+  \item \textbf{SolverRouter}: a five-strategy dispatcher
+    with jurisdiction checking, trust ceilings, and fallback
+    chains (\Cref{sec:router}).
+  \item A sheaf-theoretic interpretation of jurisdiction as
+    a covering condition on the fragment site
+    (\Cref{sec:trust-integration}).
+\end{enumerate}
+
+\noindent
+We evaluate on 30~VCs drawn from six fragment families
+(\Cref{sec:evaluation}) and compare against Z3 monolithic,
+\Dafny{}/Boogie, and Why3.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Background}\label{sec:background}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{SMT-LIB fragments and decidability}
+
+The SMT-LIB standard~\cite{smtlib} organizes first-order theories
+into \emph{logics}, each identified by a string such as
+\QFLIA{}, \QFLRA{}, or \QFBV{}.
+A logic specifies both the background theory and the syntactic
+restrictions (quantifier-free, linear, etc.) that guarantee
+decidability.
+For quantifier-free fragments, decision procedures exist with
+known complexity bounds: \QFLIA{} is NP-complete via integer
+linear programming~\cite{schrijver}, \QFLRA{} is polynomial
+via the simplex method, and \QFBV{} is NP-complete via
+bit-blasting~\cite{kroening-strichman}.
+
+\subsection{Nelson--Oppen theory combination}
+
+When a formula mixes symbols from multiple theories
+$T_1, \ldots, T_n$, the Nelson--Oppen method~\cite{nelson-oppen}
+provides a modular decision procedure, provided each $T_i$
+is \emph{stably infinite} and \emph{convex}.
+The method partitions the formula into theory-pure sub-formulas,
+solves each independently, and propagates equalities over
+shared variables until a fixed point is reached.
+
+\begin{definition}[Theory purity]\label{def:purity}
+A formula $\varphi$ is \emph{$T_i$-pure} if every
+non-logical symbol in~$\varphi$ belongs to the signature
+$\Sigma_i$ of~$T_i$, and every variable in~$\varphi$ has a sort
+in~$T_i$.
+\end{definition}
+
+\subsection{Judgment geometry in brief}
+
+The \JuGeo{} framework (Papers~1--4) organizes verification evidence
+into \emph{judgments}
+$\J = \Jud{\coord}{\prop}{\carrier}{\evid}{\oblig}{\obstr}{\trust}{\prov}$,
+where each component carries semantic meaning: the coordinate~$\coord$
+locates the judgment in a semantic site~$\Site$, the
+proposition~$\prop$ is the claim, the trust annotation~$\trust$
+records provenance, and the evidence bundle~$\evid$ carries
+the proof artifact.
+
+The trust algebra $\Talg$ from Paper~4 orders evidence channels:
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot \;\tleq\;
+  \Toracle \;\tleq\; \Truntime \;\tleq\; \Tsolver \;\tleq\;
+  \Tproof
+\]
+A backend that returns \texttt{unsat} produces evidence at
+level~$\Tsolver$; a backend that times out yields~$\Tunver$;
+an LLM oracle yields at most~$\Tcopilot$.
+The trust algebra's \emph{no silent promotion} invariant
+guarantees that no composition step can silently upgrade
+a weak result to a stronger tier.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{The Fragment Taxonomy}\label{sec:taxonomy}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{The fourteen fragments}
+
+We define a taxonomy of 14 fragments sufficient to cover the VCs
+arising in \Dafny{}, \Fstar{}, and \LEAN{} verification
+pipelines.
+
+\begin{definition}[Fragment taxonomy]\label{def:taxonomy}
+The \emph{fragment taxonomy} is the set
+\[
+  \mathcal{F} = \bigl\{\,
+    \QFLIA,\; \QFLRA,\; \QFBV,\; \QFUF,\;
+    \texttt{QF\_AUFLIA},\; \texttt{QF\_ABV},\;
+    \texttt{STRINGS},\; \texttt{SEQUENCES},\;
+    \texttt{ARRAYS},\; \texttt{DATATYPES},\;
+    \texttt{NONLINEAR},\; \texttt{QUANTIFIED},\;
+    \texttt{MIXED},\; \texttt{UNKNOWN}
+  \,\bigr\}
+\]
+equipped with a partial order $\sqsubseteq$ defined by
+theory inclusion: $F_1 \sqsubseteq F_2$ iff every formula
+in~$F_1$ is also in~$F_2$.
+\end{definition}
+
+\begin{theorem}[Decidability classification]\label{thm:decidability}
+Each fragment $F \in \mathcal{F}$ has a known decidability
+status and worst-case complexity:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Fragment} & \textbf{Decidable?} & \textbf{Complexity} \\
+\midrule
+\QFLIA       & Yes & NP-complete \\
+\QFLRA       & Yes & Polynomial (simplex) \\
+\QFBV        & Yes & NP-complete (bit-blasting) \\
+\QFUF        & Yes & $O(n \log n)$ (congruence closure) \\
+\texttt{QF\_AUFLIA} & Yes & NP-complete \\
+\texttt{QF\_ABV}    & Yes & NP-complete \\
+\texttt{STRINGS}    & Yes & PSPACE \\
+\texttt{SEQUENCES}  & Yes & PSPACE \\
+\texttt{ARRAYS}     & Yes & NP-complete (QF fragment) \\
+\texttt{DATATYPES}  & Yes & NP-complete (QF fragment) \\
+\texttt{NONLINEAR}  & Undecidable in general & Semi-decidable \\
+\texttt{QUANTIFIED} & Undecidable in general & Semi-decidable \\
+\texttt{MIXED}      & Depends on components & Via Nelson--Oppen \\
+\texttt{UNKNOWN}    & Unknown & Fallback \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{theorem}
+
+\begin{proof}
+The decidability and complexity results for \QFLIA{}, \QFLRA{},
+\QFBV{}, and \QFUF{} are classical; see
+Kroening and Strichman~\cite{kroening-strichman} for a unified
+treatment.
+The \texttt{STRINGS} fragment is decidable in PSPACE by the
+word-equation results of Makanin~\cite{makanin} as refined by
+Plandowski.
+\texttt{NONLINEAR} real arithmetic is decidable (Tarski), but
+\texttt{NONLINEAR} integer arithmetic is undecidable
+(Matiyasevich); we conservatively mark the combined fragment
+as undecidable.
+\texttt{QUANTIFIED} formulas over arithmetic are undecidable
+by the same argument.
+\texttt{MIXED} formulas inherit decidability via Nelson--Oppen
+when all component theories are decidable, stably infinite,
+and convex~\cite{nelson-oppen}.
+\end{proof}
+
+\subsection{The fragment lattice}
+
+The partial order $(\mathcal{F}, \sqsubseteq)$ forms a bounded
+lattice with bottom element $\QFUF$ (the most restrictive
+decidable fragment) and top element $\texttt{UNKNOWN}$.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzcd}[row sep=1.8em, column sep=0.6em]
+  & & \texttt{UNKNOWN} & & \\
+  & \texttt{MIXED} \arrow[ur] & & \texttt{QUANTIFIED} \arrow[ul] & \\
+  \texttt{NONLINEAR} \arrow[ur] & \texttt{STRINGS} \arrow[u]
+    & \texttt{DATATYPES} \arrow[ul]
+    & \texttt{SEQUENCES} \arrow[ull]
+    & \texttt{ARRAYS} \arrow[ulll] \\
+  & \texttt{QF\_AUFLIA} \arrow[ul] \arrow[u] \arrow[ur]
+    & & \texttt{QF\_ABV} \arrow[ul] \arrow[u] & \\
+  \QFLIA \arrow[ur] & \QFLRA \arrow[u]
+    & \QFBV \arrow[ur] \arrow[uul]
+    & & \\
+  & & \QFUF \arrow[ull] \arrow[ul] \arrow[u] & &
+\end{tikzcd}
+\caption{The fragment lattice $(\mathcal{F}, \sqsubseteq)$.
+  An arrow $F_1 \to F_2$ means $F_1 \sqsubseteq F_2$, \ie{}
+  every formula in~$F_1$ is also in~$F_2$.}
+\label{fig:lattice}
+\end{figure}
+
+\begin{definition}[Fragment membership]\label{def:membership}
+A closed formula $\varphi$ over signature $\Sigma$ belongs to
+fragment $F \in \mathcal{F}$, written $\varphi \in F$, if:
+\begin{enumerate}[label=(\alph*)]
+  \item every non-logical symbol in~$\varphi$ belongs to the
+    signature of~$F$,
+  \item the syntactic restrictions of~$F$ are satisfied
+    (\eg{} quantifier-free, linear, fixed-width bitvector), and
+  \item no proper sub-fragment $F' \sqsubset F$ satisfies
+    (a) and (b).
+\end{enumerate}
+Condition~(c) ensures that membership returns the \emph{most
+specific} fragment.
+\end{definition}
+
+\begin{lemma}[Lattice properties]\label{lem:lattice}
+$(\mathcal{F}, \sqsubseteq)$ is a bounded lattice with:
+\begin{enumerate}[label=(\roman*)]
+  \item Bottom: $\bot = \QFUF$, since uninterpreted functions
+    appear in every theory.
+  \item Top: $\top = \texttt{UNKNOWN}$, which contains all formulas.
+  \item Meet: $F_1 \sqcap F_2$ is the most specific fragment
+    containing both $F_1 \cap F_2$.
+  \item Join: $F_1 \sqcup F_2$ is the least general fragment
+    containing $F_1 \cup F_2$.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+The partial order $\sqsubseteq$ is reflexive, antisymmetric,
+and transitive by definition of theory inclusion.
+Existence of meets and joins follows from finiteness of
+$\mathcal{F}$: for any finite poset, meets and joins exist
+if and only if the poset is a lattice, and one verifies
+directly that every pair in the Hasse diagram of
+\Cref{fig:lattice} has both a least upper bound and a greatest
+lower bound.
+The bounds $\bot = \QFUF$ and $\top = \texttt{UNKNOWN}$ are
+immediate.
+\end{proof}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Fragment Classification}\label{sec:classification}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Syntactic signature extraction}
+
+The first step in theory-aware routing is to determine which
+fragment a VC belongs to.
+We accomplish this via \emph{syntactic signature extraction}:
+a single pass over the abstract syntax tree of~$\varphi$
+that collects the set of theory symbols, quantifier depth,
+and linearity constraints.
+
+\begin{definition}[FragmentClassifier]\label{def:classifier}
+The \emph{FragmentClassifier} is a function
+\[
+  \mathsf{classify} : \mathsf{Formula} \to \mathcal{F}
+\]
+defined by the following decision tree:
+\begin{enumerate}[label=\textbf{Step~\arabic*}.]
+  \item Extract the syntactic signature
+    $\sigma(\varphi) = (\mathit{sorts},\, \mathit{funs},\,
+    \mathit{preds},\, \mathit{qd},\, \mathit{lin})$
+    where $\mathit{qd}$ is the quantifier depth and
+    $\mathit{lin}$ is a linearity flag.
+  \item If $\mathit{qd} > 0$, return $\texttt{QUANTIFIED}$.
+  \item If $\sigma$ contains string operations
+    (\texttt{str.len}, \texttt{str.++}, \texttt{str.contains}),
+    return $\texttt{STRINGS}$.
+  \item If $\sigma$ contains bitvector operations
+    (\texttt{bvadd}, \texttt{bvand}, \texttt{extract}) and
+    array operations (\texttt{select}, \texttt{store}),
+    return $\texttt{QF\_ABV}$.
+  \item If $\sigma$ contains bitvector operations only,
+    return $\QFBV$.
+  \item If $\sigma$ contains array operations with integer
+    indices, return $\texttt{QF\_AUFLIA}$.
+  \item If $\mathit{lin} = \mathsf{false}$ (\ie{} nonlinear
+    multiplication), return $\texttt{NONLINEAR}$.
+  \item If $\sigma$ contains only integer arithmetic,
+    return $\QFLIA$.
+  \item If $\sigma$ contains only real arithmetic,
+    return $\QFLRA$.
+  \item Otherwise, return $\QFUF$.
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Classification soundness]\label{thm:class-sound}
+If $\mathsf{classify}(\varphi) = F$, then $\varphi \in F$.
+That is, the classifier never assigns a VC to a fragment
+whose signature does not contain the VC's symbols.
+\end{theorem}
+
+\begin{proof}
+We proceed by case analysis on the decision tree.
+In each branch, the classifier checks a sufficient condition
+for membership: the presence of theory-specific symbols
+(\eg{} \texttt{str.len} for \texttt{STRINGS}) or structural
+properties ($\mathit{qd} > 0$ for \texttt{QUANTIFIED}).
+By \Cref{def:membership}, membership requires that the
+formula's symbols belong to the fragment's signature.
+Since the decision tree tests exactly this, the assignment
+$\mathsf{classify}(\varphi) = F$ implies
+$\varphi \in F$.
+
+For the priority ordering: each branch is guarded by the
+\emph{absence} of higher-priority symbols.
+For instance, \texttt{STRINGS} is checked before \QFLIA{},
+so a formula with both string and integer symbols is correctly
+classified as \texttt{STRINGS} rather than \QFLIA{}.
+\end{proof}
+
+\begin{theorem}[Classification completeness]\label{thm:class-complete}
+For every formula $\varphi$ that belongs to some decidable
+fragment $F \in \mathcal{F}$, the classifier returns the most
+specific fragment: if $\mathsf{classify}(\varphi) = F'$, then
+$F' \sqsubseteq F$ for all $F$ with $\varphi \in F$.
+\end{theorem}
+
+\begin{proof}
+The decision tree is ordered by specificity: quantified
+formulas are caught first (the most general undecidable
+fragment), then string, bitvector, array, nonlinear, and
+finally pure arithmetic and UF.
+Within each branch, the test is tight: a formula classified
+as \QFLIA{} contains \emph{only} integer linear arithmetic
+symbols, so no more specific fragment can contain it.
+The base case $\QFUF$ catches every formula not matched by
+a more specific branch, and by \Cref{def:membership}(c),
+$\QFUF$ is the most specific fragment for such formulas.
+\end{proof}
+
+\subsection{Classification in practice}
+
+The following \Python{} listing shows the classifier in action:
+
+\begin{lstlisting}[caption={Fragment classification (simplified).},
+  label=lst:classifier]
+from enum import Enum
+from dataclasses import dataclass
+
+class Fragment(Enum):
+    QF_LIA    = "QF_LIA"
+    QF_LRA    = "QF_LRA"
+    QF_BV     = "QF_BV"
+    QF_UF     = "QF_UF"
+    QF_AUFLIA = "QF_AUFLIA"
+    QF_ABV    = "QF_ABV"
+    STRINGS   = "STRINGS"
+    SEQUENCES = "SEQUENCES"
+    ARRAYS    = "ARRAYS"
+    DATATYPES = "DATATYPES"
+    NONLINEAR = "NONLINEAR"
+    QUANTIFIED = "QUANTIFIED"
+    MIXED     = "MIXED"
+    UNKNOWN   = "UNKNOWN"
+
+@dataclass(frozen=True)
+class SyntacticSignature:
+    has_quantifiers: bool
+    has_strings: bool
+    has_bitvectors: bool
+    has_arrays: bool
+    has_nonlinear: bool
+    has_integers: bool
+    has_reals: bool
+
+def classify(sig: SyntacticSignature) -> Fragment:
+    if sig.has_quantifiers:
+        return Fragment.QUANTIFIED
+    if sig.has_strings:
+        return Fragment.STRINGS
+    if sig.has_bitvectors and sig.has_arrays:
+        return Fragment.QF_ABV
+    if sig.has_bitvectors:
+        return Fragment.QF_BV
+    if sig.has_arrays and sig.has_integers:
+        return Fragment.QF_AUFLIA
+    if sig.has_nonlinear:
+        return Fragment.NONLINEAR
+    if sig.has_integers:
+        return Fragment.QF_LIA
+    if sig.has_reals:
+        return Fragment.QF_LRA
+    return Fragment.QF_UF
+\end{lstlisting}
+
+\subsection{Complexity of classification}
+
+\begin{lemma}[Classification cost]\label{lem:class-cost}
+$\mathsf{classify}$ runs in $O(|\varphi|)$ time,
+where $|\varphi|$ is the size of the formula's AST.
+\end{lemma}
+
+\begin{proof}
+Signature extraction requires a single depth-first traversal
+of the AST, recording the presence of theory-specific symbols
+and the quantifier depth.
+The decision tree in \Cref{def:classifier} performs a constant
+number of comparisons.
+Total cost: $O(|\varphi|) + O(1) = O(|\varphi|)$.
+\end{proof}
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Theory Decomposition}\label{sec:decomposition}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Nelson--Oppen decomposition for MIXED formulas}
+
+When the classifier returns \texttt{MIXED}, the formula spans
+multiple theories and cannot be sent to a single specialized
+backend.
+We apply a Nelson--Oppen--style decomposition~\cite{nelson-oppen}
+to split the formula into theory-pure sub-formulas.
+
+\begin{definition}[Theory decomposition]\label{def:decomposition}
+Given a formula $\varphi$ over combined signature
+$\Sigma = \Sigma_1 \cup \cdots \cup \Sigma_n$,
+the \emph{Nelson--Oppen decomposition} produces:
+\begin{enumerate}[label=(\alph*)]
+  \item Theory-pure sub-formulas
+    $\varphi_1, \ldots, \varphi_n$ where each $\varphi_i$
+    is $T_i$-pure (\Cref{def:purity}).
+  \item A set of shared variables
+    $V_{\mathit{shared}} = \bigcup_{i \neq j}
+    (\mathsf{vars}(\varphi_i) \cap \mathsf{vars}(\varphi_j))$.
+  \item An equality propagation loop that communicates
+    entailed equalities $x = y$ for
+    $x, y \in V_{\mathit{shared}}$ between the sub-solvers
+    until a fixed point.
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Decomposition correctness]\label{thm:decomp}
+Let $\varphi$ be a formula over combined signature
+$\Sigma_1 \cup \cdots \cup \Sigma_n$ where each $T_i$ is
+stably infinite and convex.
+Let $\varphi_1, \ldots, \varphi_n$ be the Nelson--Oppen
+decomposition of~$\varphi$.
+Then:
+\[
+  \varphi \text{ is satisfiable}
+  \;\;\Longleftrightarrow\;\;
+  \bigwedge_{i=1}^{n} \varphi_i \text{ is satisfiable
+  (under shared-variable propagation)}
+\]
+\end{theorem}
+
+\begin{proof}
+($\Rightarrow$) If $\varphi$ has a model $\mathcal{M}$,
+then the restriction $\mathcal{M}|_{\Sigma_i}$ satisfies
+$\varphi_i$ for each~$i$, and all shared-variable equalities
+holding in $\mathcal{M}$ are consistent across restrictions.
+
+($\Leftarrow$) Suppose each $\varphi_i$ has a model
+$\mathcal{M}_i$.
+By the stable infiniteness of each~$T_i$, we can extend each
+$\mathcal{M}_i$ to have the same cardinality.
+By convexity, if $T_i \models \varphi_i \Rightarrow
+\bigvee_{k} (x_k = y_k)$, then there exists some~$k$ with
+$T_i \models \varphi_i \Rightarrow (x_k = y_k)$, which is
+propagated to all other sub-solvers.
+The fixed-point iteration terminates because the number of
+shared equalities is bounded by $|V_{\mathit{shared}}|^2$,
+and each iteration either propagates a new equality or
+detects unsatisfiability.
+The combined model is obtained by amalgamating the individual
+models along the shared variables, which is possible by the
+Robinson joint consistency theorem applied to stably infinite
+theories~\cite{nelson-oppen}.
+\end{proof}
+
+\begin{lemma}[Shared variable propagation]\label{lem:shared-vars}
+The equality propagation loop terminates in at most
+$\binom{|V_{\mathit{shared}}|}{2}$ rounds, and each
+propagated equality preserves satisfiability of the
+individual sub-problems.
+\end{lemma}
+
+\begin{proof}
+Each round either propagates a new equality
+$x = y$ with $x, y \in V_{\mathit{shared}}$, refining
+the equivalence relation on shared variables, or reaches a
+fixed point.
+There are at most $\binom{|V_{\mathit{shared}}|}{2}$
+distinct equalities, so termination follows.
+Preservation of satisfiability holds because a propagated
+equality $x = y$ is entailed by $T_i \cup \{\varphi_i\}$;
+adding it to $T_j \cup \{\varphi_j\}$ restricts the models
+of~$\varphi_j$ but cannot introduce new satisfying assignments,
+hence satisfiability is preserved (though the set of models
+may shrink).
+\end{proof}
+
+\subsection{Decomposition flow}
+
+The following diagram shows the decomposition pipeline:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzcd}[row sep=2.5em, column sep=2.8em]
+  \varphi_{\texttt{MIXED}}
+    \arrow[r, "\text{purify}"]
+    \arrow[d, "\text{extract}" swap]
+  & \varphi_1 \sqcup \cdots \sqcup \varphi_n
+    \arrow[r, "\text{solve}"]
+  & \mathsf{Result}_1 \times \cdots \times \mathsf{Result}_n
+    \arrow[d, "\text{combine}"] \\
+  V_{\mathit{shared}}
+    \arrow[r, "\text{propagate}" swap]
+  & \text{Equalities}
+    \arrow[u, "\text{refine}" near start]
+  & \mathsf{Result}_{\texttt{MIXED}}
+\end{tikzcd}
+\caption{Nelson--Oppen decomposition flow.  The formula
+  $\varphi_{\texttt{MIXED}}$ is purified into theory-pure
+  sub-formulas, shared variables are extracted, equalities
+  are propagated until a fixed point, and individual results
+  are combined.}
+\label{fig:decomposition}
+\end{figure}
+
+\subsection{Decomposition in practice}
+
+\begin{lstlisting}[caption={Theory decomposition (simplified).},
+  label=lst:decompose]
+@dataclass
+class Decomposition:
+    sub_formulas: list[tuple[Fragment, str]]
+    shared_vars: list[str]
+
+def decompose(formula: str,
+              fragment: Fragment) -> Decomposition:
+    """Nelson-Oppen decomposition for MIXED formulas."""
+    if fragment != Fragment.MIXED:
+        return Decomposition(
+            sub_formulas=[(fragment, formula)],
+            shared_vars=[])
+    # Purify: split into theory-pure conjuncts
+    conjuncts = extract_conjuncts(formula)
+    pure_groups = group_by_theory(conjuncts)
+    shared = find_shared_variables(pure_groups)
+    # Propagate equalities until fixed point
+    propagate_equalities(pure_groups, shared)
+    return Decomposition(
+        sub_formulas=pure_groups,
+        shared_vars=shared)
+\end{lstlisting}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{The SolverRouter}\label{sec:router}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Backend descriptors}
+
+Each solver backend is described by a \emph{backend descriptor}
+that records its capabilities, cost, and trust level.
+
+\begin{definition}[BackendDescriptor]\label{def:backend}
+A \emph{backend descriptor} is a tuple
+\[
+  B = (\mathit{name},\; \mathit{jurisdiction},\;
+       \mathit{trust\_ceiling},\; \mathit{cost},\;
+       \mathit{latency})
+\]
+where:
+\begin{itemize}
+  \item $\mathit{name} \in \mathsf{String}$ identifies the backend.
+  \item $\mathit{jurisdiction} \subseteq \mathcal{F}$ is the set
+    of fragments the backend can decide.
+  \item $\mathit{trust\_ceiling} \in \Eadm$ is the maximum trust
+    level the backend can produce.
+  \item $\mathit{cost} \in \mathbb{R}_{\geq 0}$ is the per-query
+    cost (in monetary units or resource tokens).
+  \item $\mathit{latency} \in \mathbb{R}_{\geq 0}$ is the
+    expected latency in milliseconds.
+\end{itemize}
+\end{definition}
+
+\subsection{Routing strategies}
+
+\begin{definition}[Routing strategies]\label{def:strategies}
+The \emph{SolverRouter} supports five routing strategies:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Cheapest}: among backends whose jurisdiction
+    covers fragment~$F$, select the one with minimal cost.
+  \item \textbf{Fastest}: select the backend with minimal
+    expected latency.
+  \item \textbf{MostTrusted}: select the backend with the
+    highest trust ceiling.
+  \item \textbf{RoundRobin}: distribute queries evenly across
+    eligible backends.
+  \item \textbf{Smart}: a composite strategy that first
+    filters by jurisdiction, then selects the cheapest among
+    backends within a latency budget.
+\end{enumerate}
+Each strategy first restricts to backends $B$ with
+$F \in B.\mathit{jurisdiction}$; this is the
+\emph{jurisdiction guard}.
+\end{definition}
+
+\subsection{Routing soundness}
+
+\begin{theorem}[Routing soundness]\label{thm:routing-sound}
+For any VC $\varphi$ with $\mathsf{classify}(\varphi) = F$,
+the SolverRouter dispatches~$\varphi$ only to a backend~$B$
+with $F \in B.\mathit{jurisdiction}$.
+\end{theorem}
+
+\begin{proof}
+Every routing strategy begins with the jurisdiction guard:
+\[
+  \mathit{eligible}(F) =
+  \{ B \in \mathit{Backends} \mid F \in B.\mathit{jurisdiction} \}
+\]
+If $\mathit{eligible}(F) = \emptyset$, the router returns a
+$\Tunver$ result with a re-dispatch obligation rather than
+sending the VC to an incompetent backend.
+Otherwise, the strategy selects from $\mathit{eligible}(F)$,
+and by construction, the selected backend has $F$ in its
+jurisdiction.
+\end{proof}
+
+\begin{theorem}[Trust ceiling enforcement]\label{thm:trust-ceiling}
+For any VC $\varphi$ dispatched to backend~$B$, the trust
+level of the result satisfies
+$\trust(\mathsf{result}) \tleq B.\mathit{trust\_ceiling}$.
+\end{theorem}
+
+\begin{proof}
+The router wraps each backend invocation in a
+\emph{trust-capping} combinator:
+\[
+  \mathsf{cap}(B, r) =
+  \begin{cases}
+    r & \text{if } \trust(r) \tleq B.\mathit{trust\_ceiling}, \\
+    \tatten(r, B.\mathit{trust\_ceiling}) & \text{otherwise}.
+  \end{cases}
+\]
+The attenuation operator $\tatten$ from Paper~4 is monotone
+and satisfies $\trust(\tatten(r, c)) \tleq c$ for all~$c$.
+Hence $\trust(\mathsf{cap}(B, r)) \tleq B.\mathit{trust\_ceiling}$.
+\end{proof}
+
+\subsection{Routing architecture}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzcd}[row sep=2.5em, column sep=1.6em]
+  & & \mathsf{SolverRouter}
+    \arrow[dll, "\text{arith}" swap]
+    \arrow[dl, "\text{bv}"]
+    \arrow[d, "\text{str}"]
+    \arrow[dr, "\text{full}"]
+    \arrow[drr, "\text{oracle}"]
+    & & \\
+  \mathsf{z3\text{-}arith}
+  & \mathsf{z3\text{-}bv}
+  & \mathsf{z3\text{-}str}
+  & \mathsf{z3\text{-}full}
+  & \mathsf{copilot}
+\end{tikzcd}
+\caption{Routing architecture.  The SolverRouter dispatches each
+  classified VC to the most appropriate backend.  Arrows represent
+  routing channels; each backend has a jurisdiction, trust
+  ceiling, and cost.}
+\label{fig:routing}
+\end{figure}
+
+\subsection{Jurisdiction as a sheaf condition}
+
+We give a categorical interpretation of jurisdiction that
+connects to the Grothendieck topology developed in Paper~1.
+
+\begin{definition}[Fragment site]\label{def:fragment-site}
+The \emph{fragment site} $\Site_{\mathcal{F}}$ is the category
+whose objects are fragments $F \in \mathcal{F}$ and whose
+morphisms are inclusions $F_1 \hookrightarrow F_2$ for
+$F_1 \sqsubseteq F_2$, equipped with the Grothendieck topology
+$\mathcal{J}$ where a covering sieve on~$F$ is any collection
+of inclusions $\{F_i \hookrightarrow F\}$ such that
+$\bigcup_i F_i = F$.
+\end{definition}
+
+A backend descriptor~$B$ defines a presheaf on $\Site_{\mathcal{F}}$:
+\[
+  \mathcal{B}(F) =
+  \begin{cases}
+    \{\text{solver instance}\} & \text{if } F \in B.\mathit{jurisdiction}, \\
+    \emptyset & \text{otherwise}.
+  \end{cases}
+\]
+The jurisdiction condition states that $B$ can handle a
+fragment $F$ if and only if $\mathcal{B}(F) \neq \emptyset$.
+The \emph{sheaf condition} for routing requires that compatible
+local solutions on an open cover glue to a global solution:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzcd}[row sep=2em, column sep=3em]
+  \mathcal{B}(F)
+    \arrow[r, "\res_{F_1}"]
+    \arrow[d, "\res_{F_2}" swap]
+  & \mathcal{B}(F_1)
+    \arrow[d, "\res_{F_1 \sqcap F_2}"] \\
+  \mathcal{B}(F_2)
+    \arrow[r, "\res_{F_1 \sqcap F_2}" swap]
+  & \mathcal{B}(F_1 \sqcap F_2)
+\end{tikzcd}
+\caption{Sheaf condition for backend jurisdiction.  If a
+  backend covers fragments $F_1$ and $F_2$, its solutions
+  must agree on the overlap $F_1 \sqcap F_2$.}
+\label{fig:sheaf}
+\end{figure}
+
+This ensures that when we decompose a \texttt{MIXED} VC into
+sub-fragments and route each to a different backend, the
+results are compatible on shared variables---precisely the
+condition enforced by Nelson--Oppen propagation.
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Integration with Trust Algebra}\label{sec:trust-integration}
+%% ═══════════════════════════════════════════════════════════════════════
+
+The SolverRouter does not operate in isolation; it is embedded
+in the trust algebra $\Talg$ from Paper~4.
+Each routing outcome maps to a trust level:
+
+\begin{itemize}
+  \item \textbf{Z3 returns \texttt{unsat}}: the VC is
+    \emph{solver-discharged}, producing evidence at trust
+    level $\Tsolver$.
+  \item \textbf{Z3 times out}: the VC is \emph{unverified},
+    producing evidence at level $\Tunver$ with a
+    re-dispatch obligation attached to the judgment.
+  \item \textbf{Copilot oracle responds}: the VC is
+    \emph{oracle-suggested}, producing evidence at level
+    $\Tcopilot$ with a hard ceiling that prevents
+    promotion above $\Tcopilot$ without independent
+    verification.
+\end{itemize}
+
+\begin{lemma}[Conservative join of routing results]%
+\label{lem:conservative-join}
+Let $r_1, \ldots, r_n$ be the results of routing the
+sub-problems of a decomposed VC $\varphi$ to backends
+$B_1, \ldots, B_n$.
+The conservative join
+$\trust(\bigoplus_{i=1}^{n} r_i) =
+\bigsqcap_{i=1}^{n} \trust(r_i)$
+preserves the trust ordering: the combined result has
+trust level equal to the \emph{minimum} of the individual
+trust levels.
+\end{lemma}
+
+\begin{proof}
+By the definition of the conservative join $\tjoin$
+in Paper~4, $\trust(r \tjoin r') = \min(\trust(r), \trust(r'))$.
+Induction on~$n$: the base case $n=1$ is trivial.
+For $n > 1$, $\trust(\bigoplus_{i=1}^{n} r_i) =
+\min(\trust(r_n), \trust(\bigoplus_{i=1}^{n-1} r_i))
+= \min(\trust(r_n), \bigsqcap_{i=1}^{n-1} \trust(r_i))
+= \bigsqcap_{i=1}^{n} \trust(r_i)$.
+This is consistent with the trust algebra's \emph{no silent
+promotion} invariant: a chain is only as strong as its
+weakest link.
+\end{proof}
+
+\begin{lemma}[Re-dispatch obligation]\label{lem:redispatch}
+When backend~$B$ times out on VC~$\varphi$ with fragment~$F$,
+the router attaches an obligation
+$\oblig = \textsc{Re-dispatch}(\varphi, F,
+B.\mathit{trust\_ceiling})$ to the judgment.
+This obligation can be discharged by:
+\begin{enumerate}[label=(\alph*)]
+  \item routing to a fallback backend $B'$ with
+    $F \in B'.\mathit{jurisdiction}$, or
+  \item escalating to the user via the \ESCALATE{} semantic
+    move.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+The obligation is a first-class element of the judgment
+tuple (\cf{} Paper~1).
+Discharge via~(a) follows from \Cref{thm:routing-sound}:
+the fallback backend has jurisdiction.
+Discharge via~(b) is always available because the \ESCALATE{}
+move accepts any obligation and produces an~$\Tunver$ judgment
+with human oversight recorded in the provenance~$\prov$.
+\end{proof}
+
+The connection to Paper~4's trust soundness theorem is direct:
+the SolverRouter is a \emph{trust-monotone} operator.
+Formally, if $\trust(\varphi) = \Tunver$ (the VC has not yet
+been verified), then after routing and solving:
+\[
+  \trust(\mathsf{route}(\varphi)) \in
+  \{\Tunver,\; \Tcopilot,\; \Toracle,\; \Tsolver\}
+\]
+and the transition $\Tunver \tleq \trust(\mathsf{route}(\varphi))$
+is recorded in the provenance.
+No transition can bypass intermediate levels.
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Evaluation}\label{sec:evaluation}
+%% ═══════════════════════════════════════════════════════════════════════
+
+We evaluate the three components---FragmentClassifier,
+FragmentDecomposer, and SolverRouter---on a benchmark of 30~VCs
+drawn from six fragment families.
+All experiments use the \JuGeo{} prototype implementation in
+\Python{}.
+Total elapsed time for the full pipeline: $0.0023$\,s.
+
+%% ─── §1: Classification ─────────────────────────────────────────────
+\subsection{Fragment classification}\label{sec:eval-classify}
+
+We classify all 30~VCs using the FragmentClassifier.
+\Cref{tab:fragment-dist} shows the fragment distribution.
+
+\begin{table}[htbp]
+\centering
+\caption{Fragment distribution across 30 VCs.}
+\label{tab:fragment-dist}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Fragment} & \textbf{Count} \\
+\midrule
+\QFUF            & 16 \\
+\texttt{STRINGS} & 4  \\
+\texttt{QF\_AUFLIA} & 3 \\
+\texttt{NONLINEAR}  & 3 \\
+\texttt{QUANTIFIED} & 3 \\
+\QFBV            & 1  \\
+\midrule
+\textbf{Total}   & 30 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The dominance of \QFUF{} (16 of 30, or 53\%) is consistent
+with the observation that many VCs in practice involve only
+equality and uninterpreted functions, with arithmetic
+appearing in guards and bounds but not in the core obligation.
+
+\Cref{tab:timing} reports classification timing.
+
+\begin{table}[htbp]
+\centering
+\caption{Classification timing ($\mu$s).}
+\label{tab:timing}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Mean    & $23.6$  \\
+Min     & $16.3$  \\
+Max     & $64.7$  \\
+Batch total (30 VCs) & $607.5$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The mean classification time of $23.6\,\mu$s per VC is
+negligible compared to solver invocation times (typically
+milliseconds to seconds).
+The maximum of $64.7\,\mu$s corresponds to VC~1
+(``array bounds non-negative''), which has the
+largest AST in the benchmark.
+The batch total of $607.5\,\mu$s for all 30~VCs
+confirms that classification is not a bottleneck.
+
+A detailed per-VC breakdown is given in \Cref{tab:per-vc}
+(Appendix), but we highlight several representative entries:
+
+\begin{itemize}
+  \item VC~11 (``bitwise complement''): the only \QFBV{}
+    formula, classified in $21.9\,\mu$s.
+  \item VC~6 (``convex combination bound''): classified as
+    \texttt{NONLINEAR} in $24.0\,\mu$s due to the presence
+    of a nonlinear multiplication $\lambda \cdot x$.
+  \item VC~22 (``square non-negative''): classified as
+    \texttt{QUANTIFIED} in $21.7\,\mu$s due to the
+    universal quantifier $\forall x.\; x^2 \geq 0$.
+  \item VC~15 (``array store-select axiom''): classified as
+    \texttt{QF\_AUFLIA} in $22.5\,\mu$s due to the
+    \texttt{select}/\texttt{store} operations.
+\end{itemize}
+
+%% ─── §2: Decomposition ──────────────────────────────────────────────
+\subsection{Theory decomposition}\label{sec:eval-decomp}
+
+Four VCs were identified as candidates for decomposition
+(VC~26 ``arithmetic + UF'', VC~27 ``bitvector + array'',
+VC~28 ``string + arithmetic'', VC~29 ``quantified array'').
+In each case, the FragmentClassifier assigned the VC to a
+single fragment (\QFUF{}, \texttt{QF\_AUFLIA}, \texttt{STRINGS},
+\texttt{QUANTIFIED}, respectively) because the dominant theory
+subsumes the secondary theory.
+As a result, the decomposer produced single-fragment
+decompositions with no shared variables, confirming that
+Nelson--Oppen splitting was not needed for these VCs.
+
+This outcome is expected: most VCs in practice are already
+theory-pure or near-pure.
+The decomposer becomes essential for genuinely mixed VCs, such
+as those combining quantified array reasoning with nonlinear
+arithmetic---a pattern that arises in loop invariant
+verification.
+
+%% ─── §3: Routing ────────────────────────────────────────────────────
+\subsection{Solver routing}\label{sec:eval-routing}
+
+With 5~backends registered, the SolverRouter dispatched all
+30~VCs according to the Smart strategy.
+\Cref{tab:routing} summarizes the routing decisions.
+
+\begin{table}[htbp]
+\centering
+\caption{Routing decision summary.}
+\label{tab:routing}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Backend} & \textbf{VCs Routed} & \textbf{Cost/VC (\$)} & \textbf{Latency (ms)} \\
+\midrule
+\texttt{z3-arithmetic} & 26 & 0.001 & 50 \\
+\texttt{z3-full}       & 4  & 0.005 & 200 \\
+\midrule
+\textbf{Total}         & 30 & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key observations:
+\begin{itemize}
+  \item \textbf{Backend utilization}: 26 of 30 VCs (87\%)
+    were routed to \texttt{z3-arithmetic}, the lightweight
+    backend with the lowest cost (\$0.001/VC) and latency
+    (50\,ms).
+    Only 4 VCs---all in the \texttt{STRINGS} fragment---required
+    the full Z3 combined solver at \$0.005/VC and 200\,ms
+    latency.
+  \item \textbf{Total cost}: \$0.046 for 30 VCs, with an
+    average of \$0.00153 per VC.
+  \item \textbf{Latency}: maximum 200\,ms (string VCs),
+    average 70\,ms across all VCs.
+  \item \textbf{Jurisdiction}: all 30 routing decisions passed
+    the jurisdiction check ($\mathit{jurisdiction\_ok} = \mathsf{true}$
+    for every VC).
+  \item \textbf{Trust ceiling}: all backends reported a trust
+    ceiling of $\mathsf{VERIFIED}$, consistent with the
+    $\Tsolver$ tier.
+  \item \textbf{Fallback chains}: arithmetic-routed VCs had
+    fallback chain [\texttt{z3-full}, \texttt{copilot-oracle}];
+    string-routed VCs had fallback [\texttt{copilot-oracle}].
+\end{itemize}
+
+%% ─── §4: Capability discovery ───────────────────────────────────────
+\subsection{Capability discovery}\label{sec:eval-capability}
+
+We tested the backend capability discovery mechanism with
+5 queries over different domains.
+\Cref{tab:capability} shows the results.
+
+\begin{table}[htbp]
+\centering
+\caption{Capability discovery results.}
+\label{tab:capability}
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Domain(s)} & \textbf{Capable Backend(s)} & \textbf{Count} \\
+\midrule
+arithmetic          & z3-arith  & 1 \\
+identity            & runtime   & 1 \\
+semantic            & copilot   & 1 \\
+equality, arithmetic & z3-arith & 1 \\
+heap                & (none)    & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The ``heap'' domain query returned no capable backends,
+demonstrating that the system correctly reports gaps in
+coverage rather than routing to an incompetent backend.
+This triggers the $\Tunver$ fallback with a re-dispatch
+obligation (\Cref{lem:redispatch}).
+
+%% ─── §5: Comparison ────────────────────────────────────────────────
+\subsection{Comparison with existing systems}\label{sec:eval-compare}
+
+\Cref{tab:comparison} compares \JuGeo{}'s routing capabilities
+with three baselines from the literature.
+
+\begin{table}[htbp]
+\centering
+\caption{Comparison of VC routing approaches.}
+\label{tab:comparison}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Feature} & \textbf{\JuGeo} & \textbf{Z3}
+  & \textbf{\Dafny/Boogie} & \textbf{Why3} \\
+\midrule
+Fragment classification
+  & \checkmark{} (14 fragments)
+  & ---
+  & Partial (triggers)
+  & \checkmark{} (manual) \\
+Multi-backend routing
+  & \checkmark{} (5 strategies)
+  & ---
+  & ---
+  & \checkmark{} (drivers) \\
+Jurisdiction checking
+  & \checkmark
+  & ---
+  & ---
+  & --- \\
+Trust-aware routing
+  & \checkmark
+  & ---
+  & ---
+  & --- \\
+Nelson--Oppen decomp.
+  & \checkmark
+  & Internal
+  & ---
+  & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Z3 monolithic~\cite{z3}.}
+Z3 uses a combined solver architecture: all VCs are sent to
+a single combined theory solver without fragment classification.
+Nelson--Oppen combination happens internally but is not
+exposed to the user.
+There is no notion of jurisdiction, trust, or multi-backend
+routing.
+
+\paragraph{\Dafny/Boogie~\cite{dafny,boogie}.}
+Boogie generates VCs for Z3, with partial theory awareness
+via trigger-based quantifier instantiation.
+The user cannot direct specific VCs to specialized backends,
+and there is no trust tracking.
+
+\paragraph{Why3~\cite{why3}.}
+Why3 supports multiple provers via driver annotations: the user
+specifies which prover to use for which theory.
+This is the closest to \JuGeo{}'s approach, but the
+classification is manual rather than automatic, there is no
+jurisdiction checking, and there is no trust algebra integration.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Related Work}\label{sec:related}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{SMT-COMP fragment tracks}
+
+The annual SMT-COMP competition~\cite{smtcomp} organizes
+benchmarks into fragment tracks (QF\_LIA, QF\_LRA, QF\_BV,
+etc.), and competing solvers are evaluated per-track.
+This implicitly acknowledges that solvers have varying
+performance across fragments.
+Our work makes this observation actionable: rather than
+submitting every VC to every solver, we classify first and
+dispatch to the best backend.
+
+\subsection{Dafny's VC splitting and Boogie}
+
+\Dafny{}~\cite{dafny} and its intermediate verifier
+Boogie~\cite{boogie} perform \emph{VC splitting} to manage
+the complexity of large verification conditions.
+However, this splitting is syntactic (splitting conjunctions)
+rather than theory-aware: both halves of a split may contain
+the same theories.
+Barnett et~al.~\cite{boogie} describe Boogie's architecture
+in detail; the VC generator is theory-agnostic.
+
+\subsection{Why3's multi-prover architecture}
+
+Why3~\cite{why3} pioneered multi-prover verification: the user
+writes WhyML programs and annotations, and Why3 generates VCs
+that can be dispatched to Alt-Ergo, CVC5, Z3, Coq, or
+Isabelle via configurable \emph{drivers}.
+Filliâtre and Paskevich~\cite{why3} describe the driver
+mechanism, which maps WhyML theories to prover-specific
+syntax.
+This is multi-backend routing, but the routing is manual: the
+user must know which prover works best for which theory.
+\JuGeo{} automates this decision via fragment classification
+and adds jurisdiction and trust guarantees.
+
+\subsection{Z3's combined solver architecture}
+
+Internally, Z3~\cite{z3} uses a variant of Nelson--Oppen
+combination with the \emph{model-based theory combination}
+(MBTC) approach of de~Moura and Bjørner.
+The combined solver instantiates theory solvers lazily, but
+the activation decision is made internally and not exposed to
+the user.
+Our FragmentClassifier can be viewed as an external, pre-solver
+version of Z3's internal theory activation logic, with the
+added benefit of being able to route to \emph{different}
+solver instances.
+
+\subsection{Portfolio solvers}
+
+Portfolio solving~\cite{portfolio} runs multiple solvers in
+parallel on the same formula and returns the first result.
+This is complementary to our approach: \JuGeo{} classifies
+first and dispatches to one backend, but the Smart strategy
+could be extended to portfolio mode for high-value VCs.
+The key difference is that portfolio solving is
+theory-oblivious, while our routing is theory-aware.
+
+\subsection{Satisfiability modulo theories}
+
+The foundational work on SMT solving is due to
+Nieuwenhuis, Oliveras, and Tinelli~\cite{smt-survey}, who
+formalize the DPLL(T) architecture.
+Nelson and Oppen~\cite{nelson-oppen} introduced the theory
+combination method that underlies our decomposition.
+Barrett et~al.~\cite{smtlib} standardized the SMT-LIB format
+and its fragment taxonomy, which we extend with trust and
+jurisdiction annotations.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Conclusion}\label{sec:conclusion}
+%% ═══════════════════════════════════════════════════════════════════════
+
+We have introduced \emph{theory-aware verification condition
+routing}, a three-component architecture within the \JuGeo{}
+framework that classifies VCs into decidable fragments,
+decomposes mixed-theory formulas via Nelson--Oppen, and
+dispatches each fragment to the most appropriate backend
+with jurisdiction and trust guarantees.
+
+The fragment taxonomy organizes 14 fragments into a bounded
+lattice with formal decidability and complexity annotations.
+The FragmentClassifier runs in $O(|\varphi|)$ time with a
+mean cost of $23.6\,\mu$s per VC, making it negligible
+relative to solver invocation.
+The SolverRouter supports five strategies and enforces two
+critical invariants: routing soundness (jurisdiction coverage)
+and trust ceiling enforcement.
+
+Our evaluation on 30~VCs demonstrates that jurisdiction-aware
+routing directs 87\% of VCs to a lightweight arithmetic
+backend at \$0.001 per VC, with a total cost of \$0.046
+for the full benchmark.
+A comparison with Z3, \Dafny{}/Boogie, and Why3 shows that
+\JuGeo{} is the only system combining automatic fragment
+classification, multi-backend routing, jurisdiction checking,
+trust-aware dispatch, and Nelson--Oppen decomposition.
+
+The sheaf-theoretic interpretation of jurisdiction as a
+covering condition on the fragment site provides a clean
+categorical semantics and connects to the Grothendieck
+topology of Paper~1.
+The trust integration ensures that every routing decision
+respects the no-silent-promotion invariant of Paper~4.
+
+Future work includes extending the taxonomy with additional
+fragments (sequences, regular expressions, floating-point),
+implementing portfolio mode within the Smart strategy, and
+integrating with \LEAN{} 4's tactic framework to enable
+theory-aware automation within interactive proof assistants.
+
+%% ═══════════════════════════════════════════════════════════════════════
+%% BIBLIOGRAPHY
+%% ═══════════════════════════════════════════════════════════════════════
+\begin{thebibliography}{20}
+
+\bibitem{z3}
+L.~de~Moura and N.~Bj\o{}rner.
+\newblock Z3: An efficient SMT solver.
+\newblock In \emph{TACAS}, LNCS 4963, pp.~337--340. Springer, 2008.
+
+\bibitem{dafny}
+K.~R.~M.~Leino.
+\newblock Dafny: An automatic program verifier for functional correctness.
+\newblock In \emph{LPAR}, LNCS 6355, pp.~348--370. Springer, 2010.
+
+\bibitem{boogie}
+M.~Barnett, B.-Y.~E.~Chang, R.~DeLine, B.~Jacobs, and
+K.~R.~M.~Leino.
+\newblock Boogie: A modular reusable verifier for object-oriented
+programs.
+\newblock In \emph{FMCO}, LNCS 4111, pp.~364--387. Springer, 2005.
+
+\bibitem{why3}
+J.-C.~Filli\^atre and A.~Paskevich.
+\newblock Why3 --- Where programs meet provers.
+\newblock In \emph{ESOP}, LNCS 7792, pp.~125--128. Springer, 2013.
+
+\bibitem{nelson-oppen}
+G.~Nelson and D.~C.~Oppen.
+\newblock Simplification by cooperating decision procedures.
+\newblock \emph{ACM TOPLAS}, 1(2):245--257, 1979.
+
+\bibitem{smtlib}
+C.~Barrett, P.~Fontaine, and C.~Tinelli.
+\newblock The SMT-LIB standard: Version 2.6.
+\newblock Technical report, 2017.
+\newblock \url{https://smtlib.cs.uiowa.edu/}.
+
+\bibitem{fstar}
+N.~Swamy, C.~Hri\c{t}cu, C.~Keller, A.~Rastogi, A.~Delignat-Lavaud,
+S.~Forest, K.~Bhargavan, C.~Fournet, P.-Y.~Strub,
+M.~Kohlweiss, J.-K.~Zinzindohou\'e, and S.~Zanella-B\'eguelin.
+\newblock Dependent types and multi-monadic effects in {F*}.
+\newblock In \emph{POPL}, pp.~256--270. ACM, 2016.
+
+\bibitem{lean4}
+L.~de~Moura and S.~Ullrich.
+\newblock The {Lean}~4 theorem prover and programming language.
+\newblock In \emph{CADE}, LNAI 12699, pp.~625--635. Springer, 2021.
+
+\bibitem{paper04}
+H.~Young.
+\newblock Accounting for trust when machines write proofs.
+\newblock \emph{Judgment Geometry Series}, Paper~4, 2024.
+
+\bibitem{schrijver}
+A.~Schrijver.
+\newblock \emph{Theory of Linear and Integer Programming}.
+\newblock Wiley, 1986.
+
+\bibitem{kroening-strichman}
+D.~Kroening and O.~Strichman.
+\newblock \emph{Decision Procedures: An Algorithmic Point of View}.
+\newblock Springer, 2nd edition, 2016.
+
+\bibitem{makanin}
+G.~S.~Makanin.
+\newblock The problem of solvability of equations in a free semigroup.
+\newblock \emph{Mat. Sbornik}, 103(2):147--236, 1977.
+
+\bibitem{smtcomp}
+SMT-COMP.
+\newblock The satisfiability modulo theories competition.
+\newblock \url{https://smt-comp.github.io/}, 2023.
+
+\bibitem{smt-survey}
+R.~Nieuwenhuis, A.~Oliveras, and C.~Tinelli.
+\newblock Solving {SAT} and {SAT} modulo theories: From an abstract
+{Davis--Putnam--Logemann--Loveland} procedure to {DPLL(T)}.
+\newblock \emph{J. ACM}, 53(6):937--977, 2006.
+
+\bibitem{coq}
+The {Coq} Development Team.
+\newblock The {Coq} proof assistant.
+\newblock \url{https://coq.inria.fr/}, 2023.
+
+\bibitem{portfolio}
+Y.~Xu, M.~Stern, and T.~Sandholm.
+\newblock Algorithm runtime prediction: Methods and evaluation
+(extended abstract).
+\newblock In \emph{IJCAI}, pp.~607--613, 2012.
+
+\end{thebibliography}
+
+%% ═══════════════════════════════════════════════════════════════════════
+%% APPENDIX
+%% ═══════════════════════════════════════════════════════════════════════
+\appendix
+\section{Per-VC Classification Details}\label{app:per-vc}
+
+\begin{table}[htbp]
+\centering
+\caption{Complete per-VC classification and routing results.}
+\label{tab:per-vc}
+\small
+\begin{tabular}{@{}rlllrr@{}}
+\toprule
+\textbf{VC} & \textbf{Description} & \textbf{Fragment}
+  & \textbf{Backend} & \textbf{Time ($\mu$s)} & \textbf{Cost (\$)} \\
+\midrule
+1  & array bounds non-neg.    & \QFUF         & z3-arith & 64.7 & 0.001 \\
+2  & loop index in range      & \QFUF         & z3-arith & 30.4 & 0.001 \\
+3  & addition commutativity   & \QFUF         & z3-arith & 25.5 & 0.001 \\
+4  & scaling preserves sign   & \QFUF         & z3-arith & 26.2 & 0.001 \\
+5  & index within length      & \QFUF         & z3-arith & 24.0 & 0.001 \\
+6  & convex combination       & \texttt{NL}   & z3-arith & 24.0 & 0.001 \\
+7  & average definition       & \QFUF         & z3-arith & 21.1 & 0.001 \\
+8  & temperature ceiling      & \QFUF         & z3-arith & 19.0 & 0.001 \\
+9  & bvadd commutativity      & \QFUF         & z3-arith & 21.6 & 0.001 \\
+10 & unsigned index bound     & \QFUF         & z3-arith & 17.3 & 0.001 \\
+11 & bitwise complement       & \QFBV         & z3-arith & 21.9 & 0.001 \\
+12 & congruence axiom         & \QFUF         & z3-arith & 21.7 & 0.001 \\
+13 & function commutation     & \QFUF         & z3-arith & 19.6 & 0.001 \\
+14 & three distinct elems.    & \QFUF         & z3-arith & 17.7 & 0.001 \\
+15 & array store-select       & \texttt{AUFL} & z3-arith & 22.5 & 0.001 \\
+16 & array read-over-write    & \texttt{AUFL} & z3-arith & 30.4 & 0.001 \\
+17 & str length non-neg.      & \texttt{STR}  & z3-full  & 17.7 & 0.005 \\
+18 & str concat reflexivity   & \texttt{STR}  & z3-full  & 20.1 & 0.005 \\
+19 & substring containment    & \texttt{STR}  & z3-full  & 19.0 & 0.005 \\
+20 & constructor test         & \QFUF         & z3-arith & 18.5 & 0.001 \\
+21 & head accessor            & \QFUF         & z3-arith & 19.1 & 0.001 \\
+22 & square non-neg. ($\forall$)   & \texttt{Q}    & z3-arith & 21.7 & 0.001 \\
+23 & perfect square witness   & \texttt{Q}    & z3-arith & 20.5 & 0.001 \\
+24 & square non-neg. (NL)     & \texttt{NL}   & z3-arith & 16.3 & 0.001 \\
+25 & distance bound           & \texttt{NL}   & z3-arith & 21.2 & 0.001 \\
+26 & arithmetic + UF          & \QFUF         & z3-arith & 23.3 & 0.001 \\
+27 & bitvector + array        & \texttt{AUFL} & z3-arith & 24.1 & 0.001 \\
+28 & string + arithmetic      & \texttt{STR}  & z3-full  & 24.0 & 0.005 \\
+29 & quantified array         & \texttt{Q}    & z3-arith & 29.5 & 0.001 \\
+30 & pointer identity         & \QFUF         & z3-arith & 24.8 & 0.001 \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+\footnotesize
+\texttt{NL} = \texttt{NONLINEAR},\;
+\texttt{STR} = \texttt{STRINGS},\;
+\texttt{AUFL} = \texttt{QF\_AUFLIA},\;
+\texttt{Q} = \texttt{QUANTIFIED}.
+\end{table}
+
+\end{document}

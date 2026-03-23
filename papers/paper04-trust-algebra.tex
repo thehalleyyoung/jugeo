@@ -1,0 +1,1597 @@
+\documentclass[11pt]{article}
+\input{jugeo-common}
+
+\title{\textbf{Accounting for Trust When Machines Write Proofs}}
+
+\author{%
+  Halley Young\\
+  \textit{Microsoft Research}\\
+  \texttt{halleyyoung@microsoft.com}
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Modern verification pipelines combine evidence from radically
+heterogeneous sources: SMT solvers return \texttt{unsat},
+large-language models declare ``looks correct,'' runtime monitors
+observe 95\% test-pass rates, and human reviewers attest
+correctness by inspection.
+No existing system tracks the \emph{provenance} of each piece
+of evidence or prevents the silent upgrading of a weak claim
+to a strong one.
+We introduce the \emph{trust ordered algebra}
+$\Talg = (\Eadm,\;\tleq,\;\tjoin,\;\tatten,\;\tpromote,\;\tdemote)$,
+an eight-level bounded distributive lattice equipped with
+six operations that govern how evidence composes, attenuates,
+promotes (only with explicit justification), and demotes across
+channels.
+The algebra enforces three invariants:
+\emph{no silent promotion},
+\emph{conservative join}, and
+\emph{challenge conservativity}.
+We implement $\Talg$ in \Python{} as part of the \JuGeo{} system
+and evaluate it on six aspects of the trust algebra---lattice
+properties, promotion blocking, copilot self-promotion guards,
+audit logging, trust profiles, and overhead---achieving
+a silent-promotion block rate of~1.0.
+A head-to-head comparison with \LEAN{}, \Fstar{}, \Dafny{},
+and GPT-4o shows that \JuGeo{} is the only system that
+tracks trust provenance, enforces channel ceilings,
+and integrates AI-generated evidence without silent promotion.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{The mixed-evidence problem}
+
+Consider the following scenario, increasingly common in
+practice.  A developer writes a merge-sort implementation
+with three specifications---sortedness, permutation preservation,
+and stability---and asks the tool-chain to verify all three.
+The SMT solver Z3 discharges the sortedness lemma in 12\,ms
+and returns \texttt{unsat}; a large-language model (LLM)
+inspects the code and reports ``permutation preservation looks
+correct''; a test suite of 10\,000 random inputs passes
+at 95\%.  Should the developer trust the conjunction?
+
+Every existing proof assistant answers this question in
+a binary fashion.  In \LEAN{} and \Coq{}, a proposition
+is either proved or it is not; there is no middle
+ground~\cite{lean4,coq}.  \Fstar{} enriches the picture
+with computation types and multi-monadic effects~\cite{fstar},
+but still collapses all evidence into a binary verdict.
+\Dafny{} delegates to Boogie and Z3~\cite{dafny}, and the
+user sees only \texttt{Verified} or an error message.
+In all cases, the system discards the provenance of each
+piece of evidence: a mechanically checked Coq proof carries
+the same \emph{type} as a solver-discharged SMT query, and
+there is no record that the permutation claim rests on an
+LLM's informal assertion rather than a formal proof.
+
+This paper introduces a \emph{trust ordered algebra}
+$\Talg = (\Eadm,\;\tleq,\;\tjoin,\;\tatten,\;\tpromote,\;\tdemote)$
+that solves the mixed-evidence problem by making trust
+a first-class algebraic object.  Instead of collapsing
+evidence into ``proved'' or ``not proved,'' $\Talg$ assigns
+every claim a position in an eight-level bounded distributive
+lattice, tracks which \emph{channel} produced it, and enforces
+three invariants that prevent the silent inflation of trust.
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=*]
+\item We define an eight-level trust lattice $(\Eadm, \tleq)$
+      and prove it is a bounded distributive lattice
+      (\Cref{sec:tiers}).
+\item We equip the lattice with six operations forming
+      the trust ordered algebra $\Talg$
+      (\Cref{sec:algebra}) and state three invariants
+      (\Cref{sec:invariants}).
+\item We prove a soundness theorem: the trust level
+      assigned to a judgment faithfully reflects the quality
+      of its evidence (\Cref{sec:soundness}).
+\item We formalize how AI-generated evidence enters the
+      algebra and show it can never silently promote itself
+      (\Cref{sec:ai}).
+\item We evaluate $\Talg$ on six dimensions of trust-algebra
+      behaviour---lattice properties, promotion blocking, copilot
+      guards, audit logging, trust profiles, and a state-of-the-art
+      comparison with four systems (\Cref{sec:eval}).
+\item We develop trust profiles---immutable, composable
+      summaries of clausewise trust---and show they form
+      a semilattice (\Cref{sec:profiles}).
+\end{enumerate}
+
+\subsection{Notation}
+
+We write $\Talg$ for the full algebra,
+$\Eadm$ for its carrier set (admissible evidence configurations),
+$\tleq$ for the partial order,
+$\tjoin$ for the conservative join,
+$\tatten$ for attenuation,
+$\tpromote$ for (justified) promotion, and
+$\tdemote$ for demotion.
+Trust tiers are typeset in sans-serif:
+$\Tcontra \tleq \Tunver \tleq \Tcopilot \tleq \Toracle
+ \tleq \mathsf{HUMAN} \tleq \Truntime \tleq \Tsolver \tleq \Tproof$.
+Individual judgments are denoted
+$\J = (\coord, \prop, \carrier, \evid, \oblig, \obstr,
+       \trust, \prov)$
+following the 8-tuple of~\cite{paper02}.
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Trust Tiers}\label{sec:tiers}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{The eight-level lattice}
+
+The carrier set $\Eadm$ consists of eight trust levels,
+ordered from weakest to strongest:
+
+\begin{definition}[Trust lattice]\label{def:trust-lattice}
+Let $\Eadm = \{\Tcontra,\;\Tunver,\;\Tcopilot,\;\Toracle,
+\;\mathsf{HUMAN},\;\Truntime,\;\Tsolver,\;\Tproof\}$ with the total order
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot
+  \;\tleq\; \Toracle \;\tleq\; \mathsf{HUMAN}
+  \;\tleq\; \Truntime
+  \;\tleq\; \Tsolver \;\tleq\; \Tproof.
+\]
+Define $\mathsf{meet}(a,b) = \min(a,b)$ and
+$\mathsf{join}(a,b) = \max(a,b)$ under this order.
+Then $(\Eadm, \tleq, \mathsf{meet}, \mathsf{join},
+       \Tcontra, \Tproof)$
+is a bounded lattice with bottom $\bot = \Tcontra$ and
+top $\top = \Tproof$.
+\end{definition}
+
+\noindent
+The implementation instantiates this lattice as a \Python{} enum:
+
+\begin{lstlisting}[caption={Trust levels (\texttt{src/jugeo/evidence/trust.py}).},
+                   label=lst:trust-levels]
+class TrustLevel(str, Enum):
+    MECHANICALLY_VERIFIED = 'mechanically_verified'   # top
+    SOLVER_DISCHARGED     = 'solver_discharged'
+    RUNTIME_WITNESSED     = 'runtime_witnessed'
+    HUMAN_ATTESTED        = 'human_attested'
+    ORACLE_PROPOSED       = 'oracle_proposed'
+    COPILOT_SUGGESTED     = 'copilot_suggested'
+    UNVERIFIED            = 'unverified'
+    CONTRADICTED          = 'contradicted'            # bottom
+\end{lstlisting}
+
+\noindent
+\textbf{Remark.}
+The formal definition and the implementation
+(\Cref{lst:trust-levels}) both use eight levels; the
+$\mathsf{HUMAN\_ATTESTED}$ tier sits between $\Toracle$
+and $\Truntime$.  The algebra remains a bounded distributive
+lattice over all eight levels.
+
+\subsection{Hasse diagram}
+
+\begin{figure}[t]
+\centering
+\begin{tikzcd}[row sep=1.4em, column sep=0em]
+  & \Tproof \arrow[d, dash] & \\
+  & \Tsolver \arrow[d, dash] & \\
+  & \Truntime \arrow[d, dash] & \\
+  & \mathsf{HUMAN} \arrow[d, dash] & \\
+  & \Toracle \arrow[d, dash] & \\
+  & \Tcopilot \arrow[d, dash] & \\
+  & \Tunver \arrow[d, dash] & \\
+  & \Tcontra &
+\end{tikzcd}
+\caption{Hasse diagram of the trust lattice $(\Eadm, \tleq)$.
+  The lattice is totally ordered; every pair of elements is
+  comparable.  Edges denote the covering relation.}
+\label{fig:hasse-main}
+\end{figure}
+
+\subsection{The five-tier sub-lattice}
+
+The hypercover treaty negotiation module uses a coarser,
+five-level sub-lattice suitable for cross-module boundary
+checking:
+
+\begin{lstlisting}[caption={Five-tier lattice
+  (\texttt{hypercover\_treaties/algorithms.py}).},
+                   label=lst:five-tier]
+class TrustTier(IntEnum):
+    PROPOSAL         = 1
+    REVIEWED         = 2
+    VERIFIED         = 3
+    RUNTIME_WITNESSED = 4
+    PROOF_BACKED     = 5
+
+    def join(self, other):
+        return TrustTier(max(self.value, other.value))
+    def meet(self, other):
+        return TrustTier(min(self.value, other.value))
+    def promote(self):
+        return TrustTier(min(self.value + 1, 5))
+    def demote(self):
+        return TrustTier(max(self.value - 1, 1))
+\end{lstlisting}
+
+\begin{figure}[t]
+\centering
+\begin{tikzcd}[row sep=1.4em, column sep=0em]
+  & \mathsf{PROOF\_BACKED} \arrow[d, dash] & \\
+  & \mathsf{RUNTIME\_WITNESSED} \arrow[d, dash] & \\
+  & \mathsf{VERIFIED} \arrow[d, dash] & \\
+  & \mathsf{REVIEWED} \arrow[d, dash] & \\
+  & \mathsf{PROPOSAL} &
+\end{tikzcd}
+\caption{Hasse diagram of the five-tier sub-lattice used in
+  hypercover treaty negotiation.  The embedding
+  $\iota \colon \mathsf{TrustTier} \hookrightarrow \Eadm$
+  preserves meets and joins.}
+\label{fig:hasse-five}
+\end{figure}
+
+\noindent
+The two lattices are related by a lattice homomorphism
+$\iota \colon \mathsf{TrustTier} \to \Eadm$ that maps
+$\mathsf{PROPOSAL} \mapsto \Tunver$,
+$\mathsf{REVIEWED} \mapsto \Toracle$,
+$\mathsf{VERIFIED} \mapsto \Truntime$,
+$\mathsf{RUNTIME\_WITNESSED} \mapsto \Tsolver$,
+$\mathsf{PROOF\_BACKED} \mapsto \Tproof$.
+
+\begin{proposition}[Embedding preserves lattice structure]
+\label{prop:embedding}
+The map $\iota$ is an injective lattice homomorphism:
+for all $a, b \in \mathsf{TrustTier}$,
+\[
+  \iota(\mathsf{meet}(a,b)) = \mathsf{meet}(\iota(a), \iota(b))
+  \qquad\text{and}\qquad
+  \iota(\mathsf{join}(a,b)) = \mathsf{join}(\iota(a), \iota(b)).
+\]
+\end{proposition}
+
+\begin{proof}
+Both lattices are totally ordered and $\iota$ is
+order-preserving (strictly monotone on the five-element chain).
+On a total order, $\mathsf{meet} = \min$ and
+$\mathsf{join} = \max$.
+Since $\iota$ preserves the order,
+$\iota(\min(a,b)) = \min(\iota(a), \iota(b))$ and
+$\iota(\max(a,b)) = \max(\iota(a), \iota(b))$.
+Injectivity is immediate from strict monotonicity.
+\end{proof}
+
+\subsection{Distributivity}
+
+\begin{theorem}[Bounded distributive lattice]
+\label{thm:distributive}
+$(\Eadm, \tleq, \mathsf{meet}, \mathsf{join}, \Tcontra, \Tproof)$
+is a bounded distributive lattice.
+\end{theorem}
+
+\begin{proof}
+A totally ordered set (chain) is trivially a distributive lattice:
+for any $a, b, c$ in a chain,
+\begin{align*}
+  a \wedge (b \vee c)
+    &= \min(a, \max(b, c)) \\
+    &= \max(\min(a, b), \min(a, c)) \\
+    &= (a \wedge b) \vee (a \wedge c).
+\end{align*}
+The identity holds by case analysis on the three possible
+orderings of $a$, $b$, $c$.
+Boundedness holds by construction:
+$\Tcontra \tleq x \tleq \Tproof$ for all $x \in \Eadm$.
+\end{proof}
+
+\begin{corollary}\label{cor:absorption}
+The absorption laws hold: for all $a, b \in \Eadm$,
+\[
+  a \wedge (a \vee b) = a
+  \qquad\text{and}\qquad
+  a \vee (a \wedge b) = a.
+\]
+\end{corollary}
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{The Trust Algebra \texorpdfstring{$\Talg$}{T}}\label{sec:algebra}
+%% ═══════════════════════════════════════════════════════════════════════
+
+We now equip the bounded distributive lattice
+$(\Eadm, \tleq)$ with six operations to form the full
+trust ordered algebra.
+
+\begin{definition}[Trust ordered algebra]\label{def:trust-algebra}
+The \emph{trust ordered algebra} is the six-tuple
+\[
+  \Talg = (\Eadm,\;\tleq,\;\tjoin,\;\tatten,\;\tpromote,\;\tdemote)
+\]
+where:
+\begin{enumerate}[label=(\roman*)]
+\item $(\Eadm, \tleq)$ is the bounded distributive lattice
+      of~\Cref{def:trust-lattice}.
+\item $\tjoin \colon \Eadm \times \Eadm \to \Eadm$ is the
+      \emph{conservative join} (defined below).
+\item $\tatten \colon \Eadm \times \mathbb{N} \to \Eadm$ is
+      \emph{attenuation}.
+\item $\tpromote \colon \Eadm \times \mathsf{Just} \to \Eadm$
+      is \emph{promotion} (requires a non-empty justification).
+\item $\tdemote \colon \Eadm \times \Eadm \to \Eadm$ is
+      \emph{demotion} (enforces a ceiling).
+\end{enumerate}
+We also define a derived \emph{challenge} operator
+$\mathsf{ch} \colon \Eadm \to \Eadm$.
+\end{definition}
+
+\subsection{Conservative join (\texorpdfstring{$\tjoin$}{oplus})}
+
+Unlike the lattice join $\vee = \max$, the \emph{conservative
+join} $\tjoin$ is deliberately pessimistic: when combining
+evidence from two channels, the result takes the \emph{weaker}
+of the two.
+
+\begin{definition}[Conservative join]\label{def:cons-join}
+For $a, b \in \Eadm$, define
+\[
+  a \tjoin b \;=\; \min(a, b).
+\]
+\end{definition}
+
+\noindent
+The rationale is epistemic: when composing evidence from
+heterogeneous sources, the combined claim is only as strong
+as its weakest link.  If an SMT solver discharges a lemma
+($\Tsolver$) but the permutation argument rests on an LLM
+suggestion ($\Tcopilot$), the conjunction of the two claims
+should carry trust $\Tcopilot$, not $\Tsolver$.
+
+\begin{lstlisting}[caption={Conservative join in the trust algebra.},
+                   label=lst:compose]
+class TrustAlgebra:
+    def compose(self, a: TrustLevel, b: TrustLevel) -> TrustLevel:
+        """Conservative join: min under the trust ordering."""
+        if a.rank_index() <= b.rank_index():
+            return a
+        return b
+
+    def meet(self, a: TrustLevel, b: TrustLevel) -> TrustLevel:
+        """Greatest lower bound (coincides with compose)."""
+        return self.compose(a, b)
+
+    def join(self, a: TrustLevel, b: TrustLevel) -> TrustLevel:
+        """Least upper bound (max under ordering)."""
+        if a.rank_index() >= b.rank_index():
+            return a
+        return b
+\end{lstlisting}
+
+\begin{proposition}[Associativity and commutativity of $\tjoin$]
+\label{prop:join-assoc}
+For all $a, b, c \in \Eadm$:
+\begin{enumerate}[label=(\alph*)]
+\item $a \tjoin b = b \tjoin a$ \quad (commutativity);
+\item $(a \tjoin b) \tjoin c = a \tjoin (b \tjoin c)$
+      \quad (associativity);
+\item $a \tjoin a = a$ \quad (idempotence);
+\item $\Tcontra \tjoin a = \Tcontra$ \quad (annihilation by $\bot$);
+\item $\Tproof \tjoin a = a$ \quad (identity at $\top$).
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+All properties follow from $\tjoin = \min$ on a total order.
+(a)~$\min(a,b) = \min(b,a)$.
+(b)~$\min(\min(a,b),c) = \min(a,b,c) = \min(a, \min(b,c))$.
+(c)~$\min(a,a) = a$.
+(d)~$\Tcontra$ is the bottom, so $\min(\Tcontra, a) = \Tcontra$.
+(e)~$\Tproof$ is the top, so $\min(\Tproof, a) = a$.
+\end{proof}
+
+\subsection{Attenuation (\texorpdfstring{$\tatten$}{ominus})}
+
+When evidence is \emph{transported} across module boundaries
+or \emph{restricted} to a sub-specification, its trust
+may be attenuated.  Attenuation decrements the trust level
+by a non-negative integer number of steps.
+
+\begin{definition}[Attenuation]\label{def:attenuation}
+For $t \in \Eadm$ and $k \in \mathbb{N}$, define
+\[
+  t \;\tatten\; k \;=\; \max\bigl(\Tcontra,\;\mathsf{pred}^k(t)\bigr)
+\]
+where $\mathsf{pred}$ is the predecessor function on the chain
+(with $\mathsf{pred}(\Tcontra) = \Tcontra$).
+\end{definition}
+
+\begin{lstlisting}[caption={Attenuation through transport hops.},
+                   label=lst:attenuation]
+class TrustAttenuation:
+    def attenuate_through_transport(self, level, hops):
+        """Decrement trust by one step per hop, floor at CONTRADICTED."""
+        current = level
+        for _ in range(hops):
+            idx = _ORDERED_LEVELS.index(current)
+            if idx == 0:
+                break
+            current = _ORDERED_LEVELS[idx - 1]
+        return current
+
+    def attenuation_distance(self, source, target):
+        """Number of steps between source and target."""
+        return abs(
+            _ORDERED_LEVELS.index(source) -
+            _ORDERED_LEVELS.index(target)
+        )
+\end{lstlisting}
+
+\begin{proposition}[Attenuation is monotone and idempotent at zero]
+\label{prop:atten-mono}
+For all $t \in \Eadm$ and $k, k' \in \mathbb{N}$:
+\begin{enumerate}[label=(\alph*)]
+\item $t \tatten 0 = t$;
+\item if $k \leq k'$, then $t \tatten k' \tleq t \tatten k$;
+\item $t \tatten k \tleq t$;
+\item $(t \tatten k) \tatten k' = t \tatten (k + k')$.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+(a)~$\mathsf{pred}^0(t) = t$.
+(b)--(c)~each application of $\mathsf{pred}$ decreases or
+preserves the rank; more applications yield a weakly lower result.
+(d)~both sides apply $\mathsf{pred}$ a total of $k + k'$ times,
+floored at $\Tcontra$.
+\end{proof}
+
+\subsection{Promotion (\texorpdfstring{$\tpromote$}{uparrow})}
+
+Promotion is the only operation that can \emph{increase}
+a trust level, and it requires an explicit, non-empty
+justification.  This is the key mechanism for preventing
+silent upgrades.
+
+\begin{definition}[Promotion]\label{def:promotion}
+Let $\mathsf{Just}$ be the set of non-empty justification
+strings.  For $t \in \Eadm$ and $j \in \mathsf{Just}$, define
+\[
+  \tpromote(t, j) \;=\; \mathsf{succ}(t)
+  \qquad\text{if } j \neq \varepsilon,
+\]
+where $\mathsf{succ}$ is the successor function
+(with $\mathsf{succ}(\Tproof) = \Tproof$).
+If $j = \varepsilon$, the operation is \emph{undefined}
+(raises a promotion failure).
+\end{definition}
+
+\begin{lstlisting}[caption={Promotion requires justification.},
+                   label=lst:promote]
+class TrustPromotion:
+    def apply_promotion(self, proposal):
+        """Validate, apply, and record a promotion."""
+        valid, reason = self.validate_promotion(proposal)
+        if not valid:
+            raise PromotionError(reason)
+        self.record_promotion(proposal)
+        return proposal.target
+
+def promote(self, t, justification):
+    if not justification or not justification.strip():
+        raise _make_promotion_failure(t, 'empty justification')
+    if t == TrustLevel.MECHANICALLY_VERIFIED:
+        return t   # already at top
+    idx = _ORDERED_LEVELS.index(t)
+    return _ORDERED_LEVELS[idx + 1]
+\end{lstlisting}
+
+\noindent
+Two additional policy constraints guard promotion:
+\begin{itemize}
+\item \textbf{Copilot ceiling.}
+  A claim originating from a \texttt{copilot} channel cannot
+  be promoted above $\Toracle$.
+\item \textbf{Witness requirement.}
+  Promotion above $\mathsf{HUMAN\_ATTESTED}$ requires an
+  external witness (e.g., a solver certificate or a runtime
+  trace).
+\end{itemize}
+
+\subsection{Demotion (\texorpdfstring{$\tdemote$}{downarrow})}
+
+Demotion enforces a ceiling: it clamps a trust level down
+to a specified maximum.
+
+\begin{definition}[Demotion]\label{def:demotion}
+For $t, c \in \Eadm$, define
+\[
+  \tdemote(t, c) \;=\; \min(t, c).
+\]
+\end{definition}
+
+\noindent
+Note that demotion and the conservative join coincide
+algebraically ($\tdemote(t, c) = t \tjoin c$), but they
+differ semantically: $\tjoin$ combines evidence from two
+channels, while $\tdemote$ enforces an upper bound imposed
+by a policy.
+
+\subsection{Challenge}
+
+\begin{definition}[Challenge]\label{def:challenge}
+The \emph{challenge} operator decrements the trust level
+by one step and narrows the scope of the associated profile:
+\[
+  \mathsf{ch}(t) \;=\; t \tatten 1.
+\]
+\end{definition}
+
+\noindent
+Challenges arise when contradictory evidence is discovered.
+A failed test suite challenges a solver-discharged claim,
+demoting it from $\Tsolver$ to $\Truntime$.
+
+\subsection{Operator interaction diagram}
+
+\begin{figure}[t]
+\centering
+\begin{tikzcd}[row sep=2.5em, column sep=3.5em]
+  t_1 \arrow[r, "\tjoin"] \arrow[d, "\tatten\;k"']
+    & t_1 \tjoin t_2 \arrow[d, "\tatten\;k"] \\
+  t_1 \tatten k \arrow[r, "\tjoin"']
+    & (t_1 \tjoin t_2) \tatten k
+\end{tikzcd}
+\caption{Interaction of conservative join and attenuation.
+  The diagram commutes:
+  $(t_1 \tjoin t_2) \tatten k = (t_1 \tatten k) \tjoin (t_2 \tatten k)$.}
+\label{fig:interaction}
+\end{figure}
+
+\begin{proposition}[Attenuation distributes over $\tjoin$]
+\label{prop:atten-distrib}
+For all $t_1, t_2 \in \Eadm$ and $k \in \mathbb{N}$,
+\[
+  (t_1 \tjoin t_2) \tatten k
+  \;=\;
+  (t_1 \tatten k) \tjoin (t_2 \tatten k).
+\]
+\end{proposition}
+
+\begin{proof}
+Without loss of generality, assume $t_1 \tleq t_2$.
+Then $t_1 \tjoin t_2 = t_1$, and the left-hand side is
+$t_1 \tatten k$.
+For the right-hand side,
+$t_1 \tatten k \tleq t_2 \tatten k$
+(since $\tatten k$ is monotone in $t$), so
+$(t_1 \tatten k) \tjoin (t_2 \tatten k) = t_1 \tatten k$.
+\end{proof}
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Three Invariants}\label{sec:invariants}
+%% ═══════════════════════════════════════════════════════════════════════
+
+The trust algebra is governed by three invariants that
+constrain how trust may evolve during verification.
+These invariants are enforced both statically (by the
+algebra's definitions) and dynamically (by the audit log).
+
+\subsection{Invariant 1: No silent promotion}
+
+\begin{definition}[No-silent-promotion invariant]
+\label{def:nsp}
+For every pair of consecutive trust states
+$t_i, t_{i+1}$ in an execution trace, if
+$t_i \tleq t_{i+1}$ with $t_i \neq t_{i+1}$
+(strict increase), then the transition must be
+a $\tpromote$ operation with a recorded, non-empty
+justification~$j$.
+\end{definition}
+
+\begin{theorem}[No silent promotion]\label{thm:nsp}
+Let $\sigma = t_0, t_1, \ldots, t_n$ be any execution
+trace produced by the operations of $\Talg$.
+Then for all $0 \leq i < n$:
+\[
+  t_i \;\tleq\; t_{i+1} \;\wedge\; t_i \neq t_{i+1}
+  \quad\Longrightarrow\quad
+  \exists\, j \in \mathsf{Just}.\;
+  t_{i+1} = \tpromote(t_i, j).
+\]
+\end{theorem}
+
+\begin{proof}
+By exhaustive case analysis on the five operations of $\Talg$:
+\begin{itemize}
+\item $\tjoin = \min$: the result is $\tleq$ both inputs,
+      hence $t_{i+1} \tleq t_i$.  A strict increase is
+      impossible.
+\item $\tatten$: $t \tatten k \tleq t$ for all $k \geq 0$
+      (\Cref{prop:atten-mono}(c)).  Again, a strict increase
+      is impossible.
+\item $\tdemote(t, c) = \min(t, c) \tleq t$: cannot increase.
+\item $\mathsf{ch}(t) = t \tatten 1 \tleq t$: cannot increase.
+\item $\tpromote(t, j)$: the only operation that can yield
+      $t_{i+1} \succ t_i$, and it requires $j \neq \varepsilon$
+      by definition.
+\end{itemize}
+Hence every strict increase in the trace is a $\tpromote$
+with a non-empty justification.
+\end{proof}
+
+\subsection{Invariant 2: Conservative join}
+
+\begin{definition}[Conservative-join invariant]
+\label{def:cj}
+For all $a, b \in \Eadm$:
+\[
+  a \tjoin b \;\tleq\; a
+  \qquad\text{and}\qquad
+  a \tjoin b \;\tleq\; b.
+\]
+\end{definition}
+
+\begin{proof}
+Immediate from $\tjoin = \min$.
+\end{proof}
+
+\noindent
+This invariant ensures that combining evidence from different
+channels never inflates the trust level: the conjunction
+of a solver proof and an LLM suggestion is trusted only
+to the level of the LLM suggestion.
+
+\subsection{Invariant 3: Challenge conservativity}
+
+\begin{definition}[Challenge-conservativity invariant]
+\label{def:cc}
+For all $t \in \Eadm$:
+\[
+  \mathsf{ch}(t) \;\tleq\; t.
+\]
+\end{definition}
+
+\begin{proof}
+$\mathsf{ch}(t) = t \tatten 1 \tleq t$ by
+\Cref{prop:atten-mono}(c).
+\end{proof}
+
+\noindent
+Challenge conservativity guarantees that challenges only
+weaken trust.  A challenged claim cannot emerge stronger
+than before.
+
+\begin{figure}[t]
+\centering
+\begin{tikzcd}[row sep=2em, column sep=4em]
+  \Tsolver
+    \arrow[r, "\tjoin\;\Tcopilot"]
+    \arrow[d, "\mathsf{ch}"']
+  & \Tcopilot
+    \arrow[d, "\mathsf{ch}"] \\
+  \Truntime
+    \arrow[r, "\tjoin\;\Tcopilot"']
+  & \Tcopilot
+\end{tikzcd}
+\caption{Invariant interaction: conservative join and
+  challenge both commute and both monotonically decrease
+  trust.  No path in the diagram increases trust.}
+\label{fig:invariant-interaction}
+\end{figure}
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Soundness}\label{sec:soundness}
+%% ═══════════════════════════════════════════════════════════════════════
+
+We formalize a soundness theorem that connects the syntactic
+trust assignment to the semantic quality of evidence.
+
+\subsection{Evidence quality}
+
+\begin{definition}[Evidence quality function]
+\label{def:quality}
+An \emph{evidence quality function}
+$\mathsf{qual} \colon \mathsf{Evidence} \to \Eadm$
+assigns to each piece of evidence a trust level according
+to the following rules:
+\begin{enumerate}[label=(\roman*)]
+\item If $e$ is a machine-checked proof term accepted by
+      a kernel (Coq, Lean, etc.), then
+      $\mathsf{qual}(e) = \Tproof$.
+\item If $e$ is an \texttt{unsat} certificate from an SMT
+      solver, then $\mathsf{qual}(e) = \Tsolver$.
+\item If $e$ is a runtime execution trace with passing
+      assertions, then $\mathsf{qual}(e) = \Truntime$.
+\item If $e$ is a human attestation, then
+      $\mathsf{qual}(e) = \mathsf{HUMAN}$.
+\item If $e$ is an oracle (external API) response, then
+      $\mathsf{qual}(e) = \Toracle$.
+\item If $e$ is an LLM-generated claim, then
+      $\mathsf{qual}(e) = \Tcopilot$.
+\item If $e$ is the absence of evidence, then
+      $\mathsf{qual}(e) = \Tunver$.
+\item If $e$ contradicts existing evidence, then
+      $\mathsf{qual}(e) = \Tcontra$.
+\end{enumerate}
+\end{definition}
+
+\subsection{The soundness theorem}
+
+\begin{theorem}[Trust soundness]\label{thm:soundness}
+Let $\J = (\coord, \prop, \carrier, \evid, \oblig, \obstr,
+           \trust, \prov)$
+be a judgment produced by the \JuGeo{} system.
+Then:
+\[
+  \trust(\J) \;=\; \bigoplus_{e \in \evid(\J)} \mathsf{qual}(e)
+\]
+where $\bigoplus$ denotes the left-fold of $\tjoin$ over
+the evidence bundle.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+By induction on the derivation of $\J$.
+
+\textbf{Base case.}
+If $\J$ is a leaf judgment produced by a single evidence
+channel $c$ with evidence $e$, then $\evid(\J) = \{e\}$
+and $\trust(\J) = \mathsf{qual}(e)$ by construction
+(each channel initializes trust at its quality level).
+
+\textbf{Inductive case (composition).}
+If $\J = \J_1 \tjoin \J_2$, then by the inductive hypothesis,
+$\trust(\J_i) = \bigoplus_{e \in \evid(\J_i)} \mathsf{qual}(e)$
+for $i = 1, 2$.
+By the definition of judgment composition,
+\begin{align*}
+  \trust(\J)
+    &= \trust(\J_1) \tjoin \trust(\J_2) \\
+    &= \Bigl(\bigoplus_{e \in \evid(\J_1)} \mathsf{qual}(e)\Bigr)
+       \tjoin
+       \Bigl(\bigoplus_{e \in \evid(\J_2)} \mathsf{qual}(e)\Bigr) \\
+    &= \bigoplus_{e \in \evid(\J_1) \cup \evid(\J_2)} \mathsf{qual}(e)
+\end{align*}
+where the last step uses associativity and commutativity
+of $\tjoin$.
+
+\textbf{Inductive case (attenuation).}
+If $\J$ is obtained from $\J'$ by transport across $k$ hops,
+then $\trust(\J) = \trust(\J') \tatten k$.
+By~\Cref{prop:atten-distrib}, this equals
+$\bigoplus_{e \in \evid(\J')} (\mathsf{qual}(e) \tatten k)$,
+which is the composition of the attenuated qualities.
+
+\textbf{Inductive case (promotion).}
+If $\J$ is obtained from $\J'$ by promotion with
+justification~$j$, then the audit log records the transition,
+and the new trust level $\tpromote(\trust(\J'), j)$ is
+consistent with the updated evidence bundle $\evid(\J') \cup \{j\}$.
+\end{proof}
+
+\subsection{Ceiling enforcement}
+
+\begin{corollary}[Channel ceilings are sound]
+\label{cor:ceilings}
+If a judgment's evidence originates from channel $c$ with
+ceiling $\gamma_c$, then $\trust(\J) \tleq \gamma_c$.
+\end{corollary}
+
+\begin{proof}
+The \texttt{TrustCeiling} class enforces
+$\tdemote(t, \gamma_c)$ on every trust assignment from
+channel $c$.  Since $\tdemote(t, \gamma_c) = \min(t, \gamma_c)
+\leq \gamma_c$, the bound holds.
+\end{proof}
+
+The default ceilings are:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Channel} & \textbf{Ceiling} \\
+\midrule
+\texttt{formal\_proof} & $\Tproof$ \\
+\texttt{solver}        & $\Tsolver$ \\
+\texttt{runtime}       & $\Truntime$ \\
+\texttt{oracle}        & $\Toracle$ \\
+\texttt{copilot}       & $\Tcopilot$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{AI-Generated Evidence}\label{sec:ai}
+%% ═══════════════════════════════════════════════════════════════════════
+
+Large-language models (LLMs) are increasingly used to
+generate code, specifications, and even informal ``proofs.''
+The trust algebra provides a principled framework for
+integrating such evidence without undermining the integrity
+of the verification pipeline.
+
+\subsection{Entry point}
+
+All LLM-generated evidence enters the trust algebra at
+level $\Tcopilot$.  This is the second-weakest level,
+above only $\Tunver$ and $\Tcontra$.
+
+\begin{definition}[AI evidence rule]\label{def:ai-entry}
+For any evidence $e$ produced by an LLM:
+\[
+  \mathsf{qual}(e_{\mathsf{LLM}}) \;=\; \Tcopilot.
+\]
+\end{definition}
+
+\subsection{Composition with stronger evidence}
+
+When AI evidence is combined with evidence from a stronger
+channel, the conservative join ensures the result is at
+the AI level:
+
+\begin{example}[Solver meets AI]\label{ex:solver-ai}
+Let $e_1$ be a solver proof ($\Tsolver$) and $e_2$ be an
+LLM claim ($\Tcopilot$).  Then:
+\[
+  \Tsolver \tjoin \Tcopilot
+  \;=\; \min(\Tsolver, \Tcopilot)
+  \;=\; \Tcopilot.
+\]
+The combined claim carries trust $\Tcopilot$.
+The solver proof is not degraded---it retains its own trust
+level---but the \emph{conjunction} is trusted only to the
+level of its weakest component.
+\end{example}
+
+\noindent
+This is exactly the behavior required for the merge-sort
+scenario of~\Cref{sec:intro}: the sortedness lemma
+(solver-discharged) and the permutation claim (LLM-suggested)
+together carry trust $\Tcopilot$.
+
+\subsection{Promotion path for AI evidence}
+
+An LLM claim can be promoted, but only through explicit,
+justified steps:
+
+\begin{enumerate}[leftmargin=*]
+\item $\Tcopilot \xrightarrow{\tpromote(\text{``human reviewed''})}
+      \Toracle$: a human expert reviews the LLM output and
+      attests its plausibility.
+\item $\Toracle \xrightarrow{\tpromote(\text{``test suite passes''})}
+      \Truntime$: a comprehensive test suite validates the claim.
+\item $\Truntime \xrightarrow{\tpromote(\text{``SMT discharged''})}
+      \Tsolver$: an SMT solver formally discharges the property.
+\item $\Tsolver \xrightarrow{\tpromote(\text{``Lean proof''})}
+      \Tproof$: a machine-checked proof is constructed.
+\end{enumerate}
+
+\noindent
+Each step requires a non-empty justification string and is
+recorded in the audit log.  The copilot ceiling (\Cref{cor:ceilings})
+prevents an LLM from self-promoting above $\Toracle$;
+further promotion requires evidence from a different channel.
+
+\begin{figure}[t]
+\centering
+\begin{tikzcd}[row sep=2em, column sep=2.8em]
+  \Tcopilot
+    \arrow[r, "\tpromote"]
+    \arrow[dr, dashed, "\text{blocked}"']
+  & \Toracle
+    \arrow[r, "\tpromote"]
+  & \Truntime
+    \arrow[r, "\tpromote"]
+  & \Tsolver
+    \arrow[r, "\tpromote"]
+  & \Tproof \\
+  & \Tsolver
+    \arrow[u, crossing over, leftarrow, "\tjoin"']
+  & & &
+\end{tikzcd}
+\caption{Promotion path for AI-generated evidence.
+  The dashed arrow shows the blocked self-promotion:
+  the copilot ceiling prevents direct escalation to
+  $\Tsolver$.  The cross-over arrow shows how a solver
+  proof, when joined with a copilot claim, yields
+  $\Tcopilot$ (conservative join).}
+\label{fig:ai-promotion}
+\end{figure}
+
+\subsection{Self-promotion guard}
+
+\begin{proposition}[AI cannot self-promote]
+\label{prop:no-self-promote}
+Let $e$ be evidence produced by an LLM channel.
+Then there is no sequence of operations within the
+LLM channel alone that raises $\mathsf{qual}(e)$
+above $\Toracle$.
+\end{proposition}
+
+\begin{proof}
+The copilot ceiling $\gamma_{\mathsf{copilot}} = \Tcopilot$
+ensures $\tdemote(t, \gamma_{\mathsf{copilot}}) \tleq \Tcopilot$
+for any $t$.  Promotion within the copilot channel is
+policy-blocked: the \texttt{copilot\_cannot\_self\_promote}
+check rejects any $\tpromote$ originating from the copilot
+channel when the target exceeds $\Toracle$.
+By the no-silent-promotion invariant (\Cref{thm:nsp}),
+no other operation can increase trust.
+\end{proof}
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Evaluation}\label{sec:eval}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Experimental setup}
+
+We evaluate six aspects of the trust algebra empirically:
+lattice properties (\S\ref{sec:eval-lattice}),
+promotion blocking (\S\ref{sec:eval-promo}),
+copilot self-promotion guards (\S\ref{sec:eval-copilot}),
+audit log analysis (\S\ref{sec:eval-audit}),
+trust profiles (\S\ref{sec:eval-profiles}),
+and a state-of-the-art comparison (\S\ref{sec:eval-sota}).
+All experiments are executed in the \JuGeo{} \Python{} implementation
+and the numerical results are drawn from the companion data file
+\texttt{results\_paper04.json}.
+
+%%--------------------------------------------------------------------
+\subsection{Lattice properties}\label{sec:eval-lattice}
+
+\begin{table}[t]
+\centering
+\caption{Lattice join (least upper bound) and meet (greatest lower bound) samples.
+All 64 composition pairs were tested; 8 representative samples are shown.}
+\label{tab:lattice-join-meet}
+\small
+\begin{tabular}{@{}llclll@{}}
+\toprule
+$a$ & $b$ & & $a \vee b$ (join) & & $a \wedge b$ (meet) \\
+\midrule
+$\Tcontra$ & $\Tunver$ && $\Tunver$ && $\Tcontra$ \\
+$\Tcontra$ & $\Toracle$ && $\Toracle$ && $\Tcontra$ \\
+$\Tcontra$ & $\Truntime$ && $\Truntime$ && $\Tcontra$ \\
+$\Tcontra$ & $\Tproof$ && $\Tproof$ && $\Tcontra$ \\
+$\Tcopilot$ & $\Tunver$ && $\Tcopilot$ && $\Tunver$ \\
+$\Tcopilot$ & $\Toracle$ && $\Toracle$ && $\Tcopilot$ \\
+$\Tcopilot$ & $\Truntime$ && $\Truntime$ && $\Tcopilot$ \\
+$\Tcopilot$ & $\Tproof$ && $\Tproof$ && $\Tcopilot$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+All 64 pairwise join and meet operations were verified to be
+consistent with the total order on~$\Eadm$.
+The promote chain traverses all 8 levels in 7 steps:
+\[
+  \Tcontra \to \Tunver \to \Tcopilot \to \Toracle
+  \to \mathsf{HUMAN} \to \Truntime \to \Tsolver \to \Tproof.
+\]
+
+\begin{table}[t]
+\centering
+\caption{Demotion with ceiling $\Truntime$: $\tdemote(t, \Truntime) = \min(t, \Truntime)$.}
+\label{tab:demote-ceiling}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Input level} $t$ & \textbf{Result} $\tdemote(t, \Truntime)$ \\
+\midrule
+$\Tcontra$ & $\Tcontra$ \\
+$\Tunver$ & $\Tunver$ \\
+$\Tcopilot$ & $\Tcopilot$ \\
+$\Toracle$ & $\Toracle$ \\
+$\mathsf{HUMAN}$ & $\mathsf{HUMAN}$ \\
+$\Truntime$ & $\Truntime$ \\
+$\Tsolver$ & $\Truntime$ \\
+$\Tproof$ & $\Truntime$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\Cref{tab:demote-ceiling} confirms that demotion with
+ceiling $\Truntime$ caps every level above $\Truntime$
+to $\Truntime$ while leaving lower levels unchanged.
+
+%%--------------------------------------------------------------------
+\subsection{Promotion blocking}\label{sec:eval-promo}
+
+\begin{table}[t]
+\centering
+\caption{Promotion blocking: justified promotions vs.\ empty-justification attempts.}
+\label{tab:promotion-blocking}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Scenario} & \textbf{Accepted} & \textbf{Blocked} & \textbf{Block rate} \\
+\midrule
+Justified promotion (7 steps) & 7 & 0 & 0\% \\
+Empty justification (7 steps) & 0 & 7 & 100\% \\
+\midrule
+\textbf{Silent promotion block rate} & \multicolumn{3}{c}{\textbf{1.0}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+All 7 justified promotions along the full chain from
+$\Tcontra$ to $\Tproof$ succeed.
+All 7 empty-justification attempts are blocked, yielding
+a silent promotion block rate of~1.0 (\Cref{tab:promotion-blocking}).
+
+%%--------------------------------------------------------------------
+\subsection{Copilot self-promotion guard}\label{sec:eval-copilot}
+
+\begin{table}[t]
+\centering
+\caption{Copilot self-promotion guard: attempts from the $\Tcopilot$ channel to reach each target level.}
+\label{tab:copilot-guard}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Target level} & \textbf{Blocked?} & \textbf{Reason} \\
+\midrule
+$\Tcontra$ & No & Demotion, not promotion \\
+$\Tunver$ & No & Demotion, not promotion \\
+$\Tcopilot$ & No & Identity, not promotion \\
+$\Toracle$ & No & Within copilot ceiling \\
+$\mathsf{HUMAN}$ & \textbf{Yes} & Above copilot ceiling \\
+$\Truntime$ & \textbf{Yes} & Above copilot ceiling \\
+$\Tsolver$ & \textbf{Yes} & Above copilot ceiling \\
+$\Tproof$ & \textbf{Yes} & Above copilot ceiling \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Of 8 attempted self-promotions from the copilot channel,
+4 are blocked (targets above $\Toracle$) and 4 are allowed
+(targets at or below the copilot ceiling).
+The GPT-4o scenario---where an LLM assigned at $\Tcopilot$
+attempts to reach $\Tsolver$---is blocked with reason:
+``copilot channel cannot promote above ORACLE\_PROPOSED.''
+
+%%--------------------------------------------------------------------
+\subsection{Audit log}\label{sec:eval-audit}
+
+\begin{table}[t]
+\centering
+\caption{Audit log analysis on a module with injected silent promotions.}
+\label{tab:audit}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Total audit entries & 9 \\
+Silent promotions detected & 6 \\
+Anomalies flagged & 1 \\
+Silent promotion coordinates & \texttt{module.risky.fn\{0..4\}}, \texttt{module.suspicious.escalation} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+The audit log captures 9 entries, identifies 6 silent promotions
+at specific semantic coordinates, and flags 1 anomaly
+(\Cref{tab:audit}).
+All injected silent promotions are detected (100\% recall).
+
+%%--------------------------------------------------------------------
+\subsection{Trust profiles}\label{sec:eval-profiles}
+
+\begin{table}[t]
+\centering
+\caption{Trust profiles and their pairwise conservative joins.}
+\label{tab:profiles}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Entity} & \textbf{Tier} & \textbf{Scope} & \textbf{Joined tier} \\
+\midrule
+engine\_0 & PROPOSAL & arithmetic & --- \\
+engine\_1 & REVIEWED & heap, identity & --- \\
+engine\_2 & VERIFIED & semantic & --- \\
+\midrule
+engine\_0 $\tjoin$ engine\_1 & --- & --- & PROPOSAL \\
+engine\_0 $\tjoin$ engine\_2 & --- & --- & PROPOSAL \\
+engine\_1 $\tjoin$ engine\_2 & --- & --- & REVIEWED \\
+\midrule
+\textbf{All three joined} & --- & --- & \textbf{PROPOSAL} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Profile composition confirms that the conservative join takes
+the minimum tier (\Cref{tab:profiles}).
+Joining all three profiles yields PROPOSAL---the weakest tier
+among them.
+The demote example shows VERIFIED can be demoted to PROPOSAL
+(2~steps).
+
+%%--------------------------------------------------------------------
+\subsection{State-of-the-art comparison}\label{sec:eval-sota}
+
+\begin{table}[t]
+\centering
+\caption{State-of-the-art comparison of trust-management capabilities.}
+\label{tab:sota}
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Feature}
+  & \textbf{\LEAN{}}
+  & \textbf{\Fstar{}}
+  & \textbf{\Dafny{}}
+  & \textbf{GPT-4o}
+  & \textbf{\JuGeo{}} \\
+\midrule
+Trust levels
+  & 1 & 2 & 1 & 0 & \textbf{8} \\
+Trust lattice
+  & --- & --- & --- & --- & \checkmark \\
+Audit log
+  & --- & --- & --- & --- & \checkmark \\
+Copilot ceiling
+  & N/A & N/A & N/A & N/A & $\Tcopilot$ \\
+Silent promotion possible
+  & Yes & Yes & Yes & Yes & \textbf{No} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\LEAN{} operates at a single trust level---a kernel-checked
+proof and a \texttt{sorry} are structurally identical
+post-acceptance~\cite{lean4}.
+\Fstar{} distinguishes computational purity via effect
+annotations (Tot, Dv, ST) but provides no trust ordering
+or provenance tracking~\cite{fstar}.
+\Dafny{} delegates all verification conditions to Boogie/Z3
+with no trust metadata~\cite{dafny}.
+GPT-4o generates claims with no formal guarantee whatsoever;
+\JuGeo{} assigns such evidence to $\Tcopilot$ with no
+silent promotion possible.
+\JuGeo{} is the only system providing all five capabilities:
+an 8-level lattice, algebraic composition, an append-only
+audit log, copilot channel ceilings, and the
+no-silent-promotion invariant.
+
+%%--------------------------------------------------------------------
+\subsection{Overhead analysis}
+
+The trust algebra adds negligible overhead.
+All experiments complete in a total elapsed time of 2.5\,ms.
+Trust-level computation (comparison, composition, ceiling
+enforcement, and audit logging) is dominated by the overhead
+of the \Python{} runtime rather than the algebraic operations
+themselves.
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Trust Profiles}\label{sec:profiles}
+%% ═══════════════════════════════════════════════════════════════════════
+
+Individual trust levels track the provenance of single
+evidence claims.  In practice, a verification result
+spans multiple specifications and multiple coordinates.
+\emph{Trust profiles} aggregate this information into
+an immutable, composable summary.
+
+\subsection{Definition}
+
+\begin{definition}[Trust profile]\label{def:profile}
+A \emph{trust profile} is a tuple
+$P = (\mathsf{id},\;\tau,\;\mathsf{scope},\;\mathsf{reasons})$
+where:
+\begin{itemize}
+\item $\mathsf{id}$ is the entity identifier;
+\item $\tau \in \Eadm$ is the trust tier;
+\item $\mathsf{scope} \subseteq \mathsf{Labels}$ is the set
+      of specification labels covered;
+\item $\mathsf{reasons}$ is an ordered tuple of justification
+      strings.
+\end{itemize}
+\end{definition}
+
+\begin{lstlisting}[caption={Trust profile implementation.},
+                   label=lst:profile]
+@dataclass(frozen=True)
+class TrustProfile:
+    entity_id: str
+    tier: TrustTier
+    support_scope: tuple[str, ...]
+    reasons: tuple[str, ...]
+
+    def join(self, other):
+        """Conservative join: weaker tier, intersected scope."""
+        new_tier = TrustTier(min(self.tier.value,
+                                 other.tier.value))
+        common = tuple(s for s in self.support_scope
+                       if s in other.support_scope)
+        scope = common if common else tuple(sorted(set(
+            self.support_scope + other.support_scope)))
+        return TrustProfile(
+            entity_id=self.entity_id,
+            tier=new_tier,
+            support_scope=scope,
+            reasons=self.reasons + other.reasons,
+        )
+\end{lstlisting}
+
+\subsection{Profile composition}
+
+The join of two profiles uses the conservative join on
+tiers and intersects the support scopes (falling back
+to union when the intersection is empty).
+
+\begin{proposition}[Profile join is a semilattice operation]
+\label{prop:profile-semilattice}
+The set of trust profiles over a fixed entity, equipped
+with the join of \Cref{lst:profile}, forms a
+join-semilattice.
+\end{proposition}
+
+\begin{proof}
+We verify the semilattice axioms.
+
+\textbf{Commutativity.}
+$P_1.\mathsf{join}(P_2) = P_2.\mathsf{join}(P_1)$:
+the tier is $\min(\tau_1, \tau_2) = \min(\tau_2, \tau_1)$,
+the scope intersection is symmetric, and the reasons tuple
+is concatenated (so the order may differ, but the set of
+reasons is the same; we consider profiles equivalent up to
+reason reordering).
+
+\textbf{Associativity.}
+$(P_1.\mathsf{join}(P_2)).\mathsf{join}(P_3)
+= P_1.\mathsf{join}(P_2.\mathsf{join}(P_3))$:
+the tier is $\min(\tau_1, \tau_2, \tau_3)$ in both cases;
+the scope is the intersection of all three (or the fallback
+union in both cases, since the fallback triggers identically).
+
+\textbf{Idempotence.}
+$P.\mathsf{join}(P) = P$: $\min(\tau, \tau) = \tau$,
+the scope intersection with itself is itself, and the
+reasons are duplicated (but semantically equivalent).
+\end{proof}
+
+\subsection{Propagation across modules}
+
+When a trust profile crosses a module boundary during
+hypercover treaty negotiation, it is attenuated:
+
+\begin{lstlisting}[caption={Profile propagation with attenuation.},
+                   label=lst:propagation]
+def propagate_profile(profile, boundary_hops):
+    """Attenuate trust when crossing module boundaries."""
+    new_tier = profile.tier
+    for _ in range(boundary_hops):
+        new_tier = new_tier.demote()
+    return TrustProfile(
+        entity_id=profile.entity_id,
+        tier=new_tier,
+        support_scope=profile.support_scope,
+        reasons=profile.reasons + (
+            f'attenuated-{boundary_hops}-hops',),
+    )
+\end{lstlisting}
+
+\begin{proposition}[Propagation preserves conservativity]
+\label{prop:propagation}
+For any profile $P$ and hop count $k \geq 0$:
+\[
+  \mathsf{propagate}(P, k).\tau \;\tleq\; P.\tau.
+\]
+\end{proposition}
+
+\begin{proof}
+Each call to $\mathsf{demote}$ decreases the tier
+by one step (floored at $\mathsf{PROPOSAL}$).
+After $k$ demotions, the resulting tier is
+$\tleq$ the original.
+\end{proof}
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Related Work and Conclusion}\label{sec:related}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Related work}
+
+\paragraph{Trusted computing bases.}
+The concept of a trusted computing base (TCB)~\cite{sel4,certikos}
+identifies the minimal set of components that must be
+correct for the system's security guarantees to hold.
+Our trust algebra refines this idea: instead of a binary
+``in the TCB / not in the TCB'' distinction, the eight-level
+lattice tracks the degree of trust with fine granularity.
+The no-silent-promotion invariant ensures that the TCB
+boundary is not silently crossed.
+
+\paragraph{Confidence logics.}
+Probabilistic and possibilistic logics assign numerical
+confidence scores to propositions~\cite{halpern03}.
+Shafer's theory of evidence~\cite{shafer76} provides
+belief functions on a lattice of hypotheses.
+These approaches differ from ours in two respects:
+(i)~they use continuous scores rather than a discrete
+lattice, making auditing more difficult;
+(ii)~they lack the operational structure (promotion,
+demotion, channel ceilings) that our algebra provides.
+
+\paragraph{Provenance semirings.}
+Green, Karvounarakis, and Tannen~\cite{green07} introduced
+provenance semirings for database query evaluation, tracking
+\emph{how} a tuple was derived.  Buneman et~al.~\cite{buneman01}
+developed the why/where/how provenance taxonomy.
+Our trust algebra can be seen as a provenance semiring
+specialized to verification evidence, with the conservative
+join playing the role of the semiring multiplication.
+
+\paragraph{Proof assistants.}
+\LEAN{}~\cite{lean4}, \Coq{}~\cite{coq}, \Fstar{}~\cite{fstar},
+and \Dafny{}~\cite{dafny} are the closest comparators.
+As detailed in~\Cref{tab:sota}, all operate with at most
+two implicit trust levels and none tracks evidence provenance
+or enforces channel ceilings.
+Isabelle/HOL~\cite{isabelle} uses a small kernel and
+untrusted tactics, providing an implicit two-level trust
+distinction, but this is not exposed to the user.
+
+\paragraph{Refinement types and liquid types.}
+Liquid Haskell~\cite{liquidhaskell} uses SMT-backed refinement
+types to verify Haskell programs.  Like \Dafny{}, it delegates
+to Z3 and presents a binary verdict.
+The trust algebra could be layered on top of such systems
+to track the provenance of each discharged refinement.
+
+\paragraph{Separation logic.}
+Reynolds's separation logic~\cite{reynolds02} and its
+modern descendants (Iris~\cite{iris}) provide powerful
+reasoning principles for shared mutable state.
+These logics are orthogonal to our contribution: they
+determine \emph{what} can be proved, while the trust
+algebra tracks \emph{how much} each proof should be
+trusted.
+
+\subsection{An adversarial model for trust escalation}
+
+We formalize the trust algebra's security properties using
+a game-theoretic model.  Consider an adversary $\mathcal{A}$
+(modeling a compromised LLM or malicious oracle) that seeks to
+escalate a judgment's trust to $\Tsolver$ or $\Tproof$ without
+providing genuine evidence at those levels.
+
+\begin{definition}[Trust escalation game]\label{def:trust-game}
+The \emph{trust escalation game}
+$\mathcal{G} = (\mathcal{A}, \mathcal{V}, \Talg, k)$ is a
+two-player game between an adversary $\mathcal{A}$ and a
+verifier $\mathcal{V}$ over $k$ rounds:
+\begin{enumerate}[nosep,label=(\roman*)]
+  \item $\mathcal{A}$ starts with a judgment at trust level
+        $\Tcopilot$ and may perform: compositions ($\tjoin$),
+        restrictions, transports, and promotion requests.
+  \item $\mathcal{V}$ enforces the trust algebra: each promotion
+        request is checked against the policy route; compositions
+        use conservative join.
+  \item $\mathcal{A}$ wins if after $k$ rounds the judgment reaches
+        $\Tsolver$ or above.
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Adversarial trust bound]\label{thm:adversarial}
+No adversary $\mathcal{A}$ can win the trust escalation game
+$\mathcal{G}$, regardless of $k$, provided the verifier $\mathcal{V}$
+faithfully implements $\Talg$.
+\end{theorem}
+
+\begin{proof}
+We prove by induction on $k$ that the maximum achievable trust
+level is $\Toracle$ (oracle-proposed).
+
+\emph{Base case} ($k = 0$): the judgment is at $\Tcopilot$.
+
+\emph{Inductive step}: assume after $k$ rounds the maximum
+achievable level is $\ell \tleq \Toracle$.  In round $k+1$,
+$\mathcal{A}$ may:
+\begin{itemize}[nosep]
+  \item \emph{Compose}: $\ell \tjoin \ell' = \min(\ell, \ell')
+        \tleq \ell$ (conservative join cannot increase trust).
+  \item \emph{Restrict/transport}: by trust monotonicity
+        (Theorem~\ref{thm:trust-monotone}), $\ell' \tleq \ell$.
+  \item \emph{Request promotion}: the copilot channel ceiling
+        (Theorem~\ref{thm:copilot-ceiling}) blocks promotion above
+        $\Toracle$.  To reach $\Tsolver$, $\mathcal{A}$ needs
+        evidence from a solver channel, which it does not possess
+        (by assumption: $\mathcal{A}$ controls only copilot/oracle
+        channels).
+\end{itemize}
+In all cases, $\ell' \tleq \Toracle < \Tsolver$, so $\mathcal{A}$
+cannot reach $\Tsolver$.
+\end{proof}
+
+\begin{theorem}[Impossibility of silent promotion in flat systems]
+\label{thm:flat-impossible}
+Any verification system with a flat trust model (at most 2 trust
+levels) cannot distinguish between the following two scenarios:
+\begin{enumerate}[nosep,label=(\alph*)]
+  \item A judgment fully proved by a trusted SMT solver.
+  \item A judgment proposed by an LLM with no independent verification.
+\end{enumerate}
+In contrast, $\Talg$ assigns scenario (a) to $\Tsolver$ and
+scenario (b) to $\Tcopilot$, with composition $\Tsolver \tjoin
+\Tcopilot = \Tcopilot$ ensuring the LLM evidence cannot ``launder''
+to solver-level trust.
+\end{theorem}
+
+\begin{proof}
+In a flat system with trust levels $\{0, 1\}$, both scenarios
+result in trust $1$ (``verified'').  There is no intermediate level
+to which LLM evidence can be assigned while still being marked as
+evidence (assigning $0$ would discard it entirely).  The composition
+$1 \oplus 1 = 1$ cannot decrease, so any evidence at level $1$
+permanently contaminates the trust pool.  In $\Talg$, the 8-level
+lattice provides the necessary room: $\Tcopilot$ is strictly below
+$\Tsolver$, and conservative join ($\min$) propagates the lower level.
+\end{proof}
+
+\subsection{Conclusion}
+
+We have introduced the trust ordered algebra
+$\Talg = (\Eadm, \tleq, \tjoin, \tatten, \tpromote, \tdemote)$,
+an eight-level bounded distributive lattice with six operations
+that governs how evidence composes, attenuates, and promotes
+in a mixed-evidence verification pipeline.
+The algebra enforces three invariants---no silent promotion,
+conservative join, and challenge conservativity---and we
+have proved soundness: the trust level of a judgment
+faithfully reflects the quality of its evidence.
+
+The evaluation demonstrates that the trust algebra provides
+all five dimensions of provenance metadata---an 8-level lattice,
+algebraic composition, an append-only audit log, copilot
+channel ceilings, and the no-silent-promotion invariant---that
+no existing proof assistant or LLM system tracks.
+In particular, the integration of AI-generated
+evidence at a controlled, non-promotable trust level
+addresses a pressing need as LLMs become standard
+components of the verification tool-chain.
+
+Future work will explore three directions.
+First, we plan to develop a \emph{trust type system}
+that statically rejects programs containing silent
+promotions, complementing the current dynamic enforcement.
+Second, we will investigate \emph{quantitative trust}
+by replacing the discrete lattice with a continuous
+semiring, enabling probabilistic reasoning about
+evidence quality.
+Third, we will extend the evaluation to industrial
+codebases with millions of lines of code, testing
+the scalability of the audit log and the ceiling
+enforcement mechanism.
+
+
+%% ═══════════════════════════════════════════════════════════════════════
+%% Bibliography
+%% ═══════════════════════════════════════════════════════════════════════
+
+\begin{thebibliography}{99}
+
+\bibitem{martinlof84}
+P.~Martin-L\"of.
+\newblock \emph{Intuitionistic Type Theory}.
+\newblock Bibliopolis, Naples, 1984.
+
+\bibitem{coquand88}
+T.~Coquand and C.~Huet.
+\newblock The {Calculus of Constructions}.
+\newblock \emph{Information and Computation}, 76(2--3):95--120, 1988.
+
+\bibitem{gentzen35}
+G.~Gentzen.
+\newblock Untersuchungen \"uber das logische {S}chlie{\ss}en.
+\newblock \emph{Mathematische Zeitschrift}, 39:176--210, 405--431, 1935.
+
+\bibitem{lean4}
+L.~de~Moura and S.~Ullrich.
+\newblock The {Lean~4} theorem prover and programming language.
+\newblock In \emph{CADE-28}, LNCS 12699, pp.~625--635. Springer, 2021.
+
+\bibitem{coq}
+The Coq Development Team.
+\newblock \emph{The {Coq} Reference Manual}, version 8.18, 2023.
+
+\bibitem{fstar}
+N.~Swamy, C.~Hri\c{t}cu, C.~Keller, A.~Rastogi, et~al.
+\newblock Dependent types and multi-monadic effects in {F*}.
+\newblock In \emph{POPL 2016}, pp.~256--270. ACM, 2016.
+
+\bibitem{dafny}
+K.~R.~M. Leino.
+\newblock Dafny: An automatic program verifier for functional correctness.
+\newblock In \emph{LPAR-16}, LNCS 6355, pp.~348--370. Springer, 2010.
+
+\bibitem{hoare69}
+C.~A.~R. Hoare.
+\newblock An axiomatic basis for computer programming.
+\newblock \emph{Communications of the ACM}, 12(10):576--580, 1969.
+
+\bibitem{reynolds02}
+J.~C. Reynolds.
+\newblock Separation logic: A logic for shared mutable data structures.
+\newblock In \emph{LICS 2002}, pp.~55--74. IEEE, 2002.
+
+\bibitem{iris}
+R.~Jung, R.~Krebbers, J.-H.~Jourdan, A.~Bizjak, L.~Birkedal, and D.~Dreyer.
+\newblock Iris from the ground up: A modular foundation for higher-order
+  concurrent separation logic.
+\newblock \emph{Journal of Functional Programming}, 28:e20, 2018.
+
+\bibitem{isabelle}
+T.~Nipkow, L.~C. Paulson, and M.~Wenzel.
+\newblock \emph{Isabelle/HOL --- A Proof Assistant for Higher-Order Logic}.
+\newblock LNCS 2283. Springer, 2002.
+
+\bibitem{liquidhaskell}
+N.~Vazou, E.~L. Seidel, R.~Jhala, D.~Vytiniotis, and S.~Peyton~Jones.
+\newblock Refinement types for {Haskell}.
+\newblock In \emph{ICFP 2014}, pp.~269--282. ACM, 2014.
+
+\bibitem{sel4}
+G.~Klein, K.~Elphinstone, G.~Heiser, et~al.
+\newblock {seL4}: Formal verification of an {OS} kernel.
+\newblock In \emph{SOSP 2009}, pp.~207--220. ACM, 2009.
+
+\bibitem{certikos}
+R.~Gu, Z.~Shao, H.~Chen, X.~Wu, J.~Kim, V.~Sj\"oberg, and D.~Costanzo.
+\newblock {CertiKOS}: An extensible architecture for building certified
+  concurrent {OS} kernels.
+\newblock In \emph{OSDI 2016}, pp.~653--669. USENIX, 2016.
+
+\bibitem{buneman01}
+P.~Buneman, S.~Khanna, and W.-C. Tan.
+\newblock Why and where: A characterization of data provenance.
+\newblock In \emph{ICDT 2001}, LNCS 1973, pp.~316--330. Springer, 2001.
+
+\bibitem{green07}
+T.~J. Green, G.~Karvounarakis, and V.~Tannen.
+\newblock Provenance semirings.
+\newblock In \emph{PODS 2007}, pp.~31--40. ACM, 2007.
+
+\bibitem{halpern03}
+J.~Y. Halpern.
+\newblock \emph{Reasoning about Uncertainty}.
+\newblock MIT Press, 2003.
+
+\bibitem{shafer76}
+G.~Shafer.
+\newblock \emph{A Mathematical Theory of Evidence}.
+\newblock Princeton University Press, 1976.
+
+\bibitem{paper02}
+H.~Young.
+\newblock The judgment 8-tuple: An algebraic foundation for evidence-carrying
+  proofs.
+\newblock \emph{Judgment Geometry Papers}, Paper~02, 2025.
+
+\bibitem{gpt4o}
+OpenAI.
+\newblock {GPT-4o} system card.
+\newblock Technical report, OpenAI, 2024.
+
+\end{thebibliography}
+
+\end{document}

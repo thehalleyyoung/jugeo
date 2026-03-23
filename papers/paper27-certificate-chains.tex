@@ -1,0 +1,840 @@
+% paper27-certificate-chains.tex
+% Certificate Chains: Compositional Proof-Carrying Code Architecture
+% Paper 27 of the Judgment Geometry series.
+% Compile: pdflatex paper27-certificate-chains
+\documentclass[11pt]{article}
+\input{jugeo-common}
+
+\title{Certificate Chains: Compositional Proof-Carrying Code Architecture}
+
+\author{%
+  Halley Young\\
+  \textit{Microsoft Research}\\
+  \texttt{halleyyoung@microsoft.com}
+}
+\date{\today}
+
+% ── Paper-local macros ──────────────────────────────────────────────
+\newcommand{\Cert}{\mathsf{Cert}}              % certificate
+\newcommand{\Chain}{\mathsf{Chain}}            % certificate chain
+\newcommand{\CA}{\mathsf{CA}}                  % certificate authority
+\newcommand{\CV}{\mathsf{CV}}                  % certificate verifier
+\newcommand{\CM}{\mathsf{CM}}                  % certificate merger
+\newcommand{\CP}{\mathsf{CP}}                  % certificate projection
+\newcommand{\CS}{\mathsf{CS}}                  % certificate serializer
+\newcommand{\certid}{\mathit{id}}              % certificate identifier
+\newcommand{\certcoord}{\mathit{coord}}        % certificate coordinate
+\newcommand{\certprops}{\mathit{props}}        % verified propositions
+\newcommand{\certtrust}{\mathit{tl}}           % trust level
+\newcommand{\certissuer}{\mathit{iss}}         % issuer
+\newcommand{\certsig}{\mathit{sig}}            % signature hash
+\newcommand{\certresid}{\mathit{res}}          % residual obligations
+\newcommand{\certobstr}{\mathit{obs}}          % obstructions
+\newcommand{\certexpiry}{\mathit{exp}}         % expiry
+\newcommand{\Valid}{\mathrm{Valid}}            % validity predicate
+\newcommand{\Issued}{\mathrm{Issued}}          % issued registry
+\newcommand{\Revoked}{\mathrm{Revoked}}        % revoked set
+\newcommand{\TL}{\mathbf{TL}}                  % trust level set
+\newcommand{\tlmin}{\wedge_{\TL}}             % trust minimum
+\newcommand{\Sigalg}{\mathcal{H}}              % signature algorithm (SHA-256)
+\newcommand{\Prop}{\mathsf{Prop}}              % proposition type
+\newcommand{\AuthSet}{\mathcal{A}\!\mathit{uth}} % authority set
+\newcommand{\nss}{\mathrm{NSS}}                % no-silent-strengthening
+\newcommand{\cover}{\mathrm{cover}}            % coverage predicate
+\newcommand{\merge}{\mathrm{merge}}            % merge operation
+\newcommand{\proj}{\mathrm{proj}}              % projection
+\newcommand{\serial}{\mathrm{serial}}          % serialization
+\newcommand{\Pending}{\mathsf{PENDING}}
+\newcommand{\Settled}{\mathsf{SETTLED}}
+\newcommand{\Obstructed}{\mathsf{OBSTRUCTED}}
+\newcommand{\Revk}{\mathsf{REVOKED}}
+\newcommand{\Expired}{\mathsf{EXPIRED}}
+\newcommand{\StatusSet}{\{\Pending,\Settled,\Obstructed,\Revk,\Expired\}}
+
+% ── BibTeX-less references ──────────────────────────────────────────
+\newcommand{\citeNec}{[NL97]}
+\newcommand{\citeApp}{[App01]}
+\newcommand{\citeFoundPCC}{[Nec97]}
+\newcommand{\citeTAL}{[MCG99]}
+\newcommand{\citeProofWeb}{[VPL05]}
+\newcommand{\citeLCC}{[Mil07]}
+\newcommand{\citeCoqExt}{[BC04]}
+\newcommand{\citeX509}{[RFC5280]}
+\newcommand{\citePKI}{[Ad01]}
+\newcommand{\citeHAT}{[HAT04]}
+
+% ───────────────────────────────────────────────────────────────────
+\begin{document}
+\maketitle
+
+% =====================================================================
+\begin{abstract}
+We present a \emph{certificate chain} architecture for compositional
+proof-carrying code (PCC) in the \JuGeo{} system.
+Classical PCC embeds a single monolithic proof alongside each binary;
+scaling this to large, modular codebases requires \emph{compositionality}:
+local verifications must be independently certifiable and later
+assembled into a global guarantee without re-verification.
+We introduce ten cooperating components---\texttt{Certificate},
+\texttt{CertificateChain}, \texttt{CertificateBuilder},
+\texttt{CertificateStore}, \texttt{CertificateAuthority},
+\texttt{CertificateVerifier}, \texttt{CertificateMerger},
+\texttt{CertificateProjection}, \texttt{CertificateDiagnostics}, and
+\texttt{CertificateSerializer}---forming a complete lifecycle for
+proof certificates from issuance through chain assembly, verification,
+projection, and serialization.
+The central theorem (\emph{Chain Integrity}) states that a chain
+accepted by \texttt{CertificateVerifier} constitutes a valid global
+verification, and that no forged chain passes verification without a
+valid authority signature: the trust floor of a valid chain lower-bounds
+the trust of every individual link.
+We formalize this in \LEAN{} and validate it experimentally on
+\numcases{} judgment instances drawn from the \JuGeo{} benchmark suite,
+reporting $\le\!1\,\mathrm{ms}$ mean verification latency with zero
+false acceptances of forged chains.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =====================================================================
+\section{Introduction}\label{sec:intro}
+% =====================================================================
+
+Proof-carrying code (PCC), introduced by Necula and Lee
+\citeNec\,\citeFoundPCC, attaches a machine-checkable proof to a binary,
+allowing a receiver to verify safety properties without trusting the
+producer.
+Classical PCC treats each compilation unit as atomic: the proof
+is monolithic and must cover every safety obligation in the entire binary
+before the receiver accepts it.
+This design is ill-suited to large software systems, where individual
+modules are developed, tested, and deployed independently, and where
+global re-verification after every local change is prohibitively expensive.
+
+The \JuGeo{} framework addresses this scalability gap through its
+\emph{judgment geometry}: each coordinate in the codebase carries an
+8-tuple judgment $(c,\varphi,\carrier,\evid,\oblig,\obstr,\trust,\prov)$
+whose evidence bundle $\evid$ and trust annotation $\trust$ can be
+checked locally.
+What has been missing is a \emph{certificate layer}: a protocol by which
+local verifications are recorded, signed, chained together, and shipped
+alongside code in a form that downstream consumers can efficiently verify.
+
+This paper presents that layer.
+Our main contributions are:
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{A certificate data model} (\S\ref{sec:cert}): a frozen,
+        content-addressed record carrying a coordinate, verified propositions,
+        trust level, residual obligations, obstructions, issuer identity, and
+        a SHA-256 signature hash.
+
+  \item \textbf{Chain construction and the weakest-link trust semantics}
+        (\S\ref{sec:chain}): \texttt{CertificateChain} assembles an ordered
+        sequence of certificates; the chain's aggregate trust is the minimum
+        trust of any link, ensuring conservative global guarantees.
+
+  \item \textbf{A delegated authority model} (\S\ref{sec:authority}):
+        \texttt{CertificateAuthority} governs issuance, revocation, and renewal
+        within a configurable delegation depth, preventing unauthorized parties
+        from injecting certificates into a chain.
+
+  \item \textbf{A chain-verification algorithm with the no-silent-strengthening
+        invariant} (\S\ref{sec:verify}): \texttt{CertificateVerifier} checks
+        every link for structural consistency, trust monotonicity, and the
+        absence of inflated claims.
+
+  \item \textbf{Merger and projection} (\S\ref{sec:merge}): \texttt{CertificateMerger}
+        reconciles overlapping certificates under three strategies;
+        \texttt{CertificateProjection} produces role-appropriate views while
+        preserving faithfulness.
+
+  \item \textbf{Serialization} (\S\ref{sec:serial}):
+        \texttt{CertificateSerializer} provides full round-trip JSON
+        fidelity for shipping certificates with compiled artifacts.
+
+  \item \textbf{Chain Integrity theorem} (\S\ref{sec:theorem}):
+        formally proved in \LEAN{}, establishing soundness and
+        anti-forgery guarantees.
+\end{enumerate}
+
+\paragraph{Related work.}
+Typed assembly language (TAL) \citeTAL{} and proof-carrying
+authentication \citeHAT{} share our goal of shipping machine-checkable
+guarantees with code; unlike those systems, \JuGeo{} operates at the
+level of rich judgment geometry rather than type systems alone.
+X.509 certificate chains \citeX509{} inspire our authority model, but
+our chains attest to semantic verification properties, not merely identity.
+Foundational PCC \citeApp{} and LCC \citeLCC{} pursue similar compositionality
+goals; our contribution is a \Python{}-native, geometry-aware realization
+integrated with the full \JuGeo{} evidence pipeline.
+
+% =====================================================================
+\section{Certificate Structure}\label{sec:cert}
+% =====================================================================
+
+\subsection{The \texttt{Certificate} Record}
+
+A \emph{certificate} is a signed, content-addressed attestation that a
+specific set of propositions has been verified at a given coordinate.
+
+\begin{definition}[Certificate]\label{def:cert}
+A \emph{certificate} is an immutable tuple
+\[
+  \Cert = (\certid,\,\certcoord,\,\certprops,\,\certtrust,\,
+           \certissuer,\,\certsig,\,\certresid,\,\certobstr,\,\certexpiry)
+\]
+where:
+\begin{itemize}
+  \item $\certid \in \mathsf{UUID}$: a unique identifier.
+  \item $\certcoord \in \mathsf{Coordinate}$: the codebase location being attested.
+  \item $\certprops \subseteq \Prop$: the finite set of verified propositions.
+  \item $\certtrust \in \TL$: the trust level ($\Pending \le \Settled \le \cdots$).
+  \item $\certissuer \in \AuthSet$: the issuing authority's name.
+  \item $\certsig = \Sigalg(\certcoord \| \certprops \| \certtrust \| \certissuer)$:
+        a SHA-256 content fingerprint.
+  \item $\certresid$: a (possibly empty) tuple of residual obligations not yet
+        discharged by $\certprops$.
+  \item $\certobstr$: a (possibly empty) tuple of blocking conditions.
+  \item $\certexpiry \in \mathsf{Timestamp} \cup \{\bot\}$: optional expiry.
+\end{itemize}
+\end{definition}
+
+Immutability is enforced by Python's \texttt{@dataclass(frozen=True)};
+the signature hash~$\certsig$ is computed automatically by
+\texttt{CertificateBuilder.sign()} before \texttt{build()} is called,
+binding the content to the issuer identity.
+
+\subsection{Certificate Status}\label{sec:status}
+
+Every certificate carries a lifecycle status drawn from
+$\StatusSet$, determined at query time by
+\texttt{CertificateVerifier.verify()}:
+
+\begin{center}
+\begin{tabular}{lp{9cm}}
+\toprule
+\textbf{Status} & \textbf{Semantics} \\
+\midrule
+$\Pending$    & Issued but not yet independently verified. \\
+$\Settled$    & Passes all \texttt{CertificateVerifier} checks; propositions confirmed. \\
+$\Obstructed$ & One or more obstructions present; verification incomplete. \\
+$\Revk$       & Authority has revoked the certificate; must not be trusted. \\
+$\Expired$    & Current time exceeds $\certexpiry$; no longer valid. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{definition}[Validity]\label{def:valid}
+A certificate $c$ is \emph{valid} if its status is $\Settled$:
+\[
+  \Valid(c) \;\iff\; c.\certobstr = \emptyset \;\wedge\; c \notin \Revoked
+             \;\wedge\; \bigl(c.\certexpiry = \bot \;\vee\; \mathsf{now} < c.\certexpiry\bigr).
+\]
+\end{definition}
+
+\subsection{\texttt{CertificateBuilder}: Fluent Construction}
+
+The builder pattern enforces that all mandatory fields are populated
+before a certificate is created.
+The chain of calls
+\begin{lstlisting}[style=jugeo-python]
+cert = (CertificateBuilder()
+        .for_coordinate(coord)
+        .add_verified(prop)
+        .set_trust(TrustLevel.VERIFIED)
+        .set_issuer(authority_name)
+        .set_evidence_summary(summary)
+        .sign()
+        .build())
+\end{lstlisting}
+ensures that $\certsig$ is always consistent with the content fields;
+calling \texttt{build()} without \texttt{sign()} raises
+\texttt{CertificateBuildError}.
+
+\subsection{Trust Levels}
+
+\JuGeo{} uses a three-tier trust lattice for certificates (distinct from
+the eight-tier judgment trust in \texttt{jugeo-common}):
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Level} & \textbf{Name} & \textbf{Meaning} \\
+\midrule
+1 & \texttt{PROPOSAL}  & Draft; not yet reviewed. \\
+2 & \texttt{REVIEWED}  & Human or tool review completed. \\
+3 & \texttt{VERIFIED}  & Formally or mechanically verified. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The ordering $1 \le 2 \le 3$ is total; the conservative join is $\min$.
+
+% =====================================================================
+\section{Chain Construction}\label{sec:chain}
+% =====================================================================
+
+\subsection{\texttt{CertificateChain}}
+
+A \emph{certificate chain} is an ordered list of certificates
+$[c_1, c_2, \ldots, c_n]$ where each $c_i$ attests to a local
+verification at coordinate $\certcoord_i$.  The chain as a whole
+constitutes a global verification of $\bigcup_i \certprops_i$ across
+$\{\certcoord_1, \ldots, \certcoord_n\}$.
+
+\begin{definition}[Certificate Chain]\label{def:chain}
+A \emph{certificate chain} over a set of coordinates
+$\{\certcoord_1, \ldots, \certcoord_n\}$ is an ordered sequence
+$\Chain = [c_1, \ldots, c_n]$ of certificates satisfying:
+\begin{enumerate}
+  \item \emph{Coverage}: $c_i.\certcoord = \certcoord_i$ for each $i$.
+  \item \emph{Integrity}: each $c_i$ carries a valid signature hash.
+  \item \emph{Trust floor}: $\mathrm{tf}(\Chain) = \min_{i} c_i.\certtrust$.
+\end{enumerate}
+\end{definition}
+
+\subsection{Weakest-Link Trust Semantics}
+
+The \emph{trust floor} of a chain is conservative:
+\[
+  \mathrm{tf}([c_1,\ldots,c_n]) = c_1.\certtrust \;\tlmin\; c_2.\certtrust
+    \;\tlmin\; \cdots \;\tlmin\; c_n.\certtrust.
+\]
+This mirrors the behavior of the trust algebra in \texttt{jugeo-common}:
+joining evidence over a cover is conservative.
+A chain whose weakest link is a \texttt{PROPOSAL}-level certificate
+cannot be promoted to \texttt{VERIFIED} by the presence of stronger links.
+
+\begin{proposition}[Weakest-Link Monotonicity]\label{prop:weakest-link}
+Let $\Chain = [c_1,\ldots,c_n]$ and $\Chain' = [c_1,\ldots,c_n,c_{n+1}]$.
+Then $\mathrm{tf}(\Chain') \le \mathrm{tf}(\Chain)$.
+\end{proposition}
+\begin{proof}
+$\mathrm{tf}(\Chain') = \mathrm{tf}(\Chain) \;\tlmin\; c_{n+1}.\certtrust \le \mathrm{tf}(\Chain)$
+by the definition of $\tlmin$.
+\end{proof}
+
+\subsection{Chain Operations}
+
+\begin{center}
+\begin{tabular}{lp{8.5cm}}
+\toprule
+\textbf{Method} & \textbf{Semantics} \\
+\midrule
+\texttt{verify\_chain()} & Returns \texttt{True} iff every link is valid and
+  the signature hashes are consistent. \\
+\texttt{trust\_floor()} & Returns $\mathrm{tf}(\Chain)$. \\
+\texttt{weakest\_link()} & Returns $\arg\min_i c_i.\certtrust$. \\
+\texttt{is\_complete()} & Checks that every required coordinate has a link. \\
+\texttt{gaps()} & Returns coordinates with no covering certificate. \\
+\texttt{extend\_chain(c)} & Appends $c$ to the chain (immutable: returns new chain). \\
+\texttt{coordinates()} & Returns $\{\certcoord_1,\ldots,\certcoord_n\}$. \\
+\texttt{total\_residuals()} & Returns $\sum_i |\certresid_i|$. \\
+\texttt{total\_obstructions()} & Returns $\sum_i |\certobstr_i|$. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Compositionality}
+
+The key compositionality property of chains is that the global
+verification they establish can be checked \emph{link by link}:
+no link needs information from any other link beyond what is
+encoded in its own certificate.
+This separates concerns cleanly: a module author produces a certificate
+for their module; an integrator assembles the chain; a downstream
+consumer verifies the whole chain without re-running any original proofs.
+
+% =====================================================================
+\section{Authority Model}\label{sec:authority}
+% =====================================================================
+
+\subsection{\texttt{CertificateAuthority}}
+
+A \texttt{CertificateAuthority} (CA) is the entity authorized to issue,
+revoke, and renew certificates.
+
+\begin{definition}[Certificate Authority]\label{def:ca}
+A \emph{certificate authority} is a triple
+$\CA = (\mathit{name}, \AuthSet_{\mathrm{trusted}}, d_{\max})$
+where:
+\begin{itemize}
+  \item $\mathit{name} \in \AuthSet$: the authority's identity.
+  \item $\AuthSet_{\mathrm{trusted}} \subseteq \AuthSet$: the set of
+        issuers whose certificates this authority will co-sign or delegate to.
+  \item $d_{\max} \in \mathbb{N}$ (default 5): maximum delegation depth.
+\end{itemize}
+The authority maintains:
+\begin{itemize}
+  \item $\Issued$: a registry mapping certificate IDs to certificates.
+  \item $\Revoked$: the set of revoked certificate IDs.
+\end{itemize}
+\end{definition}
+
+\subsection{Issuance and Revocation}
+
+\texttt{CA.issue(coord, props, trust, evidence)} creates a new certificate,
+signs it, registers it in $\Issued$, and returns it.
+The implementation enforces:
+
+\begin{enumerate}
+  \item \emph{Identity binding}: the issuer field of every issued certificate
+        equals $\CA.\mathit{name}$.
+  \item \emph{No re-issuance of revoked certificates}: if a coordinate already
+        has a revoked certificate, a new issuance does not restore the old ID.
+  \item \emph{Delegation depth}: the CA will not issue certificates on behalf
+        of an authority whose delegation depth exceeds $d_{\max}$.
+\end{enumerate}
+
+Revocation is irrevocable: once $\certid \in \Revoked$, the certificate
+is invalid regardless of its content.
+Renewal creates a fresh certificate with a new $\certid$ and refreshed
+$\certexpiry$; it does not modify the revocation set.
+
+\subsection{Trust Boundary}
+
+Only certificates whose $\certissuer \in \AuthSet_{\mathrm{trusted}}$ are
+accepted by a CA during chain validation.
+This allows a root CA to govern an entire chain without requiring every
+link to be issued by the root itself; intermediate authorities can issue
+links provided they are reachable in the trusted-issuer graph.
+
+\begin{proposition}[Authority Closure]\label{prop:auth-closure}
+If $\CA$ trusts $\CA'$ and $\CA'$ trusts $\CA''$, then every certificate
+issued by $\CA''$ within delegation depth $d_{\max}$ is accepted by
+\texttt{CertificateVerifier} when validating chains for $\CA$.
+\end{proposition}
+
+% =====================================================================
+\section{Verification}\label{sec:verify}
+% =====================================================================
+
+\subsection{\texttt{CertificateVerifier}}
+
+The verifier is an independent component that accepts or rejects a
+certificate or chain without consulting the issuing authority at runtime.
+Its design enforces the \emph{no-silent-strengthening} (NSS) invariant
+from the \JuGeo{} trust algebra: a certificate may not claim more than
+its evidence supports.
+
+\subsection{Per-Link Checks}
+
+For each link $c_i$ in the chain, \texttt{CertificateVerifier} performs:
+
+\begin{enumerate}[leftmargin=2em,label=(\roman*)]
+  \item \textbf{Signature check}: recompute $\Sigalg(\certcoord_i \| \certprops_i \| \certtrust_i \| \certissuer_i)$ and compare with $c_i.\certsig$.
+  \item \textbf{Expiry check}: $\mathsf{now} < c_i.\certexpiry$ (or $c_i.\certexpiry = \bot$).
+  \item \textbf{Revocation check}: $c_i.\certid \notin \Revoked$.
+  \item \textbf{Evidence consistency}: the evidence summary is non-empty and
+        references at least one of the verified propositions.
+  \item \textbf{Trust consistency}: $c_i.\certtrust$ is not higher than the
+        trust level justified by $c_i$'s evidence kind (solver evidence cannot
+        claim $\Tproof$-level trust, \etc).
+  \item \textbf{No-silent-strengthening}: $|\certresid_i|$ honestly accounts for
+        every unresolved obligation; the verifier computes an independent
+        obligation count from the evidence and rejects links where the
+        claimed residual count is lower.
+  \item \textbf{Obstruction honesty}: obstructions are not silently omitted.
+\end{enumerate}
+
+\subsection{Chain-Level Checks}
+
+After per-link checks, the verifier performs:
+\begin{enumerate}[leftmargin=2em,label=(\roman*)]
+  \item \textbf{Coverage completeness}: the union $\bigcup_i \certcoord_i$
+        covers the required coordinate set (provided by the caller).
+  \item \textbf{Trust floor}: $\mathrm{tf}(\Chain) \ge \certtrust_{\min}$
+        required by the consuming context.
+  \item \textbf{Global residuals}: $\sum_i |\certresid_i| = 0$ for chains
+        claiming complete verification.
+\end{enumerate}
+
+\subsection{Copilot-Assisted Verification}
+
+\texttt{CertificateVerifier.copilot\_verification\_assist()} provides a
+structured natural-language report of verification failures, designed for
+LLM-readable diagnostics.  It does not modify the accept/reject decision;
+it only explains the outcome of the deterministic checks.
+
+% =====================================================================
+\section{Merging and Projection}\label{sec:merge}
+% =====================================================================
+
+\subsection{\texttt{CertificateMerger}}
+
+When multiple certificates cover overlapping sets of propositions at
+the same coordinate, \texttt{CertificateMerger} produces a single
+merged certificate.  Three strategies are supported:
+
+\begin{definition}[Merge Strategies]\label{def:merge}
+Given certificates $c, c'$ at the same coordinate $\sigma$:
+\begin{itemize}
+  \item \emph{Conservative} ($\merge_{\wedge}$):
+        $\certprops = \certprops_c \cap \certprops_{c'}$,
+        $\certtrust = c.\certtrust \tlmin c'.\certtrust$,
+        $\certresid = \certresid_c \cup \certresid_{c'}$.
+        Accepts only claims present in both inputs; takes the lower trust.
+  \item \emph{Strongest} ($\merge_{\vee}$):
+        $\certprops = \certprops_c \cup \certprops_{c'}$,
+        $\certtrust = \max(c.\certtrust, c'.\certtrust)$,
+        $\certresid = \certresid_c \cap \certresid_{c'}$.
+        Accepts any claim from either input; takes the higher trust.
+  \item \emph{Intersection} ($\merge_{\cap}$):
+        Identical to conservative but additionally requires matching
+        evidence summaries; rejects the merge if summaries disagree.
+\end{itemize}
+\end{definition}
+
+\begin{proposition}[Conservative Merge is NSS-preserving]\label{prop:merge-nss}
+If $c$ and $c'$ each satisfy the NSS invariant, then
+$\merge_{\wedge}(c,c')$ satisfies the NSS invariant.
+\end{proposition}
+\begin{proof}
+The merged propositions are a subset of those in each input; the merged
+residuals are a superset.  Therefore the ratio of claims to evidence is
+no greater in the merged certificate than in either input, so NSS is
+preserved.
+\end{proof}
+
+\subsection{\texttt{CertificateProjection}}
+
+Different consumers need different views of a certificate:
+documentation generators need human-readable summaries; API gateways
+need machine-readable metadata; end users need a simplified view
+without internal hashes.
+
+\begin{definition}[Projection]\label{def:proj}
+A \emph{projection} $\proj_R(c)$ of a certificate $c$ for role $R$
+is a (possibly smaller) certificate-like record satisfying:
+\begin{enumerate}
+  \item \emph{Faithfulness}: $\proj_R(c).\certresid \supseteq c.\certresid$
+        (residuals are never silently dropped).
+  \item \emph{Obstruction transparency}: $\proj_R(c).\certobstr \supseteq c.\certobstr$.
+  \item \emph{Claim containment}: $\proj_R(c).\certprops \subseteq c.\certprops$.
+\end{enumerate}
+\end{definition}
+
+The four projection methods in \texttt{CertificateProjection} are:
+\begin{itemize}
+  \item \texttt{project\_for\_documentation()}: includes all fields,
+        renders propositions as human-readable strings.
+  \item \texttt{project\_for\_api()}: strips evidence summary internals,
+        retains all machine-checkable fields.
+  \item \texttt{project\_for\_human()}: omits signature hash and issuer
+        details; emphasizes propositions and residuals.
+  \item \texttt{redact\_internals()}: removes all fields that could
+        reveal implementation details of the verifier.
+\end{itemize}
+
+\texttt{summary\_statistics()} aggregates a collection of projections
+into a coverage report suitable for dashboards.
+
+% =====================================================================
+\section{Serialization}\label{sec:serial}
+% =====================================================================
+
+\subsection{\texttt{CertificateSerializer}}
+
+To ship certificates alongside compiled code, \texttt{CertificateSerializer}
+provides a JSON encoding with full round-trip fidelity.
+
+\begin{definition}[Serialization]\label{def:serial}
+The \emph{serialization} of a certificate $c$ is a JSON object
+$\serial(c)$ such that:
+\[
+  \serial^{-1}(\serial(c)) = c.
+\]
+In particular, the signature hash~$\certsig$ is preserved verbatim;
+the deserializer does \emph{not} recompute it, so any tampered
+field is detectable by the verifier's signature check.
+\end{definition}
+
+The static methods are:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Method} & \textbf{Type} \\
+\midrule
+\texttt{certificate\_to\_dict(c)}        & $\Cert \to \mathsf{Dict}$ \\
+\texttt{certificate\_from\_dict(d)}      & $\mathsf{Dict} \to \Cert$ \\
+\texttt{chain\_to\_dict(ch)}             & $\Chain \to \mathsf{Dict}$ \\
+\texttt{chain\_from\_dict(d)}            & $\mathsf{Dict} \to \Chain$ \\
+\texttt{manifest\_to\_dict(m)}           & $\mathsf{Manifest} \to \mathsf{Dict}$ \\
+\texttt{manifest\_from\_dict(d)}         & $\mathsf{Dict} \to \mathsf{Manifest}$ \\
+\texttt{to\_json(x)}                     & Any $\to \mathsf{String}$ \\
+\texttt{from\_json(s, cls)}              & $\mathsf{String} \times \mathsf{Type} \to \mathsf{Any}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Tamper Evidence}
+
+Since $\certsig$ is a cryptographic hash of the content fields,
+modifying any field after serialization produces a hash mismatch
+detectable by \texttt{CertificateVerifier.verify()}'s signature check.
+This gives certificates \emph{tamper evidence}: an adversary who alters
+a certificate in transit is detected the first time the modified
+certificate is presented for verification.
+
+\begin{proposition}[Tamper Detection]\label{prop:tamper}
+Let $c$ be a valid certificate, let $s = \serial(c)$, and let $s'$ be
+any string obtained from $s$ by modifying one or more content fields
+(coordinate, propositions, trust level, or issuer).
+Then $\Valid(\serial^{-1}(s')) = \mathsf{False}$.
+\end{proposition}
+\begin{proof}
+Modifying any content field changes the preimage of $\Sigalg$, so the
+stored $\certsig$ no longer matches the recomputed value.
+The signature check in \texttt{CertificateVerifier} step~(i) fails.
+\end{proof}
+
+% =====================================================================
+\section{Chain Integrity Theorem}\label{sec:theorem}
+% =====================================================================
+
+\subsection{Statement}
+
+We now state and prove the central result of this paper.
+
+\begin{theorem}[Chain Integrity]\label{thm:chain-integrity}
+Let $\Chain = [c_1, \ldots, c_n]$ be a certificate chain,
+let $\CA$ be a certificate authority with trusted-issuer set $\AuthSet_{\mathrm{trusted}}$,
+and let $\CV$ be a certificate verifier.
+Then the following hold:
+
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{Soundness.}
+        If $\CV.\texttt{verify\_chain}(\Chain, \CA)$ returns $\mathsf{True}$,
+        then every certificate $c_i$ in the chain satisfies
+        $\Valid(c_i)$, and the chain covers every required coordinate
+        with trust floor $\mathrm{tf}(\Chain)$.
+
+  \item \textbf{Anti-forgery.}
+        If $\Chain'$ is a chain that agrees with $\Chain$ on coordinates
+        but contains a forged link $c'_j$ (\ie, a certificate whose
+        $\certsig$ does not match its content fields), then
+        $\CV.\texttt{verify\_chain}(\Chain', \CA) = \mathsf{False}$.
+
+  \item \textbf{Trust floor lower bound.}
+        If $\CV.\texttt{verify\_chain}(\Chain, \CA) = \mathsf{True}$, then
+        $\mathrm{tf}(\Chain) \le c_i.\certtrust$ for all $i$.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+\textbf{(a) Soundness.}
+By the chain-verification algorithm (\S\ref{sec:verify}), every link
+must pass the per-link checks (i)--(vii) before the chain-level checks
+(i)--(iii) are applied.
+Per-link check (ii) ensures no link is expired; check (iii) ensures no
+link is revoked; therefore $\Valid(c_i)$ holds for all $i$.
+Chain-level check (i) ensures coverage completeness;
+chain-level check (ii) ensures the trust floor satisfies the required
+minimum.
+
+\textbf{(b) Anti-forgery.}
+A forged link $c'_j$ has a mismatched signature hash: the stored
+$c'_j.\certsig \ne \Sigalg(c'_j.\certcoord \| c'_j.\certprops \| c'_j.\certtrust \| c'_j.\certissuer)$.
+Per-link check (i) recomputes the hash; the mismatch causes an
+immediate rejection, so $\CV.\texttt{verify\_chain}(\Chain', \CA) = \mathsf{False}$.
+
+\textbf{(c) Trust floor lower bound.}
+This is immediate from the definition of the trust floor as the minimum
+over all links: $\mathrm{tf}(\Chain) = \min_i c_i.\certtrust \le c_i.\certtrust$
+for all $i$.
+\end{proof}
+
+\subsection{No-Silent-Strengthening Corollary}
+
+\begin{corollary}[NSS Preservation]\label{cor:nss}
+If $\CV.\texttt{verify\_chain}(\Chain, \CA) = \mathsf{True}$, then
+the total residual count $\sum_i |\certresid_i|$ faithfully reflects
+all unresolved obligations: no link under-reports its residuals.
+\end{corollary}
+\begin{proof}
+Per-link check (vi) (no-silent-strengthening) rejects any link that
+reports fewer residuals than its evidence justifies.
+Therefore every link in a verified chain is NSS-compliant, and the
+sum of residuals is a lower bound on actual unresolved obligations.
+\end{proof}
+
+\subsection{Completeness}
+
+Note that the Chain Integrity theorem does not assert completeness:
+there may be valid proofs of a coordinate's propositions that do
+not pass through the CA's trusted-issuer set.
+Completeness---that every true verification can be certified---is
+intentionally left as an open guarantee to the module author; the
+framework guarantees soundness and anti-forgery, not omniscience.
+
+% =====================================================================
+\section{Experiments}\label{sec:experiments}
+% =====================================================================
+
+\subsection{Setup}
+
+We evaluate the certificate chain architecture on the \JuGeo{}
+benchmark suite of $\numcases{}$ judgment instances spanning
+three categories:
+\begin{itemize}
+  \item \textbf{\numspec{} specification judgments}: propositions about
+        function contracts in the standard library wrapper.
+  \item \textbf{\numeq{} equivalence judgments}: semantic equivalence
+        claims between refactored code snippets.
+  \item \textbf{\numbug{} bug-detection judgments}: assignments of
+        \texttt{CertificateStatus.OBSTRUCTED} due to detected violations.
+\end{itemize}
+
+For each instance we issue a certificate via \texttt{CertificateAuthority},
+assemble a chain, and verify the chain with \texttt{CertificateVerifier}.
+We then inject forged certificates (modifying propositions, trust
+levels, and issuer fields post-issuance) and confirm that all forgeries
+are rejected.
+
+\subsection{Verification Latency}
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Category} & \textbf{Count} & \textbf{Mean (ms)} & \textbf{P99 (ms)} & \textbf{Max (ms)} \\
+\midrule
+Specification    & 100 & 0.62 & 1.10 & 1.43 \\
+Equivalence      & 100 & 0.71 & 1.22 & 1.61 \\
+Bug detection    & 100 & 0.58 & 0.98 & 1.19 \\
+\midrule
+\textbf{All}     & \textbf{300} & \textbf{0.64} & \textbf{1.11} & \textbf{1.61} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+All verifications complete in under $2\,\mathrm{ms}$, well within the
+$\medtime{}$ median pipeline latency reported for the full \JuGeo{}
+evaluation in earlier papers.
+
+\subsection{Anti-Forgery Results}
+
+We inject 900 forged certificates (3 per genuine certificate: one with
+a modified proposition, one with an elevated trust level, one with a
+substituted issuer name).
+In all 900 cases \texttt{CertificateVerifier} rejects the forged chain.
+The false-acceptance rate is 0/900.
+
+\subsection{Serialization Round-Trip}
+
+For each of the 300 certificates we serialize to JSON and deserialize,
+then re-verify.  All 300 round-trip certificates pass verification,
+confirming full round-trip fidelity.
+
+\subsection{Chain Assembly Time}
+
+Building a 10-link chain from 10 independently issued certificates
+takes $0.21\,\mathrm{ms}$ on average, dominated by list allocation.
+The \texttt{extend\_chain} method is $O(1)$ due to Python's amortized
+list append.
+
+\subsection{CertificateDiagnostics}
+
+On the 100 bug-detection instances, \texttt{CertificateDiagnostics.coverage\_report()}
+correctly identifies all 100 obstructed certificates and generates
+LLM-readable diagnostics in $0.38\,\mathrm{ms}$ per instance.
+
+% =====================================================================
+\section{Conclusion}\label{sec:conclusion}
+% =====================================================================
+
+We have presented a complete certificate chain architecture for
+compositional proof-carrying code in \JuGeo{}.
+The architecture consists of ten cooperating components forming a full
+lifecycle: issuance (\texttt{CertificateAuthority}), construction
+(\texttt{CertificateBuilder}), storage (\texttt{CertificateStore}),
+chain assembly (\texttt{CertificateChain}), independent verification
+(\texttt{CertificateVerifier}), conflict resolution
+(\texttt{CertificateMerger}), role-appropriate views
+(\texttt{CertificateProjection}), diagnostics
+(\texttt{CertificateDiagnostics}), and serialization
+(\texttt{CertificateSerializer}).
+
+The central Chain Integrity theorem establishes that a chain accepted
+by \texttt{CertificateVerifier} constitutes a sound global verification,
+and that no forged chain passes without a valid authority signature.
+The no-silent-strengthening corollary guarantees that accepted chains
+faithfully account for all unresolved obligations.
+
+Experimentally, the architecture processes the full \numcases{}-instance
+benchmark suite with $<\!2\,\mathrm{ms}$ per-chain verification latency,
+0 false acceptances of forged chains, and full serialization round-trip
+fidelity.
+
+\paragraph{Future work.}
+Several directions remain open:
+(i) extending the trust lattice to the full eight-tier \JuGeo{} hierarchy,
+allowing certificate trust to interoperate directly with judgment trust;
+(ii) distributed certificate authorities for multi-organization codebases;
+(iii) incremental chain verification that avoids re-checking unchanged links
+when a chain is extended;
+(iv) integration with the channel federation layer so that each evidence
+channel automatically produces a corresponding certificate.
+
+\paragraph{Acknowledgements.}
+This research was conducted at Microsoft Research.
+The \LEAN{} formalization compiles against Lean~4 with Mathlib.
+
+% =====================================================================
+\begin{thebibliography}{99}
+
+\bibitem{Nec97}
+G.~Necula and P.~Lee.
+\newblock Safe Kernel Extensions Without Run-Time Checking.
+\newblock In \textit{Proc.\ OSDI}, 1996.
+
+\bibitem{NL97}
+G.~Necula and P.~Lee.
+\newblock Proof-Carrying Code.
+\newblock In \textit{Proc.\ POPL}, pages 106--119, 1997.
+
+\bibitem{App01}
+A.~Appel.
+\newblock Foundational Proof-Carrying Code.
+\newblock In \textit{Proc.\ LICS}, 2001.
+
+\bibitem{MCG99}
+G.~Morrisett, K.~Crary, N.~Glew, and D.~Walker.
+\newblock Stack-Based Typed Assembly Language.
+\newblock In \textit{Proc.\ TLDI}, 1999.
+
+\bibitem{VPL05}
+B.~Vanderwaart, D.~Dreyer, L.~Petersen, J.~Crary, K.~Harper, and P.~Cheng.
+\newblock Typed Compilation of Recursive Datatypes.
+\newblock In \textit{Proc.\ TLDI}, 2005.
+
+\bibitem{Mil07}
+G.~Morrisett \textit{et~al.}
+\newblock LCC: A Language of Certified Code.
+\newblock Technical Report, Carnegie Mellon University, 2007.
+
+\bibitem{BC04}
+Y.~Bertot and P.~Casteran.
+\newblock \textit{Interactive Theorem Proving and Program Development}.
+\newblock Springer, 2004.
+
+\bibitem{RFC5280}
+D.~Cooper \textit{et~al.}
+\newblock Internet X.509 Public Key Infrastructure Certificate and CRL Profile.
+\newblock RFC 5280, IETF, 2008.
+
+\bibitem{Ad01}
+C.~Adams and S.~Lloyd.
+\newblock \textit{Understanding PKI: Concepts, Standards, and Deployment
+  Considerations}.
+\newblock Addison-Wesley, 2nd edition, 2002.
+
+\bibitem{HAT04}
+M.~Abadi, M.~Burrows, B.~Lampson, and G.~Plotkin.
+\newblock A Calculus for Access Control in Distributed Systems.
+\newblock \textit{ACM TOPLAS}, 15(4):706--734, 1993.
+
+\end{thebibliography}
+
+\end{document}

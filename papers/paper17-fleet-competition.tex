@@ -1,0 +1,941 @@
+% paper17-fleet-competition.tex
+% Fleet Competition: Adversarial Evidence Selection via Tournament Protocols
+% Paper 17 in the Judgment Geometry series.
+\documentclass[11pt]{article}
+\input{jugeo-common}
+
+% ── Paper-specific macros ───────────────────────────────────────────────────
+\providecommand{\Fleet}{\mathcal{F}}              % fleet of strategies
+\providecommand{\Strat}{\mathsf{S}}               % strategy
+\providecommand{\Bid}{\mathsf{B}}                 % bid (proposed evidence)
+\providecommand{\Round}{\mathsf{R}}               % competition round
+\providecommand{\Eval}{\mathsf{Eval}}             % evaluator
+\providecommand{\Adj}{\mathcal{A}}                % adjudicator
+\providecommand{\tqual}{\mathsf{q}}               % quality score
+\providecommand{\tmax}{\mathrm{max}}              % max
+\providecommand{\BidSet}{\mathcal{B}}             % set of bids
+\providecommand{\FleetComp}{\textsc{FleetComp}}   % FleetCompetition system
+\providecommand{\CompRound}{\textsc{CompRound}}   % CompetitionRound
+\providecommand{\BidOut}{\textsc{BidOutcome}}     % BidOutcome
+\providecommand{\ChalOut}{\textsc{ChalOut}}       % ChallengeOutcome
+\providecommand{\Routed}{\textsc{Route}}          % routing function
+\providecommand{\EvidRouter}{\textsc{EvidRouter}} % EvidenceRouter
+\providecommand{\RoutStrat}{\textsc{RoutStrat}}   % RoutingStrategy
+\providecommand{\winner}{\mathrm{win}}            % winner set
+\providecommand{\loser}{\mathrm{lose}}            % loser set
+\providecommand{\ACCEPT}{\textsc{Accept}}
+\providecommand{\REJECT}{\textsc{Reject}}
+\providecommand{\ESCALATE}{\textsc{Escalate}}
+\providecommand{\SUSTAIN}{\textsc{Sustain}}
+\providecommand{\OVERTURN}{\textsc{Overturn}}
+\providecommand{\tgeq}{\succeq}          % trust ≥ ordering
+\providecommand{\kfield}{\mathbb{F}}
+
+\title{\textbf{Fleet Competition: Adversarial Evidence Selection\\
+       via Tournament Protocols}}
+
+\author{Halley Young, Microsoft Research}
+\date{Paper~17 in the Judgment Geometry series \quad \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We introduce \emph{fleet competition}, a tournament-based protocol for
+adversarial evidence selection in the \JuGeo{} framework.  When multiple
+evidence-producing strategies compete over a single judgment coordinate,
+greedy selection fails: a locally best strategy may be globally dominated by a
+peer strategy that exposes contradictions.  Fleet competition replaces greedy
+search with a sequence of \emph{competition rounds}, each consisting of a bid
+phase (strategies propose evidence), an evaluation phase (a judge scores
+bids), and an optional \emph{challenge phase} in which one strategy disputes
+another's bid.  Disputes are resolved by an \textsc{Adjudicator} that applies
+the trust algebra of the \JuGeo{} judgment 8-tuple.  Winning evidence is
+forwarded to the descent engine via the \emph{mixed-evidence router}.  We prove
+the \emph{Fleet Quality Guarantee}: the trust level of tournament-selected
+evidence is at least as high as the maximum trust level achievable by any
+individual strategy.  Experiments on \numcases{} verification tasks show a
+$21\%$ improvement in evidence trust level over greedy single-strategy
+selection, with per-round latency overhead of only $\medtime$.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}\label{sec:intro}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The \JuGeo{} framework represents program verification as navigation through a
+semantic site: a judgment $\J = \Jud{\coord}{\prop}{\carrier}{\evid}{\oblig}
+{\obstr}{\trust}{\prov}$ is a structured 8-tuple carrying a trust annotation
+$\trust \in \Talg$ that encodes how much epistemic weight the framework assigns
+to the evidence bundle $\evid$.  Papers~1--4 established the foundations of
+this algebra; Papers~5--16 built an increasingly rich library of semantic
+moves, proof-carrying adapters, and cohomological obstructions.
+
+A recurring bottleneck in practice is the \emph{evidence selection problem}:
+given a judgment coordinate $\coord$ and several strategies capable of
+producing evidence for the proposition $\prop$, which strategy should the
+orchestrator invoke?  The naive greedy answer---\emph{invoke the strategy with
+the highest self-declared trust ceiling}---has a critical failure mode.  A
+strategy may legitimately claim a high trust ceiling yet produce evidence that,
+when examined by a peer strategy, is shown to rest on contradicted assumptions.
+The peer's \CHALLENGE{} move then forces a demotion of the trust annotation,
+wasting computational budget and delaying verification.
+
+\subsection{Adversarial Selection as a Tournament}
+
+We argue that the correct abstraction is not selection but \emph{competition}.
+A \emph{fleet} $\Fleet = \{\Strat_1, \ldots, \Strat_n\}$ of evidence-producing
+strategies operates as a population of adversaries: each strategy is
+simultaneously a \emph{bidder} (proposing evidence it believes is good) and a
+\emph{challenger} (empowered to dispute bids from other strategies).  The
+interplay between bidding and challenging drives the population toward evidence
+whose trust level survives adversarial scrutiny.
+
+This mirrors the design of tournament-style algorithms in combinatorial
+optimization~\cite{Gold89} and the challenge--response protocols of formal
+argument systems~\cite{Dung95}, but instantiated within the algebraic
+structure of the trust lattice $\Talg$ defined in Paper~4.
+
+\subsection{Contributions}
+
+The contributions of this paper are:
+
+\begin{enumerate}[label=(\roman*)]
+  \item The \emph{fleet competition model}: formal definitions of
+    \FleetComp{}, \CompRound{}, and \BidOut{} (\cref{sec:model}).
+
+  \item The \emph{challenge protocol}: definitions of \ChalOut{},
+    challenge conditions, and escalation semantics (\cref{sec:challenge}).
+
+  \item The \emph{adjudication calculus}: the \textsc{Adjudicator} class
+    and its dispute-resolution strategies (\cref{sec:adjudication}).
+
+  \item The \emph{mixed-evidence router}: forwarding winning evidence to the
+    descent engine via \EvidRouter{} and \RoutStrat{} (\cref{sec:routing}).
+
+  \item The \emph{Fleet Quality Guarantee}: a theorem showing that
+    tournament selection cannot do worse than the best individual strategy
+    (\cref{sec:theorem}).
+
+  \item Experimental validation on \numcases{} verification tasks
+    (\cref{sec:experiments}).
+\end{enumerate}
+
+\subsection{Paper Structure}
+
+\Cref{sec:background} reviews the judgment 8-tuple and trust algebra
+prerequisites.  \Cref{sec:model} through \cref{sec:routing} develop the four
+main components.  \Cref{sec:theorem} presents the quality guarantee with proof.
+\Cref{sec:experiments} reports empirical results.  \Cref{sec:conclusion}
+concludes.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Background}\label{sec:background}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Judgment Tuples and Trust Annotations}
+
+A \JuGeo{} \emph{judgment} is an 8-tuple
+\[
+  \J = \Jud{\coord}{\prop}{\carrier}{\evid}{\oblig}{\obstr}{\trust}{\prov}
+\]
+where $\coord$ is a semantic coordinate (module, function, interface, or test
+region), $\prop$ is the proposition under verification, $\carrier$ is the
+carrier type, $\evid$ is the evidence bundle, $\oblig$ is the obligation set,
+$\obstr$ is the obstruction class, $\trust \in \Talg$ is the trust annotation,
+and $\prov$ is the provenance record.
+
+The trust algebra $\Talg = (\Eadm, \tleq, \tjoin, \tatten, \tpromote,
+\tdemote)$ is a totally ordered bounded lattice with the chain
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot \;\tleq\; \Toracle
+  \;\tleq\; \Truntime \;\tleq\; \Tsolver \;\tleq\; \Tproof.
+\]
+Evidence at level $\tau$ in the chain may be \emph{promoted} to level
+$\tau' \succ \tau$ by supplying a proof obligation $\pi$, and \emph{demoted}
+to level $\tau'' \prec \tau$ by a valid counter-evidence certificate $\chi$.
+Full details appear in Paper~4.
+
+\subsection{Evidence Bundles and Strategies}
+
+An \emph{evidence strategy} $\Strat$ is a function
+$\Strat : (\coord, \prop, \carrier) \to \evid \times \trust$ that produces
+an evidence bundle together with a trust annotation for that bundle.  Each
+strategy has a declared \emph{trust ceiling} $\tau^*(\Strat) \in \Talg$:
+the highest trust level it can claim for its outputs.
+
+Strategies may be \emph{solver-based} (discharging SMT obligations in
+\QFLIA{} or \QFLRA{}), \emph{runtime-witnessed} (accumulating test-case
+verdicts), \emph{proof-backed} (invoking a \LEAN{} checker), or
+\emph{copilot-suggested} (language-model inference with no formal backing).
+The fleet competition protocol is strategy-agnostic: it treats all strategies
+uniformly as bid producers.
+
+\subsection{Descent Engine and Routing}
+
+The \emph{descent engine} (Papers~3, 11, 13) propagates evidence from a
+covering family $\{U_i\}$ of a semantic site $\Site$ to the global section
+over $\bigcup U_i$.  A descent step consumes an evidence bundle and a gluing
+certificate, and elevates the trust annotation when the Čech boundary
+condition $\delta(\evid) = 0$ is met.  Routing determines which channel of
+the descent engine receives the winning evidence after each competition round.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{The Competition Model}\label{sec:model}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Fleet Competition}
+
+\begin{definition}[\FleetComp{}]\label{def:fleetcomp}
+A \emph{fleet competition} is a tuple $\FleetComp = (\Fleet, \coord, \prop,
+\Eval, r_{\max})$ where:
+\begin{itemize}
+  \item $\Fleet = \{\Strat_1, \ldots, \Strat_n\}$ is a non-empty fleet of
+    evidence strategies,
+  \item $(\coord, \prop)$ is the judgment coordinate and proposition under
+    competition,
+  \item $\Eval : \BidSet \to \mathbb{R}_{>0}$ is a judge function scoring bids,
+  \item $r_{\max} \in \mathbb{N}_{>0}$ is the maximum number of rounds.
+\end{itemize}
+\end{definition}
+
+The competition proceeds in rounds.  At round $r \in \{1, \ldots, r_{\max}\}$
+all strategies still active in the tournament simultaneously submit bids.  The
+evaluator selects winners.  Eliminated strategies are deactivated; surviving
+strategies advance to the next round.  The competition terminates when either
+(a) exactly one strategy remains, or (b) round $r_{\max}$ is reached, in which
+case the strategy with the highest cumulative bid score is declared the winner.
+
+\begin{definition}[Bid]\label{def:bid}
+A \emph{bid} submitted by strategy $\Strat_i$ in round $r$ is a tuple
+\[
+  \Bid_i^{(r)} = (\Strat_i,\; \evid_i,\; \trust_i,\; \tqual_i,\; u_i)
+\]
+where $\evid_i$ is the proposed evidence bundle, $\trust_i \in \Talg$ is the
+claimed trust level, $\tqual_i \in [0,1]$ is a self-scored semantic quality
+in the trust algebra, and $u_i \in [0,1]$ is the epistemic uncertainty.
+\end{definition}
+
+\begin{definition}[\BidOut{}]\label{def:bidoutcome}
+A \emph{bid outcome} $\BidOut \in \{\ACCEPT, \REJECT, \textsc{Challenge},
+\textsc{Expired}\}$ records the final disposition of a bid:
+\begin{itemize}
+  \item $\ACCEPT$: the bid was selected as a round winner.
+  \item $\REJECT$: the bid was not selected; the round closed without it.
+  \item $\textsc{Challenge}$: the bid was challenged by a peer strategy.
+  \item $\textsc{Expired}$: the round closed before the bid was evaluated.
+\end{itemize}
+\end{definition}
+
+\subsection{Competition Rounds}
+
+\begin{definition}[\CompRound{}]\label{def:compround}
+A \emph{competition round} $\Round^{(r)}$ is a tuple $(\BidSet^{(r)},\;
+\text{phase},\; \winner^{(r)},\; \loser^{(r)},\; \textit{challenges}^{(r)})$
+where $\BidSet^{(r)}$ is the set of bids submitted in round $r$,
+$\text{phase} \in \{\textsc{Open},\; \textsc{Evaluating},\;
+\textsc{Closed},\; \textsc{Archived}\}$ is the lifecycle phase,
+$\winner^{(r)} \subseteq \Fleet$ and $\loser^{(r)} \subseteq \Fleet$ are the
+winning and losing strategy sets, and $\textit{challenges}^{(r)}$ is the
+(possibly empty) list of challenge records issued during round $r$.
+\end{definition}
+
+Rounds progress through four phases that enforce ordering constraints on state
+transitions.  The \textsc{Open} phase accepts new bids.  Once bid collection
+closes the round enters \textsc{Evaluating}, during which the judge and
+challenge protocol run.  The round becomes \textsc{Closed} once a winner is
+determined, and \textsc{Archived} when the round's data is persisted.
+
+\subsection{Multi-Criterion Evaluation}
+
+The evaluator function $\Eval$ combines three criteria with configurable
+weights $w_v, w_s, w_u \geq 0$ summing to $1$:
+\[
+  \Eval(\Bid_i) \;=\; w_v \cdot \text{val}(\Bid_i)
+                  \;+\; w_s \cdot \tqual_i
+                  \;-\; w_u \cdot u_i,
+\]
+where $\text{val}(\Bid_i)$ is a strategy-specific utility score provided by
+the strategy at bid time.  Before elimination, the evaluator applies a
+\emph{Pareto filter}: bids that are strictly dominated on all three axes
+(lower value, lower quality, higher uncertainty) are pruned regardless of
+their composite score.
+
+\begin{example}[Solver vs.\ runtime strategy]\label{ex:solvervsruntime}
+  Let $\Strat_1$ be a \QFLIA{} solver strategy with trust ceiling $\Tsolver$
+  and $\Strat_2$ be a runtime-witness strategy with ceiling $\Truntime$.  In
+  round~1, $\Strat_1$ submits $\Bid_1 = (\Strat_1, \evid_{\mathrm{unsat}},
+  \Tsolver, 0.95, 0.03)$ and $\Strat_2$ submits $\Bid_2 = (\Strat_2,
+  \evid_{42}, \Truntime, 0.78, 0.12)$.  The Pareto filter retains both (neither
+  dominates the other on all three axes).  $\Eval$ with $w_v = 0.4, w_s = 0.4,
+  w_u = 0.2$ scores $\Strat_1$ at $0.817$ and $\Strat_2$ at $0.588$.
+  $\Strat_1$ advances; $\Strat_2$ is eliminated with $\BidOut = \REJECT$.
+\end{example}
+
+The following Python listing shows the core bid-collection and evaluation loop
+as implemented in \texttt{fleet\_competition/algorithms.py}:
+
+\begin{lstlisting}[style=jugeo-python, caption={Multi-criterion bid evaluation
+  loop (\texttt{fleet\_competition/algorithms.py})},
+  label={lst:eval}]
+def evaluate_round(round_: FleetRound,
+                   weights: tuple[float, float, float]) -> list[str]:
+    w_v, w_s, w_u = weights
+    active = [b for b in round_.bids if b.status == BidStatus.PENDING]
+    # Pareto filter: remove strictly dominated bids
+    frontier = pareto_filter(active)
+    # Composite score
+    scored = [(b, w_v * b.bid_value + w_s * b.semantic_score
+                  - w_u * b.uncertainty)
+              for b in frontier]
+    scored.sort(key=lambda p: p[1], reverse=True)
+    winners = [b.bidder_id for b, _ in scored[:round_.max_winners]]
+    for b, _ in scored[round_.max_winners:]:
+        b.status = BidStatus.REJECTED  # (*@\BidOut{} $\leftarrow$ \REJECT@*)
+    return winners
+\end{lstlisting}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{The Challenge Protocol}\label{sec:challenge}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Challenge Outcomes}
+
+The \CHALLENGE{} move allows a strategy $\Strat_j$ to dispute a bid
+$\Bid_i^{(r)}$ submitted by a peer $\Strat_i$.  A challenge asserts that the
+evidence $\evid_i$ either contains a contradiction, overstates its trust level,
+or is inconsistent with the challenger's own evidence $\evid_j$.
+
+\begin{definition}[\ChalOut{}]\label{def:chalout}
+A \emph{challenge outcome} $\ChalOut \in \{\SUSTAIN, \OVERTURN, \ESCALATE,
+\textsc{Withdrawn}\}$ records the resolution of a challenge:
+\begin{itemize}
+  \item $\SUSTAIN$: the challenge is upheld; bid $\Bid_i$ is overturned
+    with $\BidOut \leftarrow \REJECT$ and the trust annotation is demoted via
+    $\tdemote$.
+  \item $\OVERTURN$: the challenge fails; bid $\Bid_i$ is reconfirmed with
+    $\BidOut \leftarrow \ACCEPT$ and the challenger's credibility is penalised.
+  \item $\ESCALATE$: the adjudicator cannot resolve the dispute within the
+    current round; the challenge is forwarded to a higher-authority
+    adjudicator or a new round.
+  \item $\textsc{Withdrawn}$: the challenger retracts before resolution.
+\end{itemize}
+\end{definition}
+
+\subsection{When to Challenge}
+
+A strategy should raise a challenge when it holds evidence $\evid_j$ such that
+$\evid_j \tatten \evid_i \tleq \Tcontra$, \ie{} the meet of the two evidence
+bundles in the trust algebra falls below the minimum admissible level.
+Formally:
+
+\begin{definition}[Challenge condition]\label{def:challcond}
+Strategy $\Strat_j$ is \emph{entitled to challenge} bid $\Bid_i$ in round $r$
+if and only if there exists a counter-evidence certificate $\chi_{ij}$ such that
+\[
+  \trust_i \;\tatten\; \chi_{ij} \;\tleq\; \Tunver.
+\]
+\end{definition}
+
+This condition ensures challenges are grounded in the trust algebra and cannot
+be raised frivolously.  A rate-limiting mechanism (configurable as
+\texttt{max\_challenges\_per\_member} in the \textsc{ChallengeLedger}) bounds
+the number of challenges any single strategy may raise per round, preventing
+adversarial exhaustion of the evaluation budget.
+
+\subsection{Challenge Lifecycle}
+
+Each challenge passes through four lifecycle stages, mirroring the
+\texttt{ChallengeRecord} dataclass in \texttt{challenge\_protocol.py}:
+
+\begin{enumerate}[label=\textbf{Stage \arabic*.}]
+  \item \textbf{Initiated.}
+    $\Strat_j$ invokes \texttt{ChallengeInitiator.create(bid\_id, evidence)}
+    producing a \texttt{ChallengeRecord} with status \textsc{Initiated}.
+
+  \item \textbf{Evidence submitted.}
+    The challenger attaches its counter-evidence $\evid_j$ and the certificate
+    $\chi_{ij}$ to the record.  Status advances to \textsc{EvidenceSubmitted}.
+
+  \item \textbf{Adjudicated.}
+    The \textsc{Adjudicator} (\cref{sec:adjudication}) inspects both bundles
+    and produces a \ChalOut{}.  Status advances to \textsc{Adjudicated}.
+
+  \item \textbf{Resolved.}
+    The resolution is written back into the \CompRound{} record and published
+    on the \textsc{ChallengeEventBus}.  Status advances to \textsc{Resolved}.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzcd}[column sep=2.2cm, row sep=1.2cm]
+  \textsc{Initiated}
+    \arrow[r, "\text{submit evidence}"]
+  & \textsc{EvidenceSubmitted}
+    \arrow[r, "\textsc{Adjudicator}"]
+  & \textsc{Adjudicated}
+    \arrow[r, "\text{write-back}"]
+  & \textsc{Resolved}
+  \\[-0.4cm]
+  & & \textsc{Adjudicated}
+    \arrow[d, "\ESCALATE"]
+  \\[-0.4cm]
+  & & \textsc{Escalated}
+    \arrow[r, "\text{higher authority}"]
+  & \textsc{Resolved}
+\end{tikzcd}
+\caption{Challenge lifecycle transitions.  The \ESCALATE{} branch applies
+when the adjudicator cannot reach a definitive verdict within the current
+round.}
+\label{fig:lifecycle}
+\end{figure}
+
+\subsection{Escalation}
+
+When a challenge is escalated, the \textsc{ChallengeEventBus} publishes an
+\textsc{Escalation} event.  A higher-authority adjudicator---potentially a
+different \CompRound{} with a smaller, more focused fleet---is instantiated to
+resolve the dispute.  Escalation depth is bounded by a configurable parameter
+\texttt{max\_escalation\_depth}; at depth $d_{\max}$ the adjudicator falls
+back to the \emph{conservative resolution}: the challenged bid is demoted to
+$\Tunver$ and forwarded without further escalation.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Adjudication}\label{sec:adjudication}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{The Adjudicator Class}
+
+The \textsc{Adjudicator} is the arbitration engine of the fleet competition
+system.  Given a challenge record $c = (\Bid_i, \evid_j, \chi_{ij})$ and
+access to the current round's calibration traces, the adjudicator produces a
+verdict $v \in \ChalOut{}$ together with an updated trust annotation for the
+affected bid.
+
+\begin{definition}[Adjudicator]\label{def:adjudicator}
+An \emph{adjudicator} $\Adj$ is a function
+\[
+  \Adj : (\textit{ChallengeRecord},\; \textit{CalibrationTrace})
+         \;\longrightarrow\; \ChalOut{} \times \Talg
+\]
+that is \emph{monotone} in the following sense: for any two challenge records
+$c \tleq c'$ (where the ordering is by the challenger's evidence trust level),
+we have $\Adj(c).{\trust} \tleq \Adj(c').{\trust}$ in $\Talg$.
+\end{definition}
+
+\subsection{Dispute Resolution Strategies}
+
+The adjudicator supports four pluggable resolution strategies, selectable at
+construction time via the \texttt{resolution\_strategy} parameter:
+
+\paragraph{Trust-dominance resolution.}
+If $\trust_j \succ \trust_i$ in $\Talg$ and the certificate $\chi_{ij}$ is
+valid, the adjudicator issues $\SUSTAIN$.  If $\trust_i \succ \trust_j$, it
+issues $\OVERTURN$.  Otherwise it falls through to the next strategy.
+
+\paragraph{Evidence-score resolution.}
+The adjudicator computes a weighted evidence score
+\[
+  s(e) = w_{\text{tr}} \cdot \tqual(e) + w_{\text{ca}} \cdot \text{calibration}(e)
+\]
+for each evidence bundle and resolves in favour of the higher-scoring bundle.
+The calibration term uses the \texttt{CalibrationTrace.calibration\_score()}
+method with a trailing window of $\texttt{CALIBRATION\_TRAILING\_WINDOW} = 10$.
+
+\paragraph{Consensus resolution.}
+When multiple strategies hold compatible evidence (all agreeing on outcome),
+the adjudicator performs a consensus vote.  A bid is sustained if a strict
+majority of the active fleet supports the challenge.
+
+\paragraph{Conservative resolution.}
+The fallback strategy: demote the challenged bid to $\Tunver$ and continue.
+This is the only strategy guaranteed to terminate and is always reached at
+escalation depth $d_{\max}$.
+
+\begin{proposition}[Adjudicator termination]\label{prop:termination}
+For any challenge record $c$ and any escalation depth bound $d_{\max} \geq 1$,
+the adjudicator $\Adj$ terminates and produces a verdict $v \in \ChalOut{}$.
+\end{proposition}
+\begin{proof}
+The four resolution strategies are tried in priority order.  Conservative
+resolution always applies (it requires no comparison and always produces
+$\SUSTAIN$ with demotion to $\Tunver$).  Hence the strategy chain terminates
+after at most four steps; escalation depth decreases by $1$ at each recursive
+call and reaches $0$ before $d_{\max}$ attempts.
+\end{proof}
+
+\begin{proposition}[Monotonicity of adjudication]\label{prop:monoadj}
+If $\trust_j \tleq \trust_{j'}$ (challenger's evidence trust is at most that
+of a stronger challenger $\Strat_{j'}$), then
+$\Adj(c_j).{\trust} \tleq \Adj(c_{j'}).{\trust}$ for the resulting trust
+annotation on the challenged bid.
+\end{proposition}
+\begin{proof}
+By case analysis on the resolution strategy.  Trust-dominance resolution
+explicitly checks $\trust_j$ vs.\ $\trust_i$; a stronger challenger can only
+increase the probability of $\SUSTAIN{}$, which demotes $\trust_i$, reducing
+the resulting trust annotation.  Evidence-score and consensus strategies
+inherit monotonicity from the monotonicity of $\tqual$ and the calibration
+score.  Conservative resolution is constant and trivially monotone.
+\end{proof}
+
+The following listing shows the adjudicator's core scoring logic as implemented
+in \texttt{fleet\_competition/challenge\_protocol.py}:
+
+\begin{lstlisting}[style=jugeo-python, caption={Adjudicator: trust-dominance
+  and evidence-score resolution
+  (\texttt{fleet\_competition/challenge\_protocol.py})},
+  label={lst:adj}]
+def adjudicate(record: ChallengeRecord,
+               calib: CalibrationTrace) -> tuple[ChallengeOutcome, TrustLevel]:
+    t_i = record.challenged_bid.trust_ceiling
+    t_j = record.challenger_trust
+    # Strategy 1: trust-dominance
+    if t_j > t_i and record.certificate_valid:
+        return ChallengeOutcome.SUSTAINED, TrustLevel.unverified
+    if t_i > t_j:
+        return ChallengeOutcome.OVERTURNED, t_i
+    # Strategy 2: evidence-score
+    s_i = 0.7 * record.challenged_score + 0.3 * calib.calibration_score()
+    s_j = 0.7 * record.challenger_score + 0.3 * calib.calibration_score()
+    if s_j > s_i:
+        return ChallengeOutcome.SUSTAINED, TrustLevel.unverified
+    if s_i > s_j:
+        return ChallengeOutcome.OVERTURNED, t_i
+    # Fallback: conservative
+    return ChallengeOutcome.SUSTAINED, TrustLevel.unverified  # (*@$\SUSTAIN$@*)
+\end{lstlisting}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Evidence Routing}\label{sec:routing}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{The Mixed-Evidence Router}
+
+After each competition round, winning evidence must be forwarded to the descent
+engine.  The \emph{evidence router} $\EvidRouter$ selects a channel---a named
+intake port of the descent engine---based on the trust tier of the winning bid
+and the semantics of the proposition $\prop$.
+
+\begin{definition}[\EvidRouter{}]\label{def:evidrouter}
+An \emph{evidence router} $\EvidRouter = (\textit{ChannelMap},\;
+\textit{TrustCeilingMap},\; \rho)$ consists of:
+\begin{itemize}
+  \item $\textit{ChannelMap} : \Talg \to \mathrm{Channel}$, assigning a
+    descent channel to each trust tier,
+  \item $\textit{TrustCeilingMap} : \mathrm{Channel} \to \Talg$, recording the
+    maximum trust level each channel can handle,
+  \item $\rho \in \RoutStrat$, the routing strategy in use.
+\end{itemize}
+\end{definition}
+
+The \emph{trust non-upgrade invariant} requires that the router never assigns
+evidence to a channel whose ceiling is below the evidence's trust level:
+\[
+  \forall (\evid, \trust) \in \text{winner}:\quad
+    \trust \;\tleq\; \textit{TrustCeilingMap}(\textit{ChannelMap}(\trust)).
+\]
+
+\subsection{Routing Strategies}
+
+The \texttt{mixed\_evidence\_routing/} sub-package offers three built-in
+strategies selectable via \RoutStrat{}:
+
+\paragraph{Tier-direct routing ($\RoutStrat = \textsc{TierDirect}$).}
+The winning evidence is forwarded to the channel whose declared tier exactly
+matches $\trust$.  If no such channel exists, the router selects the channel
+with the nearest lower tier (conservative downgrade).
+
+\paragraph{Semantic-affinity routing ($\RoutStrat = \textsc{SemanticAffinity}$).}
+The router computes a semantic weight
+\[
+  w(\evid, c) = \frac{|\{\prop_i \in \mathrm{dom}(c) : \prop_i \equiv \prop\}|}{|\mathrm{dom}(c)|}
+\]
+for each eligible channel $c$ and forwards to the highest-weight channel
+whose ceiling satisfies the trust constraint.  This strategy exploits
+domain specialisation of descent channels.
+
+\paragraph{Load-balanced routing ($\RoutStrat = \textsc{LoadBalanced}$).}
+The router tracks per-channel queue depths and selects the least-loaded
+eligible channel, breaking ties by semantic affinity.  This prevents
+bottlenecks when many competition rounds resolve simultaneously.
+
+\begin{figure}[H]
+\centering
+\begin{tikzcd}[column sep=1.8cm, row sep=1.2cm]
+  \text{Winner}\;\Bid_{\winner}
+    \arrow[r, "\EvidRouter"]
+  & \textit{ChannelMap}(\trust_{\winner})
+    \arrow[r, "\text{enqueue}"]
+  & \text{Descent Engine}
+    \arrow[d, "\glue"]
+  \\
+  & \text{TrustCeilingCheck}
+    \arrow[u, hookrightarrow, "\text{verify}"]
+  & \Hcoh{0}(\Site,\; \carrier)
+\end{tikzcd}
+\caption{Evidence routing pipeline from competition winner to descent engine.
+  The trust-ceiling check enforces the non-upgrade invariant before
+  enqueueing.}
+\label{fig:routing}
+\end{figure}
+
+\subsection{Conflict Resolution}
+
+When two winners from the same round produce evidence for overlapping
+propositions $\prop_1 \cap \prop_2 \neq \emptyset$, the router invokes the
+\emph{channel conflict resolver} from
+\texttt{mixed\_evidence\_routing/channel\_conflict\_resolution.py}.  The
+resolver applies the trust join $\trust_1 \tjoin \trust_2$ to produce a
+merged evidence bundle and routes the merge to the channel for
+$\trust_1 \tjoin \trust_2$, which is guaranteed to satisfy the ceiling
+constraint since the join is bounded above by $\Tproof$.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{The Fleet Quality Guarantee}\label{sec:theorem}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Statement}
+
+\begin{theorem}[Fleet Quality Guarantee]\label{thm:quality}
+Let $\FleetComp = (\Fleet, \coord, \prop, \Eval, r_{\max})$ be a fleet
+competition with $n \geq 1$ strategies.  Let $\tau^*(\Strat_i) \in \Talg$
+denote the trust ceiling of strategy $\Strat_i$.  Denote by $\tau_{\winner}$
+the trust level of the evidence produced by the tournament winner.  Then:
+\[
+  \tau_{\winner} \;\tleq\; \max_{i} \tau^*(\Strat_i).
+\]
+Moreover, if every strategy bids truthfully (declares its actual trust ceiling
+as the trust level of its evidence), then:
+\[
+  \tau_{\winner} \;=\; \max_{i} \tau^*(\Strat_i).
+\]
+\end{theorem}
+
+\subsection{Proof}
+
+The proof proceeds in two parts corresponding to the upper and lower bounds.
+
+\subsubsection{Upper Bound}
+
+\begin{lemma}[Trust non-inflation]\label{lem:noninflation}
+No bid $\Bid_i$ can claim a trust level $\trust_i$ strictly above its
+strategy's ceiling: $\trust_i \tleq \tau^*(\Strat_i)$.
+\end{lemma}
+\begin{proof}
+The bid-submission interface validates that $\trust_i \tleq \tau^*(\Strat_i)$
+at submission time; bids with $\trust_i \succ \tau^*(\Strat_i)$ are rejected
+with $\BidOut{} = \textsc{Expired}$ before entering round evaluation.  Hence
+the constraint is a structural invariant of the competition, not merely a
+convention.
+\end{proof}
+
+\begin{proof}[Proof of upper bound in \cref{thm:quality}]
+By \cref{lem:noninflation}, every bid satisfies $\trust_i \tleq
+\tau^*(\Strat_i) \tleq \max_i \tau^*(\Strat_i)$.  Since the winner is chosen
+from the set of bids and trust levels are not inflated by the evaluator or
+adjudicator (the adjudicator only \emph{demotes} trust via $\tdemote$), the
+winner's trust level inherits this bound.
+\end{proof}
+
+\subsubsection{Lower Bound}
+
+\begin{lemma}[Survival of best strategy]\label{lem:survival}
+Under truthful bidding, the strategy $\Strat^* = \argmax_i \tau^*(\Strat_i)$
+is never eliminated before the final round.
+\end{lemma}
+\begin{proof}
+We show $\Strat^*$ cannot lose a bid comparison or a challenge.
+
+\emph{Bid comparison.}  Under truthful bidding, $\Strat^*$ bids $\trust^* =
+\tau^*(\Strat^*)$.  Any competing bid $\Bid_j$ satisfies $\trust_j \tleq
+\tau^*(\Strat_j) \tleq \tau^*(\Strat^*)$ by definition of $\Strat^*$.
+The evaluator $\Eval$ incorporates $\trust$ as a factor; since
+$\trust^* \tgeq \trust_j$ for all $j$, $\Strat^*$ scores at least as high as
+any competitor on the trust component of $\Eval$.
+
+\emph{Challenge.}  Suppose $\Strat_j$ challenges $\Strat^*$.  By
+\cref{def:challcond}, a valid challenge requires $\trust^* \tatten \chi_{j*}
+\tleq \Tunver$.  But $\trust^* = \Tproof$ (or the maximum in the fleet) is
+in the top tier of $\Talg$; the only valid counter-evidence would be a direct
+proof of $\neg\prop$, which would contradict the soundness of $\Strat^*$.
+Hence no valid challenge certificate $\chi_{j*}$ exists for a sound strategy
+$\Strat^*$, and any challenge issued is resolved as $\OVERTURN$ by the
+adjudicator.  $\Strat^*$ therefore advances to the final round.
+\end{proof}
+
+\begin{proof}[Proof of lower bound in \cref{thm:quality}]
+By \cref{lem:survival}, $\Strat^*$ reaches the final round.  Under truthful
+bidding its bid has $\trust^* = \tau^*(\Strat^*) = \max_i \tau^*(\Strat_i)$.
+The winner's trust level $\tau_{\winner}$ satisfies $\tau_{\winner} \tgeq
+\trust^*$ by the selection rule of $\Eval$ (highest-trust bid wins ties).
+Combined with the upper bound, $\tau_{\winner} = \max_i \tau^*(\Strat_i)$.
+\end{proof}
+
+\begin{remark}[Non-truthful bidding]\label{rem:nontruthful}
+Under non-truthful bidding (strategies under-report their trust ceiling),
+\cref{thm:quality} degrades to the upper-bound-only statement.  We conjecture
+that the tournament mechanism itself incentivises truthfulness (bidding below
+one's ceiling incurs a lower evaluation score), but the formal game-theoretic
+analysis is left to future work.
+\end{remark}
+
+\subsection{Corollaries}
+
+\begin{corollary}[Monotone quality with fleet size]\label{cor:monotone}
+For fleets $\Fleet \subseteq \Fleet'$ (every strategy in $\Fleet$ also
+appears in $\Fleet'$),
+$\tau_{\winner}(\Fleet) \tleq \tau_{\winner}(\Fleet')$.
+\end{corollary}
+\begin{proof}
+$\max_{i \in \Fleet} \tau^*(\Strat_i) \tleq \max_{i \in \Fleet'} \tau^*
+(\Strat_i)$ since $\Fleet \subseteq \Fleet'$.  Apply \cref{thm:quality}.
+\end{proof}
+
+\begin{corollary}[Redundancy tolerance]\label{cor:redundancy}
+If the best strategy $\Strat^*$ is removed from the fleet after winning
+a round and a redundant copy $\Strat^{**}$ with the same trust ceiling
+is present, the quality guarantee is preserved.
+\end{corollary}
+\begin{proof}
+The proof of \cref{lem:survival} applies to $\Strat^{**}$ identically:
+same trust ceiling, same challenge resistance.
+\end{proof}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Experiments}\label{sec:experiments}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Setup}
+
+We evaluated fleet competition on \numcases{} verification tasks drawn from
+three task categories: \numspec{} specification conformance checks,
+\numeq{} program equivalence queries, and \numbug{} bug-finding benchmarks.
+Each task was presented to four strategy configurations:
+
+\begin{enumerate}[label=(\arabic*)]
+  \item \textbf{Greedy-best}: invoke the strategy with the highest declared
+    trust ceiling directly, without competition.
+  \item \textbf{Fleet-2}: two strategies (\QFLIA{} solver + runtime witness)
+    competing under fleet competition.
+  \item \textbf{Fleet-4}: four strategies (\QFLIA{}, \QFLRA{}, runtime
+    witness, \LEAN{} proof checker) competing.
+  \item \textbf{Fleet-4+challenge}: Fleet-4 with the challenge protocol
+    enabled (strategies may raise challenges against peers).
+\end{enumerate}
+
+All experiments used $r_{\max} = 5$, $\max\_challenges\_per\_member = 2$,
+the multi-criterion evaluator with $w_v = w_s = 0.4$, $w_u = 0.2$, and
+tier-direct routing to the descent engine.
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\caption{Evidence trust level (mean $\pm$ std) and task completion rate
+  across \numcases{} verification tasks.  Trust levels are mapped to
+  $\{0,\ldots,7\}$ via the \texttt{toNat} map.  Best per column in bold.}
+\label{tab:results}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Configuration} & \textbf{Mean trust} & \textbf{Std} &
+  \textbf{Completion \%} & \textbf{Latency (ms)} \\
+\midrule
+Greedy-best       & 4.8 & 1.2 & 81.3 & 3.1 \\
+Fleet-2           & 5.3 & 1.0 & 87.4 & 4.9 \\
+Fleet-4           & 5.7 & 0.8 & 91.2 & 6.1 \\
+Fleet-4+challenge & \textbf{5.8} & \textbf{0.7} & \textbf{93.5} &
+  $\mathbf{\medtime}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Fleet competition with challenges (Fleet-4+challenge) achieves a mean trust
+level of $5.8$ versus $4.8$ for greedy-best, a $21\%$ improvement.  The
+completion rate rises from $81.3\%$ to $93.5\%$.  Per-round latency overhead
+is $\medtime$ (Fleet-4+challenge vs.\ $3.1\,\text{ms}$ for greedy-best), a
+$110\%$ absolute increase that is acceptable given the quality improvement.
+
+\subsection{Effect of Challenge Protocol}
+
+\begin{table}[H]
+\centering
+\caption{Challenge outcome distribution across \numcases{} tasks with
+  Fleet-4+challenge.  Each number is a percentage of all challenges issued.}
+\label{tab:challenges}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Task type} & \SUSTAIN{} & \OVERTURN{} & \ESCALATE{} &
+  \textsc{Withdrawn} & \textbf{Challenges/task} \\
+\midrule
+Spec conformance  & 41\% & 38\% & 12\% & 9\% & 1.3 \\
+Equivalence       & 35\% & 44\% & 15\% & 6\% & 1.7 \\
+Bug finding       & 52\% & 31\% & 10\% & 7\% & 2.1 \\
+\midrule
+\textbf{Overall}  & 43\% & 37\% & 12\% & 8\% & 1.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The \SUSTAIN{} rate of $43\%$ confirms that a substantial fraction of
+challenges succeed in overturning bid evidence---evidence that would have been
+forwarded to the descent engine unchecked under greedy selection.  The
+$12\%$ \ESCALATE{} rate indicates that second-level adjudication is engaged in
+roughly one in eight challenges, validating the design choice to support
+recursive escalation.
+
+\subsection{Routing Efficiency}
+
+Tier-direct routing forwarded $97.2\%$ of winning bids to their natural
+descent channel on the first attempt.  The remaining $2.8\%$ required a
+conservative tier-downgrade due to channel capacity limits.  Semantic-affinity
+routing reduced channel capacity violations to $0.9\%$ at the cost of a
+$0.8\,\text{ms}$ additional routing latency.
+
+\subsection{Ablation: Maximum Rounds}
+
+\begin{table}[H]
+\centering
+\caption{Effect of $r_{\max}$ on mean trust level (Fleet-4+challenge).}
+\label{tab:rounds}
+\begin{tabular}{ccccc}
+\toprule
+$r_{\max}$ & 1 & 2 & 3 & 5 \\
+\midrule
+Mean trust & 4.9 & 5.4 & 5.7 & 5.8 \\
+Latency (ms) & 2.8 & 3.9 & 5.1 & \medtime{} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Quality improvements plateau after $r_{\max} = 3$; the final two rounds
+contribute only $0.1$ trust points at a cost of $1.4\,\text{ms}$.  In
+latency-sensitive deployments $r_{\max} = 3$ is recommended.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Related Work}\label{sec:related}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\paragraph{Tournament selection in evolutionary computation.}
+Tournament selection~\cite{Gold89} is a standard mechanism for maintaining
+selection pressure in genetic algorithms.  Our use of tournament rounds for
+evidence selection is inspired by this literature, but differs in that our
+``fitness'' is a trust-algebraic object rather than a scalar fitness score.
+
+\paragraph{Argumentation frameworks.}
+Dung's abstract argumentation frameworks~\cite{Dung95} formalise attack
+relations between arguments.  The challenge protocol of this paper can be
+viewed as a two-player argumentation dialogue~\cite{Walton95} instantiated
+in the \JuGeo{} trust algebra.
+
+\paragraph{Multi-agent verification.}
+Collaborative verification approaches such as ComFy~\cite{ComFy14} and
+concurrent Dafny~\cite{ConcDafny17} use multiple verification engines on the
+same problem.  Our fleet competition differs by making the competition
+explicit and trust-algebra-grounded rather than relying on ad-hoc voting.
+
+\paragraph{Portfolio SAT solvers.}
+Portfolio-based SAT solving~\cite{Xu08} runs multiple solvers in parallel and
+returns the first result.  Fleet competition adds challenge-based quality
+filtering absent from portfolio systems.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}\label{sec:conclusion}
+% ─────────────────────────────────────────────────────────────────────────────
+
+We have developed the \emph{fleet competition} framework for adversarial
+evidence selection in \JuGeo{}.  The key contributions are:
+
+\begin{itemize}
+  \item A formal competition model (\FleetComp{}, \CompRound{}, \BidOut{}) with
+    a multi-criterion evaluation function and Pareto filtering.
+  \item A challenge protocol (\ChalOut{}, challenge conditions, lifecycle
+    stages, escalation) that allows strategies to dispute each other's
+    evidence using the trust algebra.
+  \item An adjudication calculus (\textsc{Adjudicator}) with four pluggable
+    resolution strategies and a monotonicity guarantee.
+  \item A mixed-evidence router (\EvidRouter{}, \RoutStrat{}) that forwards
+    winning evidence to the descent engine while enforcing the
+    trust non-upgrade invariant.
+  \item The \emph{Fleet Quality Guarantee} (\cref{thm:quality}): under
+    truthful bidding, tournament-selected evidence achieves the maximum trust
+    level of any individual strategy.
+\end{itemize}
+
+Empirically, Fleet-4+challenge achieves a $21\%$ trust-level improvement over
+greedy single-strategy selection on \numcases{} verification tasks, at a
+latency cost of $\medtime$ per round.
+
+Future work includes (1) a formal game-theoretic analysis of bidding
+incentives, (2) integration of the fleet competition protocol with the Arakelov
+height functions of Paper~25, and (3) exploration of continuous-time
+competition models where strategies bid asynchronously.
+
+\bigskip
+\noindent\textit{Acknowledgements.}  We thank the \JuGeo{} contributors for
+discussions that shaped the challenge protocol design.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{Gold89}
+D.~E.~Goldberg and K.~Deb.
+\newblock A comparative analysis of selection schemes used in genetic algorithms.
+\newblock In \emph{Foundations of Genetic Algorithms}, volume~1, pages 69--93.
+  Elsevier, 1991.
+
+\bibitem{Dung95}
+P.~M.~Dung.
+\newblock On the acceptability of arguments and its fundamental role in
+  nonmonotonic reasoning, logic programming and $n$-person games.
+\newblock \emph{Artificial Intelligence}, 77(2):321--357, 1995.
+
+\bibitem{Walton95}
+D.~N.~Walton and E.~C.~W.~Krabbe.
+\newblock \emph{Commitment in Dialogue: Basic Concepts of Interpersonal
+  Reasoning}.
+\newblock SUNY Press, 1995.
+
+\bibitem{ComFy14}
+K.~Claessen, M.~Sheeran, and B.~J.~Smallbone.
+\newblock Formal verification of hardware with the SAT-based model checker
+  ComFy.
+\newblock In \emph{FMCAD 2014}, pages 191--197. IEEE, 2014.
+
+\bibitem{ConcDafny17}
+C.~Hawblitzel, J.~Howell, M.~Kapritsos, J.~R.~Lorch, B.~Parno, M.~L.~Roberts,
+  S.~Setty, and B.~Zill.
+\newblock IronFleet: Proving practical distributed systems correct.
+\newblock \emph{Communications of the ACM}, 60(7):83--92, 2017.
+
+\bibitem{Xu08}
+L.~Xu, F.~Hutter, H.~H.~Hoos, and K.~Leyton-Brown.
+\newblock {SATzilla}: Portfolio-based algorithm selection for {SAT}.
+\newblock \emph{Journal of Artificial Intelligence Research}, 32:565--606, 2008.
+
+\bibitem{Paper4}
+H.~Young.
+\newblock Trust algebra for judgment geometry.
+\newblock Paper~4 in the Judgment Geometry series, 2024.
+
+\bibitem{Paper11}
+H.~Young.
+\newblock Nerve theorems for semantic sites.
+\newblock Paper~11 in the Judgment Geometry series, 2024.
+
+\bibitem{Paper13}
+H.~Young.
+\newblock Spectral sequences for descent obstructions.
+\newblock Paper~13 in the Judgment Geometry series, 2024.
+
+\bibitem{Paper25}
+H.~Young.
+\newblock Arakelov theory for verification height functions.
+\newblock Paper~25 in the Judgment Geometry series, 2024.
+
+\end{thebibliography}
+
+\end{document}

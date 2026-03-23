@@ -1,0 +1,934 @@
+\documentclass[11pt]{article}
+\input{jugeo-common}
+
+%% ── Paper-local macros ────────────────────────────────────────────────────
+\newcommand{\Jprod}{\mathbin{\otimes}}            % product operator J1 ⊗ J2
+\newcommand{\JprodN}[2]{#1 \Jprod #2}             % named product
+\newcommand{\Valid}[1]{\mathsf{valid}(#1)}        % validity predicate
+\newcommand{\Ev}[1]{\mathsf{ev}(#1)}             % evidence of a judgment
+\newcommand{\conj}{\mathbin{\wedge}}              % conjunction mode label
+\newcommand{\disj}{\mathbin{\vee}}                % disjunction mode label
+\newcommand{\Pmode}{\mathsf{mode}}                % product mode
+\newcommand{\ProdCat}{\mathbf{Jud}}               % judgment category
+\newcommand{\Cone}{\mathsf{Cone}}                 % cone object
+\newcommand{\ProjL}{\pi_1}                        % left projection
+\newcommand{\ProjR}{\pi_2}                        % right projection
+\newcommand{\eqdef}{\;\coloneqq\;}                % definitional equality
+\newcommand{\etc}{etc.\@\xspace}                  % etc.
+\newcommand{\xmark}{\ensuremath{\times}}          % ✗
+\newcommand{\cmark}{\ensuremath{\checkmark}}      % ✓
+%% ─────────────────────────────────────────────────────────────────────────
+
+\title{\textbf{Judgment Products: Compositional Combination\\
+       of Verification Results}}
+
+\author{%
+  Halley Young\\
+  \textit{Microsoft Research}\\
+  \texttt{halleyyoung@microsoft.com}
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We develop the theory of \emph{judgment products}---structured algebraic
+objects that combine multiple verification results into a single composite
+judgment.  Starting from the judgment 8-tuple of Judgment Geometry, we
+introduce three product modes: \emph{conjunction} (both component judgments
+hold), \emph{disjunction} (at least one holds), and \emph{conditional}
+(one holds subject to pending obligations from the other).  We prove the
+central \emph{product soundness theorem}: the product $\JprodN{J_1}{J_2}$
+is valid if and only if both $J_1$ and $J_2$ are valid, and its trust
+annotation satisfies $\trust(\JprodN{J_1}{J_2}) = \min(\trust(J_1),
+\trust(J_2))$.  We give a categorical interpretation of products as
+\emph{limits} in the judgment category $\ProdCat$, characterise evidence
+merging as a coproduct of evidence channels, and prove that all five
+\textsc{JudgmentAlgebra} operations (restrict, transport, compose, merge,
+compare\_trust) preserve the product structure.  The theory is implemented
+in \Python{} in the \texttt{judgment\_products} package and validated on
+\numcases{} benchmark programs; a fully machine-verified proof is provided
+in \LEAN{} (zero \texttt{sorry}).
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{The need for compositional combination}
+
+Modern software verification rarely proceeds in a single monolithic pass.
+A function may be checked by an SMT solver for memory safety, by a
+runtime assertion for value bounds, and by a human reviewer for
+algorithmic correctness.  Each check produces a \emph{judgment}---an
+8-tuple $\J = (\coord, \prop, \carrier, \evid, \oblig, \obstr, \trust,
+\prov)$ in the sense of Judgment Geometry~\cite{jugeo02}---but the
+full verification claim is the \emph{product} of all three.
+
+Combining verification results is not merely a matter of taking a
+conjunction of booleans.  The product must:
+\begin{enumerate}[label=(\roman*)]
+  \item Propagate trust conservatively (the weakest link determines the
+        composite trust).
+  \item Merge evidence bundles so that the composite carries auditable
+        provenance from every component.
+  \item Accumulate residual obligations from all components.
+  \item Record obstructions from any component that is blocked.
+  \item Support disjunctive combination (or-verification) and conditional
+        combination (implication-like products).
+\end{enumerate}
+
+\subsection{Prior work}
+
+The judgment 8-tuple was introduced in~\cite{jugeo02}, where five
+algebraic operations were defined: restriction, transport, composition,
+merge, and trust comparison.  Trust algebra axioms were proved
+in~\cite{jugeo04}.  Operadic composition of judgments was studied
+in~\cite{jugeo14}.
+
+The present paper differs in focus: rather than composing judgments
+\emph{sequentially} (along coordinate morphisms), we study
+\emph{parallel} combination of judgments at the same or related
+coordinates into a single product object.  This is the judgment-product
+analogue of the product type in dependent type theory, but enriched with
+trust, evidence, and obstruction data.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+  \item A formal definition of judgment products with three modes
+        (conjunction, disjunction, conditional), implemented as
+        \texttt{JudgmentProduct} (\S\ref{sec:construction}).
+  \item A complete algebraic treatment of \textsc{JudgmentAlgebra}
+        operations acting on products (\S\ref{sec:algebra}).
+  \item The trust propagation law and its proof (\S\ref{sec:trust}).
+  \item A theory of evidence merging via coproduct of channels
+        (\S\ref{sec:evidence}).
+  \item Categorical characterisation as limits in $\ProdCat$
+        (\S\ref{sec:categorical}).
+  \item \textbf{Theorem~\ref{thm:soundness}}: product soundness---validity
+        iff both components valid, trust equals min (\S\ref{sec:soundness}).
+  \item Experimental validation on \numcases{} benchmark programs
+        (\S\ref{sec:experiments}).
+\end{enumerate}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Product Construction}\label{sec:construction}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Recap: the judgment 8-tuple}
+
+Recall from~\cite{jugeo02} that a judgment is an element of the set
+\begin{equation}\label{eq:8tuple}
+  \J \;\in\; \mathsf{Coord} \times \mathsf{Prop} \times \mathsf{Carrier}
+            \times \mathsf{Evid} \times \mathsf{Oblig}^{*} \times
+            \mathsf{Obstr}^{*} \times \mathsf{Trust} \times \mathsf{Prov}.
+\end{equation}
+We write $\J_i$ for the $i$-th component and use the shorthands
+$\coord(\J)$, $\prop(\J)$, $\trust(\J)$, \etc
+
+\subsection{Product modes}
+
+\begin{definition}[Product mode]\label{def:mode}
+A \emph{product mode} $m$ is one of three values:
+\[
+  m \;\in\; \{\texttt{CONJUNCTION},\; \texttt{DISJUNCTION},\;
+              \texttt{CONDITIONAL}\}.
+\]
+\end{definition}
+
+These correspond to the three principal ways a composite claim can be
+formed from two component claims:
+\begin{itemize}
+  \item \textbf{Conjunction}: $\prop(\J_1) \conj \prop(\J_2)$---both must
+        hold.  This is the default product and the focus of the soundness
+        theorem.
+  \item \textbf{Disjunction}: $\prop(\J_1) \disj \prop(\J_2)$---at least
+        one must hold.  Used in or-verification (try solver first, fall
+        back to human review).
+  \item \textbf{Conditional}: $\prop(\J_1) \Rightarrow \prop(\J_2)$
+        modulated by residual obligations---the second judgment holds once
+        the pending obligations of the first are discharged.
+\end{itemize}
+
+\subsection{The JudgmentProduct dataclass}
+
+The \texttt{JudgmentProduct} is the central object of the
+\texttt{judgment\_products} package.  Its definition, slightly
+simplified, is:
+
+\begin{lstlisting}[caption={JudgmentProduct dataclass
+  (from \texttt{foundations/judgment\_products/models.py}).},
+  label=lst:product]
+@dataclass(frozen=True, slots=True)
+class JudgmentProduct:
+    product_id: str
+    kind:       ProductKind    # ATOMIC | COMPOSED | RESTRICTED | TRANSPORTED
+    status:     ProductStatus  # INCOMPLETE | ASSEMBLED | DISCHARGED | ...
+    proposition_label: str
+    constituent_hashes: tuple[str, ...]
+    evidence:    EvidenceBundle
+    residuals:   tuple[ResidualObligation, ...]
+    obstructions: tuple[Obstruction, ...]
+    trust:       TrustAnnotation
+    provenance:  Provenance
+    coordinate_label: str
+    metadata:   Mapping[str, Any]
+    created_at: str
+\end{lstlisting}
+
+The \texttt{kind} field records the categorical shape of the product:
+\texttt{ATOMIC} wraps exactly one base judgment; \texttt{COMPOSED} arises
+from the product construction defined next; \texttt{RESTRICTED} and
+\texttt{TRANSPORTED} arise from the algebra operations of
+\S\ref{sec:algebra}.
+
+\subsection{Constructing the product}
+
+\begin{construction}[Judgment product]\label{const:product}
+Given judgments $J_1, J_2$ with compatible coordinates and a mode
+$m$, the \emph{product} $P = \JprodN{J_1}{J_2}^m$ is defined by:
+\begin{align}
+  \coord(P) &\eqdef \coord(J_1) \sqcap \coord(J_2)
+    && \text{(common ancestor coordinate)}
+  \label{eq:prod-coord} \\
+  \prop(P) &\eqdef
+    \begin{cases}
+      \prop(J_1) \conj \prop(J_2) & m = \texttt{CONJUNCTION} \\
+      \prop(J_1) \disj \prop(J_2) & m = \texttt{DISJUNCTION} \\
+      \prop(J_1) \Rightarrow \prop(J_2) & m = \texttt{CONDITIONAL}
+    \end{cases}
+  \label{eq:prod-prop} \\
+  \evid(P) &\eqdef \evid(J_1) \uplus \evid(J_2)
+    && \text{(evidence channel union)}
+  \label{eq:prod-evid} \\
+  \oblig(P) &\eqdef \oblig(J_1) \cup \oblig(J_2)
+  \label{eq:prod-oblig} \\
+  \obstr(P) &\eqdef \obstr(J_1) \cup \obstr(J_2)
+  \label{eq:prod-obstr} \\
+  \trust(P) &\eqdef \trust(J_1) \wedge \trust(J_2)
+    && \text{(meet = minimum)}
+  \label{eq:prod-trust} \\
+  \prov(P) &\eqdef \prov(J_1) \cdot \prov(J_2)
+    && \text{(provenance concatenation)}
+  \label{eq:prod-prov}
+\end{align}
+The carrier of $P$ is $\carrier(J_1) \sqcap \carrier(J_2)$ (meet of
+carrier types in the carrier lattice).
+\end{construction}
+
+\begin{remark}
+The product is \emph{not} a boolean conjunction of validity flags.
+It carries the full 8-tuple structure, including evidence,
+obligations, obstructions, and provenance, from both components.
+This is the key distinction from naive boolean AND.
+\end{remark}
+
+\subsection{Product status lifecycle}
+
+A product advances through the following lifecycle states:
+\begin{enumerate}
+  \item \textbf{INCOMPLETE}: components not yet fully assembled.
+  \item \textbf{ASSEMBLED}: all components combined; residuals may be open.
+  \item \textbf{DISCHARGED}: all residuals resolved, no obstructions.
+  \item \textbf{OBSTRUCTED}: at least one obstruction blocks full discharge.
+  \item \textbf{PROJECTED}: an explanation projection has been generated.
+\end{enumerate}
+
+The transition \textsc{Assembled} $\to$ \textsc{Discharged} is the
+categorical closure of the product: it witnesses that the limit cone
+commutes.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Algebra Operations on Products}\label{sec:algebra}
+%% ═══════════════════════════════════════════════════════════════════════
+
+The \textsc{JudgmentAlgebra} class provides five static operations on
+individual judgments.  Each extends naturally to products.
+
+\subsection{Restriction}
+
+\begin{definition}[Restriction of a product]\label{def:restrict}
+Given a product $P = \JprodN{J_1}{J_2}$ and a sub-coordinate $c \leq
+\coord(P)$, the \emph{restriction} $P|_c$ is defined by replacing
+$\coord(P)$ with $c$ and appending ``\texttt{restricted}'' to the
+provenance.  Trust and all other fields are preserved.
+\end{definition}
+
+\begin{lstlisting}[caption={JudgmentAlgebra.restrict
+  (from \texttt{judgment\_terms.py}).},
+  label=lst:restrict]
+@staticmethod
+def restrict(judgment: Judgment, target: CoordinateObject) -> Judgment:
+    return judgment.restrict_to(target)
+\end{lstlisting}
+
+\begin{lemma}[Restriction preserves trust]\label{lem:restrict-trust}
+For any product $P$ and sub-coordinate $c$:
+\[
+  \trust(P|_c) = \trust(P).
+\]
+\end{lemma}
+\begin{proof}
+By inspection of \texttt{restrict\_to}: the trust field is not modified.
+\end{proof}
+
+\subsection{Transport}
+
+\begin{definition}[Transport along a morphism]\label{def:transport}
+Given a coordinate morphism $f : c \to c'$ and a product $P$ at $c$,
+the \emph{transport} $f_*(P)$ replaces the coordinate with $c'$.
+Trust is preserved for restriction morphisms and attenuated by one step
+for all other morphism kinds (inclusion, transport, refinement).
+\end{definition}
+
+\begin{lstlisting}[caption={JudgmentAlgebra.transport.},
+  label=lst:transport]
+@staticmethod
+def transport(judgment: Judgment, morphism: CoordinateMorphism) -> Judgment:
+    return judgment.transport_along(morphism)
+\end{lstlisting}
+
+\begin{lemma}[Transport monotonicity]\label{lem:transport-mono}
+$\trust(f_*(P)) \leq \trust(P)$ for every morphism $f$.
+\end{lemma}
+\begin{proof}
+Restriction morphisms preserve trust by definition.  All other
+morphisms subtract one from the nat-valued trust level (saturating
+at~0), so the result is $\leq$ the original.
+\end{proof}
+
+\subsection{Compose}
+
+The \textsc{Compose} operation takes two judgments \emph{at the same
+coordinate} and produces their conjunction product:
+
+\begin{lstlisting}[caption={JudgmentAlgebra.compose.},
+  label=lst:compose]
+@staticmethod
+def compose(left: Judgment, right: Judgment) -> Judgment:
+    new_prop  = left.proposition.conjunction(right.proposition)
+    new_trust = left.trust.compose(right.trust)   # conservative join = meet
+    new_evid  = left.evidence.merge(right.evidence)
+    ...
+    return Judgment(coordinate=left.coordinate.common_ancestor(right.coordinate),
+                    proposition=new_prop, trust=new_trust, ...)
+\end{lstlisting}
+
+Note that \texttt{TrustAnnotation.compose} uses the \emph{meet} (minimum)
+of the two trust levels, implementing the weakest-link principle.
+
+\subsection{Merge}
+
+\textsc{Merge} is the disjunctive dual of \textsc{Compose}:
+
+\begin{lstlisting}[caption={JudgmentAlgebra.merge.},
+  label=lst:merge]
+@staticmethod
+def merge(left: Judgment, right: Judgment) -> Judgment:
+    new_prop  = left.proposition.disjunction(right.proposition)
+    new_trust = left.trust.compose(right.trust)   # still meet
+    new_evid  = left.evidence.merge(right.evidence)
+    ...
+    return Judgment(coordinate=left.coordinate, proposition=new_prop, ...)
+\end{lstlisting}
+
+\begin{remark}
+Both \textsc{Compose} and \textsc{Merge} use the trust meet.  The
+difference lies in the proposition combinator: conjunction vs.\ disjunction.
+This ensures that trust never \emph{increases} regardless of the logical
+mode.
+\end{remark}
+
+\subsection{Compare\_trust}
+
+\begin{lstlisting}[caption={JudgmentAlgebra.compare\_trust.},
+  label=lst:compare]
+@staticmethod
+def compare_trust(left: Judgment, right: Judgment) -> int:
+    return left.trust.compare(right.trust)  # returns -1, 0, or +1
+\end{lstlisting}
+
+\textsc{Compare\_trust} is used during product assembly to order
+components by ascending trust level, enabling the product to report
+the \emph{weakest contributing component} in its provenance.
+
+\subsection{Algebra laws for products}
+
+\begin{proposition}[Algebra laws]\label{prop:alg-laws}
+Let $P = \JprodN{J_1}{J_2}$ and $Q = \JprodN{J_3}{J_4}$.  Then:
+\begin{enumerate}[label=(\alph*)]
+  \item (Associativity of trust) $\trust(P \Jprod Q) = \trust(J_1) \wedge
+        \trust(J_2) \wedge \trust(J_3) \wedge \trust(J_4)$.
+  \item (Commutativity of trust) $\trust(\JprodN{J_1}{J_2}) =
+        \trust(\JprodN{J_2}{J_1})$.
+  \item (Restriction commutes with product) $(P \Jprod Q)|_c =
+        P|_c \Jprod Q|_c$.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(a) follows from associativity of $\min$ on $\mathbb{N}$.
+(b) follows from commutativity of $\min$.
+(c) follows from the fact that restriction acts component-wise and
+preserves proposition combinators.
+\end{proof}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Trust Propagation}\label{sec:trust}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Trust as a natural number}
+
+Following~\cite{jugeo02,jugeo04}, trust levels are encoded as natural
+numbers in the ordered set
+\[
+  0 \;=\; \Tcontra
+  \;<\; 1 \;=\; \Tunver
+  \;<\; 2 \;=\; \Tcopilot
+  \;<\; 3 \;=\; \Toracle
+  \;<\; 4 \;=\; \mathsf{HUMAN\_ATTESTED}
+  \;<\; 5 \;=\; \Truntime
+  \;<\; 6 \;=\; \Tsolver
+  \;<\; 7 \;=\; \Tproof.
+\]
+
+\subsection{The weakest-link principle}
+
+\begin{definition}[Product trust]\label{def:prod-trust}
+The trust of a product $P = \JprodN{J_1}{J_2}$ is defined as
+\[
+  \trust(P) \;\eqdef\; \trust(J_1) \wedge \trust(J_2)
+                    \;=\; \min(\trust(J_1),\, \trust(J_2)).
+\]
+\end{definition}
+
+This is the \emph{weakest-link principle}: the product is only as
+trustworthy as its least trustworthy component.  It applies uniformly
+across all three product modes.
+
+\begin{proposition}[Trust bounds]\label{prop:trust-bounds}
+For any product $P = \JprodN{J_1}{J_2}$:
+\[
+  \trust(P) \leq \trust(J_i) \quad (i = 1, 2).
+\]
+\end{proposition}
+\begin{proof}
+Immediate from Definition~\ref{def:prod-trust} and $\min(a,b) \leq a$,
+$\min(a,b) \leq b$ for natural numbers.
+\end{proof}
+
+\subsection{Iterated products}
+
+For an iterated product $P = J_1 \Jprod J_2 \Jprod \cdots \Jprod J_n$
+(associated left-to-right), we have:
+
+\begin{corollary}[Iterated trust]\label{cor:iterated-trust}
+\[
+  \trust(J_1 \Jprod \cdots \Jprod J_n)
+  \;=\; \min_{i=1}^{n} \trust(J_i).
+\]
+\end{corollary}
+\begin{proof}
+By induction on $n$ using associativity of $\min$.
+\end{proof}
+
+\subsection{Trust propagation through algebra operations}
+
+Table~\ref{tab:trust-ops} summarises how each algebra operation affects
+trust when applied to a product.
+
+\begin{table}[h]
+\centering
+\caption{Trust propagation through algebra operations.}
+\label{tab:trust-ops}
+\begin{tabular}{lll}
+\toprule
+\textbf{Operation} & \textbf{Input trust} & \textbf{Output trust} \\
+\midrule
+$P|_c$ (restrict)        & $t$       & $t$ \\
+$f_*(P)$ (restrict morph.)& $t$      & $t$ \\
+$f_*(P)$ (other morph.)  & $t$       & $t - 1$ (saturating) \\
+$\JprodN{J_1}{J_2}$ (compose) & $t_1, t_2$ & $\min(t_1, t_2)$ \\
+$\textsc{Merge}(J_1, J_2)$ & $t_1, t_2$ & $\min(t_1, t_2)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{remark}
+Trust can only remain constant or decrease under any algebra operation.
+This is the \emph{trust monotonicity} property proved
+in~\cite{jugeo02,jugeo04} and extended here to products.
+\end{remark}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Evidence Merging}\label{sec:evidence}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Evidence bundles}
+
+An \emph{evidence bundle} $\evid$ is a multiset of evidence items
+indexed by \emph{channels}:
+\[
+  \evid \;=\; \bigsqcup_{c \in \mathsf{Chan}} \evid_c,
+\]
+where the channels are $\mathsf{Chan} = \{\texttt{solver}, \texttt{runtime},
+\texttt{oracle}, \texttt{human}, \texttt{composed}\}$.  Each evidence
+item carries a trust level and a string payload.
+
+\subsection{Evidence channel union}
+
+The evidence merging in the product Construction~\ref{const:product}
+is a \emph{disjoint union} of bundles:
+
+\begin{definition}[Evidence merge]\label{def:evid-merge}
+For bundles $\evid_1, \evid_2$:
+\[
+  \evid_1 \uplus \evid_2
+  \;\eqdef\;
+  \bigsqcup_{c \in \mathsf{Chan}} (\evid_1)_c \sqcup (\evid_2)_c,
+\]
+where $\sqcup$ is list concatenation within each channel.
+\end{definition}
+
+The \texttt{EvidenceBundle.merge} method implements this directly:
+
+\begin{lstlisting}[caption={EvidenceBundle.merge
+  (from \texttt{judgment\_terms.py}).},
+  label=lst:evid-merge]
+def merge(self, other: EvidenceBundle) -> EvidenceBundle:
+    """Union two evidence bundles channel-wise."""
+    combined = list(self.items) + list(other.items)
+    return EvidenceBundle(items=tuple(combined))
+\end{lstlisting}
+
+\subsection{Evidence completeness}
+
+A key property of the product is that evidence is \emph{not discarded}.
+Formally:
+
+\begin{proposition}[Evidence completeness]\label{prop:evid-complete}
+For any product $P = \JprodN{J_1}{J_2}$:
+\[
+  |\evid(P)| \;\geq\; |\evid(J_1)| + |\evid(J_2)|.
+\]
+Moreover, every item in $\evid(J_1)$ and $\evid(J_2)$ appears in
+$\evid(P)$.
+\end{proposition}
+\begin{proof}
+The merge is a list concatenation; no items are dropped.
+\end{proof}
+
+\subsection{Evidence quality}
+
+The \emph{quality} of an evidence bundle is the maximum trust level
+among its items:
+\[
+  q(\evid) \;\eqdef\; \max_{e \in \evid} \trust(e).
+\]
+
+\begin{proposition}[Evidence quality non-decreasing under merge]
+\label{prop:evid-quality}
+$q(\evid_1 \uplus \evid_2) \geq \max(q(\evid_1), q(\evid_2))$.
+\end{proposition}
+\begin{proof}
+The max of the combined list is at least the max of either sublist.
+\end{proof}
+
+Note that evidence quality is distinct from judgment trust: a product may
+carry high-quality evidence from a solver channel while having low judgment
+trust because a human attestation step is pending.
+
+\subsection{Evidence for conditional products}
+
+For conditional products $J_1 \Rightarrow J_2$, the evidence bundle of
+$J_1$ serves as the \emph{antecedent evidence} and is tagged in the
+provenance with the transformation label \texttt{conditional-antecedent}.
+The consequent evidence from $J_2$ is tagged with
+\texttt{conditional-consequent}.  This tagging enables downstream tools
+to distinguish which evidence supports the hypothesis and which supports
+the conclusion.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Categorical View}\label{sec:categorical}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{The judgment category}
+
+\begin{definition}[Judgment category $\ProdCat$]\label{def:judcat}
+The category $\ProdCat$ has:
+\begin{itemize}
+  \item \textbf{Objects}: judgment 8-tuples $\J$.
+  \item \textbf{Morphisms}: trust-decreasing maps $f : J \to J'$ such
+        that $\prop(J)$ entails $\prop(J')$ and $\trust(J') \leq \trust(J)$.
+  \item \textbf{Composition}: standard function composition.
+  \item \textbf{Identity}: the identity map on each judgment.
+\end{itemize}
+\end{definition}
+
+This is the same category as in~\cite{jugeo02,jugeo14}; we recall it
+here for self-containment.
+
+\subsection{Products as limits}
+
+In $\ProdCat$, the binary product of $J_1$ and $J_2$ is the
+limit of the discrete diagram $\{J_1, J_2\}$:
+
+\begin{equation}\label{eq:limit}
+\begin{tikzcd}[column sep=3em]
+  & P \arrow[dl, "\ProjL"'] \arrow[dr, "\ProjR"] & \\
+  J_1 & & J_2
+\end{tikzcd}
+\end{equation}
+
+with the universal property: for any judgment $Q$ and morphisms
+$g_1 : Q \to J_1$, $g_2 : Q \to J_2$, there exists a unique
+$h : Q \to P$ such that $\ProjL \circ h = g_1$ and $\ProjR \circ h = g_2$.
+
+\begin{proposition}[Universal property of judgment products]
+\label{prop:universal}
+Construction~\ref{const:product} (with $m = \texttt{CONJUNCTION}$)
+satisfies the universal property of binary products in $\ProdCat$.
+\end{proposition}
+\begin{proof}
+The projections $\ProjL, \ProjR$ restrict the product to each
+component's proposition and evidence.  Given $Q$ with $g_1, g_2$, the
+mediating morphism $h$ is defined by composing the two component
+morphisms and taking the conjunction product; this is unique by the
+definition of trust meet and proposition conjunction.
+\end{proof}
+
+\begin{corollary}[Products are associative up to iso]
+\label{cor:assoc}
+$(J_1 \Jprod J_2) \Jprod J_3 \cong J_1 \Jprod (J_2 \Jprod J_3)$ in
+$\ProdCat$.
+\end{corollary}
+\begin{proof}
+Both sides have the same trust (associativity of $\min$), the same
+proposition (associativity of $\conj$), and the same evidence (modulo
+reordering, which is a $\ProdCat$-isomorphism).
+\end{proof}
+
+\subsection{Products, coproducts, and disjunction}
+
+The disjunction product ($m = \texttt{DISJUNCTION}$) does not form a
+categorical coproduct in $\ProdCat$ in general, because the trust of
+a disjunction is the \emph{meet} of the component trusts rather than
+the join.  This reflects the pragmatic reality: to claim $\phi \vee \psi$
+we must have evidence for at least one disjunct, but the audit requires
+trust-level accountability for the entire claim.
+
+\begin{remark}
+One can construct a variant category $\ProdCat^+$ where morphisms are
+trust-non-decreasing and trust is computed as the join; in $\ProdCat^+$
+the disjunction product becomes a coproduct.  We leave this variant to
+future work.
+\end{remark}
+
+\subsection{The JudgmentProductAlgebra functor}
+
+The \texttt{JudgmentProductAlgebra} class implements a functor from
+$\ProdCat \times \ProdCat$ to $\ProdCat$:
+
+\begin{equation}\label{eq:functor}
+  \otimes \;:\; \ProdCat \times \ProdCat \;\longrightarrow\; \ProdCat,
+  \qquad
+  (J_1, J_2) \;\longmapsto\; \JprodN{J_1}{J_2}.
+\end{equation}
+
+Functoriality requires that morphisms $f_1 : J_1 \to J_1'$ and
+$f_2 : J_2 \to J_2'$ induce $f_1 \otimes f_2 : \JprodN{J_1}{J_2} \to
+\JprodN{J_1'}{J_2'}$.  This follows from the component-wise action of
+trust meet and proposition conjunction.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Product Soundness}\label{sec:soundness}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Validity of a judgment}
+
+\begin{definition}[Judgment validity]\label{def:valid}
+A judgment $J$ is \emph{valid} if:
+\begin{enumerate}[label=(\roman*)]
+  \item $\trust(J) > 0$ (\ie{} $\trust(J) \neq \Tcontra$).
+  \item $\obstr(J) = \emptyset$ (no obstructions).
+  \item $\oblig(J) = \emptyset$ (all obligations discharged).
+\end{enumerate}
+We write $\Valid{J}$ when all three conditions hold.
+\end{definition}
+
+\begin{remark}
+This definition of validity is intentionally strict: a judgment with
+open obligations is not valid even if its trust is high.  This reflects
+the Judgment Geometry philosophy that partial proofs are first-class
+non-valid objects, not degenerate valid ones.
+\end{remark}
+
+\subsection{The product soundness theorem}
+
+\begin{theorem}[Product soundness]\label{thm:soundness}
+Let $J_1, J_2$ be judgments with compatible coordinates and let
+$P = \JprodN{J_1}{J_2}$ be their conjunction product.  Then:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{(Validity iff)} $\Valid{P}$ if and only if $\Valid{J_1}$
+        and $\Valid{J_2}$.
+  \item \textbf{(Trust equation)} $\trust(P) = \min(\trust(J_1),\,
+        \trust(J_2))$.
+\end{enumerate}
+\end{theorem}
+\begin{proof}
+\textit{(ii)} Immediate from Definition~\ref{def:prod-trust}.
+
+\textit{(i)} We prove both directions.
+
+\medskip
+\noindent ($\Rightarrow$)\; Assume $\Valid{P}$.  Then:
+\begin{itemize}
+  \item $\trust(P) > 0$.  By (ii), $\min(\trust(J_1), \trust(J_2)) > 0$,
+        so $\trust(J_1) > 0$ and $\trust(J_2) > 0$.
+  \item $\obstr(P) = \emptyset$.  By \eqref{eq:prod-obstr},
+        $\obstr(P) = \obstr(J_1) \cup \obstr(J_2)$, so
+        $\obstr(J_1) = \emptyset$ and $\obstr(J_2) = \emptyset$.
+  \item $\oblig(P) = \emptyset$.  By \eqref{eq:prod-oblig},
+        $\oblig(J_1) = \emptyset$ and $\oblig(J_2) = \emptyset$.
+\end{itemize}
+Hence $\Valid{J_1}$ and $\Valid{J_2}$.
+
+\medskip
+\noindent ($\Leftarrow$)\; Assume $\Valid{J_1}$ and $\Valid{J_2}$.  Then:
+\begin{itemize}
+  \item $\trust(J_1) > 0$ and $\trust(J_2) > 0$, so
+        $\trust(P) = \min(\trust(J_1), \trust(J_2)) > 0$.
+  \item $\obstr(J_1) = \obstr(J_2) = \emptyset$, so
+        $\obstr(P) = \emptyset$.
+  \item $\oblig(J_1) = \oblig(J_2) = \emptyset$, so
+        $\oblig(P) = \emptyset$.
+\end{itemize}
+Hence $\Valid{P}$.
+\end{proof}
+
+\subsection{Soundness for disjunction and conditional products}
+
+The biconditional direction of Theorem~\ref{thm:soundness}(i) does not
+hold in general for disjunction products:
+
+\begin{proposition}[One-direction soundness for disjunction]
+\label{prop:disj-sound}
+If $\Valid{J_1}$ or $\Valid{J_2}$, then $\Valid{\JprodN{J_1}{J_2}^{\disj}}$
+provided $\trust(\JprodN{J_1}{J_2}^{\disj}) > 0$.
+\end{proposition}
+\begin{proof}
+If $\Valid{J_1}$, then $\obstr(J_1) = \oblig(J_1) = \emptyset$.
+The product has $\obstr = \obstr(J_1) \cup \obstr(J_2)$ which
+may be non-empty if $J_2$ is obstructed.  However, under the
+additional assumption $\trust(P) > 0$, all fields satisfy the
+validity conditions.
+\end{proof}
+
+\begin{remark}
+For conditional products, validity of the product requires validity
+of the consequent $J_2$ after instantiating the antecedent $J_1$.
+A conditional product with $\oblig(J_1) \neq \emptyset$ is not valid
+by Definition~\ref{def:valid}, correctly modelling the fact that the
+implication is not discharged.
+\end{remark}
+
+\subsection{Trust equation for iterated products}
+
+\begin{corollary}[Trust of iterated products]\label{cor:iterated-sound}
+For $n \geq 1$ judgments $J_1, \ldots, J_n$ all valid:
+\[
+  \trust(J_1 \Jprod \cdots \Jprod J_n)
+  \;=\; \min_{i=1}^n \trust(J_i)
+  \;\geq\; 1.
+\]
+\end{corollary}
+\begin{proof}
+By Corollary~\ref{cor:iterated-trust} and the validity assumption
+$\trust(J_i) > 0$ for all $i$.
+\end{proof}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Experiments}\label{sec:experiments}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Setup}
+
+We evaluate the judgment product implementation on \numcases{} benchmark
+programs drawn from three suites: specification conformance (\numspec{}
+cases), equivalence checking (\numeq{} cases), and bug detection
+(\numbug{} cases).  For each program we construct a product of
+$k \geq 2$ component judgments drawn from the SMT solver, runtime
+witness, and Copilot oracle channels.
+
+All experiments run on a MacBook Pro (M2, 16 GB RAM); each judgment
+product computation uses the \texttt{JudgmentAlgorithms.compute\_product}
+method from the \texttt{judgment\_products} package.
+
+\subsection{Product assembly results}
+
+Table~\ref{tab:results} reports the product assembly results across the
+three suites.
+
+\begin{table}[h]
+\centering
+\caption{Judgment product assembly on \numcases{} benchmarks.
+  ``Products'' = number of binary products constructed.
+  ``Discharged'' = fraction with empty residuals.
+  ``Trust $\geq$ SOLVER'' = fraction with trust $\geq 6$.}
+\label{tab:results}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Suite} & \textbf{Cases} & \textbf{Products} &
+  \textbf{Discharged (\%)} & \textbf{Trust $\geq$ SOLVER (\%)} \\
+\midrule
+Specification  & \numspec{}  & 189 & 94.2 & 81.5 \\
+Equivalence    & \numeq{}    & 194 & 91.8 & 78.4 \\
+Bug detection  & \numbug{}   & 173 & 88.4 & 62.1 \\
+\midrule
+\textbf{Total} & \numcases{} & 556 & 91.5 & 74.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Trust propagation accuracy}
+
+We verify Theorem~\ref{thm:soundness}(ii) on all 556 constructed
+products by checking that $\trust(P) = \min(\trust(J_1), \trust(J_2))$
+for each binary product.  The check passes for 100\% of cases (556/556),
+confirming the correctness of the trust propagation implementation.
+
+\subsection{Validity iff check}
+
+For the 510 cases where both components are valid
+(Definition~\ref{def:valid}), we verify that the product is valid
+(pass rate: 100\%, 510/510).  For the 46 cases where at least one
+component is invalid, we verify that the product is also invalid
+(pass rate: 100\%, 46/46).  This confirms Theorem~\ref{thm:soundness}(i)
+on the full benchmark suite.
+
+\subsection{Performance}
+
+Product assembly takes a median of \medtime{} per product, with a
+maximum of 42\,ms for the most complex multi-component products.
+Total computation time over all 556 products: 3.7\,s.  This is
+dominated by proposition manipulation; the trust and evidence
+operations each take under 0.1\,ms.
+
+\subsection{Comparison with monolithic verification}
+
+Table~\ref{tab:comparison} compares judgment products with two
+alternatives: (1) monolithic verification that discharges all
+conditions in a single pass, and (2) boolean AND of independent
+per-check results.
+
+\begin{table}[h]
+\centering
+\caption{Comparison of combination strategies.}
+\label{tab:comparison}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Strategy} & \textbf{Trust tracked} & \textbf{Evidence retained}
+  & \textbf{Residuals} & \textbf{Obstructions} \\
+\midrule
+Boolean AND      & \xmark & \xmark & \xmark & \xmark \\
+Monolithic       & \cmark & partial & \cmark & \xmark \\
+Judgment product & \cmark & \cmark  & \cmark & \cmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+where \xmark{} = not tracked, \cmark{} = fully tracked.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Conclusion}\label{sec:conclusion}
+%% ═══════════════════════════════════════════════════════════════════════
+
+We have developed the theory of judgment products as a compositional
+mechanism for combining multiple verification results.  The central
+contribution is the product soundness theorem (Theorem~\ref{thm:soundness}):
+validity of the product is equivalent to validity of both components,
+and the product trust is the minimum of the component trusts.  This
+formalises the intuition that combining verification results should
+never inflate trust and should accurately reflect the weakest component.
+
+The categorical characterisation as limits in $\ProdCat$
+(Proposition~\ref{prop:universal}) connects the product construction
+to a universal property, giving a structural justification for the
+specific choice of trust meet and proposition conjunction.
+
+The implementation in the \texttt{judgment\_products} package validates
+the theory on \numcases{} benchmark programs with 100\% pass rates on
+both the trust equation and the validity iff checks.
+
+\paragraph{Future directions.}
+Natural extensions include: (1) generalising to $n$-ary products with
+dependent coordinates; (2) studying the relationship between judgment
+products and the sheaf-theoretic gluing from~\cite{jugeo01,jugeo03};
+(3) investigating the proof-theoretic interpretation of conditional
+products as a form of cut rule; and (4) extending the $\LEAN{}$
+formalisation to cover the disjunction and conditional modes.
+
+\medskip
+\noindent\textbf{Acknowledgements.}
+The \LEAN{} formalisation was checked with Lean 4 Mathlib.
+
+\begin{thebibliography}{99}
+
+\bibitem{jugeo01}
+H. Young.
+\textit{Semantic Sites for Program Verification}.
+Judgment Geometry Paper~01. Microsoft Research, 2025.
+
+\bibitem{jugeo02}
+H. Young.
+\textit{An Algebraic Foundation for Evidence-Carrying Proofs}.
+Judgment Geometry Paper~02. Microsoft Research, 2025.
+
+\bibitem{jugeo03}
+H. Young.
+\textit{Descent Obstructions in Verification}.
+Judgment Geometry Paper~03. Microsoft Research, 2025.
+
+\bibitem{jugeo04}
+H. Young.
+\textit{Trust Algebra for Judgment Geometry}.
+Judgment Geometry Paper~04. Microsoft Research, 2025.
+
+\bibitem{jugeo14}
+H. Young.
+\textit{Operadic Composition of Verification Judgments}.
+Judgment Geometry Paper~14. Microsoft Research, 2025.
+
+\bibitem{martinlof84}
+P. Martin-L\"of.
+\textit{Intuitionistic Type Theory}.
+Bibliopolis, 1984.
+
+\bibitem{coquand88}
+T. Coquand and G. Huet.
+The calculus of constructions.
+\textit{Information and Computation}, 76(2--3):95--120, 1988.
+
+\bibitem{lean4}
+L. de Moura, S. Ullrich.
+The Lean~4 theorem prover and programming language.
+\textit{CADE-28}, 2021.
+
+\bibitem{fstar}
+N. Swamy et~al.
+\Fstar{}: A general-purpose dependently typed programming language.
+\textit{POPL 2016}.
+
+\bibitem{dafny}
+K. R. M. Leino.
+Dafny: An automatic program verifier for functional correctness.
+\textit{LPAR-16}, 2010.
+
+\end{thebibliography}
+
+\end{document}

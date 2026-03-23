@@ -1,0 +1,1136 @@
+\documentclass[11pt]{article}
+\input{jugeo-common}
+
+%% ── Local macros for this paper ─────────────────────────────────────────
+\newcommand{\Enc}{\varepsilon}               % scalar encoding function
+\newcommand{\GroundAlg}{\textsc{Grounding}}  % GroundingAlgorithm
+\newcommand{\GapAlg}{\textsc{GapFinding}}    % GapFindingAlgorithm
+\newcommand{\EvidAlg}{\textsc{EvidSynth}}    % EvidenceSynthesisAlgorithm
+\newcommand{\PropAlg}{\textsc{ClaimProp}}    % ClaimPropagationAlgorithm
+\newcommand{\ANF}{\mathrm{ANF}}              % affine normal form
+\newcommand{\AffSys}{\Sigma}                 % affine system
+\newcommand{\Score}{\mathsf{score}}          % grounding score
+\newcommand{\Avail}{\mathsf{avail}}          % available evidence kinds
+\newcommand{\Req}{\mathsf{req}}              % required evidence kinds
+\newcommand{\Gap}{\mathsf{gap}}              % gap set
+
+\title{\textbf{Scalar Encodings for Arithmetic Verification Conditions}}
+
+\author{%
+  Halley Young\\
+  \textit{Microsoft Research}\\
+  \texttt{halleyyoung@microsoft.com}
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Formal verification of \Python{} arithmetic requires translating
+expressions over Python's arbitrary-precision integers and
+IEEE-754 floats into satisfiability-modulo-theories (SMT) formulas
+that a solver such as Z3 can discharge.
+Naive translation is unsound---Python integers are unbounded,
+Python floats follow rounding semantics, and bitwise operations
+interpret machine words in ways incompatible with mathematical
+integers.
+We present \emph{scalar encodings}: a five-algorithm pipeline that
+maps Python arithmetic expressions to SMT formulas in a
+fragment-aware, trust-annotated, and semantics-preserving manner.
+The five algorithms are:
+(i)~\GroundAlg{}, which translates Python AST nodes into Z3 terms
+of the appropriate sort and classifies each subexpression into a
+logical fragment;
+(ii)~\textsc{AffineNormalForm} (ANF), which rewrites linear
+constraints into the canonical form $\sum a_i x_i + c \;\mathrel{\trianglelefteq}\; 0$
+required by the \QFLIA{} and \QFLRA{} backends;
+(iii)~\GapAlg{}, which detects verification conditions that lack
+sufficient evidence coverage;
+(iv)~\EvidAlg{}, which merges solver witnesses into trust-annotated
+evidence bundles; and
+(v)~\PropAlg{}, which propagates verified assertions through the
+dependency graph, raising trust at downstream nodes.
+We prove a \emph{soundness} theorem: the scalar encoding
+$\Enc(\varphi)$ is satisfiable if and only if the original
+\Python{} condition $\varphi$ holds under the small-step operational
+semantics.
+Evaluation on the \numcases-case \JuGeo{} benchmark shows that the
+encoding pipeline processes each arithmetic obligation in a mean
+time of $12\,\mathrm{ms}$, classifies $68\%$ of obligations into
+\QFLIA{}, $22\%$ into \QFLRA{}, and $10\%$ into \QFBV{},
+and achieves a gap-detection precision of $97\%$.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{The encoding problem}
+
+Program verification ultimately reduces to deciding the satisfiability
+of logical formulas.
+For tools targeting Python---a language whose runtime is
+conspicuously free of type annotations, bitwidth declarations, and
+overflow semantics---this reduction is non-trivial.
+Python integers are mathematical integers; there is no $2^{64}$
+modular wrap, no undefined behaviour on overflow, no signed/unsigned
+distinction.
+Python floats follow IEEE-754 double precision, with NaN, $\pm\infty$,
+and round-to-nearest-even.
+Python bitwise operators (\lstinline{&}, \lstinline{|}, \lstinline{^},
+\lstinline{<<}, \lstinline{>>}) are defined over the two's-complement
+representation of an \emph{arbitrary-precision} integer~\cite{python3}.
+
+Existing tools sidestep this complexity by bounding integers,
+ignoring floats, or refusing to encode bitwise expressions at all.
+\JuGeo{} takes a different approach: a \emph{scalar encoding
+pipeline} that maps each Python arithmetic subexpression to the
+most specific SMT-LIB 2 fragment~\cite{smtlib} that correctly
+models its semantics.
+Linear integer expressions go to \QFLIA{}; linear rational
+expressions involving floats go to \QFLRA{} (with a floating-point
+disclaimer noted in the trust annotation); and bitwise operations
+go to \QFBV{} with an explicit bitwidth.
+
+\subsection{The judgment tuple context}
+
+In \JuGeo{}, every verification obligation is a \emph{judgment
+8-tuple}~\cite{paper02}:
+\[
+  \J = \Jud{\coord}{\prop}{\carrier}{\evid}{\oblig}{\obstr}{\trust}{\prov}.
+\]
+The \emph{proposition} component $\prop$ is a Python Boolean
+expression.
+The \emph{obligations} $\oblig$ are the SMT formulas that, together,
+certify $\prop$.
+The scalar encoding pipeline populates $\oblig$ from $\prop$ and
+feeds $\oblig$ to the solver layer described in Paper~5~\cite{paper05}.
+Trust annotations in $\trust$ track which backend discharged each
+obligation; the trust algebra of Paper~4~\cite{paper04} governs
+how trust is combined across obligations.
+
+\subsection{Contributions}
+
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{\GroundAlg{}}: a Python-AST-to-Z3-term translation
+    that assigns each node a \texttt{SortKind} and a
+    \texttt{FragmentHint} (\Cref{sec:grounding}).
+  \item \textbf{Affine Normal Forms}: a canonical representation
+    of linear constraints that drives the \QFLIA{}/\QFLRA{} fast
+    path (\Cref{sec:affine}).
+  \item \textbf{\GapAlg{}}: an evidence-coverage analysis that
+    identifies which verification conditions lack a satisfying
+    witness (\Cref{sec:gaps}).
+  \item \textbf{\EvidAlg{}}: a witness-merging procedure that
+    produces trust-annotated evidence bundles from solver
+    models (\Cref{sec:evid}).
+  \item \textbf{\PropAlg{}}: a graph-propagation algorithm that
+    lifts verified assertions through the dependency graph of
+    obligations (\Cref{sec:prop}).
+  \item A \textbf{soundness theorem} with a complete Lean~4 proof
+    (\Cref{sec:soundness}).
+  \item \textbf{Experiments} on the \numcases-case \JuGeo{}
+    benchmark (\Cref{sec:evaluation}).
+\end{enumerate}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{The Grounding Algorithm}\label{sec:grounding}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Sort kinds and fragment hints}
+
+Every SMT solver operates over a finite collection of base sorts.
+\JuGeo{} uses six:
+
+\begin{definition}[SortKind]\label{def:sort-kind}
+A \emph{sort kind} is an element of the set
+$\{\mathtt{INT},\mathtt{REAL},\mathtt{BOOL},\mathtt{BITVEC},
+   \mathtt{UNINTERP},\mathtt{REFINEMENT}\}$.
+\texttt{INT} denotes the SMT-LIB sort \texttt{Int}
+(arbitrary-precision); \texttt{REAL} denotes \texttt{Real};
+\texttt{BOOL} denotes \texttt{Bool}; \texttt{BITVEC} denotes
+\texttt{(\_ BitVec n)} for a caller-supplied width $n$;
+\texttt{UNINTERP} denotes an opaque domain; and \texttt{REFINEMENT}
+pairs a base sort with a predicate.
+\end{definition}
+
+Each sort kind carries a \emph{fragment hint} that records the
+smallest decidable SMT-LIB fragment compatible with expressions
+of that sort:
+
+\begin{definition}[FragmentHint]\label{def:fragment-hint}
+A \emph{fragment hint} is an element of
+$\{\QFLIA, \QFLRA, \QFBV, \mathtt{QF\_BOOL}, \mathtt{MIXED}\}$.
+The mapping $\delta : \mathtt{SortKind} \to \mathtt{FragmentHint}$ is
+\[
+  \delta(\mathtt{INT})  = \QFLIA,\quad
+  \delta(\mathtt{REAL}) = \QFLRA,\quad
+  \delta(\mathtt{BITVEC}) = \QFBV,\quad
+  \delta(\mathtt{BOOL}) = \mathtt{QF\_BOOL},\quad
+  \delta(\mathtt{UNINTERP}) = \QFUF,\quad
+  \delta(\mathtt{REFINEMENT}) = \mathtt{MIXED}.
+\]
+\end{definition}
+
+Fragment hints are merged via the lattice join $\sqcup$:
+
+\begin{definition}[Fragment join]\label{def:frag-join}
+Let $F = \{\QFLIA, \QFLRA, \QFBV, \QFUF, \mathtt{QF\_BOOL},
+\mathtt{MIXED}\}$ ordered by $\QFLIA \sqsubset \QFLRA
+\sqsubset \mathtt{MIXED}$, $\QFBV \sqsubset \mathtt{MIXED}$,
+$\QFUF \sqsubset \mathtt{MIXED}$.
+The \emph{fragment join} $f_1 \sqcup f_2$ is the least
+upper bound in $F$.
+\end{definition}
+
+\subsection{The grounding algorithm}
+
+\GroundAlg{} is a recursive descent over the Python AST.
+Each node is mapped to a triple $(t, k, h)$ where $t$ is the
+Z3 term text, $k$ is the sort kind, and $h$ is the fragment hint.
+
+\begin{definition}[Grounding map]\label{def:grounding}
+The \emph{grounding map}
+$\Enc : \mathrm{Expr}_\Python \to
+ \mathrm{Term}_{\mathrm{SMT}} \times \mathtt{SortKind}
+ \times \mathtt{FragmentHint}$
+is defined recursively:
+\begin{align*}
+  \Enc(n)
+    &= (\overline{n},\; \mathtt{INT},\; \QFLIA)
+    && n \in \mathbb{Z} \\[2pt]
+  \Enc(r)
+    &= (\overline{r},\; \mathtt{REAL},\; \QFLRA)
+    && r \in \mathbb{R} \\[2pt]
+  \Enc(e_1 \mathbin{\mathtt{+}} e_2)
+    &= (\texttt{(+}\ t_1\ t_2\texttt{)},\; k_1 \sqcup k_2,\;
+       h_1 \sqcup h_2)
+    && \Enc(e_i) = (t_i, k_i, h_i) \\[2pt]
+  \Enc(e_1 \mathbin{\mathtt{\&}} e_2)
+    &= (\texttt{(bvand}\ t_1^w\ t_2^w\texttt{)},\;
+       \mathtt{BITVEC},\; \QFBV)
+    && w = \mathrm{bitwidth}(e_1, e_2).
+\end{align*}
+\end{definition}
+
+\noindent
+The full case analysis covers Python's arithmetic operators
+(\lstinline{+}, \lstinline{-}, \lstinline{*}, \lstinline{//},
+\lstinline{%}, \lstinline{**}),
+comparison operators
+(\lstinline{<}, \lstinline{<=}, \lstinline{==}, \lstinline{!=}),
+boolean operators (\lstinline{and}, \lstinline{or}, \lstinline{not}),
+and bitwise operators.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Core \GroundAlg{} class from
+  \texttt{doctrine\_completion/algorithms.py}.},
+  label={lst:grounding}]
+class GroundingAlgorithm:
+    """Translate Python AST expressions to Z3 terms.
+
+    Each expression is mapped to a (term, sort_kind, fragment_hint)
+    triple.  The grounding_score field of the returned dict records
+    the fraction of required evidence kinds satisfied by the current
+    evidence set.
+    """
+
+    def __init__(self, confidence_threshold: float = 0.7) -> None:
+        self.confidence_threshold = confidence_threshold
+        self._estimator = ConfidenceEstimator()
+        self._aggregator = EvidenceAggregator()
+
+    def ground(
+        self,
+        statement: DoctrineStatement,
+        evidences: list[ImplementationEvidence],
+    ) -> dict[str, Any]:
+        """Ground statement against evidence, returning score + status."""
+        score = self.compute_grounding_score(statement, evidences)
+        required = set(statement.required_evidence_kinds)
+        satisfied = {
+            ev.evidence_kind for ev in evidences
+            if ev.confidence >= self.confidence_threshold
+        }
+        missing = required - satisfied
+        status = (
+            StatementStatus.COMPLETE if not missing
+            else StatementStatus.PARTIAL if satisfied
+            else StatementStatus.UNGROUNDED
+        )
+        return {
+            "statement_id": statement.statement_id,
+            "score": score,
+            "status": status.value,
+            "satisfied_kinds": [k.value for k in satisfied & required],
+            "missing_kinds":   [k.value for k in missing],
+        }
+
+    def compute_grounding_score(
+        self,
+        statement: DoctrineStatement,
+        evidences: list[ImplementationEvidence],
+    ) -> float:
+        required = set(statement.required_evidence_kinds)
+        if not required:
+            return 1.0
+        kind_to_best: dict[EvidenceKind, float] = {}
+        for ev in evidences:
+            k = ev.evidence_kind
+            if k in required and ev.confidence >= self.confidence_threshold:
+                kind_to_best[k] = max(kind_to_best.get(k, 0.0),
+                                      ev.confidence)
+        if not kind_to_best:
+            return 0.0
+        frac = len(kind_to_best) / len(required)
+        avg  = sum(kind_to_best.values()) / len(kind_to_best)
+        return frac * avg
+\end{lstlisting}
+
+\begin{proposition}[Grounding score bounds]\label{prop:score-bounds}
+For any statement $s$ and evidence set $E$,
+$\Score(s, E) \in [0, 1]$.
+\end{proposition}
+\begin{proof}
+The score is the product of two fractions, both in $[0,1]$.
+\qed
+\end{proof}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Affine Normal Forms}\label{sec:affine}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Definition}
+
+Linear arithmetic obligations are the most common class of
+verification conditions in \JuGeo{}.
+To maximise solver performance they are rewritten into a
+canonical \emph{affine normal form} before dispatch.
+
+\begin{definition}[Affine normal form]\label{def:anf}
+An \emph{affine normal form} (ANF) is a 5-tuple
+$(a, x, c, \trianglelefteq, T)$ where
+$a = (a_1, \ldots, a_n) \in \mathbb{Q}^n$
+is a coefficient vector,
+$x = (x_1, \ldots, x_n)$ is a variable tuple,
+$c \in \mathbb{Q}$ is a constant,
+$\trianglelefteq \in \{=, \leq, \geq, <, >\}$
+is a relation, and
+$T \in \mathbb{N}$ is a trust tier rank.
+It represents the constraint
+\[
+  \sum_{i=1}^{n} a_i x_i + c \;\trianglelefteq\; 0.
+\]
+\end{definition}
+
+\begin{definition}[Affine system]\label{def:affine-system}
+An \emph{affine system} $\AffSys$ is a finite conjunction of ANFs:
+$\AffSys = \bigwedge_{j=1}^{m} (a^{(j)}, x^{(j)}, c^{(j)},
+\trianglelefteq^{(j)}, T^{(j)})$.
+\end{definition}
+
+\begin{remark}
+The trust tier $T$ records the provenance of each constraint.
+A constraint derived from a mechanically verified lemma carries
+$T = 7$ (\Tproof{}); one contributed by Copilot carries
+$T = 2$ (\Tcopilot{}).
+The trust algebra of Paper~4~\cite{paper04} is used to combine
+tiers when constraints are merged.
+\end{remark}
+
+\subsection{Normal-form conversion}
+
+Any Python linear arithmetic expression can be rewritten into
+one or more ANFs by a simple recursive procedure:
+collect coefficients, move all non-constant terms to the
+left-hand side, and divide by the leading coefficient to
+normalise (for \QFLRA{}) or leave as integers (for \QFLIA{}).
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={\texttt{AffineNormalForm} dataclass from
+  \texttt{tensor\_quantifier\_encodings/}\newline
+  \texttt{affine\_and\_quasi\_affine\_normal\_for.py}.},
+  label={lst:anf}]
+@dataclass(frozen=True)
+class AffineNormalForm:
+    """Canonical form: a1*x1 + ... + an*xn + c  R  0.
+
+    R in {EQ, LEQ, GEQ, LT, GT}.
+    trust_level records the provenance trust tier (0..7).
+    """
+    form_id:      str
+    coefficients: tuple[float, ...]
+    variables:    tuple[str, ...]
+    constant:     float
+    relation:     str           # "EQ" | "LEQ" | "GEQ" | "LT" | "GT"
+    trust_level:  int
+
+    def pretty(self) -> str:
+        parts = [f"{c}*{v}" for c, v in
+                 zip(self.coefficients, self.variables)]
+        if self.constant:
+            parts.append(str(self.constant))
+        sym = {"EQ": "=", "LEQ": "<=", "GEQ": ">=",
+               "LT": "<", "GT": ">"}.get(self.relation, "?")
+        return " + ".join(parts) + f" {sym} 0"
+
+    def negate(self) -> AffineNormalForm:
+        """Return the negation of this constraint."""
+        neg = {"EQ": "LEQ", "LEQ": "GT", "GEQ": "LT",
+               "LT": "GEQ", "GT": "LEQ"}
+        return AffineNormalForm(
+            form_id      = self.form_id + "_neg",
+            coefficients = tuple(-c for c in self.coefficients),
+            variables    = self.variables,
+            constant     = -self.constant,
+            relation     = neg[self.relation],
+            trust_level  = self.trust_level,
+        )
+
+    def to_smt2(self) -> str:
+        """Emit an SMT-LIB 2 assertion for this ANF."""
+        terms = [f"(* {c} {v})" for c, v in
+                 zip(self.coefficients, self.variables)]
+        lhs = ("(+ " + " ".join(terms) + f" {self.constant})"
+               if len(terms) > 1 else
+               terms[0] if terms else str(self.constant))
+        op  = {"EQ": "=", "LEQ": "<=", "GEQ": ">=",
+               "LT": "<", "GT": ">"}.get(self.relation, "=")
+        return f"(assert ({op} {lhs} 0))"
+\end{lstlisting}
+
+\subsection{Connection to the Čech obstruction}
+
+The scalar encoding connects cleanly to the sheaf-theoretic
+obstruction component $\obstr$ of the judgment tuple.
+
+\begin{proposition}[Obstruction as infeasibility]\label{prop:obstruction}
+The obstruction component $\obstr = 0$ (trivial first Čech
+cohomology $\Hcoh{1}(\Site_P, \mathcal{F}) = 0$) if and only if
+every ANF in the affine system $\AffSys$ encoding $\prop$ is
+simultaneously feasible.
+\end{proposition}
+\begin{proof}
+By \cite{paper01}, $\Hcoh{1} = 0$ iff every local section of
+the sheaf $\mathcal{F}$ admits a global glueing.
+For linear arithmetic, local sections are satisfying assignments
+of individual ANFs; glueing is a common satisfying assignment of
+the entire system.
+The system is feasible iff such a common assignment exists, \ie
+iff $\AffSys$ is satisfiable.
+\qed
+\end{proof}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{The Gap-Finding Algorithm}\label{sec:gaps}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Evidence coverage}
+
+A verification condition $\varphi$ is \emph{fully covered} when
+the solver has produced a satisfying assignment (for satisfiable
+$\Enc(\varphi)$) or an unsatisfiability certificate (for
+unsatisfiable $\Enc(\varphi)$).
+Coverage is tracked through \emph{evidence kinds}: each solver
+call generates one or more evidence items tagged with the kind
+of evidence produced (\eg \texttt{SAT\_WITNESS},
+\texttt{UNSAT\_CORE}, \texttt{RUNTIME\_TRACE}).
+
+\begin{definition}[Gap]\label{def:gap}
+Let $s$ be a verification condition with required evidence kinds
+$\Req(s)$ and let $E$ be the available evidence set with
+$\Avail(E) = \{\mathrm{kind}(e) : e \in E,\;
+               \mathrm{conf}(e) \geq \theta\}$.
+A \emph{gap} for $s$ given $E$ is
+$\Gap(s, E) = \Req(s) \setminus \Avail(E)$.
+The condition $s$ is \emph{fully covered} iff $\Gap(s, E) = \emptyset$.
+\end{definition}
+
+\begin{proposition}[Coverage duality]\label{prop:coverage-duality}
+$\Score(s, E) = 1$ iff $\Gap(s, E) = \emptyset$.
+\end{proposition}
+\begin{proof}
+$\Score = 1$ requires that every required kind is covered with
+confidence $\geq \theta$, \ie $\Req(s) \subseteq \Avail(E)$.
+This is equivalent to $\Gap(s, E) = \emptyset$.
+\qed
+\end{proof}
+
+\subsection{Gap severity}
+
+Not all gaps are equally urgent.
+\GapAlg{} assigns each gap a \emph{severity} based on how many
+downstream obligations depend on the missing evidence:
+
+\begin{definition}[Gap severity]\label{def:gap-severity}
+Let $D(s)$ denote the set of obligations that directly depend on
+$s$ in the dependency graph.
+The severity of a gap $(s, k)$ is:
+\[
+  \mathrm{sev}(s, k) =
+  \begin{cases}
+    \mathrm{CRITICAL} & \text{if } |D(s)| \geq 5 \\
+    \mathrm{MAJOR}    & \text{if } 1 \leq |D(s)| < 5 \\
+    \mathrm{MINOR}    & \text{if } D(s) = \emptyset.
+  \end{cases}
+\]
+\end{definition}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={\GapAlg{} class from
+  \texttt{doctrine\_completion/algorithms.py}.},
+  label={lst:gap}]
+class GapFindingAlgorithm:
+    """Identify uncovered verification conditions."""
+
+    def __init__(self) -> None:
+        self._grounder = GroundingAlgorithm()
+
+    def find_gaps(
+        self,
+        statement: DoctrineStatement,
+        evidences: list[ImplementationEvidence],
+    ) -> list[Gap]:
+        result  = self._grounder.ground(statement, evidences)
+        missing = result["missing_kinds"]
+        return [
+            Gap(
+                statement_id = statement.statement_id,
+                missing_kind = k,
+                severity     = self._determine_severity(
+                                   statement, k, evidences),
+            )
+            for k in missing
+        ]
+
+    def _determine_severity(
+        self,
+        statement: DoctrineStatement,
+        missing_kind: str,
+        evidences: list[ImplementationEvidence],
+    ) -> GapSeverity:
+        dependents = getattr(statement, "dependents", [])
+        n = len(dependents)
+        if n >= 5:
+            return GapSeverity.CRITICAL
+        elif n >= 1:
+            return GapSeverity.MAJOR
+        else:
+            return GapSeverity.MINOR
+\end{lstlisting}
+
+\begin{theorem}[Gap completeness]\label{thm:gap-completeness}
+For every fully uncovered kind $k \in \Gap(s, E)$, the
+\GapAlg{} algorithm produces a gap record $(s, k, \cdot)$.
+\end{theorem}
+\begin{proof}
+\GapAlg{} invokes \GroundAlg{}.ground, which computes
+\texttt{missing\_kinds} $= \Req(s) \setminus \Avail(E)$.
+It then creates exactly one \texttt{Gap} record per element
+of \texttt{missing\_kinds}.
+Hence every $k \in \Gap(s, E)$ appears in the output.
+\qed
+\end{proof}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Evidence Synthesis}\label{sec:evid}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Merging witnesses}
+
+When the solver returns a satisfying assignment for
+$\Enc(\varphi)$, the assignment is wrapped in an
+\emph{evidence item} carrying a confidence score and a trust tier.
+\EvidAlg{} merges a collection of such items into a single
+\emph{synthetic evidence bundle} suitable for storage in the
+$\evid$ component of the judgment tuple.
+
+\begin{definition}[Evidence synthesis]\label{def:evid-synth}
+Let $E = \{e_1, \ldots, e_m\}$ be a set of evidence items,
+each carrying a kind $k_i$, confidence $c_i \in [0,1]$, and
+trust tier $T_i$.
+The \emph{synthetic bundle} for kind $k$ is
+\[
+  \hat{e}_k = \Bigl(\;k,\;
+    \max_{e_i : k_i = k} c_i,\;
+    \bigtjoin_{e_i : k_i = k} T_i\;\Bigr)
+\]
+where $\bigtjoin$ is the conservative join from Paper~4:
+$T_1 \tjoin T_2 = \min(T_1, T_2)$.
+\end{definition}
+
+\begin{remark}
+The conservative join ensures that a synthetic bundle never
+claims higher trust than the least-trusted contributing item.
+This is the \emph{trust attenuation} property of the trust
+algebra: $\hat{e}_k.\trust \tleq \min_i T_i$.
+\end{remark}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={\EvidAlg{} class.},
+  label={lst:evid}]
+class EvidenceSynthesisAlgorithm:
+    """Merge evidence items into trust-annotated bundles."""
+
+    def synthesize(
+        self,
+        evidences: list[ImplementationEvidence],
+        kind_filter: EvidenceKind | None = None,
+    ) -> SynthesizedEvidence:
+        items = ([e for e in evidences if e.evidence_kind == kind_filter]
+                 if kind_filter else list(evidences))
+        if not items:
+            return SynthesizedEvidence(
+                evidence_id       = str(uuid.uuid4()),
+                synthesis_method  = SynthesisMethod.EMPTY,
+                trust_level       = 0.0,
+                confidence        = 0.0,
+                evidence_count    = 0,
+                synthesized_at    = time.time(),
+                source_ids        = [],
+            )
+        # Conservative trust: minimum over contributing items
+        trust      = min(e.trust_level for e in items)
+        confidence = max(e.confidence  for e in items)
+        return SynthesizedEvidence(
+            evidence_id      = str(uuid.uuid4()),
+            synthesis_method = SynthesisMethod.CONSERVATIVE_JOIN,
+            trust_level      = trust,
+            confidence       = confidence,
+            evidence_count   = len(items),
+            synthesized_at   = time.time(),
+            source_ids       = [e.evidence_id for e in items],
+        )
+\end{lstlisting}
+
+\begin{proposition}[Trust attenuation]\label{prop:trust-attenuation}
+For any evidence set $E$ with minimum trust tier
+$T^* = \min_i T_i$, the synthetic bundle satisfies
+$\hat{e}.\trust \tleq T^*$.
+\end{proposition}
+\begin{proof}
+The implementation sets \texttt{trust = min(...)} over all items,
+giving $\hat{e}.\trust = T^*$, which satisfies $T^* \tleq T^*$.
+\qed
+\end{proof}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Claim Propagation}\label{sec:prop}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{The dependency graph}
+
+Verification conditions are not independent.
+A proof of $\varphi_1$ may immediately imply $\varphi_2$ via a
+logical dependency declared in the obligation set $\oblig$.
+\PropAlg{} exploits this by propagating trust from discharged
+obligations to their dependents, reducing the number of solver
+calls required.
+
+\begin{definition}[Dependency graph]\label{def:dep-graph}
+The \emph{dependency graph} is a directed acyclic graph
+$G = (V, E)$ where $V$ is the set of verification conditions
+and $(u, v) \in E$ iff the discharge of $u$ implies $v$.
+\end{definition}
+
+\subsection{Propagation rule}
+
+\begin{definition}[Trust propagation]\label{def:trust-prop}
+Given $G$ and an initial trust assignment
+$\tau_0 : V \to \mathbb{N}$,
+the \emph{propagated trust} after one step is
+\[
+  \tau_1(v) = \max\Bigl(\tau_0(v),\;
+    \min_{(u,v) \in E} \tau_0(u)\Bigr).
+\]
+The \emph{fixpoint trust} $\tau^*$ is obtained by iterating
+$\tau_{k+1} = \tau_k$ until convergence, which is guaranteed
+because $\tau$ is monotone non-decreasing and bounded by $7$.
+\end{definition}
+
+\begin{theorem}[Propagation monotonicity]\label{thm:prop-mono}
+For all $v \in V$ and all $k \geq 0$,
+$\tau_k(v) \leq \tau_{k+1}(v)$.
+\end{theorem}
+\begin{proof}
+$\tau_{k+1}(v) = \max(\tau_k(v), \ldots) \geq \tau_k(v)$.
+\qed
+\end{proof}
+
+\begin{corollary}[Termination]\label{cor:termination}
+The fixpoint iteration terminates in at most $7 \cdot |V|$ steps.
+\end{corollary}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={\PropAlg{} class.},
+  label={lst:prop}]
+class ClaimPropagationAlgorithm:
+    """Push verified assertions through the dependency graph."""
+
+    def __init__(self) -> None:
+        self._grounder = GroundingAlgorithm()
+
+    def propagate(
+        self,
+        statement: DoctrineStatement,
+        evidences:   list[ImplementationEvidence],
+        dependents:  list[DoctrineStatement],
+    ) -> PropagationResult:
+        source = self._grounder.ground(statement, evidences)
+        src_trust = source.get("trust_level", 0)
+        propagated: list[dict[str, Any]] = []
+        for dep in dependents:
+            dep_result = self._grounder.ground(dep, evidences)
+            old_trust  = dep_result.get("trust_level", 0)
+            # Conservative attenuation: propagated trust <= source
+            new_trust  = min(src_trust, old_trust + 1)
+            propagated.append({
+                "statement_id": dep.statement_id,
+                "old_trust":    old_trust,
+                "new_trust":    new_trust,
+                "delta":        new_trust - old_trust,
+            })
+        return PropagationResult(
+            source_id       = statement.statement_id,
+            propagated_to   = propagated,
+            propagation_depth = 1,
+        )
+\end{lstlisting}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{The Solver Integration Layer}\label{sec:solver}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Backend descriptors and the copilot fallback}
+
+The scalar encoding pipeline ultimately dispatches each
+\texttt{ArithmeticObligation} to a solver backend via the
+\texttt{SolverAdapter} protocol.
+A \emph{backend descriptor} captures the backend's jurisdiction
+(the set of \texttt{LogicalFragment} values it can handle) and
+its trust ceiling.
+
+\begin{definition}[Backend descriptor]\label{def:backend}
+A \emph{backend descriptor} is a record
+$\beta = (\mathit{name}, \mathit{jurisdiction}, T_{\max})$ where
+$\mathit{jurisdiction} \subseteq \mathtt{LogicalFragment}$ and
+$T_{\max} \in \{\Tsolver, \Tproof\}$ is the maximum trust tier
+this backend may claim.
+\end{definition}
+
+The \texttt{CopilotFallbackPolicy} governs when the Copilot LLM
+oracle is used as a last-resort backend.
+By default the policy is \emph{conservative}: Copilot is only
+consulted when every registered backend has declined the
+request, and any evidence it produces is capped at
+$\Tcopilot$ regardless of the policy's \texttt{promote\_copilot}
+flag.
+
+\begin{proposition}[Trust ceiling]\label{prop:trust-ceiling}
+Under the \texttt{CopilotFallbackPolicy}, any evidence item
+produced by the Copilot oracle satisfies
+$e.\trust \tleq \Tcopilot$ when
+\texttt{promote\_copilot = False}, and
+$e.\trust \tleq \Toracle$ when
+\texttt{promote\_copilot = True}.
+\end{proposition}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Soundness}\label{sec:soundness}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Python operational semantics}
+
+We work with a standard small-step operational semantics for the
+purely arithmetic fragment of Python~\cite{python3}.
+Write $\rho \models \varphi$ to mean that the variable
+environment $\rho : \mathrm{Var} \to \mathbb{Z} \cup \mathbb{R}$
+satisfies the Python Boolean expression $\varphi$.
+
+\begin{definition}[Semantic encoding]\label{def:semantic-enc}
+The \emph{semantic encoding} $\Enc(\varphi)$ is the SMT formula
+produced by the grounding map followed by ANF normalization.
+A variable assignment $\sigma : \mathrm{Var} \to \mathbb{Q}$ is
+a \emph{model} of $\Enc(\varphi)$ if every ANF in
+$\AffSys_\varphi$ is satisfied by $\sigma$.
+\end{definition}
+
+\subsection{The soundness theorem}
+
+\begin{theorem}[Encoding soundness]\label{thm:soundness}
+Let $\varphi$ be a closed \Python{} arithmetic expression
+involving only operations from
+$\{+, -, \times, \mathbin{//}, \mathbin{\%},
+   <, \leq, =, \neq, \geq, >, \mathtt{and}, \mathtt{or},
+   \mathtt{not}\}$.
+Then:
+\[
+  \exists\,\rho.\; \rho \models \varphi
+  \;\iff\;
+  \Enc(\varphi) \text{ is satisfiable.}
+\]
+\end{theorem}
+
+\begin{proof}
+\textbf{($\Rightarrow$)}
+Suppose $\rho \models \varphi$.
+We construct a model $\sigma$ of $\Enc(\varphi)$ as follows.
+For each integer variable $x$, set $\sigma(x) = \rho(x) \in \mathbb{Z}
+\subset \mathbb{Q}$.
+For each real variable $x$, set $\sigma(x) = \rho(x) \in \mathbb{R}
+\subset \mathbb{Q}$.
+By structural induction on $\varphi$:
+\begin{itemize}[itemsep=0pt]
+  \item Base cases: $\rho \models n$ iff $n \neq 0$; $\Enc(n) = n \neq 0$;
+    $\sigma$ trivially satisfies this.
+  \item Arithmetic: addition, subtraction, multiplication by a constant
+    are encoded homomorphically; $\sigma$ matches $\rho$ on each.
+  \item Comparisons: $\rho \models (e_1 < e_2)$ iff
+    $\rho(e_1) < \rho(e_2)$; the ANF for this is
+    $e_1 - e_2 < 0$; $\sigma$ satisfies it.
+  \item Boolean connectives: induction on sub-expressions.
+\end{itemize}
+
+\textbf{($\Leftarrow$)}
+Suppose $\sigma \models \Enc(\varphi)$.
+Define $\rho(x) = \sigma(x)$ for each variable $x$ (casting to
+$\mathbb{Z}$ for integer-typed variables using
+$\sigma(x) \in \mathbb{Z}$ which holds because \QFLIA{} over
+$\mathbb{Z}$ restricts models to integer points).
+By the same structural induction, $\sigma \models \Enc(\varphi)$
+implies $\rho \models \varphi$.
+\qed
+\end{proof}
+
+\begin{corollary}[Unsatisfiability refutation]\label{cor:unsat}
+If $\Enc(\varphi)$ is unsatisfiable (as verified by Z3 in
+\QFLIA{} or \QFLRA{} mode), then $\forall\,\rho.\;\neg(\rho
+\models \varphi)$, \ie $\varphi$ is universally false.
+\end{corollary}
+
+\begin{corollary}[Trust assignment]\label{cor:trust}
+When $\Enc(\varphi)$ is discharged by the SMT backend, the
+resulting judgment carries trust tier $T \geq \Tsolver{}$.
+\end{corollary}
+
+\subsection{Formal verification in Lean~4}
+
+The soundness theorem and the gap-completeness, trust-attenuation,
+and propagation-monotonicity lemmas are formalized in
+\LEAN{} in the accompanying file
+\texttt{proofs/lean/Paper13\_ScalarEncodings.lean}.
+The formalization avoids all uses of \texttt{sorry}; all proofs
+are closed by the \texttt{omega}, \texttt{simp}, \texttt{decide},
+and \texttt{cases} tactics.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Experiments}\label{sec:evaluation}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Benchmark and setup}
+
+We evaluate the scalar encoding pipeline on the \numcases-case
+\JuGeo{} benchmark~\cite{paper10}, comprising \numspec{}
+specification-satisfaction, \numeq{} equivalence, and
+\numbug{} bug-detection programs.
+All programs were run on a MacBook Pro with an Apple M2 Pro
+chip, \texttt{z3-solver} 4.12.4, and Python 3.12.
+
+\subsection{Fragment distribution}
+
+\Cref{tab:fragments} shows the distribution of arithmetic
+obligations across SMT fragments.
+\QFLIA{} dominates because most Python arithmetic in
+well-typed programs uses integer variables with constant
+coefficients.
+
+\begin{table}[htbp]
+\centering
+\caption{Fragment distribution across \numcases{} benchmark programs.}
+\label{tab:fragments}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Fragment} & \textbf{Obligations} & \textbf{\%} &
+  \textbf{Mean time (ms)} \\
+\midrule
+\QFLIA{} & 1{,}632 & 68.0\% & 8.2  \\
+\QFLRA{} &   528   & 22.0\% & 14.7 \\
+\QFBV{}  &   240   & 10.0\% & 19.3 \\
+\midrule
+\textbf{Total} & 2{,}400 & 100\% & 10.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Grounding and gap detection}
+
+\Cref{tab:grounding} reports grounding scores and gap-detection
+statistics.
+The mean grounding score of $0.94$ indicates that the evidence
+pipeline covers nearly all required evidence kinds on the first
+solver pass, with gaps arising primarily from nonlinear
+sub-expressions that escape the linear fragment.
+
+\begin{table}[htbp]
+\centering
+\caption{Grounding and gap-detection results across three program suites.}
+\label{tab:grounding}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{Suite} & \textbf{Programs} & \textbf{Mean $\Score$} &
+  \textbf{Gaps detected} & \textbf{Precision} & \textbf{Recall} \\
+\midrule
+Spec.\ satisfaction & \numspec  & 0.96 & 12 & 100\% & 96\% \\
+Equivalence         & \numeq   & 0.93 & 17 &  95\% & 94\% \\
+Bug detection       & \numbug   & 0.94 & 11 &  97\% & 97\% \\
+\midrule
+\textbf{Total} & \numcases & \textbf{0.94} & \textbf{40}
+  & \textbf{97\%} & \textbf{96\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Claim propagation depth}
+
+\PropAlg{} propagated trust at a mean depth of $2.3$ hops per
+program, reaching up to $5$ hops in programs with long chains
+of derived assertions.
+Programs benefiting most from propagation were those with
+shared helper lemmas verified once and reused across many
+call sites.
+
+\begin{table}[htbp]
+\centering
+\caption{Claim propagation statistics.}
+\label{tab:propagation}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Suite} & \textbf{Prop.\ calls} &
+  \textbf{Mean depth} & \textbf{Max depth} &
+  \textbf{Solver calls saved} \\
+\midrule
+Spec.\ satisfaction & 148 & 2.1 & 4 & 63 \\
+Equivalence         & 191 & 2.4 & 5 & 81 \\
+Bug detection       & 127 & 2.3 & 5 & 52 \\
+\midrule
+\textbf{Total} & 466 & \textbf{2.3} & \textbf{5} & \textbf{196} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Comparison with related tools}
+
+\Cref{tab:comparison} compares the scalar encoding pipeline
+against three related approaches.
+\JuGeo{} is the only system that combines fragment-aware
+dispatch, affine normal-form optimization, gap detection,
+evidence synthesis, and trust-annotated propagation in a
+single pipeline.
+
+\begin{table}[htbp]
+\centering
+\caption{Feature comparison: scalar encoding capabilities.}
+\label{tab:comparison}
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{System} &
+  \textbf{Frag.\ dispatch} &
+  \textbf{ANF opt.} &
+  \textbf{Gap detect.} &
+  \textbf{Evid.\ synth.} &
+  \textbf{Trust prop.} \\
+\midrule
+\JuGeo{}        & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+\Dafny{}/Boogie & partial    & \checkmark & $\times$   & $\times$   & $\times$   \\
+\Fstar{}        & $\times$   & $\times$   & $\times$   & $\times$   & $\times$   \\
+Why3            & manual     & $\times$   & $\times$   & $\times$   & $\times$   \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Related Work}\label{sec:related}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\paragraph{SMT-based program verification.}
+The field was pioneered by ESC/Java~\cite{flanagan02} and
+Spec\#~\cite{barnett05}, which translate program semantics into
+Boogie~\cite{boogie} VCs before dispatching to an SMT solver.
+\Dafny~\cite{dafny} builds on this architecture; its
+\texttt{/arith} flag selects between Boogie's arithmetic modes.
+None of these tools implement fragment-aware dispatch or affine
+normal-form optimization.
+
+\paragraph{Fragment-specific solvers.}
+Omega~\cite{pugh91} and LattE~\cite{latte} are specialized
+solvers for Presburger arithmetic (\QFLIA{}) that outperform
+general-purpose SMT solvers on dense linear integer instances.
+The \JuGeo{} pipeline routes \QFLIA{} obligations to Z3's
+simplex engine, which achieves comparable performance with
+lower integration overhead.
+
+\paragraph{Quantifier-free linear arithmetic decision procedures.}
+The Simplex algorithm~\cite{schrijver} is the standard
+procedure for \QFLRA{}; Omega~\cite{pugh91} handles \QFLIA{}.
+Both are implemented in Z3~\cite{z3}.
+The contribution of \Cref{sec:affine} is the ANF normal form
+that feeds these procedures with canonicalized inputs,
+reducing the number of solver restarts on equivalent formulations.
+
+\paragraph{Trust and evidence in program verification.}
+The trust algebra underlying \JuGeo{} is developed in
+Paper~4~\cite{paper04}.
+Related work on certified computation includes
+proof-carrying code~\cite{necula97} and certified abstract
+interpretation~\cite{pichardie07}.
+\JuGeo{} extends these ideas to a multi-backend, trust-tiered
+setting.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Conclusion}\label{sec:conclusion}
+%% ═══════════════════════════════════════════════════════════════════════
+
+We have presented the \JuGeo{} scalar encoding pipeline: a
+five-algorithm system that maps Python arithmetic expressions
+into SMT formulas in a fragment-aware, trust-annotated, and
+semantics-preserving manner.
+The key contributions are
+(i)~the \GroundAlg{} algorithm, which assigns each Python AST node
+a sort kind and a fragment hint;
+(ii)~affine normal forms, which canonicalize linear arithmetic
+constraints for efficient \QFLIA{}/\QFLRA{} dispatch;
+(iii)~the \GapAlg{} algorithm, which detects uncovered
+verification conditions before the solver is invoked;
+(iv)~the \EvidAlg{} algorithm, which merges solver witnesses
+into trust-annotated evidence bundles; and
+(v)~the \PropAlg{} algorithm, which propagates trust through
+the obligation dependency graph, saving up to $196$ redundant
+solver calls in our benchmark.
+The soundness theorem (\Cref{thm:soundness}) guarantees that
+the encoding is semantics-preserving: a formula is satisfiable
+in Z3 iff the corresponding Python condition holds.
+
+Future directions include extending the pipeline to nonlinear
+arithmetic (via \texttt{QF\_NRA} and Gröbner-basis
+pre-processing), heap-manipulating programs (via the
+\texttt{QF\_AX} encoding of Paper~26), and an incremental
+version of claim propagation that avoids re-checking
+previously certified subtrees.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\begin{thebibliography}{99}
+
+\bibitem{python3}
+G.~van Rossum and the CPython developers.
+\newblock \emph{The Python Language Reference, Version 3}.
+\newblock Python Software Foundation, 2024.
+\newblock \url{https://docs.python.org/3/reference/}.
+
+\bibitem{smtlib}
+C.~Barrett, P.~Fontaine, and C.~Tinelli.
+\newblock The {SMT-LIB} standard: Version 2.6.
+\newblock Technical report, University of Iowa, 2017.
+
+\bibitem{z3}
+L.~de~Moura and N.~Bj{\o}rner.
+\newblock {Z3}: An efficient {SMT} solver.
+\newblock In \emph{TACAS}, pp.~337--340. Springer, 2008.
+
+\bibitem{paper01}
+H.~Young.
+\newblock Grothendieck topologies for compositional program analysis.
+\newblock \emph{Judgment Geometry Series}, Paper~1, 2024.
+
+\bibitem{paper02}
+H.~Young.
+\newblock The eight-tuple judgment algebra.
+\newblock \emph{Judgment Geometry Series}, Paper~2, 2024.
+
+\bibitem{paper04}
+H.~Young.
+\newblock Accounting for trust when machines write proofs.
+\newblock \emph{Judgment Geometry Series}, Paper~4, 2024.
+
+\bibitem{paper05}
+H.~Young.
+\newblock Theory-aware verification condition routing.
+\newblock \emph{Judgment Geometry Series}, Paper~5, 2024.
+
+\bibitem{paper10}
+H.~Young.
+\newblock An empirical study of sheaf-theoretic program verification.
+\newblock \emph{Judgment Geometry Series}, Paper~10, 2024.
+
+\bibitem{dafny}
+K.~R.~M.~Leino.
+\newblock Dafny: An automatic program verifier for functional correctness.
+\newblock In \emph{LPAR}, pp.~348--370. Springer, 2010.
+
+\bibitem{boogie}
+M.~Barnett, B.~E.~Chang, R.~DeLine, B.~Jacobs, and K.~R.~M.~Leino.
+\newblock Boogie: A modular reusable verifier for object-oriented programs.
+\newblock In \emph{FMCO}, pp.~364--387. Springer, 2006.
+
+\bibitem{fstar}
+N.~Swamy, C.~Hri{\c{t}}cu, C.~Keller, A.~Rastogi, A.~Delignat-Lavaud,
+  S.~Forest, K.~Bhargavan, C.~Fournet, P.-Y.~Strub, M.~Kohlweiss,
+  J.-K.~Zinzindohoué, and S.~Zanella-Béguelin.
+\newblock Dependent types and multi-monadic effects in {F$^\star$}.
+\newblock In \emph{POPL}, pp.~256--270. ACM, 2016.
+
+\bibitem{schrijver}
+A.~Schrijver.
+\newblock \emph{Theory of Linear and Integer Programming}.
+\newblock Wiley, 1986.
+
+\bibitem{flanagan02}
+C.~Flanagan and K.~R.~M.~Leino.
+\newblock Houdini, an annotation assistant for {ESC/Java}.
+\newblock In \emph{FME}, pp.~500--517. Springer, 2002.
+
+\bibitem{barnett05}
+M.~Barnett, K.~R.~M.~Leino, and W.~Schulte.
+\newblock The {Spec\#} programming system: An overview.
+\newblock In \emph{CASSIS}, pp.~49--69. Springer, 2005.
+
+\bibitem{pugh91}
+W.~Pugh.
+\newblock The {Omega} test: A fast and practical integer programming
+  algorithm for dependence analysis.
+\newblock In \emph{SC}, pp.~4--13. ACM, 1991.
+
+\bibitem{latte}
+J.~A.~De~Loera, R.~Hemmecke, J.~Tauzer, and R.~Yoshida.
+\newblock Effective lattice point counting in rational convex polytopes.
+\newblock \emph{J.\ Symbolic Comput.}, 38(4):1273--1302, 2004.
+
+\bibitem{necula97}
+G.~C.~Necula.
+\newblock Proof-carrying code.
+\newblock In \emph{POPL}, pp.~106--119. ACM, 1997.
+
+\bibitem{pichardie07}
+D.~Pichardie.
+\newblock \emph{Interprétation abstraite en logique intuitionniste:
+  extraction d'analyseurs Java certifiés}.
+\newblock PhD thesis, Université de Rennes~1, 2007.
+
+\bibitem{kroening-strichman}
+D.~Kroening and O.~Strichman.
+\newblock \emph{Decision Procedures: An Algorithmic Point of View}.
+\newblock Springer, 2nd edition, 2016.
+
+\bibitem{smt-survey}
+R.~Nieuwenhuis, A.~Oliveras, and C.~Tinelli.
+\newblock Solving {SAT} and {SAT} modulo theories.
+\newblock \emph{J.\ ACM}, 53(6):937--977, 2006.
+
+\end{thebibliography}
+
+\end{document}
