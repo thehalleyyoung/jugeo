@@ -445,8 +445,9 @@ class DirectedResearch:
         """Discover a novel mathematical approach to the prompt.
 
         This is CONSTRUCT on T: synthesize an initial section on the
-        theory surface. The approach is chosen non-deterministically
-        via the ideation engine's cross-tradition tournament.
+        theory surface. When the synthesis frontier is available, uses
+        the real cross-tradition tournament. Otherwise falls back to
+        LLM-guided ideation.
         """
         start = time.time()
         self._log("Phase 1: IDEATE — discovering novel approach...")
@@ -458,35 +459,53 @@ class DirectedResearch:
                         SurfaceKind.THEORY, 0.0, 0.3, 0, 0, time.time() - start)
             return
 
-        # Ask the LLM to ideate with explicit mathematical novelty
+        # Try using the real synthesis frontier tournament
+        if _HAS_IDEATION:
+            winner = self._ideate_via_tournament()
+            if winner:
+                return
+
+        # Fallback: LLM-guided ideation with cross-tradition constraint
         ideation_prompt = textwrap.dedent(f"""\
             You are a research mathematician and software architect. Given this prompt:
 
             "{self.prompt}"
 
             Propose a NOVEL mathematical approach that:
-            1. Combines two distant mathematical fields (e.g., tropical geometry + optimization,
-               sheaf theory + databases, category theory + ML)
-            2. Identifies specific theorems/structures from each field that create a bridge
-            3. Explains how this bridge enables a software tool that doesn't exist yet
-            4. Names the synthesized field and the key bridge theorem
+            1. Combines two DISTANT mathematical fields — they must be from different
+               traditions (e.g., algebra × geometry, logic × analysis, topology × probability).
+               Do NOT combine fields that are already closely related.
+            2. Identifies 3-5 specific theorems/structures from each field that create bridges
+            3. Explains concretely how these bridges enable a software tool that doesn't exist yet
+            4. Names the synthesized field and states the key bridge theorem formally
+            5. Describes what data structures and algorithms the bridge theorem implies
+            6. Explains what existing tools/baselines this would compete against
+
+            Be SPECIFIC about the mathematics. Name actual theorems, not vague "connections."
 
             Respond as JSON:
             {{
                 "synthesized_field": "Name of the new combined field",
                 "field_a": "First mathematical field",
                 "field_b": "Second mathematical field",
-                "bridge_theorem": "Statement of the key theorem connecting them",
-                "theory_summary": "2-paragraph description of the mathematical framework",
+                "bridge_theorem": "Formal statement of the key theorem connecting them",
+                "theory_summary": "3-paragraph description: (1) what each field contributes, (2) the bridge, (3) what it enables computationally",
                 "approach_name": "short-kebab-case-name",
-                "why_novel": "Why this combination hasn't been tried before",
-                "key_structures": ["structure1", "structure2", "structure3"]
+                "why_novel": "Why this specific combination hasn't been tried and why it should work",
+                "key_structures_from_a": ["structure1", "structure2", "structure3"],
+                "key_structures_from_b": ["structure4", "structure5", "structure6"],
+                "bridge_structures": ["bridge1", "bridge2"],
+                "competing_baselines": ["baseline1", "baseline2"],
+                "metrics_to_beat": ["metric1", "metric2"]
             }}
         """)
 
-        result = _call_llm_json(ideation_prompt)
+        result = _call_llm_json(ideation_prompt, max_tokens=8192)
         self.theory = result.get("theory_summary", f"Framework for: {self.prompt}")
         self.approach = result.get("approach_name", "novel-synthesis")
+
+        # Store ideation details for downstream use
+        self._ideation_result = result
 
         self._record(IterationKind.IDEATE,
                      f"Ideated: {result.get('synthesized_field', 'novel approach')}",
@@ -495,6 +514,49 @@ class DirectedResearch:
 
         self._log(f"  Approach: {result.get('synthesized_field', '?')}")
         self._log(f"  Bridge: {result.get('bridge_theorem', '?')[:80]}...")
+
+    def _ideate_via_tournament(self) -> bool:
+        """Use the real synthesis frontier tournament for ideation.
+
+        Runs the binary tournament over 128 mathematical fields,
+        constrained to fields relevant to the prompt. The winner
+        becomes the theory section.
+        """
+        try:
+            from jugeo.ideation.synthesis_frontier.pipeline import (
+                SynthesisFrontierPipeline, PipelineConfig,
+            )
+
+            self._log("  Running synthesis frontier tournament...")
+            config = PipelineConfig()
+            if self.seed is not None:
+                config.seed = self.seed
+            pipeline = SynthesisFrontierPipeline(config=config)
+            result = pipeline.run()
+
+            if result and result.synthesis_field:
+                winner = result.synthesis_field
+                self.theory = getattr(winner, "description", str(winner))
+                name = getattr(winner, "name", "synthesis")
+                # Convert to kebab-case identifier
+                self.approach = name.lower().replace(" ", "-").replace("×", "x")
+                self._ideation_result = {
+                    "synthesized_field": name,
+                    "field_id": getattr(winner, "field_id", ""),
+                    "propositions": len(getattr(winner, "propositions", [])),
+                }
+                self._log(f"  Tournament winner: {name}")
+                self._log(f"  Propositions: {len(getattr(winner, 'propositions', []))}")
+
+                self._record(IterationKind.IDEATE,
+                             f"Tournament winner: {name}",
+                             SurfaceKind.THEORY, 0.0, 0.4, 0, 0, 0,
+                             detail=self._ideation_result)
+                return True
+        except Exception as exc:
+            self._log(f"  Tournament failed ({exc}), falling back to LLM ideation")
+
+        return False
 
     # ── Phase 2: DESIGN ──────────────────────────────────────────────
 
@@ -602,7 +664,9 @@ class DirectedResearch:
         """Generate code for each module in the plan.
 
         This is CONSTRUCT on R: produce local sections for each patch
-        of the covering family. The code site tracks module consistency.
+        of the covering family. When an LLM is available, this delegates
+        to the full FoundationPipeline code generation infrastructure,
+        which produces 10K+ LoC with domain-specific architecture.
         """
         start = time.time()
         self._log("Phase 3: IMPLEMENT — generating code...")
@@ -610,16 +674,25 @@ class DirectedResearch:
         if not self.plan:
             return
 
+        # Try using the full FoundationPipeline for heavy code generation
+        if not self.no_llm:
+            foundation_files = self._implement_via_foundation()
+            if foundation_files:
+                self.code_files.extend(str(f) for f in foundation_files)
+                self._record(IterationKind.IMPLEMENT,
+                             f"Generated {len(foundation_files)} files via foundation pipeline",
+                             SurfaceKind.CODE, 0.2, 0.6, 0, 0, time.time() - start)
+                return
+
+        # Fallback: generate per-module via direct LLM calls
         pkg_dir = self.output_dir / "src" / self.plan.package_name.replace("-", "_")
         pkg_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write __init__.py
         init_path = pkg_dir / "__init__.py"
         init_path.write_text(f'"""{self.plan.one_liner}"""\n__version__ = "0.1.0"\n')
         self.code_files.append(str(init_path))
 
         if self.no_llm:
-            # Generate stub files
             for mod in self.plan.modules:
                 name = mod.get("name", "module")
                 path = pkg_dir / f"{name}.py"
@@ -627,26 +700,30 @@ class DirectedResearch:
                 path.write_text(f'"""{purpose}"""\n\ndef main():\n    pass\n')
                 self.code_files.append(str(path))
         else:
+            generated_so_far: list[str] = []
             for mod in self.plan.modules:
                 name = mod.get("name", "module")
                 self._log(f"  Generating {name}.py...")
-                code = self._generate_module(mod)
+                code = self._generate_module(mod, generated_so_far)
                 path = pkg_dir / f"{name}.py"
                 path.write_text(code)
                 self.code_files.append(str(path))
+                generated_so_far.append(name)
 
         # Write pyproject.toml
         toml_path = self.output_dir / "pyproject.toml"
+        pkg_name = self.plan.package_name
         toml_path.write_text(textwrap.dedent(f"""\
             [build-system]
             requires = ["setuptools>=68"]
             build-backend = "setuptools.backends._legacy:_Backend"
 
             [project]
-            name = "{self.plan.package_name}"
+            name = "{pkg_name}"
             version = "0.1.0"
             description = "{self.plan.one_liner}"
             requires-python = ">=3.10"
+            dependencies = {json.dumps(self.plan.dependencies)}
         """))
         self.code_files.append(str(toml_path))
 
@@ -654,31 +731,126 @@ class DirectedResearch:
                      f"Generated {len(self.code_files)} files",
                      SurfaceKind.CODE, 0.2, 0.5, 0, 0, time.time() - start)
 
-    def _generate_module(self, mod: dict) -> str:
-        """Generate a single module's code via LLM."""
+    def _implement_via_foundation(self) -> list:
+        """Delegate code generation to the FoundationPipeline.
+
+        The foundation pipeline already handles:
+        - LLM-designed file architecture (6-10 domain-specific files)
+        - Per-file generation with 1000+ line requirements
+        - Context passing between files (imports_from tracking)
+        - pyproject.toml and CLI entry point generation
+        - Sheaf-theoretic verification of generated code
+
+        Returns list of Path objects, or empty list on failure.
+        """
+        try:
+            from jugeo.cli.foundation_pipeline import FoundationPipeline
+        except ImportError:
+            return []
+
+        # Build a mock args namespace with the settings the pipeline expects
+        import argparse
+        args = argparse.Namespace()
+        args.seed = self.seed
+        args.verbose = self.verbose
+        args.no_llm = self.no_llm
+        args.n_fields = 3
+        args.rounds = 1  # We already ideated; just need code gen
+        args.entropy_factor = 2.5
+        args.execute_code = True
+        args.latex_only = False
+        args.model = "claude-sonnet-4.6"
+        args.format = "text"
+        args.output = str(self.output_dir)
+
+        try:
+            pipeline = FoundationPipeline(args, self.output_dir)
+
+            # Build a minimal FieldNode-like object from our ideation results
+            class _Winner:
+                def __init__(self, name, description, propositions, constituents):
+                    self.name = name
+                    self.description = description
+                    self.propositions = propositions
+                    self.constituent_fields = constituents
+
+            winner = _Winner(
+                name=self.approach,
+                description=self.theory,
+                propositions=[],
+                constituents=self.approach.split("-")[:2],
+            )
+
+            # Build killer app from our plan
+            killer_app = None
+            if self.plan:
+                killer_app = {
+                    "tool_name": self.plan.package_name,
+                    "one_liner": self.plan.one_liner,
+                    "target_users": "domain experts",
+                    "key_capability": self.plan.one_liner,
+                    "why_synthesis_needed": self.theory[:200],
+                    "cli_commands": self.plan.cli_commands[:5],
+                }
+
+            # Run the actual code generation
+            self._log("  Delegating to FoundationPipeline for 10K+ LoC generation...")
+            files = pipeline._stage2_generate_code(
+                winner, killer_app=killer_app)
+            return files
+
+        except Exception as exc:
+            self._log(f"  Foundation pipeline delegation failed: {exc}")
+            return []
+
+    def _generate_module(self, mod: dict, generated_so_far: list[str] = None) -> str:
+        """Generate a single module's code via LLM.
+
+        Uses detailed prompts with 1000+ line requirements, domain-specific
+        naming, and context from previously generated files.
+        """
         name = mod.get("name", "module")
         purpose = mod.get("purpose", "")
-        key_items = mod.get("key_classes", mod.get("key_functions", []))
+        key_classes = mod.get("key_classes", [])
+        key_functions = mod.get("key_functions", [])
+        dependencies = mod.get("dependencies", [])
+        pkg = self.plan.package_name if self.plan else "package"
+
+        import_ctx = ""
+        if dependencies:
+            import_ctx = f"This file imports from: {', '.join(dependencies)}\n"
+        if generated_so_far:
+            import_ctx += f"Already generated: {', '.join(generated_so_far)}\n"
 
         prompt = textwrap.dedent(f"""\
-            Generate a complete Python module: {name}.py
+            Generate `{name}.py` for the {pkg} package.
 
-            THEORY: {self.theory[:300]}
+            PACKAGE: {pkg}
+            THEORY: {self.theory[:500]}
+            PROMPT: {self.prompt}
+            {import_ctx}
+
             PURPOSE: {purpose}
-            KEY ITEMS: {', '.join(key_items) if key_items else 'implement the core logic'}
-            PACKAGE: {self.plan.package_name if self.plan else ''}
+            KEY CLASSES to define: {', '.join(key_classes) if key_classes else 'domain-specific types'}
+            KEY FUNCTIONS to define: {', '.join(key_functions) if key_functions else 'core algorithms'}
 
-            Requirements:
-            - Python 3.10+, use dataclasses and type hints
-            - Include docstrings explaining the mathematical content
-            - Include at least 3 classes or functions
-            - Make it importable and functional, not stubs
-            - No jugeo imports — this is standalone math/CS code
-
-            Return ONLY Python code, no markdown fences.
+            REQUIREMENTS — write AT LEAST 1000 lines:
+            - Python 3.10+, from __future__ import annotations
+            - Every class needs: __init__, __repr__, to_dict/from_dict, real methods
+            - Every function needs: docstring, type hints, real computation
+            - Use numpy/scipy for numerical work where appropriate
+            - Include proper error handling and input validation
+            - Name ALL classes/functions after concrete domain concepts
+            - This is a REAL implementation, not stubs or placeholders
+            - Include 3+ helper classes specific to this module
+            - Include detailed logging/progress output
+            - Handle edge cases: missing fields, degenerate inputs, numerical failures
+            - Write real math, not stubs — if you compute an index, show HOW
+            - No jugeo imports — this is standalone domain code
+            - Return ONLY Python code, no markdown fences
         """)
 
-        code = _call_llm(prompt, max_tokens=8192)
+        code = _call_llm(prompt, max_tokens=16384)
         # Clean up
         if code.startswith("```"):
             lines = code.split("\n")
