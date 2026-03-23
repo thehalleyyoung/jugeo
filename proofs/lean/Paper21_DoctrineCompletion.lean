@@ -107,6 +107,59 @@ theorem filter_length_le {α : Type} (p : α → Bool) (xs : List α) :
     · simp; omega
     · omega
 
+/- **L3: Gap monotone decrease**.
+    After each synthesis step, the gap list shrinks (weakly).
+    In the strict case, where the synthesised axiom actually closes the
+    target VC, it shrinks by at least one. -/
+
+/-- The gap is weakly decreasing: if doctrine d' proves everything d proves,
+    the gap of d' is a subset of the gap of d. -/
+theorem gap_subset_of_stronger_doctrine
+    (d d' : Doctrine)
+    (vcs : List VC)
+    (hmono : ∀ v, d.proves v = true → d'.proves v = true) :
+    ∀ vc ∈ gapSet d' vcs, vc ∈ gapSet d vcs := by
+  intro vc hvc
+  simp only [gapSet, List.mem_filter] at hvc ⊢
+  constructor
+  · exact hvc.1
+  · cases hd : d.proves vc with
+    | false => simp [hd]
+    | true =>
+      exfalso
+      have hd' := hmono vc hd
+      simp [hd'] at hvc
+
+/-- The gap length is weakly decreasing — proved by induction on vcs. -/
+theorem gap_length_mono
+    (d d' : Doctrine)
+    (vcs : List VC)
+    (hmono : ∀ v, d.proves v = true → d'.proves v = true) :
+    (gapSet d' vcs).length ≤ (gapSet d vcs).length := by
+  induction vcs with
+  | nil => simp [gapSet]
+  | cons h t ih =>
+    cases hpd : d.proves h with
+    | true =>
+      have hpd' : d'.proves h = true := hmono h hpd
+      have hold : (gapSet d (h :: t)).length = (gapSet d t).length := by
+        simp [gapSet, List.filter_cons, hpd]
+      have hnew : (gapSet d' (h :: t)).length = (gapSet d' t).length := by
+        simp [gapSet, List.filter_cons, hpd']
+      rw [hold, hnew]; exact ih
+    | false =>
+      have hold : (gapSet d (h :: t)).length = (gapSet d t).length + 1 := by
+        simp [gapSet, List.filter_cons, hpd]
+      cases hpd' : d'.proves h with
+      | true =>
+        have hnew : (gapSet d' (h :: t)).length = (gapSet d' t).length := by
+          simp [gapSet, List.filter_cons, hpd']
+        rw [hold, hnew]; exact Nat.le_succ_of_le ih
+      | false =>
+        have hnew : (gapSet d' (h :: t)).length = (gapSet d' t).length + 1 := by
+          simp [gapSet, List.filter_cons, hpd']
+        rw [hold, hnew]; exact Nat.succ_le_succ ih
+
 /-- Removing a proved element from a gap strictly shrinks its length.
     Proved by induction on vcs, case-splitting on provability. -/
 theorem gap_shrinks_on_prove
@@ -119,34 +172,38 @@ theorem gap_shrinks_on_prove
     (hmono : ∀ v, d.proves v = true → d'.proves v = true) :
     (gapSet d' vcs).length < (gapSet d vcs).length := by
   induction vcs with
-  | nil => simp at hvc
+  | nil => exact absurd hvc (List.not_mem_nil _)
   | cons h t ih =>
-    simp only [gapSet, List.filter, List.length]
     simp only [List.mem_cons] at hvc
-    -- Determine d.proves h and d'.proves h
-    rcases Bool.eq_false_or_eq_true (d.proves h) with hph | hph
-    · -- d doesn't prove h  → h appears in old gap
-      simp only [hph, Bool.not_false, if_true, List.length]
-      rcases Bool.eq_false_or_eq_true (d'.proves h) with hph' | hph'
-      · -- d' also doesn't prove h → h appears in new gap
-        simp only [hph', Bool.not_false, if_true, List.length]
-        rcases hvc with rfl | hvc
-        · -- vc = h: contradicts hprv : d'.proves h = true with hph' : d'.proves h = false
-          simp [hprv, hph'] at *
-        · exact Nat.succ_lt_succ (ih hvc)
-      · -- d' proves h → h absent from new gap
-        simp only [hph', Bool.not_true, if_false, List.length]
-        rcases hvc with rfl | hvc
-        · -- vc = h
-          exact Nat.lt_succ_of_le (gap_length_mono d d' t hmono)
-        · exact Nat.lt_succ_of_lt (ih hvc)
-    · -- d proves h → h absent from old gap (and d' also proves h by mono)
-      have hph' : d'.proves h = true := hmono h hph
-      simp only [hph, hph', Bool.not_true, if_false, List.length]
-      rcases hvc with rfl | hvc
-      · -- vc = h: contradicts hgap = false vs hph = true
-        simp [hgap, hph] at *
-      · exact ih hvc
+    rcases hvc with rfl | hmem
+    · -- vc = h: d doesn't prove h (hgap), d' proves h (hprv)
+      have hlen_old : (gapSet d (vc :: t)).length = (gapSet d t).length + 1 := by
+        simp [gapSet, List.filter_cons, hgap]
+      have hlen_new : (gapSet d' (vc :: t)).length = (gapSet d' t).length := by
+        simp [gapSet, List.filter_cons, hprv]
+      rw [hlen_old, hlen_new]
+      exact Nat.lt_succ_of_le (gap_length_mono d d' t hmono)
+    · -- vc ∈ t
+      cases hpd : d.proves h with
+      | false =>
+        have hlen_old : (gapSet d (h :: t)).length = (gapSet d t).length + 1 := by
+          simp [gapSet, List.filter_cons, hpd]
+        cases hpd' : d'.proves h with
+        | false =>
+          have hlen_new : (gapSet d' (h :: t)).length = (gapSet d' t).length + 1 := by
+            simp [gapSet, List.filter_cons, hpd']
+          rw [hlen_old, hlen_new]; exact Nat.succ_lt_succ (ih hmem)
+        | true =>
+          have hlen_new : (gapSet d' (h :: t)).length = (gapSet d' t).length := by
+            simp [gapSet, List.filter_cons, hpd']
+          rw [hlen_old, hlen_new]; exact Nat.lt_succ_of_lt (ih hmem)
+      | true =>
+        have hpd' : d'.proves h = true := hmono h hpd
+        have hlen_old : (gapSet d (h :: t)).length = (gapSet d t).length := by
+          simp [gapSet, List.filter_cons, hpd]
+        have hlen_new : (gapSet d' (h :: t)).length = (gapSet d' t).length := by
+          simp [gapSet, List.filter_cons, hpd']
+        rw [hlen_old, hlen_new]; exact ih hmem
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 5  Termination
@@ -190,7 +247,7 @@ theorem completion_loop_terminates (n : Nat) :
 -- § 6  Conservativity / consistency preservation
 -- ════════════════════════════════════════════════════════════════════
 
-/-- **L2: Completed doctrine is consistent**.
+/- **L2: Completed doctrine is consistent**.
     If the base doctrine is consistent and every step in the run is
     conservative, then the final doctrine (obtained by folding all
     axioms in) retains consistency. -/
@@ -205,17 +262,15 @@ theorem completed_doctrine_consistent
     ∀ (base_consistent : Bool),
       base_consistent = true →
       (run.foldl (fun acc s => acc && s.conservative) base_consistent) = true := by
-  intro base_consistent hbase
   induction run with
-  | nil => simpa
+  | nil => intro _ hbase; simp [hbase]
   | cons s rest ih =>
-    simp [List.foldl]
+    intro base_consistent hbase
+    simp only [List.foldl]
     have hs : s.conservative = true := hcons s (List.mem_cons_self s rest)
     have hrest : ∀ s' ∈ rest, s'.conservative = true :=
       fun s' hs' => hcons s' (List.mem_cons.mpr (Or.inr hs'))
-    rw [hs]
-    simp
-    exact ih hrest base_consistent hbase
+    exact ih hrest (base_consistent && s.conservative) (by simp [hbase, hs])
 
 /-- A single conservative step preserves a true consistent flag. -/
 theorem step_preserves_consistency
@@ -225,63 +280,13 @@ theorem step_preserves_consistency
     (true && step.conservative) = true := by
   simp [h]
 
--- ════════════════════════════════════════════════════════════════════
--- § 7  Gap monotone decrease
--- ════════════════════════════════════════════════════════════════════
-
-/-- **L3: Gap monotone decrease**.
-    After each synthesis step, the gap list shrinks (weakly).
-    In the strict case, where the synthesised axiom actually closes the
-    target VC, it shrinks by at least one. -/
-
-/-- The gap is weakly decreasing: if doctrine d' proves everything d proves,
-    the gap of d' is a subset of the gap of d. -/
-theorem gap_subset_of_stronger_doctrine
-    (d d' : Doctrine)
-    (vcs : List VC)
-    (hmono : ∀ v, d.proves v = true → d'.proves v = true) :
-    ∀ vc ∈ gapSet d' vcs, vc ∈ gapSet d vcs := by
-  intro vc hvc
-  simp only [gapSet, List.mem_filter] at hvc ⊢
-  constructor
-  · exact hvc.1
-  · intro hd
-    have hd' := hmono vc hd
-    simp only [hd', Bool.not_true, Bool.false_eq_true] at hvc
-
-/-- The gap length is weakly decreasing — proved by induction on vcs. -/
-theorem gap_length_mono
-    (d d' : Doctrine)
-    (vcs : List VC)
-    (hmono : ∀ v, d.proves v = true → d'.proves v = true) :
-    (gapSet d' vcs).length ≤ (gapSet d vcs).length := by
-  induction vcs with
-  | nil => simp [gapSet]
-  | cons h t ih =>
-    simp only [gapSet, List.filter, List.length]
-    cases hpd : d.proves h with
-    | true =>
-      -- d proves h, so h is NOT in gapSet d t extension; d' also proves h (by mono)
-      have hpd' : d'.proves h = true := hmono h hpd
-      simp [hpd, hpd']
-      exact ih
-    | false =>
-      -- d doesn't prove h, so h ∈ gapSet d; d' may or may not prove h
-      simp [hpd]
-      cases hpd' : d'.proves h with
-      | true =>
-        simp [hpd']
-        -- new gap doesn't include h; old gap does; use ih
-        exact Nat.le_succ_of_le ih
-      | false =>
-        simp [hpd']
-        exact Nat.succ_le_succ ih
+-- (Gap monotone lemmas moved to § 4, before gap_shrinks_on_prove)
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 8  Frontier coverage
 -- ════════════════════════════════════════════════════════════════════
 
-/-- **L4: Frontier coverage**.
+/- **L4: Frontier coverage**.
     Every boundary condition is closed by exactly one synthesis step
     (under the EAGER or LAZY strategy). -/
 
@@ -304,21 +309,28 @@ theorem frontier_length_le_gap
   induction vcs with
   | nil => simp [frontierOf, gapSet]
   | cons h t ih =>
-    simp only [frontierOf, gapSet, List.filter, List.length, isFrontier]
     cases hpd : d.proves h with
     | true =>
-      -- h not in gap → h not in frontier either
-      simp [hpd, Bool.not_true]
-      exact ih
+      have hgap : (gapSet d (h :: t)).length = (gapSet d t).length := by
+        simp [gapSet, List.filter_cons, hpd]
+      have hfr : (frontierOf d onFrontier (h :: t)).length =
+          (frontierOf d onFrontier t).length := by
+        simp [frontierOf, List.filter_cons, isFrontier, hpd]
+      rw [hgap, hfr]; exact ih
     | false =>
-      simp [hpd, Bool.not_false]
-      cases hfr : onFrontier h with
+      have hgap : (gapSet d (h :: t)).length = (gapSet d t).length + 1 := by
+        simp [gapSet, List.filter_cons, hpd]
+      cases hfr_val : onFrontier h with
       | true =>
-        simp [hfr]
-        exact Nat.succ_le_succ ih
+        have hfr : (frontierOf d onFrontier (h :: t)).length =
+            (frontierOf d onFrontier t).length + 1 := by
+          simp [frontierOf, List.filter_cons, isFrontier, hpd, hfr_val]
+        rw [hgap, hfr]; exact Nat.succ_le_succ ih
       | false =>
-        simp [hfr]
-        exact Nat.le_succ_of_le ih
+        have hfr : (frontierOf d onFrontier (h :: t)).length =
+            (frontierOf d onFrontier t).length := by
+          simp [frontierOf, List.filter_cons, isFrontier, hpd, hfr_val]
+        rw [hgap, hfr]; exact Nat.le_succ_of_le ih
 
 /-- Given that `n` frontier conditions each receive a closing step,
     at least `n` conditions are removed from the gap. -/
@@ -361,16 +373,32 @@ theorem priority_safety
 
 /-- In a sorted rule list (by priority), the first matching rule has the
     highest priority (lowest priority value).  We state the core ordering
-    property: sorted lists satisfy the ordering at any pair of indices. -/
+    property: pairwise-ordered lists satisfy the ordering at any pair of
+    indices. -/
 theorem first_match_is_highest_priority
     (rules : List Rule)
-    (hsorted : rules.Sorted (fun r₁ r₂ => r₁.priority ≤ r₂.priority)) :
+    (hsorted : List.Pairwise (fun r₁ r₂ => r₁.priority ≤ r₂.priority) rules) :
     ∀ i j : Fin rules.length, i.val < j.val →
       (rules.get i).priority ≤ (rules.get j).priority := by
-  intro i j hij
-  have hpw : rules.Pairwise (fun r₁ r₂ => r₁.priority ≤ r₂.priority) :=
-    List.sorted_iff_pairwise.mp hsorted
-  exact List.pairwise_iff_get.mp hpw ⟨i.val, i.isLt⟩ ⟨j.val, j.isLt⟩ hij
+  induction rules with
+  | nil => intro i; exact absurd i.isLt (by simp)
+  | cons r rs ih =>
+    intro ⟨i, hi⟩ ⟨j, hj⟩ hij
+    simp only [List.length_cons] at hi hj
+    simp only [Fin.val_mk] at hij
+    have hpw := List.pairwise_cons.mp hsorted
+    cases i with
+    | zero =>
+      cases j with
+      | zero => omega
+      | succ j' => exact hpw.1 _ (List.get_mem rs j' (by omega))
+    | succ i' =>
+      cases j with
+      | zero => omega
+      | succ j' =>
+        have hi' : i' < rs.length := by omega
+        have hj' : j' < rs.length := by omega
+        exact ih hpw.2 ⟨i', hi'⟩ ⟨j', hj'⟩ (show i' < j' by omega)
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 10  Main theorem: completion is sound and terminates
@@ -480,6 +508,5 @@ theorem double_extension_axiom_bound
     d.axioms.length ≤
       ((d.extend a1 p1 c1).extend a2 p2 c2).axioms.length := by
   simp [Doctrine.extend]
-  omega
 
 end JudgmentGeometry.DoctrineCompletion

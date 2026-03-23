@@ -305,6 +305,10 @@ class FoundationPipeline:
         self._latex_only = getattr(args, "latex_only", False)
         self._model = getattr(args, "model", "claude-sonnet-4.6")
 
+        # Viability gate hints (populated by _novelty_filter)
+        self._novelty_tool_hint: str = ""
+        self._novelty_reason: str = ""
+
         # --- Z3+LLM synergy state ------------------------------------------
         # theory2.tex §Ideation: "Z3 verifies LLM claims, LLM interprets Z3
         # results."  We maintain a session pool and verification ledger so
@@ -1318,8 +1322,10 @@ class FoundationPipeline:
         -----
         1. Sample ~n_fields × entropy_factor areas from the taxonomy.
         2. Build FieldNode seeds from the sampled areas.
-        3. Run the binary tournament via the SynthesisFrontierPipeline.
-        4. Return the single remaining winner.
+        3. **Novelty gate**: Use LLM to reject well-trodden pairs and keep only
+           genuinely unexplored bridges.
+        4. Run the binary tournament via the SynthesisFrontierPipeline.
+        5. Return the single remaining winner.
         """
         n_candidates = int(self._n_fields * self._entropy_factor)
         all_areas = list(_TAXONOMY_AREAS)
@@ -1328,10 +1334,16 @@ class FoundationPipeline:
 
         self._log("  Sampled %d areas from taxonomy (%d available).", len(sampled_areas), len(all_areas))
 
-        # Build initial FieldNode seeds
-        seed_fields = self._build_seed_fields(sampled_areas, self._n_fields)
+        # Build initial FieldNode seeds (oversample for novelty filtering)
+        oversample = max(self._n_fields * 3, 6)
+        seed_fields = self._build_seed_fields(sampled_areas, oversample)
 
-        self._log("  Built %d seed FieldNodes for tournament.", len(seed_fields))
+        self._log("  Built %d seed FieldNodes (oversampled for novelty filter).", len(seed_fields))
+
+        # --- Novelty gate: filter to genuinely unexplored pairs ---
+        seed_fields = self._novelty_filter(seed_fields, self._n_fields)
+
+        self._log("  After novelty filter: %d fields for tournament.", len(seed_fields))
 
         # Attempt to use the real pipeline
         if _PIPELINE_AVAILABLE:
@@ -1517,6 +1529,156 @@ class FoundationPipeline:
             f"Existence of canonical morphisms in {area}",
         ]
         return tuple(base)
+
+    # ------------------------------------------------------------------
+    # Synthesis viability gate: novelty + utility + foundational potential
+    # ------------------------------------------------------------------
+
+    def _novelty_filter(
+        self, candidates: list[Any], n_keep: int,
+    ) -> list[Any]:
+        """Score candidate pairs on novelty, CLI utility, and foundational depth.
+
+        Generates candidate pairs, asks the LLM to rate each on three axes:
+          1. Novelty — has this bridge been studied before?
+          2. CLI utility — could the synthesis power a concrete, useful tool?
+          3. Foundational potential — could this become a real area of mathematics?
+
+        The composite score determines which fields enter the tournament.
+        Falls back to random selection when --no-llm is set.
+        """
+        import itertools
+
+        if len(candidates) <= n_keep:
+            return candidates
+
+        names = [getattr(f, "name", str(f)) for f in candidates]
+        pairs = list(itertools.combinations(range(len(candidates)), 2))
+        self._rng.shuffle(pairs)
+        pairs = pairs[:15]
+
+        if self._no_llm:
+            self._rng.shuffle(candidates)
+            return candidates[:n_keep]
+
+        pair_lines = []
+        for idx, (i, j) in enumerate(pairs, 1):
+            pair_lines.append(f"  {idx}. {names[i]} × {names[j]}")
+
+        prompt = (
+            "You are a research mathematician AND software architect evaluating\n"
+            "proposed cross-field syntheses. For each pair, rate THREE dimensions (1-5):\n\n"
+            "NOVELTY — Has this bridge been studied before?\n"
+            "  1 = Well-known subfield (e.g. Algebraic Geometry × Number Theory = Arithmetic Geometry)\n"
+            "  2 = Established connection with active literature\n"
+            "  3 = Some known links, but large unexplored territory\n"
+            "  4 = Sparse/emerging connections, mostly terra incognita\n"
+            "  5 = Essentially no existing literature bridging these\n\n"
+            "UTILITY — Could this synthesis power a *concrete, useful* CLI tool?\n"
+            "  Think: what data would it take as input, what would it compute,\n"
+            "  who would use it? Not 'a tool that does math' but a tool that\n"
+            "  solves a real problem no single-field tool can.\n"
+            "  1 = No obvious computational application\n"
+            "  2 = Vaguely useful, hard to imagine concrete I/O\n"
+            "  3 = Plausible tool with moderate audience\n"
+            "  4 = Clear tool with specific users and concrete I/O\n"
+            "  5 = Killer app: solves an important problem, obvious demand\n\n"
+            "FOUNDATIONAL — Could this become a genuine new area of mathematics?\n"
+            "  Not just 'apply X to Y' but a real two-way bridge with its own theorems.\n"
+            "  1 = One field trivially subsumes the other, or connection is superficial\n"
+            "  2 = One-directional application (X applied to Y, no feedback)\n"
+            "  3 = Some bidirectional structure, a few non-trivial bridge theorems\n"
+            "  4 = Rich bidirectional structure, multiple deep theorems possible\n"
+            "  5 = Clearly a new field: own objects, own questions, own methods\n\n"
+            "BE STRICT. Most pairs should score ≤2 on novelty. 'Arithmetic Geometry ×\n"
+            "Etale Cohomology' is novelty=1 (that IS algebraic number theory). 'Order\n"
+            "Theory × Algebraic Topology' is novelty=2 (Alexandroff spaces are classical).\n\n"
+            "Pairs to evaluate:\n"
+            + "\n".join(pair_lines) + "\n\n"
+            "Return ONLY a JSON array:\n"
+            '[{"pair": 1, "novelty": 4, "utility": 5, "foundational": 4,\n'
+            '  "tool_idea": "one-line tool concept", "reason": "why novel+useful+deep"}, ...]\n'
+            "One object per pair. Return ONLY valid JSON.\n"
+        )
+
+        try:
+            raw = self._call_llm(prompt, max_tokens=4096)
+            raw = re.sub(r"^```json\s*\n?", "", raw.strip())
+            raw = re.sub(r"\n?```\s*$", "", raw.strip())
+            ratings = json.loads(raw)
+        except Exception as exc:
+            self._log("  Viability check failed (%s); using random selection.", exc)
+            self._rng.shuffle(candidates)
+            return candidates[:n_keep]
+
+        # Score each pair: composite = novelty + utility + foundational
+        scored: list[tuple[int, int, float, dict]] = []
+        for entry in ratings:
+            try:
+                pair_idx = int(entry.get("pair", 0)) - 1
+                nov = int(entry.get("novelty", 1))
+                util = int(entry.get("utility", 1))
+                found = int(entry.get("foundational", 1))
+                if 0 <= pair_idx < len(pairs):
+                    i, j = pairs[pair_idx]
+                    # Composite: all three matter, but penalize hard if any is ≤1
+                    composite = (nov + util + found) / 3.0
+                    if min(nov, util, found) <= 1:
+                        composite *= 0.5  # harsh penalty for any dimension being terrible
+                    scored.append((i, j, composite, entry))
+            except (ValueError, TypeError):
+                continue
+
+        scored.sort(key=lambda x: x[2], reverse=True)
+
+        # Always print viability scores (important user-facing decision)
+        print("\n  Synthesis viability scores (novelty / utility / foundational):")
+        for i, j, comp, e in scored[:7]:
+            nov = e.get("novelty", "?")
+            util = e.get("utility", "?")
+            found = e.get("foundational", "?")
+            tool = e.get("tool_idea", "")[:50]
+            marker = "★" if comp >= 3.5 else "✓" if comp >= 2.5 else "✗"
+            print(f"    {marker} [{comp:.1f}] {names[i]} × {names[j]}  N={nov} U={util} F={found}  → {tool}")
+        print()
+
+        # Select pairs with composite ≥ 3.5 (all dimensions solid)
+        threshold = 3.5
+        good = [(i, j, c, e) for i, j, c, e in scored if c >= threshold]
+
+        if not good:
+            self._log("  No pairs scored ≥%.1f; relaxing to ≥3.0.", threshold)
+            threshold = 3.0
+            good = [(i, j, c, e) for i, j, c, e in scored if c >= threshold]
+
+        if not good:
+            self._log("  No viable pairs; using best available.")
+            good = scored[:3] if scored else []
+
+        # Store the winning tool idea for downstream use
+        if good:
+            best = good[0]
+            self._novelty_tool_hint = best[3].get("tool_idea", "")
+            self._novelty_reason = best[3].get("reason", "")
+
+        # Select fields from the best-scoring pairs
+        used_indices: set[int] = set()
+        selected: list[Any] = []
+        for i, j, _, _ in good:
+            if len(selected) >= n_keep:
+                break
+            for idx in (i, j):
+                if idx not in used_indices and len(selected) < n_keep:
+                    used_indices.add(idx)
+                    selected.append(candidates[idx])
+
+        # Pad with remaining candidates if needed
+        if len(selected) < n_keep:
+            for c in candidates:
+                if c not in selected and len(selected) < n_keep:
+                    selected.append(c)
+
+        return selected
 
     def _run_real_pipeline(self, seed_fields: list[Any]) -> tuple[Any, int]:
         """Attempt to run the real SynthesisFrontierPipeline.
@@ -1722,12 +1884,16 @@ class FoundationPipeline:
             Key propositions:
             {chr(10).join(f'  - {getattr(p, "title", str(p)[:100])}' for p in props[:10])}
 
+            {f'Preliminary tool idea from viability analysis: {self._novelty_tool_hint}' if self._novelty_tool_hint else ''}
+            {f'Rationale: {self._novelty_reason}' if self._novelty_reason else ''}
+
             What is the single most impactful SOFTWARE TOOL that this synthesis uniquely enables?
             Not a toy or demo — a tool that practitioners in computational science, software engineering,
             or applied mathematics would actually use. The tool should:
             - Do something that was NOT possible (or was much harder) without the bridge between these fields
             - Have concrete input/output (files, data, computations)
             - Be useful to people who don't know the underlying math
+            - Solve a specific, real problem — not just "apply math" generically
 
             Respond in JSON:
             {{

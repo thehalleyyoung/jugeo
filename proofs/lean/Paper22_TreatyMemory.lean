@@ -116,15 +116,15 @@ def applyRound (cs : List ConflictRecord) : List ConflictRecord :=
     { c with resScore := min (c.resScore + gain) 1000 }
 
 /-- Each round moves the resolution score weakly closer to 1000. -/
-theorem applyRound_score_nondecreasing (c : ConflictRecord) :
-    c.resScore ≤ (applyRound [c]).head?.map (·.resScore) |>.getD c.resScore := by
-  simp [applyRound]
+theorem applyRound_score_nondecreasing (c : ConflictRecord) (h : c.resScore ≤ 1000) :
+    c.resScore ≤ ((applyRound [c]).head?.getD c).resScore := by
+  simp [applyRound, List.head?]
   omega
 
 /-- The resolution score after one round is at most 1000. -/
 theorem applyRound_score_bounded (c : ConflictRecord) (h : c.resScore ≤ 1000) :
-    (applyRound [c]).head?.map (·.resScore) |>.getD c.resScore ≤ 1000 := by
-  simp [applyRound]
+    ((applyRound [c]).head?.getD c).resScore ≤ 1000 := by
+  simp [applyRound, List.head?]
   omega
 
 -- ════════════════════════════════════════════════════════════════════
@@ -179,11 +179,31 @@ def residualAfter (r decay : Nat) : Nat → Nat
   | 0     => r
   | k + 1 => residualAfter r decay k * (100 - min decay 100) / 100
 
+-- Helper: div monotonicity
+private theorem div_le_of_mul_le (a b c : Nat) (hc : 0 < c) (h : a ≤ b) : a / c ≤ b / c := by
+  rw [Nat.le_div_iff_mul_le hc]
+  exact Nat.le_trans (Nat.div_mul_le_self a c) h
+
 theorem residual_nonincreasing (r decay : Nat) (hd : decay > 0) (hd2 : decay ≤ 100) :
     ∀ k, residualAfter r decay (k + 1) ≤ residualAfter r decay k := by
   intro k
   simp only [residualAfter]
-  apply Nat.div_le_self
+  have hle : 100 - min decay 100 ≤ 100 := Nat.sub_le _ _
+  have h1 : residualAfter r decay k * (100 - min decay 100) ≤ residualAfter r decay k * 100 :=
+    Nat.mul_le_mul_left _ hle
+  have h2 := div_le_of_mul_le _ _ 100 (by omega) h1
+  rw [Nat.mul_div_cancel _ (by omega : (0 : Nat) < 100)] at h2
+  exact h2
+
+-- Helper: residualAfter step shift
+private theorem residualAfter_succ (r decay k : Nat) :
+    residualAfter r decay (k + 1) = residualAfter (r * (100 - min decay 100) / 100) decay k := by
+  induction k with
+  | zero => simp [residualAfter]
+  | succ k ih =>
+    show residualAfter r decay (k + 1) * (100 - min decay 100) / 100 =
+         residualAfter (r * (100 - min decay 100) / 100) decay k * (100 - min decay 100) / 100
+    rw [ih]
 
 theorem residual_eventually_zero (r decay : Nat) (hd : decay ≥ 1) :
     ∃ k, residualAfter r decay k = 0 := by
@@ -197,19 +217,14 @@ theorem residual_eventually_zero (r decay : Nat) (hd : decay ≥ 1) :
         simp [residualAfter]
         have : 100 - min decay 100 = 0 := by omega
         simp [this]
-      · push_neg at hd100
+      · -- decay < 100
+        have hd_lt : decay < 100 := by omega
         have hfact : n * (100 - min decay 100) / 100 < n := by
           have hm : min decay 100 = decay := by omega
-          rw [hm]
-          have hd' : decay ≤ 99 := by omega
-          -- n * (100 - decay) / 100 < n  when  decay ≥ 1  and  n ≥ 1
-          apply Nat.lt_of_mul_lt_mul_right (b := 100) (by omega)
-          calc n * (100 - decay) / 100 * 100
-              ≤ n * (100 - decay) := Nat.div_mul_le_self _ _
-            _ = n * 100 - n * decay := by ring
-            _ < n * 100 := by omega
+          rw [hm, Nat.div_lt_iff_lt_mul (by omega : (0 : Nat) < 100)]
+          exact Nat.mul_lt_mul_of_pos_left (by omega : 100 - decay < 100) (by omega : 0 < n)
         obtain ⟨k, hk⟩ := ih _ hfact
-        exact ⟨k + 1, by simp [residualAfter, hk]⟩
+        exact ⟨k + 1, by rw [residualAfter_succ]; exact hk⟩
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 7  Deadlock classification and adjudication
@@ -297,14 +312,16 @@ def TreatyMemory.store (mem : TreatyMemory) (e : MemoryEntry) : TreatyMemory :=
 theorem memory_recall_store_fsig (mem : TreatyMemory) (fsig : Nat)
     (h : mem.recall fsig = some e) :
     (mem.store e).recall fsig = some e := by
-  simp only [TreatyMemory.store, TreatyMemory.recall]
-  simp [List.find?]
+  simp only [TreatyMemory.store, TreatyMemory.recall] at h ⊢
+  have heq : (e.fsig == fsig) = true :=
+    @List.find?_some _ (fun x => x.fsig == fsig) e mem h
+  simp [List.find?_cons, heq]
 
 /-- Storing an entry makes it findable. -/
 theorem memory_store_recall (mem : TreatyMemory) (e : MemoryEntry) :
     (mem.store e).recall e.fsig = some e := by
   simp only [TreatyMemory.store, TreatyMemory.recall]
-  simp [List.find?]
+  simp [List.find?_cons, beq_self_eq_true]
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 9  Memory monotonicity: trust level never decreases
@@ -326,15 +343,20 @@ theorem memory_trust_monotone (mem : TreatyMemory) (e : MemoryEntry)
     ∀ e' : MemoryEntry, mem'.recall e.fsig = some e' →
       old.trustLevel.toNat ≤ e'.trustLevel.toNat := by
   intro mem' e' hrecall'
-  simp only [TreatyMemory.storeIfBetter, hrecall] at mem'
-  split_ifs with h
-  · -- stored the new entry
-    simp only [TreatyMemory.recall, TreatyMemory.store] at hrecall'
-    simp [List.find?] at hrecall'
+  show old.trustLevel.toNat ≤ e'.trustLevel.toNat
+  have hmem' : mem' = mem.storeIfBetter e := rfl
+  rw [hmem'] at hrecall'
+  have hsimp : mem.storeIfBetter e =
+    if old.trustLevel.toNat ≤ e.trustLevel.toNat then mem.store e else mem := by
+    simp [TreatyMemory.storeIfBetter, hrecall]
+  rw [hsimp] at hrecall'
+  by_cases h : old.trustLevel.toNat ≤ e.trustLevel.toNat
+  · rw [if_pos h] at hrecall'
+    have hstore := memory_store_recall mem e
+    rw [hstore] at hrecall'
     cases hrecall'
     exact h
-  · -- kept the old entry
-    simp only at mem'
+  · rw [if_neg h] at hrecall'
     rw [hrecall'] at hrecall
     cases hrecall
     exact Nat.le_refl _
@@ -380,21 +402,37 @@ def decayAllNorms (norms : List Nat) (d : Nat) : List Nat :=
 theorem totalPotential_nonneg (norms : List Nat) : 0 ≤ totalPotential norms :=
   Nat.zero_le _
 
+-- Helper: foldl addition monotone in accumulator
+private theorem foldl_add_mono (xs : List Nat) (a b : Nat) (h : a ≤ b) :
+    xs.foldl (· + ·) a ≤ xs.foldl (· + ·) b := by
+  induction xs generalizing a b with
+  | nil => exact h
+  | cons x xs ih => simp only [List.foldl_cons]; exact ih (a + x) (b + x) (by omega)
+
+-- Helper: foldl over mapped list ≤ foldl over original when f x ≤ x
+private theorem foldl_add_map_le {f : Nat → Nat} (hf : ∀ x, f x ≤ x) (xs : List Nat) (a : Nat) :
+    (xs.map f).foldl (· + ·) a ≤ xs.foldl (· + ·) a := by
+  induction xs generalizing a with
+  | nil => simp
+  | cons x xs ih =>
+    simp only [List.map_cons, List.foldl_cons]
+    calc (xs.map f).foldl (· + ·) (a + f x)
+        ≤ xs.foldl (· + ·) (a + f x) := ih _
+      _ ≤ xs.foldl (· + ·) (a + x) := foldl_add_mono xs _ _ (by have := hf x; omega)
+
+-- Helper: a * b / c ≤ a when b ≤ c
+private theorem mul_div_le_self (a b c : Nat) (hb : b ≤ c) (hc : 0 < c) : a * b / c ≤ a := by
+  have h1 : a * b ≤ a * c := Nat.mul_le_mul_left a hb
+  have h2 := div_le_of_mul_le (a * b) (a * c) c hc h1
+  rw [Nat.mul_div_cancel a hc] at h2
+  exact h2
+
 /-- Each decay step reduces the total potential (when d > 0). -/
 theorem totalPotential_decreases (norms : List Nat) (d : Nat)
     (hd : d > 0) (hd2 : d ≤ 100) :
     totalPotential (decayAllNorms norms d) ≤ totalPotential norms := by
   simp only [decayAllNorms, totalPotential]
-  induction norms with
-  | nil => simp
-  | cons r rs ih =>
-    simp only [List.map_cons, List.foldl_cons]
-    have hstep : r * (100 - min d 100) / 100 ≤ r := by
-      apply Nat.div_le_of_le_mul
-      have : min d 100 = d := Nat.min_eq_left hd2
-      rw [this]
-      nlinarith [Nat.zero_le r]
-    linarith [ih]
+  exact foldl_add_map_le (fun x => mul_div_le_self x _ 100 (Nat.sub_le _ _) (by omega)) norms 0
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 12  Convergence: total potential reaches 0
@@ -405,10 +443,17 @@ def decayIter (r d : Nat) : Nat → Nat
   | 0     => r
   | k + 1 => decayIter r d k * (100 - min d 100) / 100
 
+private theorem decayIter_eq_residualAfter (r d k : Nat) :
+    decayIter r d k = residualAfter r d k := by
+  induction k with
+  | zero => simp [decayIter, residualAfter]
+  | succ k ih => simp [decayIter, residualAfter, ih]
+
 /-- Iterated decay eventually reaches 0 when d ≥ 1. -/
 theorem decayIter_terminates (r d : Nat) (hd : d ≥ 1) :
     ∃ k, decayIter r d k = 0 := by
-  exact residual_eventually_zero r d hd
+  obtain ⟨k, hk⟩ := residual_eventually_zero r d hd
+  exact ⟨k, by rw [decayIter_eq_residualAfter]; exact hk⟩
 
 /-- Once decayIter reaches 0, it stays 0 for all subsequent steps. -/
 theorem decayIter_zero_stable (r d k m : Nat) (h : decayIter r d k = 0) :
@@ -422,6 +467,30 @@ theorem decayIter_zero_stable (r d k m : Nat) (h : decayIter r d k = 0) :
 /-- **Convergence Theorem**: For n modules with at most m conflicts each,
     the total potential reaches 0 in finitely many rounds.
     (Existential version; §7 of the paper gives the O(n²) quantitative bound.) -/
+-- Helper: if foldl (+) a = 0 then a = 0 and each element is 0
+private theorem foldl_add_eq_zero (xs : List Nat) (a : Nat) (h : xs.foldl (· + ·) a = 0) :
+    a = 0 ∧ ∀ x ∈ xs, x = 0 := by
+  induction xs generalizing a with
+  | nil => exact ⟨h, fun x hx => absurd hx (List.not_mem_nil _)⟩
+  | cons y ys ih =>
+    simp only [List.foldl_cons] at h
+    have ⟨ha_y, hys⟩ := ih (a + y) h
+    exact ⟨by omega, fun x hx => by
+      cases List.mem_cons.mp hx with
+      | inl heq => subst heq; omega
+      | inr hmem => exact hys x hmem⟩
+
+-- Helper: if all elements are 0 then foldl (+) 0 = 0
+private theorem foldl_add_all_zero (xs : List Nat) (h : ∀ x ∈ xs, x = 0) :
+    xs.foldl (· + ·) 0 = 0 := by
+  induction xs with
+  | nil => simp
+  | cons y ys ih =>
+    simp only [List.foldl_cons]
+    have hy : y = 0 := h y (List.mem_cons_self _ _)
+    subst hy; simp
+    exact ih (fun x hx => h x (List.mem_cons_of_mem _ hx))
+
 theorem multimodule_convergence (norms : List Nat) (d : Nat) (hd : d ≥ 1) :
     ∃ k, totalPotential (norms.map (decayIter · d k)) = 0 := by
   induction norms with
@@ -429,53 +498,23 @@ theorem multimodule_convergence (norms : List Nat) (d : Nat) (hd : d ≥ 1) :
   | cons r rs ih =>
     obtain ⟨k₁, hk₁⟩ := decayIter_terminates r d hd
     obtain ⟨k₂, hk₂⟩ := ih
-    use k₁ + k₂
-    simp only [List.map_cons, totalPotential, List.foldl_cons]
+    refine ⟨k₁ + k₂, ?_⟩
     have hhead : decayIter r d (k₁ + k₂) = 0 :=
       decayIter_zero_stable r d k₁ k₂ hk₁
-    -- For the tail: each element rs[i] converged by round k₂,
-    -- and decayIter is non-increasing, so it is still 0 at round k₁+k₂.
-    have htail : totalPotential (rs.map (decayIter · d (k₁ + k₂))) = 0 := by
-      have : rs.map (decayIter · d (k₁ + k₂)) =
-             rs.map (fun r => decayIter r d (k₂ + k₁)) := by
-        congr 1; ext x; rw [Nat.add_comm]
-      -- each element of rs.map (decayIter · d k₂) is 0
-      have hzero : ∀ x ∈ rs, decayIter x d k₂ = 0 := by
-        intro x hx
-        have : totalPotential (rs.map (decayIter · d k₂)) = 0 := hk₂
-        simp [totalPotential] at this
-        have hmem : decayIter x d k₂ ∈ rs.map (decayIter · d k₂) :=
-          List.mem_map.mpr ⟨x, hx, rfl⟩
-        simp [totalPotential, List.foldl] at hk₂
-        -- sum of nonneg nats = 0 → each is 0
-        have hsum := hk₂
-        induction rs with
-        | nil => exact absurd hx (List.not_mem_nil _)
-        | cons y ys ihy =>
-          simp [List.map_cons, totalPotential, List.foldl] at hsum
-          cases List.mem_cons.mp hx with
-          | inl h => subst h; omega
-          | inr h =>
-            apply ihy h
-            omega
-      simp [totalPotential] at *
-      rw [this]
-      have hconv : ∀ x ∈ rs, decayIter x d (k₂ + k₁) = 0 := by
-        intro x hx
-        exact decayIter_zero_stable x d k₂ k₁ (hzero x hx)
-      induction rs with
-      | nil => simp [totalPotential]
-      | cons y ys ihys =>
-        simp [List.map_cons, totalPotential, List.foldl]
-        have hy := hconv y (List.mem_cons_self _ _)
-        have hys : ∀ x ∈ ys, decayIter x d (k₂ + k₁) = 0 :=
-          fun x hx => hconv x (List.mem_cons_of_mem _ hx)
-        constructor
-        · exact hy
-        · have := ihys hys
-          simp [totalPotential, List.foldl] at this
-          exact this
-    simp [hhead, htail, totalPotential]
+    have hzero_at_k2 : ∀ x ∈ rs.map (decayIter · d k₂), x = 0 :=
+      (foldl_add_eq_zero _ 0 hk₂).2
+    have hzero_rs : ∀ x ∈ rs, decayIter x d k₂ = 0 := fun x hx =>
+      hzero_at_k2 _ (List.mem_map.mpr ⟨x, hx, rfl⟩)
+    have hzero_tail : ∀ x ∈ rs, decayIter x d (k₁ + k₂) = 0 := fun x hx => by
+      rw [show k₁ + k₂ = k₂ + k₁ from Nat.add_comm k₁ k₂]
+      exact decayIter_zero_stable x d k₂ k₁ (hzero_rs x hx)
+    have htail : (rs.map (decayIter · d (k₁ + k₂))).foldl (· + ·) 0 = 0 :=
+      foldl_add_all_zero _ (fun x hx => by
+        obtain ⟨y, hy, rfl⟩ := List.mem_map.mp hx
+        exact hzero_tail y hy)
+    simp only [totalPotential, List.map_cons, List.foldl_cons]
+    rw [hhead]
+    simpa using htail
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 13  O(n²) round bound (quantitative)
@@ -490,8 +529,8 @@ def roundBound (n : Nat) : Nat := n * n * 10
 /-- The round bound is monotone in n. -/
 theorem roundBound_mono (n m : Nat) (h : n ≤ m) :
     roundBound n ≤ roundBound m := by
-  simp [roundBound]
-  nlinarith
+  unfold roundBound
+  exact Nat.mul_le_mul_right 10 (Nat.mul_le_mul h h)
 
 /-- For n = 1, one pair, bound is 10. -/
 theorem roundBound_one : roundBound 1 = 10 := by decide
@@ -499,7 +538,10 @@ theorem roundBound_one : roundBound 1 = 10 := by decide
 /-- The bound grows quadratically: R(2n) ≤ 4 * R(n). -/
 theorem roundBound_quadratic (n : Nat) :
     roundBound (2 * n) = 4 * roundBound n := by
-  simp [roundBound]; ring
+  simp [roundBound]
+  have : 2 * n * (2 * n) = 4 * (n * n) := by
+    simp [Nat.mul_assoc, Nat.mul_comm, Nat.mul_left_comm]
+  omega
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 14  Hypercover decomposition
