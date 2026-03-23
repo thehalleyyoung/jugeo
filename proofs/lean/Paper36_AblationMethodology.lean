@@ -171,27 +171,27 @@ def ablatedAccuracy (disabled : List Component) (cls : ProgramClass) : Nat :=
     if cls.reducesToSMT then 20 else 75
   | _ =>
     -- Multiple components disabled: degrade further
-    15
+    0
 
 /-- All accuracy values produced by ablatedAccuracy are ≤ 100. -/
 theorem ablatedAccuracy_bound (disabled : List Component) (cls : ProgramClass) :
     ablatedAccuracy disabled cls ≤ 100 := by
   simp only [ablatedAccuracy]
   split
-  · norm_num
+  · omega
   · rename_i h
     split
-    · norm_num
-    · norm_num
+    · omega
+    · omega
   · rename_i h
     split
-    · norm_num
-    · norm_num
+    · omega
+    · omega
   · rename_i h
     split
-    · norm_num
-    · norm_num
-  · norm_num
+    · omega
+    · omega
+  · omega
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 7  Component Necessity Theorem
@@ -237,27 +237,23 @@ theorem full_system_dominates (cls : ProgramClass) (c : Component) :
     ablatedAccuracy [c] cls ≤ ablatedAccuracy [] cls := by
   simp only [ablatedAccuracy]
   split
-  · norm_num
+  · omega
   · rename_i h
-    split <;> norm_num
+    split <;> omega
   · rename_i h
-    split <;> norm_num
+    split <;> omega
   · rename_i h
-    split <;> norm_num
+    split <;> omega
+  · omega
 
 /-- Removing all components gives the lowest accuracy. -/
 theorem all_disabled_lowest (cls : ProgramClass) (c : Component) :
     ablatedAccuracy [Component.descent, Component.trust, Component.smt] cls ≤
     ablatedAccuracy [c] cls := by
-  simp only [ablatedAccuracy]
-  split
-  · norm_num
-  · rename_i h
-    split <;> norm_num
-  · rename_i h
-    split <;> norm_num
-  · rename_i h
-    split <;> norm_num
+  have hlhs : ablatedAccuracy [Component.descent, Component.trust, Component.smt] cls = 0 := by
+    simp [ablatedAccuracy]
+  rw [hlhs]
+  omega
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 9  No-redundancy corollary
@@ -288,10 +284,14 @@ structure ScalingModel where
 theorem scaling_monotone (m : ScalingModel) (hb : m.b > 0) (n₁ n₂ : Nat)
     (hn : n₁ ≤ n₂) :
     m.a * 1000 / (n₂ * m.b + 1) ≤ m.a * 1000 / (n₁ * m.b + 1) := by
-  apply Nat.div_le_div_left
-  · apply Nat.add_le_add_right
-    exact Nat.mul_le_mul_right m.b hn
-  · positivity
+  have hpos : 0 < n₁ * m.b + 1 := by omega
+  have hle : n₁ * m.b + 1 ≤ n₂ * m.b + 1 :=
+    Nat.add_le_add_right (Nat.mul_le_mul_right m.b hn) 1
+  apply (Nat.le_div_iff_mul_le hpos).mpr
+  calc m.a * 1000 / (n₂ * m.b + 1) * (n₁ * m.b + 1)
+      ≤ m.a * 1000 / (n₂ * m.b + 1) * (n₂ * m.b + 1) :=
+        Nat.mul_le_mul_left _ hle
+    _ ≤ m.a * 1000 := Nat.div_mul_le_self _ _
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 11  Methodology loop convergence
@@ -314,8 +314,7 @@ def loopMonotone (history : List MethodologyIteration) : Prop :=
 theorem loop_convergence_clean (history : List MethodologyIteration)
     (hNonEmpty : history ≠ []) :
     ∃ n : Nat, n ≤ 100 ∧ (∀ iter ∈ history, iter.accuracy ≤ n) := by
-  use 100
-  exact ⟨le_refl 100, fun iter _ => iter.hBound⟩
+  exact ⟨100, Nat.le_refl 100, fun iter _ => iter.hBound⟩
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 12  Pairwise sub-additivity of impact

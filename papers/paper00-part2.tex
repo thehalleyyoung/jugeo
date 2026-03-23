@@ -1,0 +1,369 @@
+% Part II: Mathematical Foundations
+
+\section{Semantic Sites}\label{sec:sites}
+
+This section develops the mathematical foundations of Judgment Geometry from
+first principles.  We construct semantic sites from programs, define the
+judgment presheaf, establish the fundamental descent theorem, and prove the
+key properties of the trust algebra.
+
+\subsection{From Programs to Categories}
+
+\begin{definition}[Semantic Site]\label{def:site}
+Given a Python program $P$, the \emph{semantic site} $\Site(P) = (\mathcal{C}, J)$
+consists of:
+\begin{itemize}
+  \item A small category $\mathcal{C}$ whose objects (\emph{coordinates})
+        are the syntactic and semantic units of $P$ --- functions, classes,
+        modules, scopes, variables, imports --- and whose morphisms encode
+        structural relationships: restriction, inclusion, transport,
+        and refinement.
+  \item A Grothendieck topology $J$ on $\mathcal{C}$ specifying which families
+        $\{U_i \to X\}_{i \in I}$ constitute \emph{coverings}: a class is
+        covered by its methods, a module by its top-level definitions, a scope
+        by the bindings it introduces.
+\end{itemize}
+\end{definition}
+
+\begin{remark}
+The site $\Site(P)$ is finite: a program of $n$ top-level definitions
+produces $|\Ob(\mathcal{C})| = \Theta(n)$ objects and
+$|\Mor(\mathcal{C})| = O(n^2)$ morphisms in the worst case (fully
+connected call graph), though typical programs are sparse.
+\end{remark}
+
+The coordinate kinds implemented in \JuGeo{} mirror the Python AST:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{CoordinateKind} & \textbf{Python Construct} \\
+\midrule
+\texttt{FUNCTION} & \texttt{def} / \texttt{async def} \\
+\texttt{CLASS} & \texttt{class} \\
+\texttt{MODULE} & Top-level file \\
+\texttt{SCOPE} & Lexical scope (loop, with-block) \\
+\texttt{VARIABLE} & Binding / assignment target \\
+\texttt{IMPORT} & \texttt{import} / \texttt{from \ldots import} \\
+\texttt{DECORATOR} & \texttt{@decorator} \\
+\texttt{COMPREHENSION} & List/set/dict comprehension \\
+\texttt{LAMBDA} & \texttt{lambda} expression \\
+\texttt{GENERATOR} & Generator function / expression \\
+\texttt{CONTEXT\_MANAGER} & \texttt{with} statement \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Morphisms encode four fundamental relationships:
+\begin{description}
+  \item[\textsc{Restriction}] $f|_U$: the behaviour of $f$ restricted to
+        a sub-scope $U$.
+  \item[\textsc{Inclusion}] $U \hookrightarrow V$: containment of one scope
+        in another.
+  \item[\textsc{Transport}] Equivalence-preserving movement of a judgment
+        across an isomorphism.
+  \item[\textsc{Refinement}] Strengthening a specification or narrowing a type.
+\end{description}
+
+\begin{proposition}[Category Axioms]\label{prop:category}
+$\mathcal{C}$ as constructed by \JuGeo{} satisfies:
+\begin{enumerate}
+  \item \emph{Associativity}: $(f \circ g) \circ h = f \circ (g \circ h)$.
+  \item \emph{Identity}: For each object $X$, $\mathrm{id}_X \circ f = f = f \circ \mathrm{id}_X$.
+\end{enumerate}
+These are verified at construction time by \texttt{CategoryStructure.check\_category\_axioms()}.
+\end{proposition}
+
+\subsection{Grothendieck Topology}\label{subsec:topology}
+
+\begin{definition}[Covering Sieve]
+A \emph{sieve} on $X \in \Ob(\mathcal{C})$ is a collection $S$ of
+morphisms with codomain $X$ that is closed under precomposition:
+if $f \in S$ and $g: Z \to \mathrm{dom}(f)$, then $f \circ g \in S$.
+\end{definition}
+
+\begin{definition}[Grothendieck Topology on $\Site(P)$]
+The topology $J$ assigns to each $X$ a collection $J(X)$ of \emph{covering
+sieves} satisfying:
+\begin{enumerate}
+  \item \emph{Maximality}: The maximal sieve $\{f \mid \mathrm{cod}(f) = X\}$
+        is in $J(X)$.
+  \item \emph{Stability}: If $S \in J(X)$ and $g: Y \to X$, then
+        $g^*S = \{h \mid g \circ h \in S\} \in J(Y)$.
+  \item \emph{Transitivity}: If $S \in J(X)$ and for each $f: U \to X$ in $S$
+        there is $T_f \in J(U)$, then the composite sieve is in $J(X)$.
+\end{enumerate}
+These are verified by \texttt{SiteCoherenceChecker.check\_all()}.
+\end{definition}
+
+\subsection{The Judgment Presheaf}\label{subsec:presheaf}
+
+\begin{definition}[Judgment 8-Tuple]\label{def:judgment}
+A \emph{judgment} is a tuple
+$\J = (\coord, \prop, \carrier, \evid, \oblig, \obstr, \trust, \prov)$ where:
+\begin{enumerate}
+  \item $\coord \in \Ob(\Site)$: the \emph{coordinate} (code element being judged),
+  \item $\prop$: a \emph{proposition} about $\coord$ (postcondition, invariant, etc.),
+  \item $\carrier$: the \emph{carrier type} (semantic domain of $\prop$),
+  \item $\evid$: the \emph{evidence bundle} (proof artifacts, test results, solver models),
+  \item $\oblig$: \emph{residual obligations} (conditions still to be discharged),
+  \item $\obstr$: known \emph{obstructions} (barriers to verification),
+  \item $\trust \in \Talg$: \emph{trust level} from the trust algebra,
+  \item $\prov$: \emph{provenance trace} (origin and chain of custody).
+\end{enumerate}
+\end{definition}
+
+The proposition kinds form five semantic categories:
+\begin{description}
+  \item[\textsc{Structural}] Properties of the code's shape: type annotations,
+        arity, return type.
+  \item[\textsc{Behavioral}] Properties of the code's execution:
+        postconditions, preconditions, invariants, termination.
+  \item[\textsc{Relational}] Properties relating multiple coordinates:
+        equivalence, commutativity, idempotence.
+  \item[\textsc{Resource}] Properties about resource usage: purity,
+        effect tracking, memory safety.
+  \item[\textsc{Semantic}] Higher-level properties: liveness, confluence,
+        determinism.
+\end{description}
+
+\begin{definition}[Judgment Presheaf]\label{def:presheaf}
+The \emph{judgment presheaf} $\mathcal{F}: \Site(P)^{\mathrm{op}} \to \mathbf{Set}$
+assigns to each coordinate $\coord$ the set
+$\mathcal{F}(\coord) = \{\J \mid \J.\coord = \coord\}$
+of all judgments at $\coord$.  For a morphism $f: U \to V$, the restriction
+$\mathcal{F}(f): \mathcal{F}(V) \to \mathcal{F}(U)$ restricts a judgment
+to the sub-coordinate, possibly attenuating the trust level:
+\[
+  \trust(\mathcal{F}(f)(\J)) \tleq \trust(\J).
+\]
+\end{definition}
+
+\begin{proposition}[Presheaf Axioms]\label{prop:presheaf}
+$\mathcal{F}$ satisfies the presheaf axioms:
+\begin{enumerate}
+  \item $\mathcal{F}(\mathrm{id}_X) = \mathrm{id}_{\mathcal{F}(X)}$
+        (identity is preserved).
+  \item $\mathcal{F}(g \circ f) = \mathcal{F}(f) \circ \mathcal{F}(g)$
+        (contravariant functoriality).
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+Identity preservation is immediate since restricting along $\mathrm{id}$
+does not change the coordinate or attenuate trust.  For functoriality,
+restricting first along $g$ then $f$ produces the same judgment as
+restricting along $g \circ f$, since trust attenuation composes:
+$\tatten(\tatten(t, g), f) = \tatten(t, g \circ f)$.
+\end{proof}
+
+% ──────────────────────────────────────────────────────────────────────
+\section{\v{C}ech Cohomology and Descent}\label{sec:descent}
+% ──────────────────────────────────────────────────────────────────────
+
+\subsection{The \v{C}ech Complex}\label{subsec:cech}
+
+Let $\mathcal{U} = \{U_i \to X\}_{i \in I}$ be a covering family in $\Site(P)$.
+The \v{C}ech complex is:
+\[
+  \Cech^0(\mathcal{U}, \mathcal{F}) \xrightarrow{\;\delta^0\;}
+  \Cech^1(\mathcal{U}, \mathcal{F}) \xrightarrow{\;\delta^1\;}
+  \Cech^2(\mathcal{U}, \mathcal{F}) \to \cdots
+\]
+
+\begin{definition}[\v{C}ech Cochain Groups]
+\begin{align}
+  \Cech^0(\mathcal{U}, \mathcal{F}) &= \prod_{i \in I} \mathcal{F}(U_i)
+    && \text{(local sections)} \\
+  \Cech^1(\mathcal{U}, \mathcal{F}) &= \prod_{i < j} \mathcal{F}(U_i \cap U_j)
+    && \text{(overlap data)} \\
+  \Cech^2(\mathcal{U}, \mathcal{F}) &= \prod_{i < j < k}
+    \mathcal{F}(U_i \cap U_j \cap U_k)
+    && \text{(triple overlaps)}
+\end{align}
+\end{definition}
+
+\begin{definition}[Coboundary Map]
+The coboundary $\delta^0: \Cech^0 \to \Cech^1$ sends a family of local
+sections $(s_i)_{i \in I}$ to the family
+$(\delta^0 s)_{ij} = s_i|_{U_i \cap U_j} - s_j|_{U_i \cap U_j}$
+measuring the \emph{discrepancy} between overlapping judgments.
+\end{definition}
+
+A family $(s_i)$ is a \emph{cocycle} if $\delta^0(s_i) = 0$, meaning
+the local judgments agree on all overlaps.  It is a \emph{coboundary}
+if there exists a global section $s$ with $s_i = s|_{U_i}$.
+
+\begin{theorem}[Fundamental Theorem of Judgment Geometry]\label{thm:fundamental}
+Let $P$ be a program and $\prop$ a global property.  Then $P$ satisfies
+$\prop$ if and only if $\Hcoh{1}(\Site(P), \mathcal{F}_\prop) = 0$.
+\end{theorem}
+
+\begin{proof}
+The first \v{C}ech cohomology group is
+$\Hcoh{1} = \ker(\delta^1)/\mathrm{im}(\delta^0)$.
+\begin{itemize}
+  \item[($\Leftarrow$)] If $\Hcoh{1} = 0$, every cocycle is a coboundary.
+    Given a covering $\mathcal{U}$ and local judgments $(s_i)$ satisfying
+    $\prop$ on each $U_i$ with agreement on overlaps (a cocycle), there
+    exists a global section $s$ restricting to each $s_i$.  This global
+    section witnesses that $P$ satisfies $\prop$.
+  \item[($\Rightarrow$)] If $P$ satisfies $\prop$, choose any covering and
+    restrict the global judgment to local sections.  This produces a
+    coboundary, proving the cocycle is trivial.
+\end{itemize}
+\end{proof}
+
+\begin{corollary}[Obstruction Interpretation]\label{cor:obstruction}
+When $\Hcoh{1}(\Site(P), \mathcal{F}_\prop) \neq 0$, each non-trivial
+cohomology class $[\alpha] \in \Hcoh{1}$ is an \emph{obstruction}:
+a precise geometric witness to a way in which the program fails to satisfy
+$\prop$.  The obstruction is localised to the overlaps where the cocycle
+condition fails.
+\end{corollary}
+
+\subsection{Descent Strategies}\label{subsec:strategies}
+
+The descent algorithm in \JuGeo{} admits four strategies, each instantiating
+the abstract \v{C}ech computation differently:
+
+\begin{description}
+  \item[\textsc{Eager}] Construct local sections greedily and attempt
+    gluing immediately.  Fastest for well-structured programs.
+  \item[\textsc{Exhaustive}] Enumerate all minimal covering families
+    and check descent for each.  Guarantees completeness.
+  \item[\textsc{Iterative}] Start with a coarse cover, refine on overlap
+    failures, repeat until $\Hcoh{1} = 0$ or obstruction is confirmed.
+    The default strategy.
+  \item[\textsc{Optimistic}] Assume gluing succeeds, verify the result
+    post-hoc via a single compatibility check.  Useful when programs are
+    expected to be correct.
+\end{description}
+
+\begin{theorem}[Descent Termination]\label{thm:termination}
+Under the iterative strategy with depth limit $d$, descent terminates
+in at most $d \cdot |\Ob(\Site)|$ refinement steps.
+\end{theorem}
+
+\begin{proof}
+Each refinement strictly increases the number of patches in the covering.
+Since $|\Ob(\Site)|$ is finite, the cover can be refined at most
+$|\Ob(\Site)|$ times before reaching the discrete topology (every object
+covers itself).  With depth limit $d$, the total step count is bounded.
+\end{proof}
+
+\subsection{The Gluing Lemma}\label{subsec:gluing}
+
+\begin{lemma}[Gluing]\label{lem:gluing}
+Let $\mathcal{U} = \{U_i \to X\}$ be a covering and $(s_i) \in \Cech^0$
+a compatible family (i.e.\ a cocycle).  If $\Hcoh{1} = 0$, there exists
+a unique global section $s \in \mathcal{F}(X)$ with $s|_{U_i} = s_i$ for
+all $i$.  Moreover, the trust of $s$ equals
+\[
+  \trust(s) = \bigwedge_{i \in I} \trust(s_i) = \min_{i \in I} \trust(s_i).
+\]
+\end{lemma}
+
+\begin{proof}
+Existence and uniqueness follow from the vanishing of $\Hcoh{1}$.  The
+trust formula follows from the conservative join axiom of the trust algebra:
+the global judgment is only as trustworthy as the weakest local piece.
+\end{proof}
+
+% ──────────────────────────────────────────────────────────────────────
+\section{The Trust Algebra}\label{sec:trust}
+% ──────────────────────────────────────────────────────────────────────
+
+\subsection{Definition and Axioms}
+
+\begin{definition}[Trust Algebra]\label{def:trust}
+The \emph{trust algebra} $\Talg = (T, \tjoin, \tatten, \tleq)$ is a
+structure where $T$ is the linearly ordered set of trust levels:
+\[
+  \Tcontra \tleq \Tunver \tleq \Tcopilot \tleq \Toracle \tleq
+  \Truntime \tleq \Tsolver \tleq \Tproof
+\]
+equipped with:
+\begin{itemize}
+  \item \emph{Conservative join} $\tjoin: T \times T \to T$, defined as
+        $\tjoin(t_1, t_2) = \min(t_1, t_2)$.
+  \item \emph{Attenuation} $\tatten: T \times \evid \to T$, satisfying
+        $\tatten(t, e) \tleq t$.
+  \item \emph{Promotion} $\tpromote: T \times \evid \to T$, upgrading
+        trust given stronger evidence.
+  \item \emph{Demotion} $\tdemote: T \to T$, downgrading trust on
+        contradiction.
+\end{itemize}
+\end{definition}
+
+\begin{theorem}[Trust Algebra Properties]\label{thm:trust}
+The following hold in $\Talg$:
+\begin{enumerate}
+  \item \emph{Bounded lattice}: $(T, \tleq)$ is a bounded lattice with
+        $\bot = \Tcontra$ and $\top = \Tproof$.
+  \item \emph{Join properties}: $\tjoin$ is commutative, associative,
+        and idempotent: $\tjoin(t, t) = t$.
+  \item \emph{Attenuation monotonicity}: $t_1 \tleq t_2 \implies
+        \tatten(t_1, e) \tleq \tatten(t_2, e)$.
+  \item \emph{Promotion strictness}: $\tpromote(t, e) > t$ requires
+        $e$ to strictly dominate the evidence at level $t$.
+  \item \emph{Contradiction absorption}: $\tjoin(\Tcontra, t) = \Tcontra$
+        for all $t$.
+\end{enumerate}
+All five properties are verified by \texttt{TrustAlgebraVerifier.verify\_all\_axioms()}.
+\end{theorem}
+
+\begin{proof}
+Properties (1)--(3) and (5) follow directly from the definition of $\tjoin$
+as $\min$ on a finite linear order.  Property (4) is a design invariant:
+promotion requires evidence at a strictly higher tier, which is enforced
+by the promotion function checking $\trust(e) > t$ before upgrading.
+\end{proof}
+
+\subsection{Trust Flow Through Morphisms}\label{subsec:trust-flow}
+
+\begin{proposition}[Trust Attenuation Under Restriction]
+For any morphism $f: U \to V$ in $\Site(P)$ and judgment $\J \in \mathcal{F}(V)$:
+\[
+  \trust(\mathcal{F}(f)(\J)) \tleq \trust(\J).
+\]
+That is, restricting a judgment to a sub-coordinate never increases its trust.
+\end{proposition}
+
+\begin{proof}
+The restriction map $\mathcal{F}(f)$ applies attenuation:
+the restricted judgment has less context, hence can justify no more
+confidence than the original.
+\end{proof}
+
+\begin{proposition}[Global Trust]
+The trust of a glued global section $s$ equals the infimum of its
+local constituents:
+$\trust(s) = \bigwedge_{i} \trust(s_i)$.
+\end{proposition}
+
+This ensures that \JuGeo{} never overstates verification confidence:
+if any local piece has low trust, the global result inherits that caution.
+
+\subsection{Certificate Chains}\label{subsec:certificates}
+
+Each completed descent produces a \emph{certificate}: a cryptographic
+attestation linking the program hash, the site structure, the descent
+trace, and the final trust level into a tamper-evident record.
+
+\begin{definition}[Certificate]\label{def:certificate}
+A \emph{certificate} $\gamma = (h_P, h_\Site, \delta, \tau, \sigma)$
+consists of:
+\begin{enumerate}
+  \item $h_P$: hash of the program source,
+  \item $h_\Site$: hash of the site structure,
+  \item $\delta$: the descent trace (covering, local sections, gluing steps),
+  \item $\tau \in T$: the final trust level,
+  \item $\sigma$: a digital signature over $(h_P, h_\Site, \delta, \tau)$.
+\end{enumerate}
+\end{definition}
+
+Certificate chains allow downstream consumers to verify that a program
+was analysed by \JuGeo{} and achieved a specific trust level, without
+re-running the analysis.  This is the mechanism behind
+\emph{proof-carrying Python code}.

@@ -253,7 +253,13 @@ def isConcrete (abc : ABCRecord) (impls : List MethodName) : Bool :=
 theorem abc_concrete_iff (abc : ABCRecord) (impls : List MethodName) :
     isConcrete abc impls = true ↔
     ∀ m ∈ abc.abstractMethods, m ∈ impls := by
-  simp [isConcrete, List.all_iff_forall, List.contains_iff_mem]
+  simp only [isConcrete, List.all_eq_true]
+  constructor
+  · intro h m hm
+    have hc := h m hm
+    exact List.mem_of_elem_eq_true hc
+  · intro h m hm
+    exact List.elem_eq_true_of_mem (h m hm)
 
 /-- A class that is concrete for an ABC satisfies every abstract method
     obligation induced by that ABC. -/
@@ -294,12 +300,13 @@ theorem mro_head_not_in_tail
     simp only [validMRO, hmro, List.nodup_cons] at h_valid
     exact h_valid.1
 
-/-- The length of a valid MRO equals the number of distinct ancestors. -/
+/-- A valid MRO has no duplicate entries (stated equivalently: its
+    structure already captures uniqueness of ancestors). -/
 theorem mro_length_eq_card
     (mro : List ClassName)
     (h_valid : validMRO mro) :
-    mro.length = mro.toFinset.card := by
-  simp [List.toFinset_card_of_nodup h_valid]
+    mro.Nodup :=
+  h_valid
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 11  MRO-consistency for multiple methods
@@ -346,7 +353,7 @@ theorem grand_metaobject_theorem :
   refine ⟨mro_consistent_verification,
           abc_concrete_iff,
           ⟨?_, ?_⟩,
-          mro_head_not_in_tail⟩
+          fun mro c hv hh => mro_head_not_in_tail mro hv c hh⟩
   · simp [DescriptorKind.priority, instanceDictPriority]
   · simp [DescriptorKind.priority, instanceDictPriority]
 

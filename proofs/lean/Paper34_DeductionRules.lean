@@ -122,14 +122,15 @@ inductive ProofTree : Type where
 /-- Interpret a `ProofTree` as a `Provable` derivation.
     Returns `none` if the tree is not well-typed for the given context/goal. -/
 def ProofTree.toProvable (t : ProofTree) (Γ : Context) (φ : Formula) :
-    Option (Provable Γ φ) :=
-  match t, φ with
-  | .hypLeaf f, _ =>
+    Option (PLift (Provable Γ φ)) :=
+  match t with
+  | .hypLeaf f =>
       if h : f = φ ∧ f ∈ Γ then
-        some (Provable.hyp (h.2 |> (h.1 ▸ ·)))
+        some ⟨by obtain ⟨heq, hmem⟩ := h; subst heq; exact Provable.hyp hmem⟩
       else none
-  | .topLeaf, .top => some Provable.topI
-  | _, _ => none  -- other cases handled by the full chaining engine
+  | .topLeaf =>
+      if h : φ = .top then some ⟨by subst h; exact Provable.topI⟩ else none
+  | _ => none
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 5  Theorem Schemas
@@ -282,7 +283,7 @@ theorem soundness (Γ : Context) (φ : Formula)
     evalFormula φ v = true := by
   induction h with
   | hyp hmem =>
-      exact hv φ hmem
+      exact hv _ hmem
   | weak _ ih =>
       apply ih
       intro ψ hψ
@@ -290,20 +291,19 @@ theorem soundness (Γ : Context) (φ : Formula)
   | topI =>
       rfl
   | conjI _ _ ih₁ ih₂ =>
-      exact eval_conj_true (ih₁ v hv) (ih₂ v hv)
+      exact eval_conj_true (ih₁ hv) (ih₂ hv)
   | conjE₁ _ ih =>
-      exact eval_conj_left (ih v hv)
+      exact eval_conj_left (ih hv)
   | conjE₂ _ ih =>
-      exact eval_conj_right (ih v hv)
+      exact eval_conj_right (ih hv)
   | mp _ _ ih₁ ih₂ =>
-      exact eval_mp (ih₁ v hv) (ih₂ v hv)
+      exact eval_mp (ih₁ hv) (ih₂ hv)
   | univI _ ih =>
       apply ih
       intro ψ hψ
       exact hv ψ (List.mem_cons.mpr (Or.inr hψ))
   | exFalso _ ih =>
-      simp [evalFormula] at ih
-      exact absurd (ih v hv) (by decide)
+      exact absurd (ih hv) (by simp [evalFormula])
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 9  Corollaries
@@ -388,31 +388,24 @@ structure DischargedSchema where
 def cutAdmissible : DischargedSchema :=
   { schema    := cutAdmissibleSchema
     soundness := fun Γ A B hA hAB => by
-      -- hAB : Provable (A :: Γ) B
-      -- We discharge A from the context using hA.
-      -- Build: weaken hA to get A in front, then apply hAB.
-      -- Strategy: induction on hAB (cut elimination).
-      -- For this formalization we demonstrate the key base cases.
-      induction hAB with
-      | hyp hmem =>
-          -- B is a hypothesis in (A :: Γ).
-          -- Either B = A (use hA) or B ∈ Γ (use hyp).
-          cases List.mem_cons.mp hmem with
-          | inl heq => rw [← heq]; exact hA
-          | inr hmem' => exact Provable.hyp hmem'
-      | weak _ ih =>
-          -- B derivable from a tail of (A :: Γ): already in Γ
-          -- ih : Provable Γ B (after discharging A)
-          -- The weakened proof adds a fresh formula to A :: Γ;
-          -- we weakened past A so A is not relevant here.
-          exact ih
+      -- Strategy: prove a general substitution lemma then apply it
+      suffices key : ∀ (Δ : Context) (C : Formula), Provable Δ C →
+          (∀ φ ∈ Δ, Provable Γ φ) → Provable Γ C by
+        exact key (A :: Γ) B hAB (fun φ hφ => by
+          cases List.mem_cons.mp hφ with
+          | inl heq => subst heq; exact hA
+          | inr hmem => exact Provable.hyp hmem)
+      intro Δ C hprov hΔ
+      induction hprov with
+      | hyp hmem => exact hΔ _ hmem
+      | weak _ ih => exact ih (fun φ hφ => hΔ φ (List.mem_cons_of_mem _ hφ))
       | topI => exact Provable.topI
-      | conjI _ _ ih₁ ih₂ => exact Provable.conjI ih₁ ih₂
-      | conjE₁ _ ih => exact Provable.conjE₁ ih
-      | conjE₂ _ ih => exact Provable.conjE₂ ih
-      | mp _ _ ih₁ ih₂ => exact Provable.mp ih₁ ih₂
-      | univI _ ih => exact ih
-      | exFalso _ ih => exact Provable.exFalso ih }
+      | conjI _ _ ih₁ ih₂ => exact Provable.conjI (ih₁ hΔ) (ih₂ hΔ)
+      | conjE₁ _ ih => exact Provable.conjE₁ (ih hΔ)
+      | conjE₂ _ ih => exact Provable.conjE₂ (ih hΔ)
+      | mp _ _ ih₁ ih₂ => exact Provable.mp (ih₁ hΔ) (ih₂ hΔ)
+      | univI _ ih => exact ih (fun φ hφ => hΔ φ (List.mem_cons_of_mem _ hφ))
+      | exFalso _ ih => exact Provable.exFalso (ih hΔ) }
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 11  Grand Theorem (Paper 34, §7)

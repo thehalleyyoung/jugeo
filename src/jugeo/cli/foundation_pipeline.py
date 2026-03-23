@@ -2634,10 +2634,15 @@ class FoundationPipeline:
         self._log("    Wrote %s", pyproject_path)
 
         # --- Extract commands from computational theorems ---
+        # Strip the tool name prefix from commands (e.g. "schedshape deadlock-cert" → "deadlock-cert")
         commands = []
         for thm in theorems:
             cmd = thm.get("cli_command", "").strip()
             if cmd:
+                # Strip tool name prefix if present (e.g. "schedshape deadlock-cert" → "deadlock-cert")
+                parts = cmd.split()
+                if len(parts) > 1:
+                    cmd = parts[-1]  # keep only the subcommand
                 commands.append({
                     "name": cmd,
                     "help": thm.get("cli_help", thm.get("capability", ""))[:200],
@@ -2693,7 +2698,7 @@ class FoundationPipeline:
 
         # Generate handler functions
         for c in commands:
-            fn = c["name"].replace("-", "_")
+            fn = re.sub(r"[^a-zA-Z0-9]", "_", c["name"])
             if c["has_input"]:
                 L.append(f"def _cmd_{fn}(args):")
                 L.append(f'    """{c["capability"][:100]}')
@@ -2759,7 +2764,7 @@ class FoundationPipeline:
 
         # Register subcommands
         for c in commands:
-            fn = c["name"].replace("-", "_")
+            fn = re.sub(r"[^a-zA-Z0-9]", "_", c["name"])
             safe_help = c["help"].replace('"', "'")[:200]
             if c["has_input"]:
                 L.append(f'    p_{fn} = sub.add_parser("{c["name"]}", help="{safe_help}")')
@@ -2778,7 +2783,7 @@ class FoundationPipeline:
 
         dispatch_entries = []
         for c in commands:
-            fn = c["name"].replace("-", "_")
+            fn = re.sub(r"[^a-zA-Z0-9]", "_", c["name"])
             dispatch_entries.append(f'        "{c["name"]}": _cmd_{fn},')
         L.append(f"    dispatch = {{")
         L.extend(dispatch_entries)
@@ -3041,6 +3046,20 @@ class FoundationPipeline:
                 files.append(fpath)
             except Exception as exc:
                 self._log("    Failed to generate %s: %s", fname, exc)
+
+        # Ensure core.py exists — fall back to template if LLM didn't generate it
+        core_path = src_dir / "core.py"
+        if not core_path.exists():
+            self._log("    core.py missing from LLM output; using template fallback.")
+            constituents_str = f"{field_a}, {field_b}"
+            props_block = "\n".join(
+                f"    - {getattr(p, 'title', str(p))}" for p in props[:8]
+            ) or "    (none)"
+            core_code = self._build_core_py_template(
+                winner_name, constituents_str, description[:300], props_block,
+            )
+            core_path.write_text(core_code, encoding="utf-8")
+            files.insert(0, core_path)
 
         # Write __init__.py
         module_name = src_dir.name
@@ -4315,60 +4334,64 @@ class FoundationPipeline:
         # --- Generate chapters via separate LLM calls ---
         chapters: dict[str, str] = {}
         # --- Compact chapter prompts (~500-800 chars each) ---
+        # Page targets total ~80 to ensure we exceed 60 pages even if LLM
+        # undershoots each chapter.
         chapter_prompts = {
             "introduction": (
                 f"{chapter_preamble}\n"
-                f"Write the INTRODUCTION chapter in LaTeX (~6 pages). Include:\n"
+                f"Write the INTRODUCTION chapter in LaTeX (~8 pages). Include:\n"
                 f"motivation, overview of {field_a} and {field_b}, roadmap,\n"
-                f"central questions, preview of bridge, history, notation,\n"
-                f"what {tool_name} does.\n{context_block}\n"
+                f"central questions, preview of bridge, historical context, notation guide,\n"
+                f"what {tool_name} does, and who should read this book.\n{context_block}\n"
                 f"Return ONLY LaTeX body (no \\chapter, no \\documentclass). Use amsthm.\n"
             ),
             "prerequisites_a": (
                 f"{chapter_preamble}\n"
-                f"Write 'Prerequisites: {field_a}' chapter in LaTeX (~10 pages).\n"
-                f"6-8 definitions (with examples), 5-7 theorems (FULL proofs),\n"
-                f"4+ lemmas for bridge chapter, 2+ worked computations.\n"
+                f"Write 'Prerequisites: {field_a}' chapter in LaTeX (~12 pages).\n"
+                f"8-10 definitions (with examples), 6-8 theorems (FULL proofs),\n"
+                f"5+ lemmas for bridge chapter, 3+ worked computations.\n"
+                f"Be thorough — give complete proof for every theorem.\n"
                 f"{context_block}\n"
                 f"Return ONLY LaTeX body. Use amsthm.\n"
             ),
             "prerequisites_b": (
                 f"{chapter_preamble}\n"
-                f"Write 'Prerequisites: {field_b}' chapter in LaTeX (~10 pages).\n"
-                f"4-6 definitions, 3-5 theorems (FULL proofs), key lemmas,\n"
-                f"worked examples.\n{context_block}\n"
+                f"Write 'Prerequisites: {field_b}' chapter in LaTeX (~12 pages).\n"
+                f"6-8 definitions, 5-7 theorems (FULL proofs), key lemmas,\n"
+                f"3+ worked examples. Give complete proofs.\n{context_block}\n"
                 f"Return ONLY LaTeX body. Use amsthm.\n"
             ),
             "bridge_theorems": (
                 f"{chapter_preamble}\n"
-                f"Write 'Bridge Theorems' chapter in LaTeX (~15 pages).\n"
+                f"Write 'Bridge Theorems' chapter in LaTeX (~18 pages).\n"
                 f"CORE chapter. State and FULLY PROVE each:\n\n"
                 f"{foundational_block}\n"
-                f"Also: 6+ supporting lemmas (proved), categorical perspective\n"
-                f"with tikzcd diagrams, 2+ worked examples.\n{context_block}\n"
+                f"Also: 8+ supporting lemmas (proved), categorical perspective\n"
+                f"with tikzcd diagrams, 3+ worked examples.\n{context_block}\n"
                 f"Return ONLY LaTeX body. May use tikzcd.\n"
             ),
             "algorithms": (
                 f"{chapter_preamble}\n"
-                f"Write 'Algorithms' chapter in LaTeX (~10 pages).\n"
+                f"Write 'Algorithms' chapter in LaTeX (~12 pages).\n"
                 f"For each capability of {tool_name}:\n"
-                f"pseudocode (algorithmic env), correctness proof, complexity.\n"
-                f"3+ algorithms, 1+ step-by-step worked example.\n"
+                f"pseudocode (algorithmic env), correctness proof, complexity analysis.\n"
+                f"4+ algorithms, 2+ step-by-step worked examples with concrete data.\n"
                 f"{context_block}\n"
                 f"Return ONLY LaTeX body. Use algorithmic environments.\n"
             ),
             "applications": (
                 f"{chapter_preamble}\n"
-                f"Write 'Applications' chapter in LaTeX (~10 pages).\n"
+                f"Write 'Applications' chapter in LaTeX (~12 pages).\n"
                 f"For EACH application theorem, give a worked example:\n\n"
                 f"{application_block}\n"
-                f"Compare WITH vs WITHOUT the bridge.\n{context_block}\n"
+                f"Compare WITH vs WITHOUT the bridge. Show real computation.\n{context_block}\n"
                 f"Return ONLY LaTeX body.\n"
             ),
             "open_problems": (
                 f"{chapter_preamble}\n"
-                f"Write 'Open Problems' chapter in LaTeX (~4 pages).\n"
-                f"5-8 precise conjectures. For each: why hard, what it unlocks.\n"
+                f"Write 'Open Problems' chapter in LaTeX (~6 pages).\n"
+                f"8-10 precise conjectures. For each: formal statement, why hard,\n"
+                f"what it unlocks, partial results.\n"
                 f"Span: computational, geometric, algebraic, analytical.\n"
                 f"{context_block}\nReturn ONLY LaTeX body.\n"
             ),
@@ -5012,8 +5035,25 @@ The following Python code implements the {safe_name} framework:
         else:
             try:
                 lean_code = self._call_llm(prompt, max_tokens=8192)
-                lean_code = re.sub(r"^```lean\s*\n?", "", lean_code.strip())
+                lean_code = re.sub(r"^```lean4?\s*\n?", "", lean_code.strip())
                 lean_code = re.sub(r"\n?```\s*$", "", lean_code.strip())
+                # Strip any prose before actual Lean code
+                lean_lines = lean_code.split("\n")
+                start_idx = 0
+                for i, line in enumerate(lean_lines):
+                    stripped = line.strip()
+                    if (stripped.startswith("universe ") or stripped.startswith("namespace ")
+                            or stripped.startswith("set_option ") or stripped.startswith("import ")
+                            or stripped.startswith("open ") or stripped.startswith("section ")
+                            or stripped.startswith("-- ") or stripped.startswith("/-")):
+                        start_idx = i
+                        break
+                if start_idx > 0:
+                    lean_code = "\n".join(lean_lines[start_idx:])
+                # Verify it has actual theorems, not just structures
+                if "theorem " not in lean_code and "lemma " not in lean_code:
+                    self._log("  LLM Lean output has no theorems; using template.")
+                    lean_code = self._template_lean_proofs(winner)
             except Exception as exc:
                 self._log("  Lean generation failed (%s); using template.", exc)
                 lean_code = self._template_lean_proofs(winner)

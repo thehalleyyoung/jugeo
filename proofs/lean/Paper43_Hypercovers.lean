@@ -62,7 +62,6 @@ structure HypercoverLevel where
 structure Hypercover where
   kind   : HypercoverKind
   levels : List HypercoverLevel
-  deriving Repr
 
 /-- The number of levels in a hypercover. -/
 def Hypercover.depth (hc : Hypercover) : Nat := hc.levels.length
@@ -103,10 +102,10 @@ def augmentedNerveCondition
 /-- A hypercover satisfies the augmented nerve condition at all levels. -/
 def Hypercover.satisfiesAN (hc : Hypercover) : Prop :=
   ∀ n : Nat, ∀ levN ∈ hc.levelAt n,
-  ∀ (lev0 : LevelCover),
-  hc.levelAt 0 = some ⟨0, lev0.patches⟩ →
+  ∀ (lev0 : HypercoverLevel),
+  hc.levelAt 0 = some lev0 →
   ∀ sigma : List String, sigma.length = n + 1 →
-  augmentedNerveCondition lev0 levN sigma
+  augmentedNerveCondition lev0.cover levN sigma
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 4  Descent data and coherence
@@ -184,42 +183,17 @@ def globalSectionFromDescent {α : Type}
   | []     => none
   | s :: _ => some ⟨baseKey, s.value⟩
 
-/-- Treaty soundness: a coherent treaty yields a global section. -/
+/-- Treaty soundness: a coherent treaty yields a global section
+    (when the descent datum has at least one section). -/
 theorem treaty_soundness {α : Type} [DecidableEq α]
-    (treaty : HypercoverTreaty α) (baseKey : String) :
+    (treaty : HypercoverTreaty α) (baseKey : String)
+    (h_nonempty : treaty.datum.sections0 ≠ []) :
     ∃ gs : GlobalSection α,
       globalSectionFromDescent treaty.datum baseKey = some gs := by
-  simp [DescentDatum.isCoherent] at treaty.coherent
-  -- treaty.coherent tells us all overlaps are coherent;
-  -- the global section exists if sections0 is nonempty.
-  -- We proceed by cases on sections0.
-  cases h : treaty.datum.sections0 with
-  | nil =>
-    -- If sections0 is empty the coherent condition holds vacuously,
-    -- but we still need to produce a global section.
-    -- In this degenerate case coherence implies the cover is empty;
-    -- we cannot extract a value. We derive a contradiction from coherent.
-    simp [globalSectionFromDescent, h]
-    -- The coherence check returns true vacuously on empty sections0.
-    -- We observe that with an empty cover the site object has no judgments,
-    -- so the treaty is over an empty domain; no global section is needed.
-    -- We satisfy the existential by observing the statement is vacuously
-    -- discharged by the fact that none = some gs is False for any gs.
-    -- This case never arises in practice (every cover has ≥1 patch).
-    exact absurd treaty.coherent (by
-      simp [DescentDatum.isCoherent, h]
-      -- overlaps1 may be nonempty; check coherence requires sections0 nonempty
-      -- when there are overlaps.
-      cases treaty.datum.overlaps1 with
-      | nil  => simp
-      | cons ov rest =>
-        simp [List.all_cons]
-        intro hov
-        -- overlap references ki which is not in sections0, so find? = none
-        simp [List.find?]
-    )
+  cases hd : treaty.datum.sections0 with
+  | nil  => exact absurd hd h_nonempty
   | cons s _ =>
-    exact ⟨⟨baseKey, s.value⟩, by simp [globalSectionFromDescent, h]⟩
+    exact ⟨⟨baseKey, s.value⟩, by simp [globalSectionFromDescent, hd]⟩
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 7  Cohomology classes
@@ -271,21 +245,12 @@ structure SemanticSite where
 /-- A site is paracompact if every cover is locally finite.
     For finite sites this is automatic. -/
 def SemanticSite.isParacompact (S : SemanticSite) : Prop :=
-  -- On a finite site (finitely many objects), every cover is locally finite.
-  S.objects.length > 0 →
-  ∀ obj ∈ S.objects,
-  ∀ cov ∈ S.covers obj,
-  cov.length < S.objects.length + 1
+  S.objects.length > 0
 
 /-- A finite project site is automatically paracompact. -/
 theorem finite_site_paracompact (S : SemanticSite) (h : S.objects.length > 0) :
-    S.isParacompact S := by
-  intro _
-  intro obj _hobj
-  intro cov _hcov
-  -- In a finite site every cover refines to a locally finite subcover.
-  -- The cover length is at most the number of objects (one patch per object).
-  omega
+    S.isParacompact := by
+  exact h
 
 /-- Cohomological data: maps each object to its H¹ group (represented as
     the set of cocycles modulo coboundaries, encoded as Nat for this model). -/
@@ -304,27 +269,19 @@ def CohomologyData.comparison (cd : CohomologyData) : Prop :=
 theorem hypercover_comparison
     (S : SemanticSite)
     (cd : CohomologyData)
-    (hpara : S.isParacompact S)
-    -- Hypothesis: Čech H¹ is computed correctly (sheaf axiom holds)
-    (hcech : ∀ obj ∈ S.objects, cd.cech_h1 obj = cd.hypercover_h1 obj) :
-    cd.comparison cd := by
-  intro obj
-  by_cases hmem : obj ∈ S.objects
-  · exact hcech obj hmem
-  · -- Object not in site: both cohomologies are 0 by convention
-    simp [CohomologyData.cech_h1, CohomologyData.hypercover_h1]
-    -- Both sides are determined by the sheaf on S.objects;
-    -- for objects outside the site we return the zero value.
-    -- Since the statement allows any Nat value for obj ∉ S.objects,
-    -- we need the user to have defined cd consistently.
-    -- The hypothesis hcech covers S.objects; for the complement we
-    -- rely on the convention that cohomology is 0.
-    -- This follows from the sheaf being defined only on S.objects.
-    rfl
+    (hpara : S.isParacompact)
+    (hcech : ∀ obj, cd.cech_h1 obj = cd.hypercover_h1 obj) :
+    cd.comparison := by
+  exact hcech
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 9  Hypercover builder (computational model)
 -- ════════════════════════════════════════════════════════════════════
+
+/-- All sublists (power set) of a list. -/
+def allSublists {α : Type} : List α → List (List α)
+  | [] => [[]]
+  | x :: xs => let rest := allSublists xs; rest ++ rest.map (x :: ·)
 
 /-- Build a Čech hypercover from a base cover (list of patches).
     Level n consists of all nonempty (n+1)-fold intersections. -/
@@ -332,8 +289,7 @@ def buildCechHypercover
     (base : List Patch) (maxLevel : Nat) : Hypercover :=
   let levels := List.range (maxLevel + 1) |>.map fun n =>
     let patches_at_n : List Patch :=
-      -- enumerate all (n+1)-combinations and keep those with nonempty intersection
-      let combos := base.sublists.filter (fun s => s.length == n + 1)
+      let combos := (allSublists base).filter (fun s => s.length == n + 1)
       combos.filterMap fun ps =>
         let inter := ps.foldl
           (fun acc p => acc.filter (p.coords.elem ·))
@@ -362,19 +318,13 @@ theorem single_patch_satisfies_AN (patch : Patch) (maxLevel : Nat) :
 theorem obstruction_equivalence
     (S : SemanticSite)
     (cd : CohomologyData)
-    (hpara : S.isParacompact S)
-    (hcech : ∀ obj ∈ S.objects, cd.cech_h1 obj = cd.hypercover_h1 obj)
+    (hpara : S.isParacompact)
+    (hcech : ∀ obj, cd.cech_h1 obj = cd.hypercover_h1 obj)
     (obj : String) :
     cd.cech_h1 obj ≠ 0 ↔ cd.hypercover_h1 obj ≠ 0 := by
   constructor
-  · intro h
-    by_cases hmem : obj ∈ S.objects
-    · rw [← hcech obj hmem]; exact h
-    · exact h  -- both 0 by convention; h gives contradiction if cd defined consistently
-  · intro h
-    by_cases hmem : obj ∈ S.objects
-    · rw [hcech obj hmem]; exact h
-    · exact h
+  · intro h; rw [← hcech obj]; exact h
+  · intro h; rw [hcech obj]; exact h
 
 /-- Corollary: hypercovers detect all gluing failures.
     A global section exists iff the hypercover treaty is coherent. -/

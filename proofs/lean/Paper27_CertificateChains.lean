@@ -63,29 +63,16 @@ theorem TrustLevel.toNat_le_two (t : TrustLevel) : t.toNat ≤ 2 := by
 
 /-- meet is commutative. -/
 theorem TrustLevel.meet_comm (a b : TrustLevel) : a.meet b = b.meet a := by
-  unfold TrustLevel.meet
-  by_cases h : a.toNat ≤ b.toNat
-  · simp [h]
-    by_cases h2 : b.toNat ≤ a.toNat
-    · have : a.toNat = b.toNat := Nat.le_antisymm h h2
-      cases a <;> cases b <;> simp_all [TrustLevel.toNat]
-    · simp [h2]
-  · push_neg at h
-    have h2 : b.toNat ≤ a.toNat := Nat.le_of_lt h
-    simp [h2, Nat.not_le.mpr h]
+  cases a <;> cases b <;> decide
 
 /-- meet is associative. -/
 theorem TrustLevel.meet_assoc (a b c : TrustLevel) :
     (a.meet b).meet c = a.meet (b.meet c) := by
-  unfold TrustLevel.meet
-  split_ifs <;> cases a <;> cases b <;> cases c <;> simp_all [TrustLevel.toNat]
+  cases a <;> cases b <;> cases c <;> decide
 
 /-- meet lower-bounds both arguments. -/
 theorem TrustLevel.meet_le_left (a b : TrustLevel) : a.meet b ≤ a := by
-  unfold TrustLevel.meet
-  by_cases h : a.toNat ≤ b.toNat
-  · simp [h]
-  · push_neg at h; simp [Nat.not_le.mpr h]; exact Nat.le_of_lt h
+  cases a <;> cases b <;> decide
 
 theorem TrustLevel.meet_le_right (a b : TrustLevel) : a.meet b ≤ b := by
   rw [TrustLevel.meet_comm]; exact TrustLevel.meet_le_left b a
@@ -149,7 +136,7 @@ def Certificate.sigValid (c : Certificate) : Prop :=
   c.sigHash = hashFn c.content
 
 /-- Decidability of signature validity (requires decidable equality on String). -/
-instance (c : Certificate) : Decidable (c.sigValid) :=
+noncomputable instance (c : Certificate) : Decidable (c.sigValid) :=
   inferInstanceAs (Decidable (c.sigHash = hashFn c.content))
 
 -- ════════════════════════════════════════════════════════════════════
@@ -177,26 +164,37 @@ structure CertificateChain where
 def CertificateChain.trustFloor (ch : CertificateChain) : TrustLevel :=
   ch.links.foldl (fun acc c => acc.meet c.trustLevel) TrustLevel.verified
 
+private theorem foldl_meet_le_init (acc : TrustLevel) (links : List Certificate) :
+    links.foldl (fun a c => a.meet c.trustLevel) acc ≤ acc := by
+  induction links generalizing acc with
+  | nil => exact Nat.le_refl _
+  | cons hd tl ih =>
+    simp only [List.foldl_cons]
+    exact Nat.le_trans (ih _) (TrustLevel.meet_le_left acc hd.trustLevel)
+
+private theorem foldl_meet_le_each (acc : TrustLevel) (links : List Certificate)
+    (c : Certificate) (hc : c ∈ links) :
+    links.foldl (fun a c => a.meet c.trustLevel) acc ≤ c.trustLevel := by
+  induction links generalizing acc with
+  | nil => exact absurd hc (List.not_mem_nil _)
+  | cons hd tl ih =>
+    simp only [List.foldl_cons]
+    cases List.mem_cons.mp hc with
+    | inl heq =>
+      subst heq
+      exact Nat.le_trans (foldl_meet_le_init _ tl) (TrustLevel.meet_le_right acc c.trustLevel)
+    | inr hmem => exact ih _ hmem
+
 /-- Every link's trust level is ≥ the trust floor. -/
 theorem trustFloor_le_each_link (ch : CertificateChain) (c : Certificate)
     (hc : c ∈ ch.links) : ch.trustFloor ≤ c.trustLevel := by
   unfold CertificateChain.trustFloor
-  induction ch.links with
-  | nil => exact absurd hc (List.not_mem_nil _)
-  | cons hd tl ih =>
-    simp [List.foldl_cons]
-    cases List.mem_cons.mp hc with
-    | inl heq =>
-      subst heq
-      apply TrustLevel.meet_le_right
-    | inr hmem =>
-      have := ih (fun h => ch.nonempty (by simp [h])) hmem
-      exact Nat.le_trans (TrustLevel.meet_le_left _ _) this
+  exact foldl_meet_le_each TrustLevel.verified ch.links c hc
 
 /-- Extending a chain can only decrease (or maintain) the trust floor. -/
 theorem extend_weakens_floor (ch : CertificateChain) (c : Certificate) :
     let ch' : CertificateChain :=
-          ⟨ch.links ++ [c], List.append_ne_nil_of_ne_nil_left ch.links _ ch.nonempty⟩
+          ⟨ch.links ++ [c], by simp⟩
     ch'.trustFloor ≤ ch.trustFloor := by
   simp [CertificateChain.trustFloor, List.foldl_append]
   apply TrustLevel.meet_le_left
@@ -226,14 +224,14 @@ def CertificateAuthority.isTrustedIssuer (ca : CertificateAuthority) (c : Certif
 
 /-- Per-link verification: check signature, revocation, obstructions,
     and trusted issuer. -/
-def verifyLink (ca : CertificateAuthority) (c : Certificate) : Bool :=
-  c.sigValid.decide                 -- (i)  signature check
+noncomputable def verifyLink (ca : CertificateAuthority) (c : Certificate) : Bool :=
+  decide (c.sigValid)                -- (i)  signature check
   && !ca.isRevoked c                -- (iii) revocation check
   && c.locallyValid                 -- (iv)  obstruction check
   && ca.isTrustedIssuer c           -- authority check
 
 /-- Chain verification: all links valid plus coverage and residuals. -/
-def verifyChain (ca : CertificateAuthority) (ch : CertificateChain)
+noncomputable def verifyChain (ca : CertificateAuthority) (ch : CertificateChain)
     (required : List Coordinate) : Bool :=
   ch.links.all (verifyLink ca)
   && required.all (fun coord => ch.links.any (fun c => c.coord == coord))
@@ -268,12 +266,9 @@ theorem verifyChain_rejects_forged
     (ca : CertificateAuthority) (ch : CertificateChain) (req : List Coordinate)
     (c : Certificate) (hc : c ∈ ch.links) (hf : c.isForged) :
     verifyChain ca ch req = false := by
-  by_contra hv
-  push_neg at hv
-  rw [Bool.not_eq_false] at hv
-  have hlink := verifyChain_soundness ca ch req hv c hc
-  have hsig := verifyChain_sig_valid ca ch req hv c hc
-  exact hf hsig
+  cases hv : verifyChain ca ch req with
+  | false => rfl
+  | true => exfalso; exact hf (verifyChain_sig_valid ca ch req hv c hc)
 
 /-- Trust floor lower-bounds each link in a verified chain. -/
 theorem verifyChain_trustFloor_le
@@ -295,21 +290,28 @@ theorem verifyChain_no_residuals
     c.residuals = [] := by
   unfold verifyChain at h
   simp [Bool.and_eq_true] at h
-  have hresid := h.1.2 c hc
-  simp [List.isEmpty_iff_eq_nil] at hresid
-  exact hresid
+  have hresid := h.2 c hc
+  cases hr : c.residuals with
+  | nil => rfl
+  | cons hd tl => rw [hr] at hresid; simp [List.isEmpty] at hresid
+
+private theorem sum_map_residuals_eq_zero (links : List Certificate)
+    (h : ∀ c ∈ links, c.residuals = []) :
+    (links.map (fun c => c.residuals.length)).sum = 0 := by
+  induction links with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.map, List.cons_append]
+    have hhd := h hd (List.mem_cons_self hd tl)
+    have htl := ih (fun c hc => h c (List.mem_cons_of_mem hd hc))
+    simp [hhd, htl]
 
 /-- NSS corollary: total residuals is 0 in a verified chain. -/
 theorem nss_corollary
     (ca : CertificateAuthority) (ch : CertificateChain) (req : List Coordinate)
     (h : verifyChain ca ch req = true) :
-    (ch.links.map (fun c => c.residuals.length)).sum = 0 := by
-  apply List.sum_eq_zero_iff_forall_eq_zero.mpr
-  intro x hx
-  simp [List.mem_map] at hx
-  obtain ⟨c, hc, rfl⟩ := hx
-  rw [verifyChain_no_residuals ca ch req h c hc]
-  simp
+    (ch.links.map (fun c => c.residuals.length)).sum = 0 :=
+  sum_map_residuals_eq_zero ch.links (fun c hc => verifyChain_no_residuals ca ch req h c hc)
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 10  Certificate Merger (Conservative Strategy)

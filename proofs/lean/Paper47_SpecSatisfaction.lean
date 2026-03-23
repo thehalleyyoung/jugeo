@@ -41,7 +41,7 @@ def satisfies {α β : Type} (f : α → β) (S : Specification α β) : Prop :=
     each representing a fragment of the input domain. -/
 structure CoordinateSystem where
   Coord        : Type
-  fin          : Fintype Coord
+  decidableEq  : DecidableEq Coord
   inhabited    : Inhabited Coord
 
 /-- A proposition family assigns a proposition to each coordinate. -/
@@ -60,12 +60,12 @@ structure LocalSection (cs : CoordinateSystem) (P : PropFamily cs) where
 
 /-- A global section is a family of local sections — one per
     coordinate — covering the entire domain. -/
-def GlobalSection (cs : CoordinateSystem) (P : PropFamily cs) : Type :=
-  ∀ c : cs.Coord, P c
+structure GlobalSection (cs : CoordinateSystem) (P : PropFamily cs) where
+  val : ∀ c : cs.Coord, P c
 
 /-- A family of local sections indexed by coordinates. -/
-def SectionFamily (cs : CoordinateSystem) (P : PropFamily cs) : Type :=
-  ∀ c : cs.Coord, P c
+abbrev SectionFamily (cs : CoordinateSystem) (P : PropFamily cs) :=
+  GlobalSection cs P
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 4  Compatibility and Gluing
@@ -85,7 +85,7 @@ def Compatible
     (P    : PropFamily cs)
     (ov   : OverlapData cs P)
     (fam  : SectionFamily cs P) : Prop :=
-  ∀ c c' : cs.Coord, ov.restrict c c' (fam c) (fam c')
+  ∀ c c' : cs.Coord, ov.restrict c c' (fam.val c) (fam.val c')
 
 /-- A trivial overlap structure where all overlaps are vacuously
     satisfied.  Used as the default when no inter-coordinate
@@ -113,7 +113,6 @@ theorem compatible_trivial
 inductive DescentResult (cs : CoordinateSystem) (P : PropFamily cs) where
   | sat   : GlobalSection cs P → DescentResult cs P
   | unsat : cs.Coord → DescentResult cs P
-  deriving Repr
 
 /-- A descent result is successful iff it is a sat. -/
 def DescentResult.isSat {cs : CoordinateSystem} {P : PropFamily cs}
@@ -166,7 +165,7 @@ theorem soundness
     (specificationChecker cs P ov fam hc).isSat = true →
     ∀ c : cs.Coord, P c := by
   intro _h c
-  exact fam c
+  exact fam.val c
 
 /-- Completeness: if all propositions hold, the checker returns sat. -/
 theorem completeness
@@ -286,33 +285,17 @@ def specProduct {α β : Type}
   pre  := fun x     => S₁.pre x ∧ S₂.pre x
   post := fun x y   => S₁.post x y ∧ S₂.post x y
 
-/-- f satisfies the product iff it satisfies each factor. -/
+/-- If f satisfies each factor, it satisfies the product.
+    (The converse does not hold in general because the product's
+    precondition is the conjunction of the two preconditions.) -/
 theorem satisfies_product_iff
     {α β : Type}
     (f : α → β)
     (S₁ S₂ : Specification α β) :
-    satisfies f (specProduct S₁ S₂) ↔
-    satisfies f S₁ ∧ satisfies f S₂ := by
-  simp only [satisfies, specProduct, and_imp]
-  constructor
-  · intro h
-    constructor
-    · intro x hpre₁
-      -- We need hpre₂ to apply h; use a weakened version
-      -- In this model we cannot derive S₂.pre from S₁.pre alone,
-      -- so we note the one-direction implication holds when
-      -- pre₂ is trivially satisfiable.  We prove the general
-      -- statement via the biconditional structure.
-      have h1 : ∀ x, S₁.pre x ∧ S₂.pre x → S₁.post x (f x) ∧ S₂.post x (f x) :=
-        fun x ⟨hp1, hp2⟩ => h x hp1 hp2
-      -- We have the combined version; to project we need S₂.pre x.
-      -- State the projection as an implication:
-      intro hpre₂
-      exact (h1 x ⟨hpre₁, hpre₂⟩).1
-    · intro x hpre₂ hpre₁
-      exact (h x hpre₁ hpre₂).2
-  · intro ⟨h₁, h₂⟩ x hpre₁ hpre₂
-    exact ⟨h₁ x hpre₁, h₂ x hpre₂⟩
+    satisfies f S₁ ∧ satisfies f S₂ →
+    satisfies f (specProduct S₁ S₂) := by
+  intro ⟨h₁, h₂⟩ x ⟨hpre₁, hpre₂⟩
+  exact ⟨h₁ x hpre₁, h₂ x hpre₂⟩
 
 /-- Refinement is preserved under specification products. -/
 theorem refines_product
@@ -334,10 +317,11 @@ theorem globalSection_unique
     (cs : CoordinateSystem)
     (P  : PropFamily cs)
     (Γ₁ Γ₂ : GlobalSection cs P)
-    (h : ∀ c : cs.Coord, Γ₁ c = Γ₂ c) :
+    (h : ∀ c : cs.Coord, Γ₁.val c = Γ₂.val c) :
     Γ₁ = Γ₂ := by
-  funext c
-  exact h c
+  obtain ⟨v₁⟩ := Γ₁
+  obtain ⟨v₂⟩ := Γ₂
+  congr 1
 
 /-- The descent result of the specification checker carries the
     unique global section built from the compatible family. -/

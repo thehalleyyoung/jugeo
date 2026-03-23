@@ -27,7 +27,7 @@ abbrev Hash := Nat
 structure CacheKey where
   code_hash : Hash
   spec_hash : Hash
-  deriving DecidableEq, Repr, BEq
+  deriving DecidableEq, Repr
 
 /-- Verification result: a judgement is Valid, Invalid, or Unknown. -/
 inductive VerifResult where
@@ -125,9 +125,9 @@ theorem CacheIndex.lookup_fresh
     (idx : CacheIndex) (k : CacheKey) (e : CacheEntry)
     (h : idx.lookup k = some e) :
     idx.isFresh k := by
-  simp [CacheIndex.lookup, CacheIndex.isFresh] at *
-  intro hstale
-  simp [hstale] at h
+  unfold CacheIndex.isFresh
+  unfold CacheIndex.lookup at h
+  split at h <;> simp_all
 
 /-- Store a new entry (clears staleness for that key). -/
 def CacheIndex.store (idx : CacheIndex) (e : CacheEntry) : CacheIndex where
@@ -150,9 +150,9 @@ def CacheIndex.store (idx : CacheIndex) (e : CacheEntry) : CacheIndex where
 theorem CacheIndex.store_lookup_other
     (idx : CacheIndex) (e : CacheEntry) (k : CacheKey) (hne : k ≠ e.key) :
     (idx.store e).lookup k = idx.lookup k := by
-  simp [CacheIndex.lookup, CacheIndex.store]
-  have hne_beq : (k == e.key) = false := by simp [BEq.beq, beq_iff_eq, hne]
-  simp [hne_beq]
+  unfold CacheIndex.lookup CacheIndex.store
+  have h : (k == e.key) = false := beq_eq_false_iff_ne.mpr hne
+  simp [h]
 
 /-- Mark a key as stale. -/
 def CacheIndex.markStale (idx : CacheIndex) (k : CacheKey) : CacheIndex where
@@ -169,22 +169,23 @@ def CacheIndex.markStale (idx : CacheIndex) (k : CacheKey) : CacheIndex where
 theorem CacheIndex.markStale_other
     (idx : CacheIndex) (k k' : CacheKey) (hne : k' ≠ k) :
     (idx.markStale k).stale k' = idx.stale k' := by
-  simp [CacheIndex.markStale]
-  have : (k' == k) = false := by simp [beq_iff_eq, hne]
-  simp [this]
+  unfold CacheIndex.markStale
+  have h : (k' == k) = false := beq_eq_false_iff_ne.mpr hne
+  simp [h]
 
 /-- markStale does not change lookup for other keys. -/
 theorem CacheIndex.markStale_lookup_other
     (idx : CacheIndex) (k k' : CacheKey) (hne : k' ≠ k) :
     (idx.markStale k).lookup k' = idx.lookup k' := by
-  simp [CacheIndex.lookup, CacheIndex.markStale_other idx k k' hne]
+  unfold CacheIndex.lookup
+  rw [CacheIndex.markStale_other idx k k' hne]
+  simp [CacheIndex.markStale]
 
 /-- After markStale, lookup of the marked key returns none. -/
 @[simp] theorem CacheIndex.markStale_lookup_self
     (idx : CacheIndex) (k : CacheKey) :
     (idx.markStale k).lookup k = none := by
-  simp [CacheIndex.lookup, CacheIndex.markStale]
-  simp [beq_iff_eq]
+  simp [CacheIndex.lookup, CacheIndex.markStale, beq_iff_eq]
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 4  Eviction strategy
@@ -346,7 +347,8 @@ theorem markStale_eliminates
 theorem coherent_after_invalidation
     (idx : CacheIndex) (k : CacheKey) (gt : GroundTruth) (τ : Nat)
     (hcoh_prev : idx.coherent gt (τ - 1))
-    (hchange   : resultChanged gt k τ) :
+    (hchange   : resultChanged gt k τ)
+    (hstable   : ∀ k', k' ≠ k → gt k' τ = gt k' (τ - 1)) :
     (idx.markStale k).coherent gt τ := by
   intro k' e' hlookup
   -- k' ≠ k because lookup of k after markStale is always none
@@ -357,10 +359,8 @@ theorem coherent_after_invalidation
     exact absurd hlookup (by simp)
   rw [CacheIndex.markStale_lookup_other idx k k' hne] at hlookup
   -- k' is fresh in the old index with old entry e'
-  -- At time τ, gt k' τ = gt k' (τ-1) since only k changed
-  -- (this relies on the caller having a model where only k's truth changed)
-  -- We use hcoh_prev to get e'.result = gt k' (τ-1)
-  -- and assume single-step changes preserve truth for k' ≠ k
+  -- gt k' τ = gt k' (τ-1) since only k changed (by hstable)
+  rw [hstable k' hne]
   exact hcoh_prev k' e' hlookup
 
 -- ════════════════════════════════════════════════════════════════════
@@ -408,6 +408,7 @@ theorem cache_correctness_contrapos
 theorem empty_index_coherent (gt : GroundTruth) (τ : Nat) :
     let empty : CacheIndex := { data := fun _ => none, stale := fun _ => false }
     empty.coherent gt τ := by
+  show ({ data := fun _ => none, stale := fun _ => false } : CacheIndex).coherent gt τ
   intro k e h
   simp [CacheIndex.lookup] at h
 
@@ -544,15 +545,14 @@ theorem warmset_absent
   | nil => exact absurd hk (List.not_mem_nil _)
   | cons h t ih =>
     simp [warmset] at hk
-    split_ifs at hk with hcond
-    · simp at hk
+    by_cases hcond : pred h = true ∧ idx.lookup h = none
+    · rw [if_pos hcond] at hk
+      simp at hk
       cases hk with
-      | inl heq =>
-        subst heq
-        simp [Bool.and_eq_true] at hcond
-        exact of_decide_eq_true hcond.2
+      | inl heq => subst heq; exact hcond.2
       | inr hmem => exact ih hmem
-    · exact ih hk
+    · rw [if_neg hcond] at hk
+      exact ih hk
 
 /-- After warming (adding a valid entry for each warmset key), the
     index is still coherent. -/

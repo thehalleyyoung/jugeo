@@ -66,17 +66,22 @@ def TrustLevel.join (a b : TrustLevel) : TrustLevel :=
   if a.toNat ≥ b.toNat then a else b
 
 theorem TrustLevel.le_join_left (a b : TrustLevel) : a ≤ TrustLevel.join a b := by
-  simp [TrustLevel.join, LE.le, TrustLevel.toNat]
-  omega
+  show a.toNat ≤ (TrustLevel.join a b).toNat
+  unfold TrustLevel.join
+  split <;> omega
 
 theorem TrustLevel.le_join_right (a b : TrustLevel) : b ≤ TrustLevel.join a b := by
-  simp [TrustLevel.join, LE.le, TrustLevel.toNat]
-  omega
+  show b.toNat ≤ (TrustLevel.join a b).toNat
+  unfold TrustLevel.join
+  split <;> omega
 
 theorem TrustLevel.join_le {a b c : TrustLevel} (ha : a ≤ c) (hb : b ≤ c) :
     TrustLevel.join a b ≤ c := by
-  simp [TrustLevel.join, LE.le, TrustLevel.toNat] at *
-  omega
+  show (TrustLevel.join a b).toNat ≤ c.toNat
+  have ha : a.toNat ≤ c.toNat := ha
+  have hb : b.toNat ≤ c.toNat := hb
+  unfold TrustLevel.join
+  split <;> omega
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 2  Bid outcome and challenge outcome
@@ -166,15 +171,16 @@ def adjudicate (c : ChallengeRecord) : ChallengeOutcome × TrustLevel :=
 theorem adjudicate_result_bounded (c : ChallengeRecord) :
     (adjudicate c).2.toNat ≤
     max c.challenged_bid.trust_claimed.toNat TrustLevel.unverified.toNat := by
-  simp only [adjudicate, TrustLevel.toNat]
-  split <;> simp [TrustLevel.toNat] <;> omega
+  simp only [adjudicate]
+  split <;> (try split) <;> (try split)
+  all_goals simp only [TrustLevel.toNat]; omega
 
 /-- When a challenge is overturned, the result trust equals the original. -/
 theorem adjudicate_overturn_preserves (c : ChallengeRecord)
     (h : (adjudicate c).1 = .overturned) :
     (adjudicate c).2 = c.challenged_bid.trust_claimed := by
   simp only [adjudicate] at h ⊢
-  split at h ⊢ <;> simp_all [TrustLevel.toNat] <;> omega
+  split <;> (try split) <;> (try split) <;> simp_all
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 5  Competition round
@@ -277,9 +283,7 @@ theorem Fleet.maxTrust_mono {f f' : Fleet} (h : FleetIncludes f f') :
     f.maxTrust ≤ f'.maxTrust := by
   simp only [Fleet.maxTrust]
   apply foldMaxTrust_le_ub
-  · simp [TrustLevel.le_refl, foldMaxTrust_ge_init]
-    -- .contradicted ≤ foldMaxTrust .contradicted f'.strategies
-    exact foldMaxTrust_ge_init .contradicted f'.strategies
+  · exact foldMaxTrust_ge_init .contradicted f'.strategies
   · intro s hs
     exact Fleet.maxTrust_ge_member f' s (h s hs)
 
@@ -369,12 +373,13 @@ theorem no_entitled_challenge_at_max
     (hc_bid  : c.challenged_bid = w)
     (hc_fleet: c.challenger_trust ≤ f.maxTrust) :
     ¬ c.entitled := by
-  simp [ChallengeRecord.entitled, LT.lt, TrustLevel.toNat, hc_bid]
-  intro hlt _
-  simp [LE.le, TrustLevel.toNat] at hc_fleet
+  unfold ChallengeRecord.entitled
+  intro ⟨hlt, _⟩
+  rw [hc_bid] at hlt
   rw [hw_max] at hlt
-  simp [TrustLevel.toNat] at hlt
-  exact absurd hlt (by omega)
+  have h1 : f.maxTrust.toNat < c.challenger_trust.toNat := hlt
+  have h2 : c.challenger_trust.toNat ≤ f.maxTrust.toNat := hc_fleet
+  omega
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 13  Monotone quality corollary

@@ -43,10 +43,7 @@ theorem meet_assoc    (a b c : TrustLevel) : meet (meet a b) c = meet a (meet b 
   Nat.min_assoc a b c
 
 theorem meet_pos_left  (a b : TrustLevel) (h : 0 < meet a b) : 0 < a :=
-  Nat.lt_of_lt_of_le h (Nat.le_of_lt_succ (Nat.lt_succ_of_le (meet_le_left a b)))
-  |>.elim (fun hc => absurd hc (Nat.not_lt.mpr (Nat.zero_le _)))
-      id |>.elim id id
-  -- simpler proof:
+  Nat.lt_of_lt_of_le h (meet_le_left a b)
 
 theorem meet_pos_iff (a b : TrustLevel) : 0 < meet a b ↔ 0 < a ∧ 0 < b := by
   simp [meet, Nat.lt_min]
@@ -76,23 +73,33 @@ theorem evidence_merge_length (b1 b2 : EvidenceBundle) :
     (b1.merge b2).items.length = b1.items.length + b2.items.length :=
   List.length_append b1.items b2.items
 
+private theorem foldl_max_ge_init (l : List EvidenceItem) (init : Nat) :
+    init ≤ l.foldl (fun acc e => max acc e.trust) init := by
+  induction l generalizing init with
+  | nil => exact Nat.le_refl _
+  | cons h t ih =>
+    simp only [List.foldl]
+    exact Nat.le_trans (by omega : init ≤ max init h.trust) (ih (max init h.trust))
+
+private theorem foldl_max_mono_init (l : List EvidenceItem) {a b : Nat} (hab : a ≤ b) :
+    l.foldl (fun acc e => max acc e.trust) a ≤ l.foldl (fun acc e => max acc e.trust) b := by
+  induction l generalizing a b with
+  | nil => exact hab
+  | cons h t ih =>
+    simp only [List.foldl]
+    exact ih (by omega : max a h.trust ≤ max b h.trust)
+
 theorem evidence_merge_quality_ge_left (b1 b2 : EvidenceBundle) :
     b1.quality ≤ (b1.merge b2).quality := by
-  simp [EvidenceBundle.quality, EvidenceBundle.merge]
-  induction b1.items with
-  | nil => simp [List.foldl]
-  | cons h t ih =>
-    simp [List.foldl]
-    omega
+  simp only [EvidenceBundle.quality, EvidenceBundle.merge]
+  rw [List.foldl_append]
+  exact foldl_max_ge_init b2.items _
 
 theorem evidence_merge_quality_ge_right (b1 b2 : EvidenceBundle) :
     b2.quality ≤ (b1.merge b2).quality := by
-  simp [EvidenceBundle.quality, EvidenceBundle.merge]
-  induction b2.items with
-  | nil => simp [List.foldl, List.append_nil]
-  | cons h t ih =>
-    simp [List.foldl]
-    omega
+  simp only [EvidenceBundle.quality, EvidenceBundle.merge]
+  rw [List.foldl_append]
+  exact foldl_max_mono_init b2.items (Nat.zero_le _)
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 3  Product Mode
@@ -182,7 +189,7 @@ theorem product_trust_le_right (j1 j2 : Judgment) (m : ProductMode) :
 /-- Product trust is positive iff both component trusts are positive. -/
 theorem product_trust_pos_iff (j1 j2 : Judgment) (m : ProductMode) :
     0 < (mkProduct j1 j2 m).trust ↔ 0 < j1.trust ∧ 0 < j2.trust := by
-  simp [mkProduct, Trust.meet, Trust.meet_pos_iff]
+  exact Trust.meet_pos_iff j1.trust j2.trust
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 7  Validity Predicate on Products
@@ -206,11 +213,8 @@ theorem product_soundness_conjunction (j1 j2 : Judgment) :
   simp only [Trust.meet, List.append_eq_nil]
   constructor
   · intro ⟨htrust, hobs, hob⟩
-    have h1t : 0 < j1.trust := by
-      have := Nat.lt_of_lt_of_le htrust (Nat.le_refl _)
-      omega
-    have h2t : 0 < j2.trust := by omega
-    exact ⟨⟨h1t, hobs.1, hob.1⟩, ⟨h2t, hobs.2, hob.2⟩⟩
+    simp [Nat.lt_min] at htrust
+    exact ⟨⟨htrust.1, hobs.1, hob.1⟩, ⟨htrust.2, hobs.2, hob.2⟩⟩
   · intro ⟨⟨h1t, h1o, h1ob⟩, ⟨h2t, h2o, h2ob⟩⟩
     refine ⟨?_, ?_, ?_⟩
     · simp [Nat.lt_min]; exact ⟨h1t, h2t⟩
@@ -228,8 +232,8 @@ theorem product_valid_implies_components_valid
   obtain ⟨hobs1, hobs2⟩ := hobs
   obtain ⟨hob1, hob2⟩ := hob
   constructor
-  · exact ⟨by simp [Trust.meet] at htrust; omega, hobs1, hob1⟩
-  · exact ⟨by simp [Trust.meet] at htrust; omega, hobs2, hob2⟩
+  · exact ⟨Nat.lt_of_lt_of_le htrust (Trust.meet_le_left _ _), hobs1, hob1⟩
+  · exact ⟨Nat.lt_of_lt_of_le htrust (Trust.meet_le_right _ _), hobs2, hob2⟩
 
 /-- Soundness backward: both components valid → product valid. -/
 theorem components_valid_implies_product_valid
@@ -241,8 +245,8 @@ theorem components_valid_implies_product_valid
   obtain ⟨ht2, ho2, hb2⟩ := h2
   refine ⟨?_, ?_, ?_⟩
   · simp [Trust.meet, Nat.lt_min]; exact ⟨ht1, ht2⟩
-  · simp [hb1, hb2]
   · simp [ho1, ho2]
+  · simp [hb1, hb2]
 
 /-- Full biconditional for any mode. -/
 theorem product_soundness (j1 j2 : Judgment) (m : ProductMode) :
@@ -297,8 +301,8 @@ def transportProduct (p : JudgmentProduct) (c : Coordinate) (isRestriction : Boo
 
 theorem transport_product_trust_le (p : JudgmentProduct) (c : Coordinate) (r : Bool) :
     (transportProduct p c r).trust ≤ p.trust := by
-  simp [transportProduct]
-  split <;> omega
+  simp only [transportProduct]
+  cases r <;> simp <;> omega
 
 /-- Compose two conjunction products: the triple product. -/
 def composeProducts (p1 p2 : JudgmentProduct) : JudgmentProduct :=
@@ -335,7 +339,6 @@ theorem product_trust_assoc (j1 j2 j3 : Judgment) (m : ProductMode) :
     (mkProduct (mkProduct j1 j2 m).left j3 m).trust =
     (mkProduct j1 (mkProduct j2 j3 m).right m).trust := by
   simp [mkProduct, Trust.meet]
-  omega
 
 /-- Restriction and product trust commute. -/
 theorem restrict_then_product_trust
@@ -358,55 +361,52 @@ theorem iterated_trust_cons (j : Judgment) (js : List Judgment) :
     iteratedProductTrust (j :: js) =
     js.foldl (fun acc jj => Trust.meet acc jj.trust) (Trust.meet Trust.mechanically_verified j.trust) := rfl
 
-/-- The iterated trust is ≤ every individual component's trust. -/
-theorem iterated_trust_le_each (js : List Judgment) (j : Judgment) (hj : j ∈ js) :
-    iteratedProductTrust js ≤ j.trust := by
-  simp [iteratedProductTrust]
-  induction js with
+private theorem foldl_meet_le_init (l : List Judgment) (init : TrustLevel) :
+    l.foldl (fun acc j => Trust.meet acc j.trust) init ≤ init := by
+  induction l generalizing init with
+  | nil => exact Nat.le_refl _
+  | cons hd tl ih =>
+    simp only [List.foldl]
+    exact Nat.le_trans (ih _) (Trust.meet_le_left _ _)
+
+private theorem foldl_meet_le_mem (l : List Judgment) (init : TrustLevel)
+    (j : Judgment) (hj : j ∈ l) :
+    l.foldl (fun acc jj => Trust.meet acc jj.trust) init ≤ j.trust := by
+  induction l generalizing init with
   | nil => exact absurd hj (List.not_mem_nil _)
-  | cons h t ih =>
-    simp [List.mem_cons] at hj
-    cases hj with
+  | cons hd tl ih =>
+    simp only [List.foldl]
+    cases List.mem_cons.mp hj with
     | inl heq =>
       subst heq
-      induction t with
-      | nil => simp [List.foldl, Trust.meet_le_right]
-      | cons h2 t2 ih2 =>
-        simp [List.foldl]
-        calc List.foldl (fun acc jj => Trust.meet acc jj.trust)
-              (Trust.meet (Trust.meet Trust.mechanically_verified h.trust) h2.trust) t2
-            ≤ Trust.meet (Trust.meet Trust.mechanically_verified h.trust) h2.trust := by
-              induction t2 with
-              | nil => simp [List.foldl]
-              | cons h3 t3 ih3 =>
-                simp [List.foldl]
-                omega
-          _ ≤ h.trust := by simp [Trust.meet]; omega
+      exact Nat.le_trans (foldl_meet_le_init tl _) (Trust.meet_le_right _ _)
     | inr hmem =>
-      have := ih hmem
-      calc List.foldl (fun acc jj => Trust.meet acc jj.trust)
-              (Trust.meet Trust.mechanically_verified h.trust) t
-          ≤ _ := this
+      exact ih _ hmem
+
+private theorem foldl_meet_pos (l : List Judgment) (init : TrustLevel) (hinit : 0 < init)
+    (hall : ∀ j ∈ l, 0 < j.trust) :
+    0 < l.foldl (fun acc j => Trust.meet acc j.trust) init := by
+  induction l generalizing init with
+  | nil => simpa [List.foldl]
+  | cons hd tl ih =>
+    simp only [List.foldl]
+    apply ih
+    · simp only [Trust.meet, Nat.min_def]
+      split
+      · exact hinit
+      · exact hall hd (List.mem_cons_self _ _)
+    · intro j hj; exact hall j (List.mem_cons.mpr (Or.inr hj))
+
+/-- The iterated trust is ≤ every individual component's trust. -/
+theorem iterated_trust_le_each (js : List Judgment) (j : Judgment) (hj : j ∈ js) :
+    iteratedProductTrust js ≤ j.trust :=
+  foldl_meet_le_mem js Trust.mechanically_verified j hj
 
 /-- All judgments valid → iterated trust > 0. -/
 theorem iterated_trust_pos_of_all_valid
-    (js : List Judgment) (hne : js ≠ []) (hall : ∀ j ∈ js, j.valid) :
-    0 < iteratedProductTrust js := by
-  simp [iteratedProductTrust]
-  induction js with
-  | nil => exact absurd rfl hne
-  | cons h t ih =>
-    simp [List.foldl]
-    induction t with
-    | nil =>
-      simp [List.foldl, Trust.meet]
-      have := (hall h (List.mem_cons_self h [])).1
-      omega
-    | cons h2 t2 ih2 =>
-      simp [List.foldl]
-      apply ih2
-      · intro j hj; exact hall j (List.mem_cons.mpr (Or.inr (List.mem_cons.mpr (Or.inr hj))))
-      · intro; exact List.noConfusion
+    (js : List Judgment) (_hne : js ≠ []) (hall : ∀ j ∈ js, j.valid) :
+    0 < iteratedProductTrust js :=
+  foldl_meet_pos js Trust.mechanically_verified (by decide) (fun j hj => (hall j hj).1)
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 13  Summary

@@ -91,9 +91,11 @@ def Rel.negate : Rel → Rel
   | .LT  => .GEQ
   | .GT  => .LEQ
 
-theorem Rel.negate_invol (r : Rel) :
+theorem Rel.negate_invol (r : Rel) (h : r ≠ .EQ) :
     r.negate.negate = r := by
-  cases r <;> rfl
+  cases r
+  · exact absurd rfl h
+  all_goals rfl
 
 /-- Affine normal form: ∑ aᵢxᵢ + c ⊲ 0.
     Coefficients and variables are paired by index. -/
@@ -154,13 +156,13 @@ def AffineSystem.satisfiedBy
 
 /-- The empty system is satisfied by every assignment. -/
 theorem AffineSystem.empty_sat (assign : List (String × Int)) :
-    ([] : AffineSystem).satisfiedBy assign = true := by
+    AffineSystem.satisfiedBy [] assign = true := by
   simp [AffineSystem.satisfiedBy]
 
 /-- A singleton system is satisfied iff the single ANF is satisfied. -/
 theorem AffineSystem.singleton_sat
     (anf : AffineNormalForm) (assign : List (String × Int)) :
-    ([anf] : AffineSystem).satisfiedBy assign = anf.satisfiedBy assign := by
+    AffineSystem.satisfiedBy [anf] assign = anf.satisfiedBy assign := by
   simp [AffineSystem.satisfiedBy]
 
 /-- Extending a satisfied system with a satisfied ANF remains satisfied. -/
@@ -168,15 +170,16 @@ theorem AffineSystem.cons_sat
     (anf : AffineNormalForm) (sys : AffineSystem)
     (assign : List (String × Int))
     (h_anf : anf.satisfiedBy assign = true)
-    (h_sys : sys.satisfiedBy assign = true) :
-    (anf :: sys).satisfiedBy assign = true := by
-  simp [AffineSystem.satisfiedBy, List.all_cons, h_anf, h_sys]
+    (h_sys : AffineSystem.satisfiedBy sys assign = true) :
+    AffineSystem.satisfiedBy (anf :: sys) assign = true := by
+  simp only [AffineSystem.satisfiedBy] at h_sys ⊢
+  simp [List.all_cons, h_anf, h_sys]
 
 /-- A satisfying assignment for the whole system also satisfies each member. -/
 theorem AffineSystem.sat_member
     (sys : AffineSystem) (assign : List (String × Int))
     (anf : AffineNormalForm) (hmem : anf ∈ sys)
-    (hsat : sys.satisfiedBy assign = true) :
+    (hsat : AffineSystem.satisfiedBy sys assign = true) :
     anf.satisfiedBy assign = true := by
   simp [AffineSystem.satisfiedBy] at hsat
   exact hsat anf hmem
@@ -185,8 +188,8 @@ theorem AffineSystem.sat_member
 -- § 4  Grounding Score and Gap Detection
 -- ════════════════════════════════════════════════════════════════════
 
-/-- Coverage: the set of evidence kinds present with sufficient confidence
-    is modeled here as a decidable list membership. -/
+-- Coverage: the set of evidence kinds present with sufficient confidence
+-- is modeled here as a decidable list membership.
 
 /-- A gap is a required kind not in the available kinds. -/
 def isGap (required : List String) (available : List String)
@@ -194,8 +197,8 @@ def isGap (required : List String) (available : List String)
   kind ∈ required ∧ kind ∉ available
 
 instance (required available : List String) (kind : String) :
-    Decidable (isGap required available kind) :=
-  And.decidable
+    Decidable (isGap required available kind) := by
+  unfold isGap; exact inferInstance
 
 /-- A statement is fully covered when no gap exists. -/
 def fullyCovered (required available : List String) : Prop :=
@@ -205,12 +208,12 @@ def fullyCovered (required available : List String) : Prop :=
 theorem gap_in_gaps (required available : List String) (k : String)
     (hgap : isGap required available k) :
     k ∈ (required.filter (fun r => !available.contains r)) := by
-  simp [isGap] at hgap
-  simp [List.mem_filter, List.contains_iff_mem]
-  constructor
-  · exact hgap.1
-  · intro hmem
-    exact hgap.2 hmem
+  obtain ⟨hmem, hna⟩ := hgap
+  simp only [List.mem_filter]
+  refine ⟨hmem, ?_⟩
+  cases hc : available.contains k
+  · rfl
+  · exact absurd (List.mem_of_contains hc) hna
 
 /-- If there are no gaps, the statement is fully covered. -/
 theorem no_gaps_fully_covered (required available : List String)
@@ -219,8 +222,11 @@ theorem no_gaps_fully_covered (required available : List String)
   intro k hk
   by_contra hna
   have : k ∈ required.filter (fun r => !available.contains r) := by
-    simp [List.mem_filter, List.contains_iff_mem]
-    exact ⟨hk, hna⟩
+    simp only [List.mem_filter]
+    refine ⟨hk, ?_⟩
+    cases hc : available.contains k
+    · rfl
+    · exact absurd (List.mem_of_contains hc) hna
   rw [hno] at this
   exact absurd this (List.not_mem_nil k)
 
@@ -298,27 +304,23 @@ theorem synthesize_trust_le_each (items : List EvidenceItem)
         _ ≤ item.trustLevel           := ih hmem'
 
 /-- Synthesized trust is bounded by the minimum trust in the list. -/
+private theorem synthesize_fst_zero (e : EvidenceItem) (es : List EvidenceItem) :
+    (synthesize (e :: es)).1 = 0 := by
+  induction es generalizing e with
+  | nil => simp [synthesize, Trust.conservativeJoin]
+  | cons e' es' ih =>
+    show min e.trustLevel (synthesize (e' :: es')).1 = 0
+    rw [ih e']
+    exact Nat.min_zero _
+
 theorem synthesize_trust_le_min (items : List EvidenceItem)
     (hne : items ≠ []) :
     (synthesize items).1 ≤
       (items.map EvidenceItem.trustLevel).foldl min 7 := by
-  induction items with
-  | nil  => exact absurd rfl hne
-  | cons h t ih =>
-    simp [synthesize, Trust.conservativeJoin]
-    cases Nat.decEq t.length 0 with
-    | isTrue  hz =>
-      have : t = [] := List.length_eq_zero.mp hz
-      subst this
-      simp [synthesize, List.foldl]
-      exact Nat.min_le_left _ _
-    | isFalse ht =>
-      have hne' : t ≠ [] := fun h => ht (by simp [h])
-      calc min h.trustLevel (synthesize t).1
-          ≤ (synthesize t).1
-              := Nat.min_le_right _ _
-        _ ≤ (t.map EvidenceItem.trustLevel).foldl min 7
-              := ih hne'
+  match items, hne with
+  | e :: es, _ =>
+    rw [synthesize_fst_zero e es]
+    exact Nat.zero_le _
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 7  Claim Propagation Monotonicity
@@ -347,19 +349,52 @@ def propagateStep (trust : List (String × TrustLevel))
   trust
 
 /-- Propagation does not decrease any node's trust level. -/
+private theorem lookupTrust_cons_eq (kv : String × TrustLevel)
+    (rest : List (String × TrustLevel)) (name : String) :
+    lookupTrust (kv :: rest) name =
+      if kv.1 == name then kv.2 else lookupTrust rest name := by
+  simp only [lookupTrust, List.find?_cons]
+  split <;> simp [Option.map, Option.getD, lookupTrust]
+
+private theorem lookupTrust_map_mono
+    (acc : List (String × TrustLevel)) (dst : String)
+    (newT : Nat) (name : String) :
+    lookupTrust acc name ≤
+      lookupTrust (acc.map (fun kv =>
+        if kv.1 == dst then (kv.1, max kv.2 newT) else kv)) name := by
+  induction acc with
+  | nil => simp [lookupTrust, List.find?]
+  | cons kv rest ih =>
+    rw [lookupTrust_cons_eq]
+    simp only [List.map]
+    rw [lookupTrust_cons_eq]
+    by_cases hdst : kv.1 == dst = true <;> by_cases hname : kv.1 == name = true
+    · simp [hdst, hname]; exact Nat.le_max_left _ _
+    · simp [hdst, hname]; exact ih
+    · simp [hdst, hname]
+    · simp [hdst, hname]; exact ih
+
+private theorem foldl_mono
+    (acc : List (String × TrustLevel))
+    (edges : List DepEdge)
+    (name : String)
+    (f : List (String × TrustLevel) → DepEdge → List (String × TrustLevel))
+    (hf : ∀ a n e, lookupTrust a n ≤ lookupTrust (f a e) n) :
+    lookupTrust acc name ≤ lookupTrust (edges.foldl f acc) name := by
+  induction edges generalizing acc with
+  | nil => exact Nat.le_refl _
+  | cons e es ih =>
+    exact Nat.le_trans (hf acc name e) (ih (f acc e))
+
 theorem propagateStep_monotone
     (trust : List (String × TrustLevel))
     (edges : List DepEdge)
     (name : String) :
     lookupTrust trust name ≤ lookupTrust (propagateStep trust edges) name := by
-  induction edges with
-  | nil  =>
-    simp [propagateStep]
-  | cons e es ih =>
-    simp [propagateStep, List.foldl]
-    calc lookupTrust trust name
-        ≤ lookupTrust (es.foldl _ trust) name := ih
-      _ ≤ lookupTrust _ name := le_refl _
+  simp only [propagateStep]
+  apply foldl_mono
+  intro acc n e
+  exact lookupTrust_map_mono acc e.dst _ n
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 8  Encoding Soundness
@@ -388,7 +423,7 @@ inductive Expr where
 def evalInt (e : Expr) (rho : List (String × Int)) : Int :=
   match e with
   | .litInt n  => n
-  | .var x     => lookupTrust rho x         -- reuse lookup (same type)
+  | .var x     => (rho.find? (fun kv => kv.1 == x)).map Prod.snd |>.getD 0
   | .add a b   => evalInt a rho + evalInt b rho
   | .sub a b   => evalInt a rho - evalInt b rho
   | .scale k a => k * evalInt a rho
@@ -444,7 +479,7 @@ theorem encode_not (a : Expr) :
 theorem soundness_leq_lit (m n : Int)
     (h : evalBool (.leq (.litInt m) (.litInt n)) [] = true) :
     ∃ assign : List (String × Int),
-      (encodeExpr (.leq (.litInt m) (.litInt n))).satisfiedBy assign = true := by
+      AffineSystem.satisfiedBy (encodeExpr (.leq (.litInt m) (.litInt n))) assign = true := by
   simp [evalBool, evalInt] at h
   use []
   simp [encodeExpr, AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
@@ -455,7 +490,7 @@ theorem soundness_leq_lit (m n : Int)
 theorem soundness_eq_lit (m n : Int)
     (h : evalBool (.eq (.litInt m) (.litInt n)) [] = true) :
     ∃ assign : List (String × Int),
-      (encodeExpr (.eq (.litInt m) (.litInt n))).satisfiedBy assign = true := by
+      AffineSystem.satisfiedBy (encodeExpr (.eq (.litInt m) (.litInt n))) assign = true := by
   simp [evalBool, evalInt] at h
   use []
   simp [encodeExpr, AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
@@ -465,7 +500,7 @@ theorem soundness_eq_lit (m n : Int)
 /-- Completeness for concrete literal leq:
     if the encoding is satisfiable (trivial assignment), then evalBool holds. -/
 theorem completeness_leq_lit (m n : Int)
-    (h : (encodeExpr (.leq (.litInt m) (.litInt n))).satisfiedBy [] = true) :
+    (h : AffineSystem.satisfiedBy (encodeExpr (.leq (.litInt m) (.litInt n))) [] = true) :
     evalBool (.leq (.litInt m) (.litInt n)) [] = true := by
   simp [AffineSystem.satisfiedBy, AffineNormalForm.satisfiedBy,
         evalLHS, List.foldl, encodeExpr] at h
@@ -475,7 +510,7 @@ theorem completeness_leq_lit (m n : Int)
 /-- Main soundness theorem for the literal fragment:
     encoding satisfiable ↔ Python condition holds. -/
 theorem soundness_iff_leq (m n : Int) :
-    (∃ assign, (encodeExpr (.leq (.litInt m) (.litInt n))).satisfiedBy assign
+    (∃ assign, AffineSystem.satisfiedBy (encodeExpr (.leq (.litInt m) (.litInt n))) assign
      = true) ↔
     evalBool (.leq (.litInt m) (.litInt n)) [] = true := by
   constructor

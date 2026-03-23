@@ -25,7 +25,6 @@ namespace JudgmentGeometry.SequenceEncodings
 structure SeqEnc : Type where
   arr    : Nat → Nat   -- arr i = element at index i (0 for out-of-bounds)
   len    : Nat          -- number of elements
-  deriving Repr
 
 /-- Well-formedness: out-of-bounds access returns 0. -/
 def SeqEnc.WF (s : SeqEnc) : Prop :=
@@ -102,41 +101,35 @@ def applyMut (s : SeqEnc) : MutOp → SeqEnc
 -- § 3  Frame Conditions
 -- ════════════════════════════════════════════════════════════════════
 
-/-- Support of a mutation: the set of indices it may modify. -/
-def MutOp.support (s : SeqEnc) : MutOp → Finset Nat
-  | MutOp.Append _ =>
-      {s.len}
-  | MutOp.Insert k _ =>
-      (Finset.range (s.len + 1)).filter (fun i => i ≥ k)
-  | MutOp.Pop k =>
-      (Finset.range s.len).filter (fun i => i ≥ k)
-  | MutOp.Assign k _ =>
-      {k}
-  | MutOp.SliceCopy _ _ =>
-      ∅
+/-- Support of a mutation: a predicate on indices that may be modified.
+    SliceCopy has full support (True) because it creates a fresh encoding. -/
+def MutOp.support (s : SeqEnc) : MutOp → Nat → Prop
+  | MutOp.Append _       => fun i => i = s.len
+  | MutOp.Insert k _     => fun i => i ≥ k
+  | MutOp.Pop k          => fun i => i ≥ k
+  | MutOp.Assign k _     => fun i => i = k
+  | MutOp.SliceCopy _ _  => fun _ => True
 
 /-- Frame condition: indices outside the support are unchanged. -/
 def FrameHolds (s : SeqEnc) (op : MutOp) : Prop :=
   let s' := applyMut s op
-  ∀ i : Nat, i ∉ op.support s → s'.arr i = s.arr i
+  ∀ i : Nat, ¬ op.support s i → s'.arr i = s.arr i
 
 -- ── Append frame ───────────────────────────────────────────────────
 
 theorem append_frame (s : SeqEnc) (v : Nat) :
     FrameHolds s (MutOp.Append v) := by
   intro i hi
-  simp [FrameHolds, applyMut, MutOp.support] at *
-  simp [Finset.mem_singleton] at hi
-  simp [hi]
+  simp only [MutOp.support] at hi
+  simp only [applyMut, if_neg hi]
 
 -- ── Assign frame ───────────────────────────────────────────────────
 
 theorem assign_frame (s : SeqEnc) (k v : Nat) :
     FrameHolds s (MutOp.Assign k v) := by
   intro i hi
-  simp [FrameHolds, applyMut, MutOp.support, SeqEnc.store] at *
-  simp [Finset.mem_singleton] at hi
-  simp [hi]
+  simp only [MutOp.support] at hi
+  simp only [applyMut, SeqEnc.store, if_neg hi]
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 4  Key Lemmas for Append and Pop
@@ -186,7 +179,6 @@ structure FinMap : Type where
   lookup  : Nat → Nat    -- key → value (0 = undefined)
   inDom   : Nat → Bool   -- domain membership predicate
   card    : Nat           -- number of keys in domain
-  deriving Repr
 
 /-- The empty dict encoding. -/
 def FinMap.empty : FinMap where
@@ -217,19 +209,21 @@ def FinMap.del (d : FinMap) (k : Nat) : FinMap where
 theorem FinMap.set_wf (d : FinMap) (k v : Nat) (hd : d.WF) :
     (d.set k v).WF := by
   intro k' hdom
-  simp [FinMap.set] at hdom ⊢
-  split_ifs with h
-  · simp [h] at hdom
-  · exact hd k' hdom
+  simp only [FinMap.set] at hdom ⊢
+  by_cases h : k' = k
+  · subst h; simp at hdom
+  · simp [h] at hdom ⊢
+    exact hd k' hdom
 
 -- WF is preserved by del.
 theorem FinMap.del_wf (d : FinMap) (k : Nat) (hd : d.WF) :
     (d.del k).WF := by
   intro k' hdom
-  simp [FinMap.del] at hdom ⊢
-  split_ifs with h
-  · rfl
-  · exact hd k' hdom
+  simp only [FinMap.del] at hdom ⊢
+  by_cases h : k' = k
+  · subst h; simp
+  · simp [h] at hdom ⊢
+    exact hd k' hdom
 
 /-- Lookup after set: the stored value is retrievable. -/
 theorem FinMap.set_lookup_self (d : FinMap) (k v : Nat) :
@@ -261,7 +255,6 @@ theorem FinMap.del_notInDom (d : FinMap) (k : Nat) :
 structure HeapModel (n : Nat) : Type where
   identity : Fin n → Nat
   enc      : Nat → SeqEnc
-  deriving Repr
 
 /-- Two references are aliased iff they share an identity. -/
 def HeapModel.aliased {n : Nat} (h : HeapModel n) (r1 r2 : Fin n) : Prop :=
@@ -286,8 +279,8 @@ theorem HeapModel.aliased_mutation_consistent
     (hA : hm.aliased r1 r2) :
     (hm.mutate r1 op).enc (hm.identity r2) =
     applyMut (hm.enc (hm.identity r1)) op := by
-  simp [HeapModel.mutate, HeapModel.aliased] at *
-  rw [hA]
+  simp only [HeapModel.mutate, HeapModel.aliased] at *
+  rw [if_pos hA.symm, ← hA]
 
 /-- Non-aliased references are unaffected by mutations to r. -/
 theorem HeapModel.non_aliased_unaffected
@@ -296,9 +289,8 @@ theorem HeapModel.non_aliased_unaffected
     (hNA : ¬ hm.aliased r r') :
     (hm.mutate r op).enc (hm.identity r') =
     hm.enc (hm.identity r') := by
-  simp [HeapModel.mutate, HeapModel.aliased] at *
-  intro h
-  exact hNA h
+  simp only [HeapModel.mutate, HeapModel.aliased] at *
+  exact if_neg (fun h => hNA h.symm)
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 7  Mutation Soundness (Paper 32, Theorem 7.1)
@@ -328,11 +320,14 @@ theorem insert_sound (s : SeqEnc) (k v : Nat) (hk : k ≤ s.len) :
     (∀ i, k ≤ i → i < s.len → s'.arr (i + 1) = s.arr i) := by
   refine ⟨by simp [applyMut], by simp [applyMut], ?_, ?_⟩
   · intro i hi
-    simp [applyMut]
-    omega
+    simp only [applyMut]
+    exact if_pos hi
   · intro i hik hil
-    simp [applyMut]
-    omega
+    simp only [applyMut]
+    have h1 : ¬ (i + 1 < k) := by omega
+    have h2 : ¬ (i + 1 = k) := by omega
+    simp only [if_neg h1, if_neg h2]
+    simp [Nat.add_sub_cancel]
 
 /-- Pop soundness: length decreases, elements before k unchanged,
     elements from k shifted left. -/
@@ -385,35 +380,31 @@ theorem mut_satisfiable (s : SeqEnc) (op : MutOp) (hg : op.Guard s) :
 /-- If a property φ depends only on element i ∉ support(op),
     and φ holds in the pre-state, it holds in the post-state. -/
 theorem frame_completeness (s : SeqEnc) (op : MutOp)
-    (i : Nat) (hi : i ∉ op.support s)
+    (i : Nat) (hi : ¬ op.support s i)
     (φ : Nat → Prop) (hpre : φ (s.arr i)) :
     φ ((applyMut s op).arr i) := by
   cases op with
   | Append v =>
-    simp [MutOp.support, Finset.mem_singleton] at hi
-    simp [applyMut, hi]
+    simp only [MutOp.support] at hi
+    simp only [applyMut, if_neg hi]
     exact hpre
   | Assign k v =>
-    simp [MutOp.support, Finset.mem_singleton] at hi
-    simp [applyMut, SeqEnc.store, hi]
+    simp only [MutOp.support] at hi
+    simp only [applyMut, SeqEnc.store, if_neg hi]
     exact hpre
   | Insert k v =>
-    simp [MutOp.support, Finset.mem_filter, Finset.mem_range] at hi
-    push_neg at hi
-    simp [applyMut]
-    have hlt : i < k := by omega
-    simp [Nat.lt_iff_lt_of_le_iff_le.mpr (Iff.intro id id), hlt]
+    simp only [MutOp.support] at hi
+    have hlt : i < k := Nat.lt_of_not_le hi
+    simp only [applyMut, if_pos hlt]
     exact hpre
   | Pop k =>
-    simp [MutOp.support, Finset.mem_filter, Finset.mem_range] at hi
-    push_neg at hi
-    simp [applyMut]
-    have hlt : i < k := by omega
-    simp [hlt]; exact hpre
-  | SliceCopy lo hi' =>
-    simp [MutOp.support] at hi
-    simp [applyMut]
+    simp only [MutOp.support] at hi
+    have hlt : i < k := Nat.lt_of_not_le hi
+    simp only [applyMut, if_pos hlt]
     exact hpre
+  | SliceCopy lo hi' =>
+    simp only [MutOp.support] at hi
+    exact absurd trivial hi
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 9  Alias Soundness (Paper 32, Theorem 7.4)
@@ -428,7 +419,9 @@ theorem alias_soundness
     (hA : hm.aliased r1 r2) :
     (hm.mutate r1 op).enc (hm.identity r1) =
     (hm.mutate r1 op).enc (hm.identity r2) := by
-  simp [HeapModel.mutate, hA]
+  simp only [HeapModel.mutate, HeapModel.aliased] at *
+  simp only [if_true, if_pos hA.symm]
+  exact congrArg (fun id => applyMut (hm.enc id) op) hA
 
 /-- Non-aliased references in the heap are unaffected: the encoding
     of r' does not change when we mutate a different object. -/

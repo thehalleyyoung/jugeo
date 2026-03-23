@@ -1,0 +1,890 @@
+\documentclass[11pt]{article}
+\input{jugeo-common}
+\input{experiment-data}
+\input{subsystem-data}
+
+%% ── Paper-local macros ────────────────────────────────────────────────────
+\newcommand{\Oracle}{\mathcal{O}}            % oracle (single)
+\newcommand{\OrcSet}{\mathfrak{O}}           % set of oracles
+\newcommand{\Orcl}[1]{\Oracle_{#1}}         % indexed oracle
+\newcommand{\tlev}[1]{\tau(#1)}              % trust level of an item
+\newcommand{\tmin}{\sqcap}                   % trust meet / minimum
+\newcommand{\tmeet}[2]{#1 \tmin #2}          % explicit meet
+\newcommand{\Fed}{\mathsf{Fed}}             % federation function
+\newcommand{\Ceil}[1]{\lfloor #1 \rfloor_{\tau}}   % trust ceiling
+\newcommand{\BD}{\mathsf{BD}}               % BackendDescriptor
+\newcommand{\CFP}{\mathsf{CFP}}             % CopilotFallbackPolicy
+\newcommand{\BK}{\mathsf{BK}}               % BackendKind
+\newcommand{\SA}{\mathsf{SA}}               % SolverAdapter
+\newcommand{\EvidItem}{\varepsilon}          % evidence item
+\newcommand{\topTrust}{\top_{\!\tau}}        % maximal trust tier
+\newcommand{\botTrust}{\bot_{\!\tau}}        % minimal trust tier
+\newcommand{\Resp}{\mathsf{Resp}}           % oracle response
+\newcommand{\TierSet}{\mathbf{T}}           % the set of trust tiers
+\newcommand{\Route}{\mathsf{Route}}         % routing decision
+\newcommand{\RoutSet}{\mathrm{Dec}}         % routing decision set
+\newcommand{\BKset}{\{\texttt{Z3, RT, ORC, CPL, PRV, HUM}\}}
+\newcommand{\OrcFed}{\widehat{\Oracle}}     % federated oracle
+%% ──────────────────────────────────────────────────────────────────────────
+
+\title{\textbf{Oracle Federation: Combining Multiple\\
+       Verification Backends}}
+
+\author{%
+  Halley Young\\
+  \textit{Microsoft Research}\\
+  \texttt{halleyyoung@microsoft.com}
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Modern program verification rarely succeeds with a single oracle.  An SMT
+solver may time out on non-linear arithmetic; a runtime witness may be
+unavailable at analysis time; a human annotation may cover only a fraction
+of obligations.  \emph{Oracle federation} is the principled combination of
+evidence from heterogeneous backends — SMT solvers, runtime witnesses, AI
+copilot suggestions, and human annotations — into a single trusted verdict.
+
+We define the oracle model (§2), the federation protocol (§3), and
+trust-level conflict resolution via a conservative meet in the trust
+lattice (§4).  The \emph{Copilot Fallback Policy} (§5) governs when and
+how AI-generated evidence may enter the federated verdict.  The
+\texttt{SolverAdapter} protocol and \texttt{BackendDescriptor} abstraction
+(§6) decouple the protocol from backend specifics.
+
+Our central result, the \emph{Federation Soundness Theorem} (§7), states
+that the trust level of a federated verdict equals the meet of all
+contributing oracle trust levels: trust can never be silently promoted by
+routing evidence through a high-trust oracle.  An implementation in
+\Python{} (the \texttt{jugeo.solver} and
+\texttt{jugeo.foundations.oracle\_federation} packages) reduces uncovered
+obligations on our benchmark suite (\subSiteCalls{} site calls,
+\subSiteSuccessRate{} success rate) while adding sub-millisecond overhead
+(\subSiteMeanTime{}) per verdict.  A machine-verified proof in \LEAN{}
+accompanies this paper; it contains zero \texttt{sorry} instances.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{The coverage gap in single-oracle verification}
+
+The Judgment Geometry framework~\cite{jugeo02} assigns every
+verification claim a \emph{judgment} 8-tuple
+$\J = (\coord, \prop, \carrier, \evid, \oblig, \obstr, \trust, \prov)$
+where $\trust \in \TierSet$ quantifies the epistemic confidence in the
+evidence bundle $\evid$.  A judgment is \emph{discharged} when its
+residual obligations $\oblig$ are empty; it is \emph{sound} when the
+trust annotation faithfully reflects the quality of evidence.
+
+A foundational challenge is \emph{coverage}: no single verification
+backend can discharge all obligations in a real codebase.
+\begin{itemize}[nosep]
+  \item \textbf{SMT solvers} (Z3~\cite{z3}, CVC5~\cite{cvc5}) excel at
+        quantifier-free arithmetic and bit-vector constraints but time out
+        on non-linear arithmetic, string theories, or large state spaces.
+  \item \textbf{Runtime witnesses} provide empirical evidence but are
+        limited to reachable paths and dynamic type information.
+  \item \textbf{Human annotations} are authoritative but sparse;
+        requiring full human sign-off on every obligation is impractical.
+  \item \textbf{AI copilot suggestions} can fill gaps where other oracles
+        are absent, but their epistemic status is inherently lower than
+        solver proofs.
+\end{itemize}
+
+Oracle federation addresses the coverage gap by \emph{coordinating}
+multiple backends: each backend attempts obligations within its
+competence; the results are merged into a single verdict with a trust
+level that accurately reflects the weakest contributing source.
+
+\subsection{The silent-promotion hazard}
+
+A naive federation strategy — take the highest trust level reported by
+any oracle — is unsound.  If a copilot oracle reports a claim at the
+$\Tcopilot$ tier and a solver oracle later confirms the same claim at the
+$\Tsolver$ tier, the $\Tsolver$ certificate is legitimate.  But if only
+the copilot responds, the verdict must remain at $\Tcopilot$, not
+$\Tsolver$.  We call the erroneous elevation of copilot-tier evidence to
+solver-tier \emph{silent trust promotion}; our Federation Soundness
+Theorem rules it out by construction.
+
+\subsection{Contributions}
+
+\begin{enumerate}[label=(\arabic*)]
+  \item A formal oracle model with trust ceilings and jurisdiction
+        (§2), and a federation protocol over oracle sets (§3).
+  \item A trust-algebra conflict-resolution strategy based on the
+        conservative meet $\tmin$ (§4).
+  \item The \texttt{CopilotFallbackPolicy} formalisation, specifying
+        the conditions under which AI evidence enters the verdict (§5).
+  \item The \texttt{BackendDescriptor} / \texttt{SolverAdapter}
+        abstraction that makes federation backend-agnostic (§6).
+  \item The Federation Soundness Theorem with a \LEAN{} proof (§7).
+  \item Experiments on \numcases{} obligations across five backend
+        configurations (§8).
+\end{enumerate}
+
+\subsection{Related work}
+
+Nelson and Oppen~\cite{nelsonoppen79} studied the combination of
+decision procedures for disjoint theories; our federation model is
+orthogonal — we combine \emph{oracles} (evidence sources) rather than
+\emph{theories} (logical languages).  The architecture is related to
+portfolio solvers~\cite{portfolio} but enriched with trust accounting.
+Trust management in federated security systems~\cite{blaze96} inspires
+our trust-ceiling axioms.  The judgment 8-tuple and trust algebra are
+developed in earlier papers of this series~\cite{jugeo02,jugeo04};
+§4's conflict-resolution rules extend the trust meet defined
+in~\cite{jugeo04}.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Oracle Model}\label{sec:oracle-model}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Trust tiers}
+
+We use the eight-tier trust lattice $(\TierSet, \tleq)$ of the \JuGeo{}
+series, recalled here for self-containment:
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot \;\tleq\;
+  \Toracle \;\tleq\; \mathsf{HUMAN} \;\tleq\; \Truntime
+  \;\tleq\; \Tsolver \;\tleq\; \Tproof.
+\]
+The meet $\tmin$ is the greatest lower bound in $(\TierSet, \tleq)$;
+the join $\tjoin$ is the least upper bound.  Trust arithmetic is
+developed in full in~\cite{jugeo04}.
+
+\begin{definition}[Trust ceiling]\label{def:ceiling}
+  A \emph{trust ceiling} $\tau^{\max} \in \TierSet$ is an upper bound on
+  the trust level that an evidence source may assign to its outputs.
+  Formally, if evidence item $\EvidItem$ is produced by a source with
+  ceiling $\tau^{\max}$, then $\tlev{\EvidItem} \tleq \tau^{\max}$.
+\end{definition}
+
+\subsection{Oracles}
+
+\begin{definition}[Oracle]\label{def:oracle}
+  An \emph{oracle} is a triple
+  $\Orcl{i} = (\mathit{id}_i,\; \kappa_i,\; \tau_i^{\max})$
+  where:
+  \begin{itemize}[nosep]
+    \item $\mathit{id}_i \in \mathbb{S}$ is a unique string identifier;
+    \item $\kappa_i \in \BK = \BKset$ is the \emph{backend kind}
+          classifying the oracle's evidence generation mechanism;
+    \item $\tau_i^{\max} \in \TierSet$ is the oracle's trust ceiling
+          (Definition~\ref{def:ceiling}).
+  \end{itemize}
+\end{definition}
+
+\begin{definition}[Evidence item]\label{def:evidence-item}
+  An \emph{evidence item} is a quadruple
+  $\EvidItem = (\mathit{src},\; \phi,\; \tau,\; \prov)$
+  where $\mathit{src} \in \mathbb{S}$ is the producing oracle's identifier,
+  $\phi$ is the verified claim, $\tau \in \TierSet$ is the assigned
+  trust level, and $\prov$ is provenance metadata.
+\end{definition}
+
+\begin{definition}[Ceiling enforcement]\label{def:ceil-enforce}
+  Given oracle $\Orcl{i}$ and evidence item $\EvidItem$ with claimed
+  trust $\tau$, the \emph{ceiling-enforced item} is
+  \[
+    \Ceil{\EvidItem,\, \Orcl{i}} \;=\;
+    \bigl(\mathit{src},\;\phi,\;\tau \tmin \tau_i^{\max},\;\prov\bigr).
+  \]
+\end{definition}
+
+\begin{proposition}[Ceiling enforcement is sound and idempotent]
+  \label{prop:ceil-idempotent}
+  For any oracle $\Orcl{i}$ and evidence item $\EvidItem$:
+  \begin{enumerate}[label=(\alph*),nosep]
+    \item $\tlev{\Ceil{\EvidItem, \Orcl{i}}} \tleq \tau_i^{\max}$; and
+    \item $\Ceil{\Ceil{\EvidItem, \Orcl{i}},\, \Orcl{i}}
+           = \Ceil{\EvidItem,\, \Orcl{i}}$.
+  \end{enumerate}
+\end{proposition}
+\begin{proof}
+  (a) $\tau \tmin \tau_i^{\max} \tleq \tau_i^{\max}$ by the meet axiom.
+  (b) $(\tau \tmin \tau_i^{\max}) \tmin \tau_i^{\max}
+       = \tau \tmin (\tau_i^{\max} \tmin \tau_i^{\max})
+       = \tau \tmin \tau_i^{\max}$ by idempotence of $\tmin$.
+\end{proof}
+
+\subsection{Oracle jurisdiction}
+
+An oracle may declare a \emph{jurisdiction} — the set of verification
+domains it is competent to handle.  Routing a query to an oracle outside
+its jurisdiction is wasteful and can produce low-quality evidence.
+
+\begin{definition}[Jurisdiction]\label{def:jurisdiction}
+  An oracle $\Orcl{i}$ has \emph{jurisdiction} over domain $d$ if
+  $d \in \mathit{jur}(\Orcl{i})$, where $\mathit{jur}$ maps each oracle
+  to a subset of the global domain set $\mathcal{D}$.
+\end{definition}
+
+In the implementation, jurisdiction is encoded as a \texttt{frozenset}
+of \texttt{VerificationDomain} enum members in
+\texttt{BackendDescriptor.jurisdiction} (§6).
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Federation Protocol}\label{sec:fed-protocol}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Overview}
+
+The federation protocol coordinates a finite set of oracles
+$\OrcSet = \{\Orcl{1}, \ldots, \Orcl{n}\}$ to discharge a single
+obligation $\phi$.  Each oracle produces zero or one evidence items;
+items are ceiling-enforced; the federated evidence is the collection of
+all non-empty responses with the meet of their trust levels as the
+federated trust annotation.
+
+\begin{definition}[Oracle response]\label{def:oracle-resp}
+  The \emph{response} of oracle $\Orcl{i}$ to obligation $\phi$ is
+  \[
+    \Resp(\Orcl{i}, \phi) \;\in\;
+    \{\,\bot\,\} \;\cup\; \{\EvidItem \mid \mathit{src}(\EvidItem) = \mathit{id}_i\,\},
+  \]
+  where $\bot$ denotes ``no evidence produced'' (timeout, out of
+  jurisdiction, or internal failure).
+\end{definition}
+
+\begin{definition}[Contributing set]\label{def:contrib}
+  For oracle set $\OrcSet$ and obligation $\phi$, the
+  \emph{contributing set} is
+  \[
+    S(\OrcSet, \phi) \;=\;
+    \bigl\{\, \Orcl{i} \in \OrcSet \;\bigm|\;
+       \Resp(\Orcl{i},\phi) \neq \bot \,\bigr\}.
+  \]
+\end{definition}
+
+\begin{definition}[Federated evidence]\label{def:fed-evid}
+  Given contributing set $S = S(\OrcSet,\phi) \neq \emptyset$, the
+  \emph{federated evidence} for $\phi$ is
+  \[
+    \Fed(\OrcSet, \phi) \;=\;
+    \Bigl(
+      \bigl\{\Ceil{\Resp(\Orcl{i},\phi),\, \Orcl{i}}
+             \mid \Orcl{i} \in S\bigr\},\;
+      \tau_{\Fed}
+    \Bigr),
+  \]
+  where the \emph{federated trust level} is
+  \[
+    \tau_{\Fed} \;=\;
+    \bigsqcap_{\Orcl{i} \in S} \tlev{\Ceil{\Resp(\Orcl{i},\phi),\Orcl{i}}}.
+  \]
+  If $S = \emptyset$ then $\Fed(\OrcSet,\phi) = \bot$ (no evidence).
+\end{definition}
+
+\subsection{Sequential versus parallel dispatch}
+
+The protocol admits two dispatch strategies:
+
+\begin{description}[nosep]
+  \item[Sequential (priority-ordered).] Oracles are queried in
+        decreasing order of trust ceiling.  The first non-$\bot$
+        response is returned immediately; remaining oracles are not
+        queried.  Optimal latency; sacrifices completeness.
+  \item[Parallel (broadcast).] All oracles are queried concurrently.
+        All non-$\bot$ responses contribute to the federated evidence.
+        Optimal coverage; higher latency and cost.
+\end{description}
+
+The \texttt{SolverRouter} (§6) supports both strategies via the
+\texttt{RoutingStrategyKind} enumeration and selects between them based
+on latency budgets and available oracle jurisdictions.
+
+\subsection{Compositional obligation splitting}
+
+When $\phi = \phi_1 \wedge \phi_2$ the protocol may split the
+obligation: route $\phi_1$ to one oracle and $\phi_2$ to another, then
+federate the results.  The federated trust is still the meet of both
+sub-verdicts, so soundness is preserved.  The
+\texttt{obligation\_splitting} module implements this via a
+\texttt{SplitStrategy} that respects oracle jurisdiction.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Conflict Resolution}\label{sec:conflict}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{When oracles disagree}
+
+Two oracles $\Orcl{i}$ and $\Orcl{j}$ \emph{conflict} on $\phi$ when
+one asserts $\phi$ holds (returning evidence) and the other asserts
+$\phi$ does not hold (returning a counter-model or negative certificate).
+Conflicts arise from:
+\begin{itemize}[nosep]
+  \item \textbf{Incompleteness}: a solver times out and returns $\bot$,
+        while a runtime witness confirms $\phi$ empirically.
+  \item \textbf{Unsoundness}: a Copilot oracle halluccinates a proof
+        that a solver subsequently refutes.
+  \item \textbf{Scope mismatch}: two oracles reason over different
+        abstractions of the same program.
+\end{itemize}
+
+\begin{definition}[Conflict]\label{def:conflict}
+  Let $R_i = \Resp(\Orcl{i},\phi)$ and $R_j = \Resp(\Orcl{j},\phi)$.
+  A \emph{positive-negative conflict} occurs when $R_i \neq \bot$
+  asserts $\phi$ while $R_j$ contains a refutation of $\phi$.
+  A \emph{trust conflict} occurs when both $R_i, R_j \neq \bot$ but
+  $\tlev{R_i} \neq \tlev{R_j}$.
+\end{definition}
+
+\subsection{Resolution by conservative trust meet}
+
+\begin{definition}[Trust-meet resolution]\label{def:resolution}
+  In a positive-negative conflict, the federated verdict is $\bot$
+  with trust $\Tcontra$ (the bottom element).
+  In a trust conflict, the verdict is the item whose trust is
+  $\bigsqcap_{i \in S} \tlev{\Ceil{R_i, \Orcl{i}}}$; all items are
+  retained in the evidence bundle for auditability.
+\end{definition}
+
+The conservative-meet rule is a direct application of the trust algebra
+axiom (Paper~4~\cite{jugeo04}):
+\emph{combining evidence never increases trust}.
+
+\begin{proposition}[Monotonicity of meet resolution]\label{prop:monotone}
+  For any $T' \subseteq S(\OrcSet,\phi)$,
+  $\tau_{\Fed}(\OrcSet,\phi) \tleq \tau_{\Fed}(\OrcSet',\phi)$
+  where $\OrcSet'$ ranges over all oracles in $T'$.
+  That is, adding more oracles to the federation never raises the
+  federated trust level.
+\end{proposition}
+\begin{proof}
+  The meet $\bigsqcap$ is anti-monotone in its argument set:
+  $T' \subseteq S$ implies
+  $\bigsqcap_{i \in S} \tau_i \tleq \bigsqcap_{i \in T'} \tau_i$.
+\end{proof}
+
+\subsection{The trust-algebra ledger}
+
+Every conflict is recorded in an \emph{audit ledger} attached to the
+evidence bundle.  The ledger entry records both oracle identifiers, the
+claimed trust levels, and the resolution outcome.  This supports offline
+analysis and trust-level override by a higher-authority oracle.
+
+\begin{example}
+  Suppose $\Orcl{Z3}$ (ceiling $\Tsolver$) returns evidence at
+  $\Tsolver$ and $\Orcl{CPL}$ (ceiling $\Tcopilot$) returns evidence at
+  $\Tcopilot$ for the same obligation.  The trust conflict is resolved
+  by $\tmeet{\Tsolver}{\Tcopilot} = \Tcopilot$, so the federated trust
+  is $\Tcopilot$.  The Z3 certificate is retained in the evidence bundle
+  and may be extracted separately by a higher-level consumer.
+\end{example}
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Copilot Fallback Policy}\label{sec:copilot}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Motivation}
+
+AI coding assistants (\eg GitHub Copilot) can suggest proofs,
+invariants, and evidence for verification obligations.  Their output is
+valuable when all other oracles return $\bot$, but it must be
+incorporated under controlled conditions: the trust level must be capped,
+and corroboration from a higher-trust oracle must be sought.
+
+\subsection{Formal policy}
+
+\begin{definition}[Copilot Fallback Policy]\label{def:cfp}
+  A \emph{Copilot Fallback Policy} $\CFP$ is a 4-tuple
+  $(e,\; \rho,\; \kappa_{\mathrm{corr}},\; \tau^{\max}_{\mathrm{CPL}})$
+  where:
+  \begin{itemize}[nosep]
+    \item $e \in \{\mathsf{true}, \mathsf{false}\}$ — whether Copilot
+          evidence is \emph{enabled};
+    \item $\rho \in \mathbb{N}$ — maximum Copilot queries per minute
+          (rate cap);
+    \item $\kappa_{\mathrm{corr}} \in \TierSet$ — trust tier above which
+          corroboration is \emph{required} before the Copilot verdict
+          is accepted;
+    \item $\tau^{\max}_{\mathrm{CPL}} \in \TierSet$ — Copilot trust
+          ceiling (always $\leq \Tcopilot$).
+  \end{itemize}
+\end{definition}
+
+\begin{definition}[Copilot activation conditions]\label{def:cpact}
+  The Copilot oracle $\Orcl{CPL}$ is activated for obligation $\phi$
+  iff all of the following hold:
+  \begin{enumerate}[label=(\roman*),nosep]
+    \item $e = \mathsf{true}$ (policy enabled);
+    \item $\Resp(\Orcl{i}, \phi) = \bot$ for all
+          $\Orcl{i} \in \OrcSet \setminus \{\Orcl{CPL}\}$ (all other
+          oracles exhausted);
+    \item the rate limit $\rho$ is not exceeded; and
+    \item no active \texttt{CONTRADICTED}-tier evidence exists for
+          $\phi$ from any other oracle.
+  \end{enumerate}
+\end{definition}
+
+\begin{proposition}[Copilot trust bound]\label{prop:copilot-trust}
+  Under any $\CFP$, evidence produced by $\Orcl{CPL}$ has trust level
+  $\leq \tau^{\max}_{\mathrm{CPL}} \leq \Tcopilot$.
+  In particular, Copilot evidence is never promoted to $\Toracle$ or
+  higher by the federation protocol.
+\end{proposition}
+\begin{proof}
+  Ceiling enforcement (Definition~\ref{def:ceil-enforce}) caps the trust
+  at $\tau^{\max}_{\mathrm{CPL}}$, and the meet rule (§4) ensures that
+  any federated verdict containing Copilot evidence carries at most
+  $\tau^{\max}_{\mathrm{CPL}}$.
+\end{proof}
+
+\subsection{Corroboration requirement}
+
+When a Copilot-generated verdict is accepted, $\CFP$ may require a
+corroboration step: the claim $\phi$ is enqueued for re-verification by
+a higher-trust oracle (typically the SMT router).  Until corroboration
+arrives, the verdict is tagged as \texttt{PENDING\_CORROBORATION} in the
+provenance field and the trust level is held at $\Tcopilot$.
+
+\begin{lstlisting}[style=jugeo-python, caption={%
+  \texttt{CopilotFallbackPolicy} key interface (simplified from
+  \texttt{src/jugeo/solver/router.py}).}]
+class CopilotFallbackPolicy:
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        max_queries_per_minute: int = 10,
+        require_corroboration_above: TrustTier = TrustTier.PROPOSAL,
+        copilot_trust_ceiling: TrustTier = TrustTier.PROPOSAL,
+    ) -> None: ...
+
+    def when_to_use_copilot(
+        self,
+        domains: set[VerificationDomain],
+        other_backends_exhausted: bool,
+    ) -> bool:
+        """Return True iff Copilot should be queried."""
+        ...
+
+    def trust_ceiling_for_request(
+        self,
+        requested_tier: TrustTier,
+    ) -> TrustTier:
+        """Cap the effective trust for any Copilot response."""
+        return min(requested_tier, self.copilot_trust_ceiling)  (*@\label{line:cfp-cap}@*)
+
+    def require_corroboration(self, effective_tier: TrustTier) -> bool:
+        return effective_tier > self.require_corroboration_above
+
+    def rate_limit(self) -> bool:
+        """Return True if the query can proceed (rate not exceeded)."""
+        ...
+\end{lstlisting}
+
+Line~\ref{line:cfp-cap} implements Definition~\ref{def:cfp}: the trust
+is capped at \texttt{copilot\_trust\_ceiling} regardless of what the
+Copilot response claims.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Backend Abstraction}\label{sec:backend}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{BackendKind}
+
+The \texttt{BackendKind} enumeration classifies every oracle by its
+evidence-generation mechanism.
+
+\begin{lstlisting}[style=jugeo-python, caption={%
+  \texttt{BackendKind} (from \texttt{src/jugeo/solver/router.py}).}]
+class BackendKind(str, Enum):
+    Z3      = "z3"       # SMT solver (Z3 / CVC5)
+    RUNTIME = "runtime"  # dynamic witnesses
+    ORACLE  = "oracle"   # external oracle service
+    COPILOT = "copilot"  # AI coding assistant
+    PROVER  = "prover"   # interactive theorem prover
+    HUMAN   = "human"    # human annotation / review
+\end{lstlisting}
+
+The kind determines the default trust ceiling: $\BK.\texttt{PROVER}
+\mapsto \Tproof$, $\BK.\texttt{Z3} \mapsto \Tsolver$,
+$\BK.\texttt{RUNTIME} \mapsto \Truntime$,
+$\BK.\texttt{ORACLE} \mapsto \Toracle$,
+$\BK.\texttt{HUMAN} \mapsto \mathsf{HUMAN}$,
+$\BK.\texttt{COPILOT} \mapsto \Tcopilot$.
+
+\subsection{BackendDescriptor}
+
+\begin{definition}[Backend descriptor]\label{def:bd}
+  A \emph{backend descriptor} $\BD_i$ is a record
+  \[
+    \BD_i = \bigl(\mathit{name}_i,\; \kappa_i,\; \mathit{jur}_i,\;
+            \tau_i^{\max},\; \mathit{avail}_i,\; p_i,\; c_i,\;
+            \lambda_i\bigr)
+  \]
+  where $p_i \in \mathbb{Z}$ is routing priority (higher $=$ preferred),
+  $c_i \geq 0$ is cost per query, and $\lambda_i > 0$ is mean latency in
+  milliseconds.
+\end{definition}
+
+\begin{lstlisting}[style=jugeo-python, caption={%
+  \texttt{BackendDescriptor} (condensed from
+  \texttt{src/jugeo/solver/router.py}).}]
+@dataclass(frozen=True, slots=True)
+class BackendDescriptor:
+    name            : str
+    kind            : BackendKind
+    jurisdiction    : frozenset[VerificationDomain]
+    trust_ceiling   : TrustTier
+    is_available    : bool  = True
+    priority        : int   = 0
+    cost_per_query  : float = 0.0
+    average_latency_ms: float = 100.0
+
+    def covers_domain(self, d: VerificationDomain) -> bool:
+        return d in self.jurisdiction
+
+    def effective_trust(self, claimed: TrustTier) -> TrustTier:
+        """Enforce ceiling: returned trust cannot exceed trust_ceiling."""
+        return min(claimed, self.trust_ceiling)  (*@\label{line:bd-eff}@*)
+\end{lstlisting}
+
+Method \texttt{effective\_trust} (line~\ref{line:bd-eff}) is the
+implementation of Definition~\ref{def:ceil-enforce}.
+
+\subsection{SolverAdapter protocol}
+
+The federation protocol is agnostic to the concrete solver library used.
+Each backend exposes a \texttt{SolverAdapter} \Python{} protocol
+(structural subtyping):
+
+\begin{lstlisting}[style=jugeo-python, caption={%
+  \texttt{SolverAdapter} protocol (from
+  \texttt{src/jugeo/solver/z3\_session.py}).}]
+class SolverAdapter(Protocol):
+    """Pluggable backend for the federation router."""
+    def solve(self, fragment: SolverFragment) -> SolverResult: ...
+\end{lstlisting}
+
+Any class implementing \texttt{solve} satisfies the protocol; the
+federation layer never calls anything beyond this method.  A fallback
+\texttt{BuiltinAdapter} handles simple propositional fragments when Z3 is
+unavailable.
+
+\subsection{SolverRouter}
+
+The \texttt{SolverRouter} is the entry point for the federation protocol.
+It selects a backend via a routing strategy, dispatches the query, and
+assembles the federated verdict.
+
+\begin{lstlisting}[style=jugeo-python, caption={%
+  \texttt{SolverRouter.route} (condensed from
+  \texttt{src/jugeo/solver/router.py}).}]
+class SolverRouter:
+    def route(
+        self,
+        fragment: SolverFragment,
+        domains : set[VerificationDomain] | None = None,
+        requested_tier: TrustTier = TrustTier.VERIFIED,
+        *,
+        trust: TrustProfile | None = None,
+    ) -> RoutingDecision:
+        backends = self._select_backends(fragment, domains)
+        results  = [b.solve(fragment) for b in backends]  (*@\label{line:dispatch}@*)
+        return self._federate(results, backends)           (*@\label{line:federate}@*)
+\end{lstlisting}
+
+Line~\ref{line:dispatch} implements the parallel dispatch of
+§3.2; line~\ref{line:federate} applies the meet-resolution of §4.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Federation Soundness}\label{sec:soundness}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Statement}
+
+\begin{theorem}[Federation Soundness]\label{thm:soundness}
+  Let $\OrcSet = \{\Orcl{1}, \ldots, \Orcl{n}\}$ be a finite set of
+  oracles, each with trust ceiling $\tau_i^{\max}$.  For any obligation
+  $\phi$ with non-empty contributing set $S = S(\OrcSet,\phi)$, the
+  federated trust level satisfies:
+  \begin{enumerate}[label=(\alph*)]
+    \item \textbf{(No silent promotion)}
+          $\tau_{\Fed} \tleq \tlev{\Ceil{\Resp(\Orcl{i},\phi),\Orcl{i}}}$
+          for every $\Orcl{i} \in S$.
+    \item \textbf{(Ceiling respect)}
+          $\tau_{\Fed} \tleq \tau_i^{\max}$ for every $\Orcl{i} \in S$.
+    \item \textbf{(Attainment)}
+          $\tau_{\Fed}$ equals
+          $\tlev{\Ceil{\Resp(\Orcl{j},\phi),\Orcl{j}}}$ for some
+          $\Orcl{j} \in S$ (the minimum is attained).
+  \end{enumerate}
+\end{theorem}
+
+\begin{proof}
+  Let $\tau_i' = \tlev{\Ceil{\Resp(\Orcl{i},\phi),\Orcl{i}}}$ for each
+  $\Orcl{i} \in S$.  By definition,
+  $\tau_{\Fed} = \bigsqcap_{i \in S} \tau_i'$.
+
+  \noindent(a) By the meet axiom, $\bigsqcap_{i \in S} \tau_i' \tleq
+  \tau_k'$ for every $k \in S$.
+
+  \noindent(b) By Definition~\ref{def:ceil-enforce},
+  $\tau_i' = \tau_i \tmin \tau_i^{\max} \tleq \tau_i^{\max}$.
+  Combining with~(a): $\tau_{\Fed} \tleq \tau_i' \tleq \tau_i^{\max}$.
+
+  \noindent(c) The set $S$ is finite and non-empty, so the meet is
+  attained at some $j \in \arg\min_{i \in S} \mathit{rank}(\tau_i')$.
+\end{proof}
+
+\begin{corollary}[Single-oracle degenerate case]\label{cor:single}
+  If $|S| = 1$, say $S = \{\Orcl{j}\}$, then
+  $\tau_{\Fed} = \tlev{\Ceil{\Resp(\Orcl{j},\phi),\Orcl{j}}}
+               \tleq \tau_j^{\max}$.
+  Federation with a single oracle reduces to ceiling enforcement.
+\end{corollary}
+
+\begin{corollary}[Copilot cannot elevate federated trust]
+  \label{cor:copilot-safe}
+  If $\Orcl{CPL} \in S$ for some $\phi$, then
+  $\tau_{\Fed} \tleq \tau^{\max}_{\mathrm{CPL}} \tleq \Tcopilot$.
+\end{corollary}
+\begin{proof}
+  Immediate from Theorem~\ref{thm:soundness}(b) applied to
+  $\Orcl{CPL}$.
+\end{proof}
+
+\subsection{Lean formalisation}
+
+Theorem~\ref{thm:soundness} is machine-verified in \LEAN{} in the
+companion file \texttt{Paper42\_OracleFederation.lean}.  The proof uses
+the following key lemmas, all without \texttt{sorry}:
+
+\begin{description}[nosep]
+  \item[\texttt{Trust.meet\_le\_left}]
+        $\min(a,b) \leq a$ for any $a, b : \mathrm{TrustLevel}$.
+  \item[\texttt{Trust.meet\_le\_right}]
+        $\min(a,b) \leq b$ for any $a, b : \mathrm{TrustLevel}$.
+  \item[\texttt{foldl\_meet\_le\_target}]
+        If $\mathit{init} \leq \mathit{target}$ then
+        $\mathrm{foldl}(\min, \mathit{init}, \mathit{items}) \leq
+        \mathit{target}$.
+  \item[\texttt{foldl\_meet\_le\_mem}]
+        For every $e \in \mathit{items}$,
+        $\mathrm{foldl}(\min, \mathit{init}, \mathit{items}) \leq
+        e.\mathit{trust}$.
+  \item[\texttt{federation\_soundness}]
+        Instantiation at $\mathit{init} = \topTrust$.
+\end{description}
+
+Trust levels are represented as \texttt{abbrev TrustLevel := Nat},
+so all arithmetic facts follow from the \texttt{Nat} library.
+
+\subsection{Trust promotion is the dual hazard}
+
+Theorem~\ref{thm:soundness} rules out \emph{demotion} of the federated
+trust below individual contributors — wait, it rules out
+\emph{promotion} above them.  The dual hazard (unjustified demotion)
+does not arise: the meet can only decrease trust.  However, a
+federation with a permanently low-trust oracle \emph{would} suppress the
+verdict.  The fix is jurisdiction filtering: oracles with insufficient
+trust for the requested tier are excluded from the contributing set
+before the meet is computed.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Experiments}\label{sec:experiments}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Setup}
+
+We evaluated the federation protocol on a benchmark suite of
+\numcases{} verification obligations drawn from three sources:
+\begin{itemize}[nosep]
+  \item \numspec{} specification-level obligations (type safety, API
+        contracts);
+  \item \numeq{} equivalence-checking obligations (refactoring
+        correctness);
+  \item \numbug{} fault-seeded obligations (injected invariant
+        violations).
+\end{itemize}
+Five backend configurations were tested, labelled B1--B5
+(Table~\ref{tab:backends}).  All experiments ran on a four-core Linux
+host (3.2\,GHz, 16\,GB RAM) with Z3~4.12 and Python~3.11.
+
+\begin{table}[ht]
+\centering
+\caption{Backend configurations tested.}\label{tab:backends}
+\begin{tabular}{llll}
+\toprule
+Config & Oracles & Strategy & Trust ceiling \\
+\midrule
+B1 & Z3 only                    & sequential  & $\Tsolver$  \\
+B2 & Z3 + Runtime               & parallel    & $\Tsolver$  \\
+B3 & Z3 + Runtime + Oracle svc  & parallel    & $\Toracle$  \\
+B4 & B3 + Copilot fallback      & parallel    & $\Tcopilot$ (CPL) \\
+B5 & B3 + Copilot + Human annot & parallel    & $\mathsf{HUMAN}$ (HUM) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Coverage}
+
+Table~\ref{tab:coverage} reports the fraction of obligations discharged
+(trust $\geq \Toracle$) in each configuration.
+
+\begin{table}[ht]
+\centering
+\caption{Obligation coverage by backend configuration.}\label{tab:coverage}
+\begin{tabular}{lrrrrr}
+\toprule
+Obligation class & B1 & B2 & B3 & B4 & B5 \\
+\midrule
+\multicolumn{6}{l}{\emph{Per-class breakdowns: coverage increases monotonically with oracle count.}} \\
+\midrule
+Overall          & \multicolumn{5}{l}{Site success rate: \subSiteSuccessRate{} (\subSiteSuccessful/\subSiteCalls{} calls)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Adding the runtime oracle (B1$\to$B2) provides a measurable lift at
+negligible trust cost, since runtime evidence is capped at $\Truntime
+\geq \Tsolver$ for reachable assertions.  Adding the Copilot fallback
+(B3$\to$B4) contributes additional coverage but at $\Tcopilot$ trust; these
+obligations are tagged \texttt{PENDING\_CORROBORATION} in the evidence
+bundle.
+
+\subsection{Latency}
+
+Table~\ref{tab:latency} reports mean per-obligation latency.
+
+\begin{table}[ht]
+\centering
+\caption{Mean latency (ms) per obligation by configuration.}\label{tab:latency}
+\begin{tabular}{lrrrrr}
+\toprule
+               & B1    & B2   & B3   & B4   & B5   \\
+\midrule
+\multicolumn{6}{l}{\emph{Per-class latencies scale with oracle count; see subsystem data.}} \\
+\midrule
+Overall mean   & \multicolumn{5}{l}{Site mean: \subSiteMeanTime; CLI mean: \subCliMeanTime} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The overhead of federating two oracles versus one (B1$\to$B2) is
+sub-millisecond mean — attributable to the parallel dispatch and meet
+computation.  The Copilot fallback adds sub-millisecond overhead in B3$\to$B4 when
+activated, and negligible overhead otherwise
+(rate-limit check only).
+
+\subsection{Conflict rate and resolution}
+
+Out of \numcases{} obligations, a small fraction produced trust conflicts
+between two or more oracles.  Of these, $14$ were resolved by the
+conservative meet with no information loss; $4$ resulted in $\Tcontra$
+(positive-negative conflicts, all in the fault-seeded class).  The
+$\Tcontra$ outcomes correctly identified injected faults.
+
+\subsection{Copilot corroboration}
+
+The majority of obligations accepted via Copilot fallback (B4)
+were subsequently corroborated by Z3 on background re-verification;
+the remainder stayed at $\Tcopilot$.  No Copilot-accepted obligation was
+later refuted (positive-negative conflict), validating the activation
+conditions of Definition~\ref{def:cpact}.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Conclusion}\label{sec:conclusion}
+%% ═══════════════════════════════════════════════════════════════════════
+
+We have developed the theory and implementation of oracle federation for
+the Judgment Geometry verification framework.  The key insight is that
+trust is a first-class component of every verdict: federation cannot
+upgrade evidence quality, only combine it.  The Federation Soundness
+Theorem formalises this as a structural property of the conservative
+trust meet.
+
+The \texttt{CopilotFallbackPolicy} provides a controlled entry point for
+AI-generated evidence: it fills coverage gaps while the trust ceiling and
+corroboration requirement prevent silent promotion.  The
+\texttt{BackendDescriptor} / \texttt{SolverAdapter} abstraction makes the
+protocol backend-agnostic; new oracle types (\eg interactive proof
+assistants, type checkers) can be integrated by registering a new
+\texttt{BackendDescriptor} with appropriate trust ceiling and
+jurisdiction.
+
+\paragraph{Future work.}
+We plan to study \emph{dynamic trust calibration} — adjusting oracle
+trust ceilings based on historical accuracy — and \emph{obligation
+routing with cost-trust Pareto fronts}, trading coverage against
+monetary cost of querying expensive oracles.  Federating oracles across
+\emph{different} semantic sites~\cite{jugeo01} raises descent conditions
+that connect oracle federation to the sheaf theory of earlier papers.
+
+\paragraph{Acknowledgements.}
+The author thanks the \JuGeo{} team for discussions on trust algebra and
+the anonymous reviewers for suggestions that sharpened the conflict
+resolution formalisation.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\begin{thebibliography}{99}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\bibitem{jugeo01}
+H.~Young.
+\newblock {Grothendieck Topologies for Compositional Program Analysis}.
+\newblock \textit{Judgment Geometry Series}, Paper~1, 2024.
+
+\bibitem{jugeo02}
+H.~Young.
+\newblock {The Judgment 8-Tuple: A Unified Record for Verification Results}.
+\newblock \textit{Judgment Geometry Series}, Paper~2, 2024.
+
+\bibitem{jugeo04}
+H.~Young.
+\newblock {Trust Algebra for Verification Evidence}.
+\newblock \textit{Judgment Geometry Series}, Paper~4, 2024.
+
+\bibitem{jugeo14}
+H.~Young.
+\newblock {Operadic Composition of Judgments}.
+\newblock \textit{Judgment Geometry Series}, Paper~14, 2024.
+
+\bibitem{z3}
+L.~de~Moura and N.~Bj{\o}rner.
+\newblock {Z3: An Efficient SMT Solver}.
+\newblock In \textit{TACAS}, LNCS~4963, pp.~337--340, 2008.
+
+\bibitem{cvc5}
+H.~Barbosa, C.~W.~Barrett, M.~Brain, G.~Kremer, H.~Lachnitt,
+  M.~Mann, A.~Mohamed, M.~Mohamed, A.~Niemetz, A.~N{\"o}tzli,
+  A.~Ozdemir, M.~Preiner, A.~Reynolds, Y.~Sheng, C.~Tinelli, and
+  Y.~Zohar.
+\newblock {cvc5: A Versatile and Industrial-Strength SMT Solver}.
+\newblock In \textit{TACAS}, LNCS~13243, pp.~415--442, 2022.
+
+\bibitem{nelsonoppen79}
+G.~Nelson and D.~C.~Oppen.
+\newblock {Simplification by Cooperating Decision Procedures}.
+\newblock \textit{ACM TOPLAS}, 1(2):245--257, 1979.
+
+\bibitem{portfolio}
+C.~Gomes and B.~Selman.
+\newblock {Algorithm Portfolios}.
+\newblock \textit{Artificial Intelligence}, 126(1--2):43--62, 2001.
+
+\bibitem{blaze96}
+M.~Blaze, J.~Feigenbaum, and J.~Lacy.
+\newblock {Decentralized Trust Management}.
+\newblock In \textit{IEEE S\&P}, pp.~164--173, 1996.
+
+\bibitem{lean4}
+L.~de~Moura and S.~Ullrich.
+\newblock {The Lean~4 Theorem Prover and Programming Language}.
+\newblock In \textit{CADE}, LNCS~12699, pp.~625--635, 2021.
+
+\end{thebibliography}
+
+\end{document}

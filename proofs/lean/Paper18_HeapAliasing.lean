@@ -43,7 +43,6 @@ theorem aliasLevel_mayAlias_ne_noAlias :
 structure HeapModel (n : Nat) : Type where
   identity  : Fin n → Nat
   pointsTo  : Fin n → Fin n → Bool
-  deriving Repr
 
 /-- Two references are aliased in a heap model iff they share identity. -/
 def HeapModel.areAliased {n : Nat} (hm : HeapModel n)
@@ -64,7 +63,6 @@ def HeapModel.isDangling {n : Nat} (hm : HeapModel n) (r : Fin n) : Prop :=
     query r1 r2  returns the alias level for the pair. -/
 structure AliasDetector (n : Nat) : Type where
   query : Fin n → Fin n → AliasLevel
-  deriving Repr
 
 /-- The no-alias soundness predicate: whenever the detector says NoAlias,
     the references have distinct identities in the heap model. -/
@@ -122,7 +120,6 @@ theorem may_alias_overapproximation
 structure AliasPartition (n : Nat) : Type where
   rep       : Fin n → Fin n
   rep_idem  : ∀ r : Fin n, rep (rep r) = rep r   -- rep is idempotent
-  deriving Repr
 
 /-- Two references are in the same alias class iff they have the same
     representative. -/
@@ -156,7 +153,6 @@ theorem sameClass_trans {n : Nat} (ap : AliasPartition n)
     primary field (simplified to a single field for the formalisation). -/
 structure HeapSection (n : Nat) : Type where
   value : Fin n → Nat
-  deriving Repr
 
 /-- The descent condition for two sections s1, s2 over references r1, r2:
     if r1 and r2 are aliased, their field values must agree. -/
@@ -298,14 +294,14 @@ theorem exact_detector_may_sound {n : Nat} (hm : HeapModel n) [DecidableEq Nat] 
   have : (exactDetector hm).query r1 r2 = AliasLevel.MustAlias := by
     simp [exactDetector, hId]
   rw [this] at hNA
-  exact absurd rfl hNA
+  exact absurd hNA (by decide)
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 9  Footprint disjointness (separation logic encoding)
 -- ════════════════════════════════════════════════════════════════════
 
 /-- A footprint is a set of locations, represented as a list of Nats. -/
-def Footprint := List Nat
+abbrev Footprint := List Nat
 
 /-- Two footprints are disjoint iff they share no location. -/
 def disjointFootprints (fp1 fp2 : Footprint) : Prop :=
@@ -334,7 +330,7 @@ theorem noAlias_disjoint_footprints
     disjointFootprints [hm.identity r1] [hm.identity r2] := by
   have hne := hS r1 r2 hNA
   intro loc h1 h2
-  simp [List.mem_singleton] at h1 h2
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at h1 h2
   exact hne (h1 ▸ h2)
 
 -- ════════════════════════════════════════════════════════════════════

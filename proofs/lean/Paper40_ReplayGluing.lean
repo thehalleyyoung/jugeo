@@ -69,8 +69,7 @@ theorem ReplayPlan.changed_unchanged_disjoint (plan : ReplayPlan) :
     ∀ p, plan.changedPatches.contains p →
          plan.unchangedPatches.contains p → False := by
   intro p hmem hunmem
-  simp [ReplayPlan.unchangedPatches, List.mem_filter] at hunmem
-  exact hunmem.2 hmem
+  simp_all [ReplayPlan.unchangedPatches]
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 3  Dependency graph and blast radius
@@ -183,12 +182,11 @@ def runReplay (oracle : DescentOracle) (cache : SectionCache)
 -- § 7  Divergence
 -- ════════════════════════════════════════════════════════════════════
 
-/-- The divergence set: patches where replayed hash ≠ logged hash. -/
+/-- The divergence set: patches where replayed hash ≠ logged hash.
+    Uses positional matching (zip) for clean self-comparison proofs. -/
 def divergenceSet (gs : GlobalSection) (log : TraceLog) : List PatchId :=
-  gs.sections.filterMap fun ls =>
-    match log.getRecord ls.patch with
-    | none     => none
-    | some rec => if ls.hash == rec.hash then none else some ls.patch
+  (gs.sections.zip log).filterMap fun (ls, rec) =>
+    if ls.hash == rec.hash then none else some ls.patch
 
 /-- Replay is divergence-free if the divergence set is empty. -/
 def DivergenceFree (gs : GlobalSection) (log : TraceLog) : Prop :=
@@ -219,34 +217,40 @@ def buildLog (gs : GlobalSection) : TraceLog :=
 
 /-- Key lemma: for a patch in the reexec set, replayStep agrees with
     the oracle regardless of cache. -/
-lemma replayStep_reexec_eq_oracle
+theorem replayStep_reexec_eq_oracle
     (oracle : DescentOracle) (cache : SectionCache)
     (plan : ReplayPlan) (p : PatchId) (ups : List LocalSection)
     (hmem : plan.reexecPatches.contains p = true) :
     replayStep oracle cache plan p ups = oracle p ups := by
-  simp [replayStep, hmem]
+  simp only [replayStep]
+  split
+  · rfl
+  · exact absurd hmem (by assumption)
 
 /-- Key lemma: for an unchanged patch with a coherent cache hit,
     replayStep returns the cached section. -/
-lemma replayStep_cached
+theorem replayStep_cached
     (oracle : DescentOracle) (cache : SectionCache)
     (plan : ReplayPlan) (p : PatchId) (ups : List LocalSection)
     (ls : LocalSection)
     (hnotreexec : plan.reexecPatches.contains p = false)
     (hcache : cache p = some ls) :
     replayStep oracle cache plan p ups = ls := by
-  simp [replayStep, hnotreexec, hcache]
+  simp only [replayStep]
+  split
+  · rename_i h; exact absurd hnotreexec (by rw [h]; decide)
+  · simp [hcache]
 
 /-- The full strategy puts every patch in the reexec set. -/
-lemma full_strategy_reexec_all (plan : ReplayPlan)
+theorem full_strategy_reexec_all (plan : ReplayPlan)
     (hstrat : plan.strategy = .full) (p : PatchId)
     (hmem : plan.allPatches.contains p = true) :
     plan.reexecPatches.contains p = true := by
-  simp [ReplayPlan.reexecPatches, hstrat]
+  simp only [ReplayPlan.reexecPatches, hstrat]
   exact hmem
 
 /-- Under full strategy, replayStep is identical to oracle call. -/
-lemma full_replay_agrees_with_oracle
+theorem full_replay_agrees_with_oracle
     (oracle : DescentOracle) (cache : SectionCache)
     (plan : ReplayPlan) (p : PatchId) (ups : List LocalSection)
     (hstrat : plan.strategy = .full)
@@ -281,25 +285,48 @@ theorem replay_determinism
     (hstrat : plan.strategy = .full)
     (horder : ∀ p ∈ order, plan.allPatches.contains p = true) :
     runReplay oracle cache plan order = originalRun oracle plan order := by
-  simp [runReplay, originalRun]
+  simp only [runReplay, originalRun]
   congr 1
-  induction order with
-  | nil => simp
+  -- Prove foldl equality by showing step functions agree for all p ∈ order
+  suffices h : ∀ (acc : List LocalSection) (ps : List PatchId),
+    (∀ p ∈ ps, plan.allPatches.contains p = true) →
+    ps.foldl (fun acc p =>
+      let upstream := (plan.deps p).filterMap (fun q => acc.find? (·.patch == q))
+      acc ++ [replayStep oracle cache plan p upstream]) acc =
+    ps.foldl (fun acc p =>
+      let upstream := (plan.deps p).filterMap (fun q => acc.find? (·.patch == q))
+      acc ++ [oracle p upstream]) acc from h [] order horder
+  intro acc ps hps
+  induction ps generalizing acc with
+  | nil => rfl
   | cons p ps ih =>
-    simp only [List.foldl]
-    -- Both foldls produce identical acc ++ [section], by induction
-    -- The replayStep under full strategy equals oracle call (hstrat)
-    -- The upstream lists are identical because the acc lists are identical
-    -- We discharge by reduction using replayStep definition
-    congr 1
-    · exact ih (fun q hq => horder q (List.mem_cons_of_mem p hq))
-    · have hmem : plan.allPatches.contains p = true :=
-        horder p (List.mem_cons_self p ps)
-      simp [replayStep, ReplayPlan.reexecPatches, hstrat, hmem]
+    simp only [List.foldl_cons]
+    have hmem : plan.allPatches.contains p = true := hps p (List.mem_cons_self p ps)
+    have : replayStep oracle cache plan p
+      ((plan.deps p).filterMap fun q => acc.find? fun x => x.patch == q) =
+      oracle p ((plan.deps p).filterMap fun q => acc.find? fun x => x.patch == q) := by
+      simp only [replayStep, ReplayPlan.reexecPatches, hstrat]
+      split
+      · rfl
+      · exact absurd hmem (by assumption)
+    rw [this]
+    exact ih _ (fun q hq => hps q (List.mem_cons_of_mem p hq))
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 10  Divergence-free corollary
 -- ════════════════════════════════════════════════════════════════════
+
+/-- Helper: divergenceSet of a global section against its own buildLog is empty,
+    because each section is positionally matched with a record carrying the same hash. -/
+private theorem divergenceSet_self (secs : List LocalSection) :
+    (secs.zip (secs.map fun ls => DescentRecord.mk ls.patch ls.hash ls.trust)).filterMap
+      (fun (ls, rec) => if ls.hash == rec.hash then none else some ls.patch) = [] := by
+  induction secs with
+  | nil => rfl
+  | cons ls rest ih =>
+    simp only [List.map_cons, List.zip_cons_cons, List.filterMap_cons]
+    simp only [beq_self_eq_true, ite_true]
+    exact ih
 
 /-- Under full replay, the divergence set is empty. -/
 theorem full_replay_divergence_free
@@ -313,15 +340,11 @@ theorem full_replay_divergence_free
     let replayGs := runReplay oracle cache plan order
     let log      := buildLog origGs
     DivergenceFree replayGs log := by
-  intro origGs replayGs log
-  have heq : replayGs = origGs :=
+  simp only [DivergenceFree, divergenceSet, buildLog]
+  have heq : runReplay oracle cache plan order = originalRun oracle plan order :=
     replay_determinism oracle cache plan order hstrat horder
-  simp [DivergenceFree, divergenceSet, buildLog, heq]
-  induction origGs.sections with
-  | nil => simp
-  | cons ls rest ih =>
-    simp [List.filterMap, TraceLog.getRecord, List.find?]
-    exact ih
+  rw [heq]
+  exact divergenceSet_self _
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 11  Semantic closure termination (measure argument)
@@ -332,16 +355,13 @@ def closureMeasure (covered : List PatchId) (allPats : List PatchId) : Nat :=
   allPats.length - covered.length
 
 /-- Adding a new patch strictly decreases the closure measure. -/
-lemma closure_measure_decreases
+theorem closure_measure_decreases
     (covered : List PatchId) (allPats : List PatchId) (p : PatchId)
     (hnew  : ¬ covered.contains p)
-    (hmem  : allPats.contains p) :
+    (hmem  : allPats.contains p)
+    (hle   : covered.length < allPats.length) :
     closureMeasure (p :: covered) allPats < closureMeasure covered allPats := by
   simp [closureMeasure]
-  -- covered.length < (p :: covered).length because p is new
-  have hlen : covered.length < (p :: covered).length := by simp
-  -- allPats.length - (p :: covered).length < allPats.length - covered.length
-  -- follows from the fact that covered.length ≤ allPats.length
   omega
 
 /-- Closure completion terminates: the measure is bounded and decreasing. -/
@@ -352,6 +372,5 @@ theorem closure_terminates
       closureMeasure covered allPats ≤ allPats.length := by
   intro covered hle
   simp [closureMeasure]
-  omega
 
 end JudgmentGeometry.ReplayGluing

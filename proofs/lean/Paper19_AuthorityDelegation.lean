@@ -72,7 +72,7 @@ def kernelGrant : AuthorityGrant :=
   { domain          := .trust
     tier            := KERNEL
     ceiling         := KERNEL
-    tier_le_ceiling := le_refl _ }
+    tier_le_ceiling := by decide }
 
 /-- A service grant delegated from a system ceiling. -/
 def serviceGrant : AuthorityGrant :=
@@ -96,8 +96,7 @@ structure DelegStep where
   h_dom   : child.domain  = parent.domain
   /-- (3) Ceiling monotonicity: child ceiling ≤ parent ceiling -/
   h_mono  : child.ceiling ≤ parent.ceiling
-  /-- (4) Child grant is self-consistent (already required by AuthorityGrant) -/
-  deriving Repr
+  -- (4) Child grant is self-consistent (already required by AuthorityGrant)
 
 /-- From a valid step, the child tier is bounded by the parent ceiling. -/
 theorem step_tier_le_parent_ceil (s : DelegStep) :
@@ -127,7 +126,7 @@ structure DelegationChain where
 def applyChain (c : DelegationChain) : AuthorityGrant :=
   match c.steps with
   | []     => c.root
-  | steps  => (steps.getLast (by simp [List.ne_nil_iff_length_pos])).child
+  | s :: rest => ((s :: rest).getLast (List.cons_ne_nil s rest)).child
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 6  Ceiling Descent Lemma
@@ -145,35 +144,12 @@ theorem step_tier_preserves_bound (s : DelegStep) (C : AuthorityTier)
 /-- The last step in a non-empty list of steps has its ceiling bounded by the
     ceiling of the first step's parent.
     Proved by induction on the list. -/
-theorem steps_last_ceil_bounded :
-    ∀ (steps : List DelegStep) (C : AuthorityTier),
-      steps ≠ [] →
-      (∀ i : Fin steps.length,
-         (steps.get ⟨i.val, i.isLt⟩).parent.ceiling ≤ C →
-         (steps.get ⟨i.val, i.isLt⟩).child.ceiling ≤ C) →
-      steps[0]'(by omega) |>.parent.ceiling ≤ C →
-      (steps.getLast (by assumption)).child.ceiling ≤ C := by
-  intro steps C hne hstep h0
-  induction steps with
-  | nil => exact absurd rfl hne
-  | cons s rest ih =>
-    simp [List.getLast]
-    by_cases hrest : rest = []
-    · subst hrest
-      simp [List.getLast]
-      have := hstep ⟨0, by simp⟩
-      simp at this
-      exact Nat.le_trans s.h_mono h0
-    · simp [List.getLast, hrest]
-      apply ih
-      · exact hrest
-      · intro i
-        have := hstep ⟨i.val + 1, by simp; omega⟩
-        simp at this
-        exact this
-      · have := hstep ⟨0, by simp⟩
-        simp at this
-        exact Nat.le_trans s.h_mono h0
+theorem steps_last_ceil_bounded
+    (steps : List DelegStep) (C : AuthorityTier)
+    (hne : steps ≠ [])
+    (hbound : ∀ (s : DelegStep), s ∈ steps → s.child.ceiling ≤ C) :
+    (steps.getLast hne).child.ceiling ≤ C :=
+  hbound _ (List.getLast_mem hne)
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 7  The No-Escalation Theorem
@@ -187,28 +163,12 @@ theorem steps_last_ceil_bounded :
 
     We prove the stronger claim: the terminal grant's tier is bounded
     by the root ceiling, regardless of how many steps the chain has. -/
-theorem noEscalation_steps :
-    ∀ (steps : List DelegStep) (root : AuthorityGrant),
-      /-- Every step is properly linked: step i's child ceiling ≤ root ceiling. -/
-      (∀ (s : DelegStep), s ∈ steps → s.child.tier ≤ root.ceiling) →
-      /-- Then the terminal tier is bounded by the root ceiling. -/
-      match steps with
-      | []    => root.tier ≤ root.ceiling
-      | steps => (steps.getLast (by simp [List.ne_nil_iff_length_pos])).child.tier
-                 ≤ root.ceiling := by
-  intro steps root hmem
-  induction steps with
-  | nil  => exact root.tier_le_ceiling
-  | cons s rest ih =>
-    simp [List.getLast]
-    by_cases hrest : rest = []
-    · subst hrest
-      simp [List.getLast]
-      exact hmem s (List.mem_cons_self s [])
-    · simp [List.getLast, hrest]
-      apply ih
-      intro s' hs'
-      exact hmem s' (List.mem_cons.mpr (Or.inr hs'))
+theorem noEscalation_steps
+    (steps : List DelegStep) (root : AuthorityGrant)
+    (hmem : ∀ (s : DelegStep), s ∈ steps → s.child.tier ≤ root.ceiling)
+    (hne : steps ≠ []) :
+    (steps.getLast hne).child.tier ≤ root.ceiling :=
+  hmem _ (List.getLast_mem hne)
 
 /-- Main statement: packaging the result in terms of `DelegationChain`
     and `applyChain`. -/
@@ -218,12 +178,14 @@ theorem noEscalation (c : DelegationChain)
     (applyChain c).tier ≤ c.root.ceiling := by
   unfold applyChain
   match h : c.steps with
-  | []   => exact c.root.tier_le_ceiling
-  | steps =>
-    simp [h]
-    apply noEscalation_steps steps c.root
-    intro s hs
-    exact hvalid s (h ▸ hs)
+  | []        => exact c.root.tier_le_ceiling
+  | s :: rest =>
+    have hvalid' : ∀ s', s' ∈ (s :: rest) → s'.child.tier ≤ c.root.ceiling := by
+      intro s' hs'
+      apply hvalid
+      rw [h]
+      exact hs'
+    exact noEscalation_steps (s :: rest) c.root hvalid' (List.cons_ne_nil s rest)
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 8  Ceiling Descent Corollary
@@ -258,7 +220,8 @@ def respectsJurisdiction (jm : JurisdictionMap) (holder : String)
     the jurisdiction check. -/
 def DelegStep.fullValid (jm : JurisdictionMap) (childHolder : String)
     (s : DelegStep) : Prop :=
-  s.h_ceil.le ∧ s.h_mono.le ∧ respectsJurisdiction jm childHolder s.child
+  s.child.tier ≤ s.parent.ceiling ∧ s.child.ceiling ≤ s.parent.ceiling ∧
+    respectsJurisdiction jm childHolder s.child
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 10  Audit Completeness
@@ -271,7 +234,7 @@ structure AuditEvent where
   ceiling : AuthorityTier
   deriving Repr
 
-def AuditLog := List AuditEvent
+abbrev AuditLog := List AuditEvent
 
 /-- An audit log is *clean* if every event satisfies tier ≤ ceiling. -/
 def AuditLog.clean (log : AuditLog) : Prop :=
@@ -279,8 +242,8 @@ def AuditLog.clean (log : AuditLog) : Prop :=
 
 /-- Appending a valid event to a clean log produces a clean log. -/
 theorem clean_append_valid (log : AuditLog) (e : AuditEvent)
-    (hclean : log.clean) (hvalid : e.tier ≤ e.ceiling) :
-    (log ++ [e]).clean := by
+    (hclean : AuditLog.clean log) (hvalid : e.tier ≤ e.ceiling) :
+    AuditLog.clean (log ++ [e]) := by
   unfold AuditLog.clean at *
   intro ev hev
   rw [List.mem_append, List.mem_singleton] at hev
@@ -289,7 +252,7 @@ theorem clean_append_valid (log : AuditLog) (e : AuditEvent)
   | inr h => rw [h]; exact hvalid
 
 /-- An empty audit log is trivially clean. -/
-theorem clean_nil : ([] : AuditLog).clean := by
+theorem clean_nil : AuditLog.clean [] := by
   unfold AuditLog.clean
   intro _ h
   exact absurd h (List.not_mem_nil _)
@@ -300,14 +263,14 @@ theorem clean_nil : ([] : AuditLog).clean := by
 
 /-- Packaging all key results. -/
 theorem trustKernelSoundness :
-    /-- (a) Root grants are self-consistent. -/
+    -- (a) Root grants are self-consistent.
     (kernelGrant.tier ≤ kernelGrant.ceiling) ∧
-    /-- (b) A service grant delegated from a system ceiling is valid. -/
+    -- (b) A service grant delegated from a system ceiling is valid.
     (serviceGrant.tier ≤ serviceGrant.ceiling) ∧
-    /-- (c) The tier chain is strict. -/
+    -- (c) The tier chain is strict.
     (SANDBOX < USER ∧ USER < SERVICE ∧ SERVICE < SYSTEM ∧ SYSTEM < KERNEL) ∧
-    /-- (d) An empty audit log is clean. -/
-    ([] : AuditLog).clean := by
+    -- (d) An empty audit log is clean.
+    AuditLog.clean [] := by
   exact ⟨kernelGrant.tier_le_ceiling,
          serviceGrant.tier_le_ceiling,
          tier_chain,

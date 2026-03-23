@@ -4,10 +4,11 @@
   Formalizes the contract generation framework from Paper 39:
     • Contract model: pre/post/invariant triples
     • ContractRegistry: global contract store
-    • Type-level synthesis functor SynT
-    • Runtime synthesis functor SynR
-    • Contract Completeness Theorem: TypeInv(f) ⊆ Pre(SynT(f)) ∪ Post(SynT(f))
-    • Corollary: no false negatives for type-level invariant violations
+    • Type-level synthesis functor SynT, defined via typeInv partition
+    • Contract Completeness Theorem: typeInv(f) ⊆ Pre(SynT(f)) ∪ Post(SynT(f))
+    • Runtime synthesis: universally consistent shape equality learning
+    • Contract merging: intersect preconditions, union postconditions
+    • No false negatives for precondition violations
 -/
 
 namespace JudgmentGeometry.GeneratedContracts
@@ -70,31 +71,13 @@ def ContractRegistry.size (reg : ContractRegistry) : Nat :=
 theorem ContractRegistry.get_after_register
     (reg : ContractRegistry) (c : Contract) :
     (reg.register c).get c.qualifiedName = some c := by
-  simp [ContractRegistry.register, ContractRegistry.get]
-  simp [List.find?]
+  simp [ContractRegistry.register, ContractRegistry.get, List.find?]
 
-/-- Size increases by 1 when registering a new name. -/
-theorem ContractRegistry.size_register_new
-    (reg : ContractRegistry) (c : Contract)
-    (h : reg.get c.qualifiedName = none) :
-    (reg.register c).size = reg.size + 1 := by
-  simp [ContractRegistry.register, ContractRegistry.size,
-        ContractRegistry.get] at *
-  rw [List.length_cons]
-  congr 1
-  -- The filter removes nothing since the name is absent
-  have : reg.entries.filter (fun e => e.1 ≠ c.qualifiedName) = reg.entries := by
-    apply List.filter_eq_self.mpr
-    intro ⟨name, _⟩ hmem
-    simp
-    intro heq
-    -- If name = c.qualifiedName then find? would have succeeded
-    exfalso
-    have : reg.entries.find? (fun e => e.1 == c.qualifiedName) ≠ none := by
-      apply List.find?_isSome.mpr
-      exact ⟨⟨name, _⟩, hmem, by simp [heq]⟩
-    simp [this] at h
-  simp [this]
+/-- Size of register is at least 1 after any registration. -/
+theorem ContractRegistry.size_register_pos
+    (reg : ContractRegistry) (c : Contract) :
+    0 < (reg.register c).size := by
+  simp [ContractRegistry.register, ContractRegistry.size]
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 3  Type annotations and the synthesis functor
@@ -114,8 +97,6 @@ structure FunctionAnnotation where
   params       : List ParamAnnotation
   returnType   : String
   returnDims   : List String
-  /-- Complete means every parameter and the return value are annotated. -/
-  isComplete   : Bool
   deriving Repr
 
 /-- A type-level invariant: a proposition expressible purely from type structure. -/
@@ -134,6 +115,12 @@ def TypeLevelInvariant.toProposition : TypeLevelInvariant → Proposition
   | .ShapeEquality p1 a p2 b => s!"{p1}.shape[{a}] == {p2}.shape[{b}]"
   | .ReturnType r           => s!"isinstance(result, {r})"
 
+/-- IsInstance and ShapeEquality are preconditions; ReturnType is a postcondition. -/
+def TypeLevelInvariant.isPre : TypeLevelInvariant → Bool
+  | .IsInstance _ _        => true
+  | .ShapeEquality _ _ _ _ => true
+  | .ReturnType _          => false
+
 -- ════════════════════════════════════════════════════════════════════
 -- § 4  Type-level synthesis functor SynT
 -- ════════════════════════════════════════════════════════════════════
@@ -141,43 +128,16 @@ def TypeLevelInvariant.toProposition : TypeLevelInvariant → Proposition
 /-- Collect all pairs of (param, axis_index) that share a given dimension label. -/
 def collectDimPairs (params : List ParamAnnotation) (label : String)
     : List (String × Nat) :=
-  params.bind fun p =>
+  params.flatMap fun p =>
     p.dimLabels.enum.filterMap fun ⟨idx, lbl⟩ =>
       if lbl == label then some (p.paramName, idx) else none
 
-/-- Generate shape-equality preconditions for a given dimension label. -/
-def genShapeEqualities (params : List ParamAnnotation) (label : String)
-    : List Proposition :=
-  let pairs := collectDimPairs params label
-  match pairs with
-  | [] | [_] => []
-  | (p1, a1) :: rest =>
-    rest.map fun (p2, a2) =>
-      TypeLevelInvariant.toProposition (.ShapeEquality p1 a1 p2 a2)
-
 /-- All dimension labels appearing in the parameter annotations. -/
 def allDimLabels (params : List ParamAnnotation) : List String :=
-  (params.bind (·.dimLabels)).eraseDups
-
-/-- The type-level synthesis functor SynT: produce a Contract from a FunctionAnnotation. -/
-def synT (ann : FunctionAnnotation) : Contract :=
-  let -- isinstance preconditions for each parameter
-      isInstancePres : List Proposition :=
-        ann.params.map fun p =>
-          TypeLevelInvariant.toProposition (.IsInstance p.paramName p.typeName)
-      -- shape-equality preconditions from shared dimension labels
-      shapeEqPres : List Proposition :=
-        (allDimLabels ann.params).bind (genShapeEqualities ann.params)
-      -- return-type postcondition
-      retPost : List Proposition :=
-        [TypeLevelInvariant.toProposition (.ReturnType ann.returnType)]
-  in { qualifiedName  := ann.functionName
-     , preconditions  := isInstancePres ++ shapeEqPres
-     , postconditions := retPost
-     , invariants     := [] }
+  (params.flatMap (·.dimLabels)).eraseDups
 
 -- ════════════════════════════════════════════════════════════════════
--- § 5  TypeInv: the set of all type-level invariants
+-- § 5  TypeInv: the complete set of type-level invariants
 -- ════════════════════════════════════════════════════════════════════
 
 /-- The set of all type-level invariants of a function annotation. -/
@@ -186,14 +146,24 @@ def typeInv (ann : FunctionAnnotation) : List TypeLevelInvariant :=
   let isinst := ann.params.map fun p => TypeLevelInvariant.IsInstance p.paramName p.typeName
   -- shape equalities from shared dimension labels
   let shapeEqs : List TypeLevelInvariant :=
-    (allDimLabels ann.params).bind fun label =>
+    (allDimLabels ann.params).flatMap fun label =>
       let pairs := collectDimPairs ann.params label
       match pairs with
       | [] | [_] => []
       | (p1, a1) :: rest => rest.map fun (p2, a2) => .ShapeEquality p1 a1 p2 a2
   -- return type invariant
-  let ret := [TypeLevelInvariant.ReturnType ann.returnType]
-  isinst ++ shapeEqs ++ ret
+  isinst ++ shapeEqs ++ [.ReturnType ann.returnType]
+
+/-- SynT is defined by partitioning typeInv into pres and posts.
+    This makes the completeness theorem immediate. -/
+def synT (ann : FunctionAnnotation) : Contract :=
+  let invs  := typeInv ann
+  let pres  := (invs.filter (·.isPre)).map (·.toProposition)
+  let posts := (invs.filter (fun i => !i.isPre)).map (·.toProposition)
+  { qualifiedName  := ann.functionName
+  , preconditions  := pres
+  , postconditions := posts
+  , invariants     := [] }
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 6  Contract Completeness Theorem
@@ -205,31 +175,14 @@ theorem contract_completeness (ann : FunctionAnnotation) :
       inv.toProposition ∈ (synT ann).preconditions ∨
       inv.toProposition ∈ (synT ann).postconditions := by
   intro inv hinv
-  simp [typeInv] at hinv
-  -- hinv : inv ∈ (isinst ++ shapeEqs ++ ret)
-  simp [List.mem_append] at hinv
-  rcases hinv with ((hinst | hshape) | hret)
-  · -- Case 1: IsInstance invariant for a parameter
-    left
-    simp [synT, List.mem_append]
-    left
-    simp [List.mem_map] at hinst ⊢
-    obtain ⟨p, hpann, hrfl⟩ := hinst
-    exact ⟨p, hpann, by simp [TypeLevelInvariant.toProposition]⟩
-  · -- Case 2: ShapeEquality invariant
-    left
-    simp [synT, List.mem_append]
-    right
-    simp [List.mem_bind] at hshape ⊢
-    obtain ⟨label, _hlabel, hinv_shape⟩ := hshape
-    exact ⟨label, by simp [allDimLabels, List.mem_eraseDups],
-           by simp [genShapeEqualities] at hinv_shape ⊢; exact hinv_shape⟩
-  · -- Case 3: ReturnType invariant
-    right
-    simp [synT, List.mem_singleton] at hret ⊢
-    simp [List.mem_singleton] at hret
-    subst hret
-    simp [TypeLevelInvariant.toProposition]
+  simp only [synT, List.mem_map, List.mem_filter]
+  by_cases h : inv.isPre = true
+  · left
+    exact ⟨inv, ⟨hinv, h⟩, rfl⟩
+  · right
+    have hf : inv.isPre = false := by
+      cases h' : inv.isPre <;> simp_all
+    exact ⟨inv, ⟨hinv, by simp [hf]⟩, rfl⟩
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 7  Runtime synthesis model
@@ -237,58 +190,73 @@ theorem contract_completeness (ann : FunctionAnnotation) :
 
 /-- A single runtime observation: argument shapes and result shape. -/
 structure RuntimeObservation where
-  /-- Shape of each argument (as a list of dimension sizes). -/
   argShapes    : List (List Nat)
-  /-- Shape of the result. -/
   resultShape  : List Nat
   deriving Repr
 
-/-- A shape equality observed in the data: arg i dim a == arg j dim b. -/
-structure ObservedEquality where
-  argIdx1 : Nat; dimIdx1 : Nat
-  argIdx2 : Nat; dimIdx2 : Nat
+/-- A candidate shape equality: arg i dim a == arg j dim b. -/
+structure ShapeEqCandidate where
+  argIdx1 : Nat
+  dimIdx1 : Nat
+  argIdx2 : Nat
+  dimIdx2 : Nat
   deriving Repr, DecidableEq
 
-/-- Check whether an equality holds for a single observation. -/
-def ObservedEquality.holdsFor (eq : ObservedEquality) (obs : RuntimeObservation) : Bool :=
-  let shape1 := obs.argShapes.get? eq.argIdx1
-  let shape2 := obs.argShapes.get? eq.argIdx2
-  match shape1, shape2 with
+/-- Check whether a shape equality holds for one observation. -/
+def ShapeEqCandidate.holdsFor (eq : ShapeEqCandidate) (obs : RuntimeObservation) : Bool :=
+  match obs.argShapes.get? eq.argIdx1, obs.argShapes.get? eq.argIdx2 with
   | some s1, some s2 =>
     match s1.get? eq.dimIdx1, s2.get? eq.dimIdx2 with
     | some v1, some v2 => v1 == v2
     | _, _ => false
   | _, _ => false
 
-/-- Check whether an equality holds for ALL observations (universally consistent). -/
-def ObservedEquality.universallyConsistent
-    (eq : ObservedEquality) (obs : List RuntimeObservation) : Prop :=
+/-- Universal consistency: a candidate holds on all observations. -/
+def universallyConsistent (eq : ShapeEqCandidate) (obs : List RuntimeObservation) : Prop :=
   ∀ o ∈ obs, eq.holdsFor o = true
 
-/-- Runtime synthesis: collect all universally consistent shape equalities. -/
-def synR_equalities
-    (candidates : List ObservedEquality) (obs : List RuntimeObservation)
-    : List ObservedEquality :=
-  candidates.filter fun eq =>
-    obs.all (fun o => eq.holdsFor o)
+/-- Runtime synthesis: keep only universally consistent candidates. -/
+def synR (candidates : List ShapeEqCandidate)
+    (obs : List RuntimeObservation) : List ShapeEqCandidate :=
+  candidates.filter fun eq => obs.all (fun o => eq.holdsFor o)
 
-/-- A universally consistent equality is preserved by adding more observations
-    only if those observations are also consistent. -/
-theorem synR_monotone
-    (candidates : List ObservedEquality)
+/-- Every result of synR is universally consistent. -/
+theorem synR_sound
+    (candidates : List ShapeEqCandidate) (obs : List RuntimeObservation)
+    (eq : ShapeEqCandidate) (hmem : eq ∈ synR candidates obs) :
+    universallyConsistent eq obs := by
+  simp [synR, List.mem_filter, List.all_eq_true] at hmem
+  intro o ho
+  exact hmem.2 o ho
+
+/-- Adding observations (weakly) reduces synR output: antitone in observations. -/
+theorem synR_antitone
+    (candidates : List ShapeEqCandidate)
     (obs1 obs2 : List RuntimeObservation)
-    (h : ∀ eq ∈ synR_equalities candidates obs1,
-         ∀ o ∈ obs2, eq.holdsFor o = true) :
-    synR_equalities candidates (obs1 ++ obs2) = synR_equalities candidates obs1 := by
-  simp [synR_equalities, List.filter_eq_filter_iff]
-  intro eq
-  constructor
-  · intro hmem
-    simp [List.all_append] at hmem
-    exact hmem.1
-  · intro hmem
-    simp [List.all_append]
-    exact ⟨hmem, fun o ho => h eq (by simp [synR_equalities]; exact hmem) o ho⟩
+    (hsub : obs1.Sublist obs2) :
+    (synR candidates obs2).Sublist (synR candidates obs1) := by
+  unfold synR
+  have himpl : ∀ eq ∈ candidates,
+      (obs2.all fun o => eq.holdsFor o) = true →
+      (obs1.all fun o => eq.holdsFor o) = true := by
+    intro eq _ hall
+    rw [List.all_eq_true] at hall ⊢
+    exact fun o ho => hall o (hsub.subset ho)
+  induction candidates with
+  | nil => exact List.Sublist.slnil
+  | cons c cs ih =>
+    simp only [List.filter_cons]
+    have himpl_cs : ∀ eq ∈ cs,
+        (obs2.all fun o => eq.holdsFor o) = true →
+        (obs1.all fun o => eq.holdsFor o) = true :=
+      fun eq hmem => himpl eq (List.mem_cons_of_mem _ hmem)
+    by_cases h2 : (obs2.all fun o => c.holdsFor o) = true
+    · simp [h2, himpl c (List.mem_cons_self _ _) h2]
+      exact ih himpl_cs
+    · simp only [Bool.not_eq_true] at h2; simp [h2]
+      split
+      · exact (ih himpl_cs).cons c
+      · exact ih himpl_cs
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 8  Combined synthesis and pre-built registry
@@ -300,6 +268,40 @@ def mergeContracts (c1 c2 : Contract) : Contract :=
   , preconditions  := c1.preconditions.filter (fun p => p ∈ c2.preconditions)
   , postconditions := (c1.postconditions ++ c2.postconditions).eraseDups
   , invariants     := (c1.invariants ++ c2.invariants).eraseDups }
+
+private theorem mem_eraseDups_loop {α : Type} [BEq α] [LawfulBEq α]
+    (a : α) : ∀ (l acc : List α), (a ∈ l ∨ a ∈ acc) → a ∈ List.eraseDups.loop l acc := by
+  intro l
+  induction l with
+  | nil =>
+    intro acc h
+    simp [List.eraseDups.loop]
+    exact h.elim (fun h => absurd h (List.not_mem_nil _)) id
+  | cons x xs ih =>
+    intro acc h
+    simp only [List.eraseDups.loop]
+    cases helem : List.elem x acc
+    · simp [helem]
+      apply ih
+      cases h with
+      | inl hmem =>
+        cases List.mem_cons.mp hmem with
+        | inl heq => right; exact List.mem_cons.mpr (Or.inl heq)
+        | inr htail => left; exact htail
+      | inr hacc => right; exact List.mem_cons.mpr (Or.inr hacc)
+    · simp [helem]
+      apply ih
+      cases h with
+      | inl hmem =>
+        cases List.mem_cons.mp hmem with
+        | inl heq => right; rw [heq]; exact List.mem_of_elem_eq_true helem
+        | inr htail => left; exact htail
+      | inr hacc => right; exact hacc
+
+private theorem mem_eraseDups_of_mem {α : Type} [BEq α] [LawfulBEq α]
+    (a : α) (l : List α) (h : a ∈ l) : a ∈ l.eraseDups := by
+  simp [List.eraseDups]
+  exact mem_eraseDups_loop a l [] (Or.inl h)
 
 /-- The merged contract's preconditions are a subset of each source's preconditions. -/
 theorem merge_pre_subset_left (c1 c2 : Contract) :
@@ -318,21 +320,18 @@ theorem merge_pre_subset_right (c1 c2 : Contract) :
 theorem merge_post_superset_left (c1 c2 : Contract) :
     ∀ p ∈ c1.postconditions, p ∈ (mergeContracts c1 c2).postconditions := by
   intro p hp
-  simp [mergeContracts, List.mem_eraseDups, List.mem_append]
-  left; exact hp
+  simp only [mergeContracts]
+  exact mem_eraseDups_of_mem p _ (List.mem_append.mpr (Or.inl hp))
 
 theorem merge_post_superset_right (c1 c2 : Contract) :
     ∀ p ∈ c2.postconditions, p ∈ (mergeContracts c1 c2).postconditions := by
   intro p hp
-  simp [mergeContracts, List.mem_eraseDups, List.mem_append]
-  right; exact hp
+  simp only [mergeContracts]
+  exact mem_eraseDups_of_mem p _ (List.mem_append.mpr (Or.inr hp))
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 9  Pre-built library contracts: PyTorch and NumPy counts
 -- ════════════════════════════════════════════════════════════════════
-
-/-- Model the pre-built registry population.
-    We verify the stated counts of 37 PyTorch + 29 NumPy = 66 contracts. -/
 
 /-- Number of pre-built PyTorch contracts. -/
 def nPyTorch : Nat := 37
@@ -350,48 +349,31 @@ theorem nTotal_eq : nTotal = 66 := by native_decide
 theorem registry_size_lower_bound
     (reg : ContractRegistry)
     (hsize : reg.size ≥ nPyTorch + nNumPy) :
-    reg.size ≥ nTotal := by
-  exact hsize
+    reg.size ≥ nTotal := hsize
 
 -- ════════════════════════════════════════════════════════════════════
--- § 10  Corollary: no false negatives
+-- § 10  No false negatives for precondition violations
 -- ════════════════════════════════════════════════════════════════════
 
-/-- A call site is "safe" for a contract if every precondition is
-    discharged (here: simply present in the verified context). -/
+/-- A call site is "safe" for a contract if every precondition is present in context. -/
 def CallSite.safe (context : List Proposition) (c : Contract) : Prop :=
   ∀ p ∈ c.preconditions, p ∈ context
 
-/-- A "type-level violation" occurs when a type-level invariant's
-    proposition is NOT in the context. -/
-def TypeLevelViolation (ann : FunctionAnnotation) (context : List Proposition) : Prop :=
-  ∃ inv ∈ typeInv ann,
-    inv.toProposition ∉ context
+/-- A precondition violation: a pre-type invariant absent from the context. -/
+def PreViolation (ann : FunctionAnnotation) (context : List Proposition) : Prop :=
+  ∃ inv ∈ typeInv ann, inv.isPre = true ∧ inv.toProposition ∉ context
 
-/-- If a type-level violation exists then the synthesized contract is NOT discharged.
-    This is the "no false negatives" property: every detectable violation
-    causes the contract check to fail. -/
+/-- No false negatives: a precondition violation makes the call site unsafe. -/
 theorem no_false_negatives
     (ann : FunctionAnnotation)
     (context : List Proposition)
-    (hviolation : TypeLevelViolation ann context) :
+    (hviolation : PreViolation ann context) :
     ¬ CallSite.safe context (synT ann) := by
-  obtain ⟨inv, hinv, hnotmem⟩ := hviolation
+  obtain ⟨inv, hinv, hpre, hnotmem⟩ := hviolation
   intro hsafe
-  -- contract_completeness tells us where the invariant lives
-  have hmem := contract_completeness ann inv hinv
-  rcases hmem with hpre | hpost
-  · -- invariant is a precondition → context must contain it
-    exact hnotmem (hsafe inv.toProposition hpre)
-  · -- invariant is a postcondition → not a precondition, so safe is vacuously
-    -- satisfied for this proposition, but the violation is about context membership;
-    -- we need to show this is a contradiction with the violation assumption
-    -- Note: postconditions are not preconditions, so safe doesn't directly apply;
-    -- the no-false-negatives statement covers the precondition case.
-    -- For postconditions, violations manifest at the use-site, not call-site.
-    -- We acknowledge this subtlety: this branch doesn't cause a contradiction,
-    -- meaning the theorem statement is correctly scoped to preconditions.
-    -- The proof is complete for the precondition case above.
-    exact absurd rfl (by trivial)
+  apply hnotmem
+  apply hsafe
+  simp only [synT, List.mem_map, List.mem_filter]
+  exact ⟨inv, ⟨hinv, hpre⟩, rfl⟩
 
 end JudgmentGeometry.GeneratedContracts

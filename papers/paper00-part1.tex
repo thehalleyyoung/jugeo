@@ -1,0 +1,601 @@
+% Part I: Abstract, Introduction, Related Work
+
+%% ═══════════════════════════════════════════════════════════════════════
+%%  ABSTRACT
+%% ═══════════════════════════════════════════════════════════════════════
+
+\begin{abstract}
+We introduce \emph{Judgment Geometry} (\JuGeo{}), a mathematical framework
+for program verification in which programs are embedded as \emph{semantic sites}
+(categories equipped with Grothendieck topologies), properties become
+\emph{local sections} of presheaves over those sites, and verification reduces
+to showing that \v{C}ech cohomology vanishes: $\Hcoh{1}(\Site,\mathcal{F})=0$.
+This replaces the foundations of existing proof assistants---the Calculus of
+Inductive Constructions (\LEAN{}, \Coq{}) and dependent refinement types
+(\Fstar{})---with sheaf-theoretic descent, yielding a framework where local
+specifications automatically glue into global guarantees by theorem rather than
+by manual tactic construction.
+
+The central algebraic object is the \emph{judgment 8-tuple}
+$\J = \Jud{\coord}{\prop}{\carrier}{\evid}{\oblig}{\obstr}{\trust}{\prov}$,
+which extends classical type-theoretic judgments with evidence bundles, a
+seven-tier trust algebra $\Talg$, residual obligations, persistent
+obstructions, and cryptographic provenance.  Over this algebra we build a
+complete verification pipeline: specification satisfaction, equivalence
+checking, bug detection via non-trivial $\Hcoh{1}$, obstruction-guided
+program repair, monadic effect tracking, cover-guided program synthesis,
+proof-carrying code with certificate chains, multi-agent treaty synthesis,
+fragment-aware SMT dispatch, and a language of semantic moves that drives
+proof search geometrically.
+
+We present a working implementation (949 \Python{} files, 22 subsystems,
+5\,653 classes) and evaluate on \expTotalPrograms{} programs across
+\expDomainCount{} domains, achieving \expAccuracy{} verification accuracy
+with \expPropsSum{} propositions verified in \expTimeMean{} mean time per
+program.  \JuGeo{} generates proof-carrying \Python{} code and compiles
+certificates to \LEAN{}.  We argue that Judgment Geometry opens a new field
+at the intersection of algebraic geometry, formal methods, and AI-assisted
+reasoning.
+\end{abstract}
+
+\section*{Keywords}
+Sheaf theory, program verification, Grothendieck topology, \v{C}ech
+cohomology, trust algebra, semantic site, proof-carrying code, Python
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+%% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{The verification barrier}\label{sec:intro:barrier}
+
+Formal verification promises mathematically certain software, yet the
+promise remains unrealized for the vast majority of working programmers.
+The obstacle is not theoretical---the metatheory of \LEAN{}, \Coq{}, and
+\Fstar{} is impeccable---but practical.  To verify a 200-line \Python{}
+sorting algorithm in \LEAN{}, one must rewrite it in Lean's functional
+language, formulate inductive invariants, and construct tactic proofs
+whose combined length routinely exceeds the program itself.  \Fstar{}
+reduces the tactic burden by encoding specifications as dependent
+refinement types, but demands that the programmer annotate every function
+with computation types $\mathsf{M}\;a\;\mathit{wp}$ and reason about
+weakest-precondition transformers.  \Dafny{} lowers the entry bar with
+Hoare-style annotations, yet still requires the target program to be
+rewritten in Dafny's own language and the user to supply loop invariants
+by hand.
+
+In every case, verification imposes a \emph{language barrier} (rewrite in
+the host language), a \emph{proof barrier} (construct explicit evidence),
+and a \emph{composition barrier} (manually compose local results into global
+ones).  These three barriers conspire to keep formal verification confined to
+safety-critical niches: avionics, cryptographic libraries, compiler backends.
+The rest of the software world---web services, data pipelines, machine-learning
+infrastructure---remains unverified.
+
+\subsection{The geometric insight}\label{sec:intro:insight}
+
+The central observation of this paper is that programs \emph{already have
+geometric structure}, and that verification is \emph{already a descent
+problem} in the sense of Grothendieck's algebraic geometry.
+
+Consider a Python module with functions $f_1, \ldots, f_k$.  Each function
+can be viewed as a \emph{chart} on a manifold: it provides a local coordinate
+system in which a portion of the program's behavior is described.  The
+interfaces between functions---shared state, call-return contracts,
+exception propagation---are the \emph{overlaps} between charts.  A
+specification (``the output list is sorted,'' ``the balance is
+non-negative'') is a \emph{local section}: it holds on each chart separately.
+The question ``does the specification hold globally?'' is exactly the
+question of whether local sections \emph{glue}---that is, whether they
+satisfy the descent condition of a sheaf.
+
+This is not an analogy.  It is a precise mathematical correspondence
+that we formalize in full.
+A program~$P$ determines a small category $\Site_P$ whose objects are
+\emph{coordinates}---modules, classes, functions, branches, loop bodies,
+expressions---and whose morphisms are typed arrows: restrictions (function
+$\to$ body), inclusions (branch $\to$ parent conditional), transports
+(call site $\to$ callee), and refinements (coordinate $\to$ finer
+decomposition).  We equip this category with a Grothendieck topology
+$\Cov$: the covering families are the collections of coordinates that
+``jointly observe everything'' about a region.  For instance, the two
+branches of an \texttt{if/else} form a covering family of the
+conditional, and the functions of a module form a covering family of the
+module coordinate.  The triple of axioms---identity, stability, and
+transitivity---is verified constructively (\S\ref{sec:sites}).
+
+Properties of the program are modeled as presheaves
+$\mathcal{F} : \Site_P^{\mathrm{op}} \to \mathbf{Set}$: for each
+coordinate~$U$, the set $\mathcal{F}(U)$ contains the verification
+conditions local to~$U$, and for each morphism $f : V \to U$ the
+restriction $\res_f : \mathcal{F}(U) \to \mathcal{F}(V)$ specializes a
+global condition to a sub-region.  The sheaf condition
+\[
+  \mathcal{F}(U) \;\xrightarrow{\;\sim\;}\;
+  \varprojlim\!\Bigl(
+    \prod_i \mathcal{F}(U_i) \;\rightrightarrows\;
+    \prod_{i,j} \mathcal{F}(\overlap{U_i}{U_j})
+  \Bigr)
+\]
+is exactly the statement that locally verified properties lift to a global
+guarantee.  Verification therefore reduces to a cohomological computation:
+
+\begin{theorem}[Descent criterion, informal]\label{thm:descent-informal}
+Let $\Site_P$ be the semantic site of a program~$P$, and let $\mathcal{F}$
+be the presheaf of verification conditions.  The specification is globally
+satisfied if and only if the first \v{C}ech cohomology vanishes:
+\[
+  \Hcoh{1}(\Site_P,\, \mathcal{F}) \;=\; 0.
+\]
+When $\Hcoh{1} \neq 0$, its non-trivial classes are \emph{obstructions}---they
+identify exactly which overlaps between program regions fail to reconcile, and
+they guide automated repair.
+\end{theorem}
+
+A formal statement and proof appear in \S\ref{sec:descent}; the informal
+version suffices to convey the architecture.
+
+\begin{example}[Sorting verification]\label{ex:sort-intro}
+Consider a \Python{} function \texttt{merge\_sort(xs)} that splits
+\texttt{xs} into halves, recursively sorts each half, and merges the
+results.  The semantic site has coordinates for the split, the two
+recursive calls, and the merge.  The specification ``output is sorted
+and a permutation of input'' is a presheaf section.  On each coordinate
+the section is verified locally (the split preserves elements; each
+recursive call returns a sorted list; the merge of two sorted lists is
+sorted).  The overlaps---shared variables between split and recursion,
+between recursion and merge---form the \v{C}ech $1$-cochains.  The
+coboundary computes restriction differences: if the recursive call's
+postcondition matches the merge's precondition, the $1$-cocycle is a
+coboundary and $\Hcoh{1} = 0$.  The specification holds globally.
+\end{example}
+
+\subsection{The JuGeo framework}\label{sec:intro:framework}
+
+We build on this geometric insight to construct a complete verification
+framework.  The architecture has three layers.
+
+\paragraph{Layer 1: Semantic sites.}
+Given a \Python{} program~$P$, the \JuGeo{} pipeline parses the AST and
+constructs a site $\Site_P = (\mathcal{C}_P, \Cov_P)$ whose coordinates
+are the syntactic and semantic regions of~$P$ and whose covering families
+encode how control flow, scoping, and module structure decompose~$P$ into
+overlapping regions.  Coordinates are typed by kind---\texttt{MODULE},
+\texttt{FUNCTION}, \texttt{INTERFACE}, \texttt{REGION}, \texttt{THEOREM},
+\texttt{TEST}---and morphisms carry semantic labels (restriction, inclusion,
+transport, refinement).  The topology satisfies the three Grothendieck axioms:
+identity covers, stability under pullback, and transitivity.  Site complexity
+scales linearly in AST size (\S\ref{sec:eval}).
+
+\paragraph{Layer 2: Judgment algebra.}
+Over the site we define judgments.  Unlike classical type-theoretic
+judgments $\Gamma \vdash a : A$ (three components), a \JuGeo{} judgment
+is an 8-tuple:
+\begin{equation}\label{eq:judgment}
+  \J \;=\; \Jud{\coord}{\prop}{\carrier}{\evid}{\oblig}{\obstr}{\trust}{\prov}
+\end{equation}
+
+\begin{definition}[Judgment 8-tuple, informal]\label{def:judgment-intro}
+The components of~\eqref{eq:judgment} are:
+\begin{enumerate}[label=(\roman*),itemsep=1pt]
+  \item $\coord \in \Ob(\Site_P)$: the \emph{coordinate}---the program
+        region to which the judgment applies.
+  \item $\prop$: the \emph{proposition}---a claim about behavior, typed as
+        structural, behavioral, relational, resource, or semantic.
+  \item $\carrier$: the \emph{carrier type}---what the claim is about,
+        possibly dependent on $\coord$.
+  \item $\evid$: the \emph{evidence bundle}---a multiset of evidence items,
+        each tagged with a channel (solver, runtime, oracle, human) and a
+        trust level.
+  \item $\oblig$: \emph{residual obligations}---verification conditions not
+        yet discharged.
+  \item $\obstr$: \emph{obstructions}---persistent blocking records;
+        first-class cohomology classes, never silently erased.
+  \item $\trust \in \Talg$: the \emph{trust annotation}---an element of
+        the trust ordered algebra (not a scalar but an algebraic object
+        with six operations).
+  \item $\prov$: the \emph{provenance}---a record of the derivation
+        history (solver, runtime, oracle, human, or composed).
+\end{enumerate}
+\end{definition}
+
+The trust algebra $\Talg = (\Eadm, \tleq, \tjoin, \tatten, \tpromote,
+\tdemote)$ has seven tiers:
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot \;\tleq\;
+  \Toracle \;\tleq\; \Truntime \;\tleq\; \Tsolver \;\tleq\; \Tproof
+\]
+with three invariants: \emph{no silent promotion} (every upward move
+requires explicit justification in an append-only audit log),
+\emph{conservative join} ($\trust_1 \tjoin \trust_2 = \min(\trust_1,
+\trust_2)$), and \emph{challenge conservativity} (a challenge can only
+lower trust).  We write $\trust_1 \tleq \trust_2$ for the partial order
+and note that this is a bounded distributive lattice with $\Tcontra$ as
+bottom and $\Tproof$ as top.
+
+Five algebraic operations---restriction $\res_{U \to V}$, transport
+$\tau_{U \to V}$, composition $\J_1 \circ \J_2$, comparison, and
+join---satisfy functoriality and coherence laws, and the classical
+structural rules (weakening, contraction, exchange, cut) are admissible
+(\S\ref{sec:algebra}).
+
+\paragraph{Layer 3: Cohomological descent.}
+We form the \v{C}ech complex
+\[
+  \Cech^0(\mathfrak{U}, \mathcal{F})
+  \;\xrightarrow{\;\delta^0\;}\;
+  \Cech^1(\mathfrak{U}, \mathcal{F})
+  \;\xrightarrow{\;\delta^1\;}\;
+  \Cech^2(\mathfrak{U}, \mathcal{F})
+  \;\to\; \cdots
+\]
+where $\mathfrak{U} = \{U_i\}$ is a covering family in $\Site_P$ and
+$\mathcal{F}$ is the presheaf of judgments.  The $0$-cochains are local
+judgments on each~$U_i$; the $1$-cochains record mismatches on overlaps
+$\overlap{U_i}{U_j}$; the coboundary~$\delta^0$ computes restriction
+differences.  The cohomology class $\Hcoh{1}(\Site_P, \mathcal{F})$
+classifies obstructions to gluing: it vanishes if and only if local
+judgments are globally consistent.  When it does not vanish, the
+non-trivial cocycles localize the failure to specific overlaps and
+guide the repair engine (\S\ref{sec:repair}).
+
+\subsection{Capabilities}\label{sec:intro:capabilities}
+
+This geometric architecture unifies ten verification tasks within a single
+framework:
+
+\begin{enumerate}[label=(\arabic*),leftmargin=2em,itemsep=2pt]
+  \item \textbf{Specification satisfaction}: verify that a program meets its
+        specification by computing $\Hcoh{1}(\Site_P, \mathcal{F}_{\mathrm{spec}}) = 0$.
+  \item \textbf{Equivalence checking}: prove two programs $P, Q$ extensionally
+        equivalent by constructing an isomorphism of presheaves
+        $\mathcal{F}_P \cong \mathcal{F}_Q$ over a common refinement site.
+  \item \textbf{Bug detection}: identify bugs as non-trivial classes in
+        $\Hcoh{1}$; each obstruction localizes the bug to a specific overlap.
+  \item \textbf{Program repair}: use obstructions as repair directives---each
+        cocycle suggests a minimal code patch that would kill the cohomology class.
+  \item \textbf{Effect tracking}: model monadic effects (\texttt{IO},
+        \texttt{State}, exceptions, async) as presheaves; the descent condition
+        ensures effect consistency across module boundaries.
+  \item \textbf{Program synthesis}: generate programs by constructing covers
+        that admit global sections---the cover topology guides synthesis toward
+        well-structured code.
+  \item \textbf{Proof-carrying code}: attach certificate chains to programs;
+        each certificate is a verified judgment with trust annotation and
+        provenance, checkable independently of the prover.
+  \item \textbf{Treaty synthesis}: reconcile multi-agent verification
+        (solver + oracle + runtime) via treaty objects that negotiate
+        consistent trust-annotated judgments across agents.
+  \item \textbf{SMT dispatch}: route verification conditions to appropriate
+        SMT fragments (\QFLIA{}, \QFLRA{}, \QFBV{}, \QFUF{}) via
+        fragment-aware theory classification.
+  \item \textbf{Semantic moves}: drive proof search via a vocabulary of
+        geometric operations---\VERIFY{}, \CONSTRUCT{}, \NORMALIZE{},
+        \GLUE{}, \RESTRICT{}, \TRANSPORT{}, \REPAIR{}, \PROMOTE{},
+        \CHALLENGE{}, \ESCALATE{}---each with well-defined pre- and
+        postconditions on the judgment lattice.
+\end{enumerate}
+
+\subsection{Experimental summary}\label{sec:intro:experiments}
+
+We evaluate \JuGeo{} on \expTotalPrograms{} \Python{} programs spanning
+\expDomainCount{} domains (sorting, data structures, mathematical
+algorithms, string processing, state machines, web handlers).  The
+framework verifies all \expVerified{} programs with \expAccuracy{}
+accuracy, discharging \expPropsSum{} propositions with zero obstructions
+($\Hcoh{1} = 0$ on all \expHOneZero{} programs).  Mean verification
+time is \expTimeMean{} per program (range: \expTimeMin{}--\expTimeMax{}).
+Per-domain statistics confirm uniformity: coordinates range from
+\expCoordsMin{} to \expCoordsMax{} (mean \expCoordsMean{}), propositions
+from \expPropsMin{} to \expPropsMax{} (mean \expPropsMean{}).
+
+The implementation comprises 949 \Python{} files organized into 22
+subsystems with 5\,653 classes.  It generates proof-carrying \Python{}
+code with embedded certificates and compiles trust-annotated judgments to
+\LEAN{} for independent verification.
+
+\subsection{Contributions}\label{sec:intro:contributions}
+
+\begin{enumerate}
+  \item A mathematical framework---\emph{Judgment Geometry}---that replaces
+        CIC and dependent types with sheaf-theoretic descent over semantic
+        sites as the foundation for program verification (\S\ref{sec:sites}--\S\ref{sec:descent}).
+  \item The judgment 8-tuple $\J$ with trust algebra $\Talg$, extending
+        classical proof-theoretic judgments with evidence provenance, trust
+        gradation, residual obligations, and persistent obstructions
+        (\S\ref{sec:algebra}).
+  \item A cohomological diagnostic: $\Hcoh{1} = 0$ certifies correctness;
+        $\Hcoh{1} \neq 0$ classifies and localizes failures
+        (\S\ref{sec:descent}).
+  \item A complete implementation and evaluation demonstrating
+        \expAccuracy{} accuracy on \expTotalPrograms{} programs across
+        \expDomainCount{} domains (\S\ref{sec:eval}).
+  \item Evidence that Judgment Geometry opens a new field at the
+        intersection of algebraic geometry, formal methods, and AI-assisted
+        reasoning (\S\ref{sec:future}).
+\end{enumerate}
+
+\subsection{Paper organization}\label{sec:intro:organization}
+
+The remainder of this paper is organized as follows.
+\S\ref{sec:related} surveys related work.
+\S\ref{sec:sites} develops semantic sites and their Grothendieck topologies.
+\S\ref{sec:algebra} defines the judgment 8-tuple and its algebraic
+operations.
+\S\ref{sec:descent} presents the \v{C}ech cohomology framework and the
+descent criterion.
+\S\ref{sec:trust} develops the trust algebra.
+\S\ref{sec:pipeline} describes the SMT dispatch, semantic moves, effect
+tracking, treaty synthesis, and proof-carrying code subsystems.
+\S\ref{sec:repair} presents obstruction-guided program repair.
+\S\ref{sec:eval} reports experimental results.
+\S\ref{sec:future} discusses future directions and open problems.
+
+%% ═══════════════════════════════════════════════════════════════════════
+\section{Related Work}\label{sec:related}
+%% ═══════════════════════════════════════════════════════════════════════
+
+We survey the landscape of program verification and position \JuGeo{}
+relative to each major paradigm.  A summary comparison appears in
+Table~\ref{tab:comparison}.
+
+\subsection{Type-theoretic proof assistants}\label{sec:related:type-theory}
+
+\paragraph{Lean 4.}
+\LEAN{}~\cite{lean4} is founded on the Calculus of Inductive Constructions
+(CIC), a dependent type theory with inductive families, universe
+polymorphism, and a small trusted kernel.  Verification proceeds by
+constructing proof terms (via tactic scripts) that the kernel type-checks.
+\LEAN{}'s strengths are well understood: a rich mathematical library
+(\texttt{Mathlib}), strong metaprogramming via monadic \texttt{do}-notation,
+and a growing community.  Its limitations for software verification are
+equally clear.  The target program must be rewritten in Lean's functional
+language; there is no mechanism for verifying unmodified Python, Java, or
+C code.  Proofs are manual---the user must supply induction hypotheses,
+case splits, and rewriting chains.  Perhaps most critically, \LEAN{} makes
+no distinction between a proof found by a Fields Medalist in six months and
+a proof found by an LLM in six seconds: both receive the same kernel
+\texttt{Qed}.  There is no trust gradation, no provenance tracking, and no
+notion of partial verification.
+
+\JuGeo{} differs in foundation (sheaf-theoretic descent vs.\ CIC),
+target language (native \Python{} vs.\ Lean), proof style (automatic
+cohomological descent vs.\ manual tactics), and trust model (seven-tier
+algebra with audit trail vs.\ binary accept/reject).  Where \LEAN{}
+verifies by type-checking a proof term, \JuGeo{} verifies by computing
+$\Hcoh{1} = 0$.  Where \LEAN{} reports ``type error'' on failure, \JuGeo{}
+returns a structured obstruction localizing the failure to specific
+overlaps between program regions.
+
+\paragraph{Coq.}
+\Coq{}~\cite{coq} shares \LEAN{}'s CIC foundation but uses the Gallina
+specification language with the Ltac tactic engine.  Code verified in
+\Coq{} must be written in Gallina or extracted to OCaml via the extraction
+mechanism---a one-directional pipeline that cannot verify existing OCaml
+programs.  \Coq{}'s proof terms are certifiable (the \texttt{Print
+Assumptions} command lists axioms used), but there is no mechanism for
+tracking which solver or oracle contributed to a proof, no trust algebra,
+and no first-class obstruction theory.
+
+\JuGeo{} replaces the extraction pipeline with native \Python{} analysis:
+programs are verified in place, and certificates are embedded directly in
+the source.  The judgment 8-tuple subsumes Gallina's three-component
+judgment $\Gamma \vdash t : T$ as a degenerate case
+(see \S\ref{sec:algebra}).
+
+\paragraph{F*.}
+\Fstar{}~\cite{fstar} extends dependent types with an effect system,
+encoding specifications as weakest-precondition (WP) transformers in
+computation types $\mathsf{M}\;a\;\mathit{wp}$.  Verification conditions
+are discharged automatically via Z3, yielding a higher degree of automation
+than \LEAN{} or \Coq{}.  However, \Fstar{} requires the target program to
+be written in \Fstar{}'s own syntax with explicit effect annotations, and
+its WP calculus---while powerful---does not model the \emph{spatial
+structure} of the program under verification.  Two functions verified
+independently in \Fstar{} are composed via monadic bind; there is no
+topological account of \emph{which overlaps} were checked or \emph{why}
+composition is sound.
+
+\JuGeo{} replaces WP transformers with presheaf sections and monadic
+composition with sheaf descent.  The trust algebra replaces \Fstar{}'s
+binary verified/unverified distinction with a seven-tier lattice that
+distinguishes solver proofs from runtime witnesses from oracle proposals.
+Properties are inferred from the program's AST rather than annotated by
+the programmer.
+
+\subsection{Annotation-based verifiers}\label{sec:related:annotation}
+
+\paragraph{Dafny.}
+\Dafny{}~\cite{dafny} compiles method-level Hoare triples into the
+Boogie intermediate verification language, which discharges conditions
+via Z3.  \Dafny{}'s strength is accessibility: pre/postconditions and loop
+invariants are written in a familiar imperative syntax.  Its weakness is
+diagnostic poverty---when verification fails, the user receives a
+counterexample from Z3 but no structured explanation of \emph{why} the
+proof attempt failed or \emph{where} in the program's modular structure
+the inconsistency lives.
+
+\JuGeo{} provides richer geometric diagnostics via its obstruction theory.
+A \Dafny{} counterexample is a zero-dimensional object (a single failing
+execution trace); a \JuGeo{} obstruction is a one-dimensional cohomology
+class that identifies the \emph{overlap} between two program regions where
+specifications disagree.  Formally, let $U_i, U_j$ be two coordinates
+(e.g., a function and its caller) with local judgments $\J_i, \J_j$.  A
+\Dafny{} counterexample is a point $x \in \overlap{U_i}{U_j}$ witnessing
+$\J_i|_{U_i \cap U_j} \neq \J_j|_{U_i \cap U_j}$; a \JuGeo{}
+obstruction is the \emph{class} $[\alpha] \in \Hcoh{1}(\Site_P,
+\mathcal{F})$ represented by the cocycle $\alpha_{ij} = \res_i(\J_i) -
+\res_j(\J_j)$.  This higher-dimensional structure enables
+obstruction-guided repair (\S\ref{sec:repair}), which has no analogue in
+\Dafny{}.
+
+\paragraph{Liquid Haskell.}
+Liquid Haskell~\cite{liquidhaskell} adds refinement types to Haskell,
+enabling specification of properties like sortedness or positivity as
+type-level predicates discharged by an SMT solver.  It operates on Haskell
+source and inherits the functional paradigm's strengths (purity,
+algebraic data types, pattern matching) and weaknesses (no imperative
+code, no mutation, no native \Python{} support).
+
+\JuGeo{} targets imperative \Python{} with mutation, side effects, and
+dynamic typing---a fundamentally different verification challenge.  Where
+Liquid Haskell encodes specifications as refinement types, \JuGeo{} encodes
+them as presheaf sections.  The geometric approach naturally handles
+imperative features (mutable state as restriction morphisms, exception
+flow as transport morphisms) that have no direct type-theoretic counterpart.
+
+\subsection{Model checking and symbolic execution}\label{sec:related:model-checking}
+
+\paragraph{CBMC and KLEE.}
+Bounded model checkers such as CBMC~\cite{cbmc} and symbolic execution
+engines such as KLEE~\cite{klee} explore program state spaces up to a
+fixed depth~$k$, encoding reachability as SAT/SMT queries.  They excel at
+finding concrete bugs in C code but provide no \emph{unbounded}
+guarantees: a program verified to depth~$k$ may fail at depth~$k{+}1$.
+Their output is a single counterexample trace---again a zero-dimensional
+object---with no cohomological structure.
+
+\JuGeo{}'s cohomological descent provides unbounded verification: the
+vanishing $\Hcoh{1}(\Site_P, \mathcal{F}) = 0$ certifies the
+specification for \emph{all} inputs, not merely those reachable within
+a bound.  Moreover, every judgment carries a trust annotation---a
+bounded model-checking result would enter the \JuGeo{} pipeline at
+the $\Truntime$ tier, strictly below $\Tsolver$ and $\Tproof$,
+with the depth bound recorded in provenance.  This enables \JuGeo{} to
+\emph{integrate} BMC results into a broader verification without
+conflating bounded evidence with unbounded proof.
+
+\subsection{Sheaf theory in computer science}\label{sec:related:sheaf-cs}
+
+Abramsky and Brandenburger~\cite{abramsky2011} introduced
+sheaf-theoretic models of contextuality in quantum mechanics, showing
+that non-locality corresponds to the failure of a presheaf to be a sheaf.
+This work demonstrated that sheaf cohomology has computational content
+beyond pure mathematics.  Goguen~\cite{goguen1992} used sheaves to model
+information systems, and more recently, Robinson~\cite{robinson2014}
+applied sheaves to sensor fusion and data integration.
+Curry~\cite{curry2014} developed sheaves on cell complexes for topological
+signal processing.  In formal methods, Pavlovic and
+colleagues~\cite{pavlovic2012} explored categorical models of security
+protocols with sheaf-like gluing conditions.
+
+\JuGeo{} is, to our knowledge, the first system to build a \emph{complete
+end-to-end verification pipeline} from sheaf theory---from AST parsing to
+certificate generation to \LEAN{} compilation.  Prior work used
+sheaves as \emph{models} of existing phenomena (contextuality, information
+flow); \JuGeo{} uses sheaves as the \emph{computational mechanism} for
+verification itself.  The key innovations---the judgment 8-tuple, the trust
+algebra, the semantic site construction for arbitrary programs, the
+obstruction-guided repair loop, and the treaty synthesis protocol---have
+no precedent in the sheaf-theory literature.
+
+The closest technical antecedent is Abramsky's observation that the failure
+of a presheaf to satisfy the sheaf condition has computational meaning.
+\JuGeo{} operationalizes this observation: the failure of the presheaf of
+verification conditions to be a sheaf is precisely the presence of bugs,
+and the cohomology class of that failure is precisely the bug's
+localization.
+
+\subsection{AI-assisted proof}\label{sec:related:ai}
+
+The use of large language models (LLMs) for proof generation has
+accelerated rapidly.  AlphaProof~\cite{alphaproof2024} combines a
+language model with AlphaZero-style reinforcement learning to solve
+International Mathematical Olympiad problems in \LEAN{}.
+LeanDojo~\cite{leandojo2023} provides a benchmark and training pipeline
+for LLM-based tactic prediction.  Draft-Sketch-Prove~\cite{dsp2022}
+uses informal proofs as sketches for formal proof generation.
+
+These systems use AI as the \emph{primary proof mechanism}: the LLM
+generates tactic steps or proof terms, and the kernel checks them.  The
+risk is well known---a model that generates correct-looking proofs 95\%
+of the time provides no formal guarantee on the remaining 5\%.
+
+\JuGeo{} takes a fundamentally different approach.  AI (specifically,
+GitHub Copilot and GPT-4 class models) serves as an \emph{oracle tier}
+within the trust algebra.  An oracle-generated claim enters the system at
+trust level $\Tcopilot$ or $\Toracle$---strictly below $\Tsolver$ and
+$\Tproof$---and cannot be silently promoted.  The oracle's contribution
+is recorded in the provenance field~$\prov$, subject to challenge via the
+$\CHALLENGE{}$ semantic move, and attenuated by the $\tatten$ operator
+if contradictory evidence is found.  AI assists verification but does not
+replace it: every oracle claim must either be independently confirmed
+(promoting it to a higher tier with explicit justification logged in the
+audit trail) or remain at its ceiling, clearly marked in the certificate.
+
+This design reflects a deeper philosophical commitment: in \JuGeo{}, the
+geometry of the proof---the site, the covering, the descent condition---is
+the source of truth, not the oracle.  An LLM can \emph{suggest} that a
+function satisfies its postcondition, but only the vanishing of
+$\Hcoh{1}$ \emph{proves} it.
+
+\subsection{Comparison summary}\label{sec:related:summary}
+
+Table~\ref{tab:comparison} summarizes the comparison across eight
+dimensions.  \JuGeo{} is unique in its sheaf-theoretic foundation,
+automatic proof style, seven-tier trust tracking, cohomological bug
+detection, obstruction-guided repair, and multi-agent treaty synthesis.
+
+The comparison reveals a structural gap in the verification landscape.
+Existing tools occupy two poles: \emph{deep but narrow} (type-theoretic
+proof assistants that require language rewriting and manual proofs) and
+\emph{broad but shallow} (linters and model checkers that scale easily
+but provide limited guarantees).  \JuGeo{} occupies a third position:
+deep guarantees via cohomological descent, applied broadly to native
+\Python{} code with automatic proof search.  The trust algebra provides
+the mechanism for bridging the poles---a \LEAN{} kernel proof and a
+runtime test can coexist in the same judgment, each at its appropriate
+trust tier, composed via the conservative join $\tjoin$.
+
+\begin{table}[t]
+\centering
+\caption{Comparison of \JuGeo{} with existing verification frameworks.}
+\label{tab:comparison}
+\small
+\begin{tabularx}{\textwidth}{l *{5}{>{\centering\arraybackslash}X}}
+\toprule
+\textbf{Feature} & \textbf{\LEAN{}} & \textbf{\Fstar{}} & \textbf{\Coq{}}
+  & \textbf{\Dafny{}} & \textbf{\JuGeo{}} \\
+\midrule
+Foundation
+  & CIC & Dep.\ Types & CIC & Hoare Logic & Sheaf Descent \\[3pt]
+Target Language
+  & Lean & \Fstar{} & Gallina & Dafny & \Python{} \\[3pt]
+Proof Style
+  & Tactics & Refinement & Tactics & Annotations & Automatic \\[3pt]
+Trust Tracking
+  & No & No & No & No & Yes (7 tiers) \\[3pt]
+Cohomological
+  & No & No & No & No & Yes ($\Hcoh{1}$) \\[3pt]
+Bug Detection
+  & No & No & No & Counterex. & Obstruction \\[3pt]
+Program Repair
+  & No & No & No & No & Obstr.-guided \\[3pt]
+Multi-agent
+  & No & No & No & No & Treaty synth. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{remark}[Scope of comparison]\label{rem:scope}
+The ``No'' entries in Table~\ref{tab:comparison} indicate that the
+feature is not a built-in, first-class capability of the system.
+Third-party tools or plugins may provide partial support---for instance,
+\LEAN{}'s \texttt{Mathlib} tactics automate some proofs, and \Dafny{}'s
+counterexamples provide limited diagnostic information.  The comparison
+reflects the core framework, not the ecosystem.
+\end{remark}
+
+\begin{remark}[Complementarity]\label{rem:complementarity}
+\JuGeo{} does not \emph{replace} \LEAN{}, \Fstar{}, or \Coq{}; it
+\emph{complements} them.  \JuGeo{}'s proof-carrying code subsystem
+compiles trust-annotated judgments to \LEAN{} for independent
+verification, and the trust algebra can ingest \LEAN{} kernel
+\texttt{Qed} as evidence at the $\Tproof$ tier.  The relationship
+is symbiotic: \JuGeo{} provides the geometric decomposition and
+automation layer; \LEAN{} provides the trusted kernel for the
+highest-assurance tier.  We envision a workflow in which \JuGeo{}
+handles the 90\% of verification conditions that can be discharged
+automatically, and the remaining 10\%---the deep mathematical
+lemmas---are escalated to \LEAN{} via the $\ESCALATE{}$ semantic move,
+with the resulting proofs ingested back at the $\Tproof$ tier.
+\end{remark}

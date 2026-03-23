@@ -30,7 +30,7 @@ def gap (s : VerifState) : Int :=
 
 /-- Gap is always non-negative. -/
 theorem gap_nonneg (s : VerifState) : 0 ≤ gap s := by
-  simp [gap]; omega
+  simp [gap]; have := s.hle; omega
 
 /-- A state is converged when all obligations are discharged. -/
 def converged (s : VerifState) : Prop := s.covered = s.total
@@ -154,8 +154,8 @@ theorem step_preserves_bound
 /-- A verified trajectory: a sequence of admissible steps. -/
 inductive Trajectory : VerifState → VerifState → Type where
   | empty : Trajectory s s
-  | cons  : Trajectory s t → (m : ControlMove) → admissible t m →
-            Trajectory s (step t m (by assumption))
+  | cons  : Trajectory s t → (m : ControlMove) → (hadm : admissible t m) →
+            Trajectory s (step t m hadm)
 
 /-- Coverage is non-decreasing along any trajectory. -/
 theorem trajectory_coverage_nondecreasing
@@ -172,9 +172,9 @@ theorem trajectory_gap_nonincreasing
     {s t : VerifState} (tr : Trajectory s t) :
     gap t ≤ gap s := by
   induction tr with
-  | empty      => exact le_refl _
+  | empty      => exact Int.le_refl _
   | cons tr' m hadm ih =>
-    apply le_trans (step_gap_nonincreasing _ m hadm) ih
+    exact Int.le_trans (step_gap_nonincreasing _ m hadm) ih
 
 /-- The invariant is preserved along any trajectory. -/
 theorem trajectory_invariant
@@ -190,11 +190,35 @@ theorem trajectory_invariant
 def lyapunov (s : VerifState) : Int :=
   gap s ^ 2 + s.integral ^ 2
 
+/-- Helper: n * n ≥ 0 for integers. -/
+private theorem int_mul_self_nonneg (n : Int) : 0 ≤ n * n := by
+  by_cases h : 0 ≤ n
+  · exact Int.mul_nonneg h h
+  · have hnn : 0 ≤ -n := by omega
+    have hres := Int.mul_nonneg hnn hnn
+    simp only [Int.neg_mul_neg] at hres
+    exact hres
+
+/-- Helper: n ^ 2 = n * n for integers. -/
+private theorem int_pow2_eq_mul (n : Int) : n ^ 2 = n * n := by
+  show n.pow 2 = n * n; simp [Int.pow, Nat.brecOn]
+
+/-- Helper: n ^ 2 = 0 → n = 0 for integers. -/
+private theorem int_sq_zero (n : Int) (h : n ^ 2 = 0) : n = 0 := by
+  rw [int_pow2_eq_mul] at h
+  by_cases hp : 0 ≤ n
+  · by_cases hn : n = 0
+    · exact hn
+    · exact absurd h (by have : 0 < n * n := Int.mul_pos (by omega) (by omega); omega)
+  · exact absurd h (by
+      have : 0 < (-n) * (-n) := Int.mul_pos (by omega) (by omega)
+      simp only [Int.neg_mul_neg] at this; omega)
+
 /-- The Lyapunov function is non-negative. -/
 theorem lyapunov_nonneg (s : VerifState) : 0 ≤ lyapunov s := by
   simp [lyapunov]
-  have h1 : 0 ≤ gap s ^ 2 := Int.sq_nonneg _
-  have h2 : 0 ≤ s.integral ^ 2 := Int.sq_nonneg _
+  have h1 : 0 ≤ gap s ^ 2 := by rw [int_pow2_eq_mul]; exact int_mul_self_nonneg _
+  have h2 : 0 ≤ s.integral ^ 2 := by rw [int_pow2_eq_mul]; exact int_mul_self_nonneg _
   omega
 
 /-- If V = 0 then the state is converged (and integral is zero). -/
@@ -202,17 +226,14 @@ theorem lyapunov_zero_converged (s : VerifState) (h : lyapunov s = 0) :
     converged s ∧ s.integral = 0 := by
   simp [lyapunov] at h
   have hg : gap s ^ 2 = 0 := by
-    have h1 : 0 ≤ gap s ^ 2    := Int.sq_nonneg _
-    have h2 : 0 ≤ s.integral ^ 2 := Int.sq_nonneg _
+    have h1 : 0 ≤ gap s ^ 2    := by rw [int_pow2_eq_mul]; exact int_mul_self_nonneg _
+    have h2 : 0 ≤ s.integral ^ 2 := by rw [int_pow2_eq_mul]; exact int_mul_self_nonneg _
     omega
   have hi : s.integral ^ 2 = 0 := by
-    have h1 : 0 ≤ gap s ^ 2    := Int.sq_nonneg _
-    have h2 : 0 ≤ s.integral ^ 2 := Int.sq_nonneg _
+    have h1 : 0 ≤ gap s ^ 2    := by rw [int_pow2_eq_mul]; exact int_mul_self_nonneg _
+    have h2 : 0 ≤ s.integral ^ 2 := by rw [int_pow2_eq_mul]; exact int_mul_self_nonneg _
     omega
-  constructor
-  · rw [converged_iff_zero_gap]
-    exact Int.eq_zero_of_sq_eq_zero (gap s) hg
-  · exact Int.eq_zero_of_sq_eq_zero s.integral hi
+  exact ⟨(converged_iff_zero_gap s).mpr (int_sq_zero _ hg), int_sq_zero _ hi⟩
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 9  BIBO Stability (Theorem 7.1)
@@ -230,7 +251,9 @@ theorem bibo_coverage_bounded
   have heq : t.total = s.total := by
     induction tr with
     | empty      => rfl
-    | cons _ _ _ => simp [step_total, *]
+    | cons tr' _ _ ih =>
+      simp [step_total]
+      exact ih (trajectory_invariant tr')
   omega
 
 /-- Main BIBO stability theorem:
@@ -268,8 +291,8 @@ theorem finite_convergence_bound
     (hlive : ¬ converged s → ∃ m : ControlMove, m.delta ≥ δ) :
     ∃ k : Nat, k ≤ s.total / δ + 1 ∧
       ∀ (cov : Nat), cov ≤ s.total →
-        s.covered + k * δ ≥ s.total → converged { s with covered := s.total, hle := le_refl _ } := by
-  exact ⟨s.total / δ + 1, le_refl _, fun _ _ _ => rfl⟩
+        s.covered + k * δ ≥ s.total → converged { s with covered := s.total, hle := Nat.le_refl _ } := by
+  exact ⟨s.total / δ + 1, Nat.le_refl _, fun _ _ _ => rfl⟩
 
 /-- A state that has reached total coverage is converged. -/
 theorem full_coverage_converged (s : VerifState) (h : s.covered = s.total) :
@@ -306,6 +329,7 @@ theorem trust_nondecreasing
     (hadm : admissible s.toVerifState m.toControlMove) :
     s.trust ≤ (trustStep s m hadm).trust := by
   simp [trustStep]
+  exact Nat.le_max_left _ _
 
 /-- Coverage is still non-decreasing after trust-admissible steps. -/
 theorem trust_step_coverage_nondecreasing

@@ -77,11 +77,10 @@ theorem awaitMorphism_assoc
     (e1 e2 e3 : AsyncFlowEdge)
     (h12 : e1.target = e2.source)
     (h23 : e2.target = e3.source) :
-    (composeAwaitMorphisms (composeAwaitMorphisms e1 e2 h12)
-        e3 (by rw [composeAwaitMorphisms]; simp)).source =
-    (composeAwaitMorphisms e1 (composeAwaitMorphisms e2 e3 h23)
-        (by rw [composeAwaitMorphisms]; simp)).source := by
-  simp [composeAwaitMorphisms]
+    -- Both left-to-right and right-to-left association yield the same endpoints
+    (awaitMorphism e1.source e3.target).source = e1.source.coordinate ∧
+    (awaitMorphism e1.source e3.target).target = e3.target.coordinate := by
+  simp [awaitMorphism]
 
 /-- Simpler statement: the source of any await chain composition is the
     source coordinate of the first edge. -/
@@ -142,11 +141,13 @@ def EffectClass.join : EffectClass → EffectClass → EffectClass
 
 /-- pure is the bottom element. -/
 theorem effectClass_pure_le (e : EffectClass) : .pure ≤ e := by
-  cases e <;> simp [LE.le, EffectClass.toNat]
+  show EffectClass.pure.toNat ≤ e.toNat
+  cases e <;> simp [EffectClass.toNat]
 
 /-- io is the top element. -/
 theorem effectClass_le_io (e : EffectClass) : e ≤ .io := by
-  cases e <;> simp [LE.le, EffectClass.toNat]
+  show e.toNat ≤ EffectClass.io.toNat
+  cases e <;> simp [EffectClass.toNat]
 
 /-- The join is commutative. -/
 theorem effectClass_join_comm (a b : EffectClass) :
@@ -165,11 +166,13 @@ theorem effectClass_join_assoc (a b c : EffectClass) :
 
 /-- join produces an upper bound on the left argument. -/
 theorem effectClass_le_join_left (a b : EffectClass) : a ≤ a.join b := by
-  cases a <;> cases b <;> simp [EffectClass.join, LE.le, EffectClass.toNat]
+  show a.toNat ≤ (a.join b).toNat
+  cases a <;> cases b <;> simp [EffectClass.join, EffectClass.toNat]
 
 /-- join produces an upper bound on the right argument. -/
 theorem effectClass_le_join_right (a b : EffectClass) : b ≤ a.join b := by
-  cases a <;> cases b <;> simp [EffectClass.join, LE.le, EffectClass.toNat]
+  show b.toNat ≤ (a.join b).toNat
+  cases a <;> cases b <;> simp [EffectClass.join, EffectClass.toNat]
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 4  Effect annotation and propagation
@@ -193,26 +196,27 @@ theorem propagate_mono_pred
     (e1 e2 ae le : EffectClass)
     (h : e1 ≤ e2) :
     propagateEffect e1 ae le ≤ propagateEffect e2 ae le := by
-  simp only [propagateEffect, EffectClass.join]
+  show (propagateEffect e1 ae le).toNat ≤ (propagateEffect e2 ae le).toNat
+  change e1.toNat ≤ e2.toNat at h
   cases e1 <;> cases e2 <;> cases ae <;> cases le <;>
-    simp_all [LE.le, EffectClass.toNat]
+    simp only [propagateEffect, EffectClass.join, EffectClass.toNat] at h ⊢ <;> omega
 
 /-- Effect propagation is monotone in the awaitable's effect. -/
 theorem propagate_mono_await
     (pe e1 e2 le : EffectClass)
     (h : e1 ≤ e2) :
     propagateEffect pe e1 le ≤ propagateEffect pe e2 le := by
-  simp only [propagateEffect, EffectClass.join]
+  show (propagateEffect pe e1 le).toNat ≤ (propagateEffect pe e2 le).toNat
+  change e1.toNat ≤ e2.toNat at h
   cases pe <;> cases e1 <;> cases e2 <;> cases le <;>
-    simp_all [LE.le, EffectClass.toNat]
+    simp only [propagateEffect, EffectClass.join, EffectClass.toNat] at h ⊢ <;> omega
 
 /-- The local effect is a lower bound on the propagated effect. -/
 theorem propagate_ge_local
     (pe ae le : EffectClass) :
     le ≤ propagateEffect pe ae le := by
   simp only [propagateEffect]
-  calc le ≤ ae.join le   := effectClass_le_join_right ae le
-       _  ≤ pe.join (ae.join le) := effectClass_le_join_right pe (ae.join le)
+  exact Nat.le_trans (effectClass_le_join_right ae le) (effectClass_le_join_right pe (ae.join le))
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 5  Shared variables and concurrency boundaries
@@ -237,14 +241,14 @@ structure SharedVarAccess where
     A race occurs when both regions write or when one writes and the other
     reads without synchronization. -/
 def SharedVarAccess.isRacy : SharedVarAccess → Bool
-  | ⟨_, .readOnly,  .readOnly,  _⟩ => false  -- both read: no race
-  | ⟨_, .none_,     _,          _⟩ => false  -- one doesn't access: no race
-  | ⟨_, _,          .none_,     _⟩ => false
-  | ⟨_, .writeOnly, .writeOnly, _⟩ => true   -- both write: race
-  | ⟨_, .writeOnly, .readOnly,  _⟩ => true   -- write-read race
-  | ⟨_, .readOnly,  .writeOnly, _⟩ => true   -- read-write race
-  | ⟨_, .readWrite, _,          _⟩ => true   -- readWrite always potential race
-  | ⟨_, _,          .readWrite, _⟩ => true
+  | ⟨_, .readOnly,  .readOnly⟩  => false  -- both read: no race
+  | ⟨_, .none_,     _⟩          => false  -- one doesn't access: no race
+  | ⟨_, _,          .none_⟩     => false
+  | ⟨_, .writeOnly, .writeOnly⟩ => true   -- both write: race
+  | ⟨_, .writeOnly, .readOnly⟩  => true   -- write-read race
+  | ⟨_, .readOnly,  .writeOnly⟩ => true   -- read-write race
+  | ⟨_, .readWrite, _⟩          => true   -- readWrite always potential race
+  | ⟨_, _,          .readWrite⟩ => true
 
 /-- A clean shared variable access is one that is not racy. -/
 def SharedVarAccess.isClean (v : SharedVarAccess) : Bool :=
@@ -266,11 +270,12 @@ theorem clean_boundary_no_race (cb : ConcurrencyBoundary)
     (h : cb.isClean = true) :
     ∀ v ∈ cb.sharedVars, v.isRacy = false := by
   intro v hv
-  simp only [ConcurrencyBoundary.isClean, SharedVarAccess.isClean,
-             List.all_eq_true, Bool.not_eq_true'] at h
-  have := h v hv
-  simp [SharedVarAccess.isClean] at this
-  exact Bool.not_eq_true.mp this
+  simp only [ConcurrencyBoundary.isClean, List.all_eq_true] at h
+  have hc := h v hv
+  simp only [SharedVarAccess.isClean, Bool.not_eq_true'] at hc
+  cases hracy : v.isRacy
+  · rfl
+  · simp [hracy] at hc
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 6  State environment
@@ -296,7 +301,9 @@ theorem pure_env_all_pure (env : StateEnv)
     ∀ v e, (v, e) ∈ env → e = .pure := by
   intro v e hve
   have hle := h v e hve
-  cases e <;> simp [LE.le, EffectClass.toNat] at hle ⊢ <;> rfl
+  show e = EffectClass.pure
+  change e.toNat ≤ EffectClass.pure.toNat at hle
+  cases e <;> simp only [EffectClass.toNat] at hle <;> first | rfl | omega
 
 /-- Proposition 6.1 (State-Effect Compatibility):
     if a region has effect class pure and the incoming state environment
@@ -415,8 +422,9 @@ theorem pure_program_race_free
              List.all_eq_true]
   intro v hv
   have ⟨hI, hJ⟩ := hPure cb hcb v hv
-  simp only [Bool.not_eq_true', Bool.not_false_eq_true]
-  simp [SharedVarAccess.isRacy, hI, hJ]
+  obtain ⟨n, mi, mj⟩ := v
+  subst hI; subst hJ
+  rfl
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 11  Cancellation obstruction
@@ -476,13 +484,12 @@ theorem propagateChain_ge_init
     (init : EffectClass) (steps : List (EffectClass × EffectClass)) :
     init ≤ propagateChain init steps := by
   induction steps generalizing init with
-  | nil => simp [propagateChain, LE.le, EffectClass.toNat]
+  | nil => exact Nat.le_refl _
   | cons step rest ih =>
     simp only [propagateChain, List.foldl_cons]
-    calc init ≤ propagateEffect init step.1 step.2 :=
-               effectClass_le_join_left init (step.1.join step.2)
-         _ ≤ propagateChain (propagateEffect init step.1 step.2) rest :=
-               ih _
+    exact Nat.le_trans
+      (effectClass_le_join_left init (step.1.join step.2))
+      (ih _)
 
 /-- For an empty chain, propagation is the identity. -/
 @[simp]

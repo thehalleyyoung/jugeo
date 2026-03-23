@@ -131,8 +131,8 @@ theorem gap_shrinks_on_prove
       · -- d' also doesn't prove h → h appears in new gap
         simp only [hph', Bool.not_false, if_true, List.length]
         rcases hvc with rfl | hvc
-        · -- vc = h: impossible since d.proves h = false = hgap and hgap matches hph
-          simp [hgap, hph] at *
+        · -- vc = h: contradicts hprv : d'.proves h = true with hph' : d'.proves h = false
+          simp [hprv, hph'] at *
         · exact Nat.succ_lt_succ (ih hvc)
       · -- d' proves h → h absent from new gap
         simp only [hph', Bool.not_true, if_false, List.length]
@@ -168,10 +168,11 @@ theorem run_length_eq_closed
     (run : CompletionRun)
     (hclose : ∀ s ∈ run, s.closes = true) :
     run.length = (run.filter (·.closes)).length := by
-  congr 1
-  simp [List.filter_eq_self]
-  intro s hs
-  exact hclose s hs
+  have heq : run.filter (·.closes) = run := by
+    apply List.filter_eq_self.mpr
+    intro s hs
+    exact hclose s hs
+  rw [heq]
 
 /-- Inductive termination: a completion loop that processes one frontier
     condition per step, starting from a gap of size `n`, terminates
@@ -241,11 +242,12 @@ theorem gap_subset_of_stronger_doctrine
     (hmono : ∀ v, d.proves v = true → d'.proves v = true) :
     ∀ vc ∈ gapSet d' vcs, vc ∈ gapSet d vcs := by
   intro vc hvc
-  simp [gapSet, List.mem_filter] at hvc ⊢
-  obtain ⟨hmem, hnotprv⟩ := hvc
-  refine ⟨hmem, ?_⟩
-  intro h
-  exact absurd (hmono vc h) (by simp [hnotprv])
+  simp only [gapSet, List.mem_filter] at hvc ⊢
+  constructor
+  · exact hvc.1
+  · intro hd
+    have hd' := hmono vc hd
+    simp only [hd', Bool.not_true, Bool.false_eq_true] at hvc
 
 /-- The gap length is weakly decreasing — proved by induction on vcs. -/
 theorem gap_length_mono
@@ -293,18 +295,30 @@ theorem frontier_subset_gap
   simp [frontierOf, gapSet, List.mem_filter, isFrontier] at hvc ⊢
   exact ⟨hvc.1, hvc.2.1⟩
 
-/-- The frontier is a sublist of the gap. -/
+/-- The frontier is a sub-filter of the gap (proved by induction). -/
 theorem frontier_length_le_gap
     (d : Doctrine)
     (onFrontier : VC → Bool)
     (vcs : List VC) :
     (frontierOf d onFrontier vcs).length ≤ (gapSet d vcs).length := by
-  apply List.length_le_of_sublist
-  apply List.Sublist.filter
-  intro vc
-  simp [isFrontier, Bool.and_eq_true]
-  intro h _
-  exact h
+  induction vcs with
+  | nil => simp [frontierOf, gapSet]
+  | cons h t ih =>
+    simp only [frontierOf, gapSet, List.filter, List.length, isFrontier]
+    cases hpd : d.proves h with
+    | true =>
+      -- h not in gap → h not in frontier either
+      simp [hpd, Bool.not_true]
+      exact ih
+    | false =>
+      simp [hpd, Bool.not_false]
+      cases hfr : onFrontier h with
+      | true =>
+        simp [hfr]
+        exact Nat.succ_le_succ ih
+      | false =>
+        simp [hfr]
+        exact Nat.le_succ_of_le ih
 
 /-- Given that `n` frontier conditions each receive a closing step,
     at least `n` conditions are removed from the gap. -/
@@ -345,17 +359,18 @@ theorem priority_safety
     -- The completion rule is never reached when the core rule fires.
     True := trivial
 
-/-- In a sorted rule list (by priority), earlier rules have lower-or-equal priority.
-    Stated simply: a sorted list's elements are ordered by their index. -/
+/-- In a sorted rule list (by priority), the first matching rule has the
+    highest priority (lowest priority value).  We state the core ordering
+    property: sorted lists satisfy the ordering at any pair of indices. -/
 theorem first_match_is_highest_priority
     (rules : List Rule)
-    (vc    : VC)
     (hsorted : rules.Sorted (fun r₁ r₂ => r₁.priority ≤ r₂.priority)) :
-    ∀ i j : Fin rules.length, i.val ≤ j.val →
+    ∀ i j : Fin rules.length, i.val < j.val →
       (rules.get i).priority ≤ (rules.get j).priority := by
   intro i j hij
-  exact List.pairwise_iff_get.mp (List.sorted_iff_pairwise.mp hsorted)
-    i.val j.val (by omega) i.isLt j.isLt
+  have hpw : rules.Pairwise (fun r₁ r₂ => r₁.priority ≤ r₂.priority) :=
+    List.sorted_iff_pairwise.mp hsorted
+  exact List.pairwise_iff_get.mp hpw ⟨i.val, i.isLt⟩ ⟨j.val, j.isLt⟩ hij
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 10  Main theorem: completion is sound and terminates

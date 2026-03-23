@@ -68,8 +68,8 @@ def satisfies (s : List Char) : StrConstraint → Prop
   | .lenLe n      => s.length ≤ n
   | .hasPrefix p  => p.isPrefixOf s
   | .hasSuffix sf => sf.isSuffixOf s
-  | .hasSubstr t  => ∃ i, s.drop i |>.take t.length = t
-  | .noSubstr t   => ¬ ∃ i, s.drop i |>.take t.length = t
+  | .hasSubstr t  => ∃ i, (s.drop i).take t.length = t
+  | .noSubstr t   => ¬ ∃ i, (s.drop i).take t.length = t
   | .and c₁ c₂   => satisfies s c₁ ∧ satisfies s c₂
   | .top          => True
   | .bot          => False
@@ -146,7 +146,7 @@ def snakeCaseLaw : NamingLaw where
   constraint := .and (.lenGe 1) (.lenLe 80)
   witness    := ['x']
   witnessOk  := by
-    simp [satisfies]; omega
+    simp [satisfies]
 
 /-- CamelCase naming law: mixed-case identifiers. -/
 def camelCaseLaw : NamingLaw where
@@ -154,7 +154,7 @@ def camelCaseLaw : NamingLaw where
   constraint := .and (.lenGe 2) (.lenLe 80)
   witness    := ['a', 'B']
   witnessOk  := by
-    simp [satisfies]; omega
+    simp [satisfies]
 
 /-- UUID naming law: fixed 36-character format. -/
 def uuidLaw : NamingLaw where
@@ -170,7 +170,7 @@ def semverLaw : NamingLaw where
   constraint := .and (.lenGe 5) (.lenLe 30)
   witness    := ['0', '.', '1', '.', '0']
   witnessOk  := by
-    simp [satisfies]; omega
+    simp [satisfies]
 
 /-- The four standard naming laws. -/
 def standardNamingLaws : List NamingLaw :=
@@ -235,8 +235,7 @@ def sliceEncoding (i j : Nat) : Encoding where
 theorem sliceEncoding_sound (s : List Char) (i j : Nat)
     (hij : i ≤ j) (hj : j ≤ s.length) :
     satisfies ((s.drop i).take (j - i)) (sliceEncoding i j).resultConstr := by
-  simp [satisfies, sliceEncoding]
-  rw [List.length_take]
+  simp [satisfies, sliceEncoding, List.length_take, List.length_drop]
   omega
 
 -- ---------------------------------------------------------------------------
@@ -413,7 +412,11 @@ theorem trivialStreaming_satisfiable (s : List Char) :
     satisfiesStreaming [s] trivialStreaming := by
   refine ⟨rfl, ?_, trivial⟩
   intro i
-  fin_cases i
-  exact ⟨by simp, trivial⟩
+  have hi : i.val = 0 := by
+    have hlt := i.isLt
+    simp only [trivialStreaming] at hlt
+    omega
+  have hlt : i.val < [s].length := by simp [hi]
+  exact ⟨hlt, by simp [trivialStreaming, satisfies]⟩
 
 end JudgmentGeometry.TextEncodings
