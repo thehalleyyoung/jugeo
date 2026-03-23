@@ -403,6 +403,7 @@ class FoundationPipeline:
         # Viability gate hints (populated by _novelty_filter)
         self._novelty_tool_hint: str = ""
         self._novelty_reason: str = ""
+        self._novelty_killer_app_hint: dict = {}
 
         # --- Z3+LLM synergy state ------------------------------------------
         # theory2.tex §Ideation: "Z3 verifies LLM claims, LLM interprets Z3
@@ -1641,14 +1642,16 @@ class FoundationPipeline:
     def _novelty_filter(
         self, candidates: list[Any], n_keep: int,
     ) -> list[Any]:
-        """Score candidate pairs on novelty, CLI utility, and foundational depth.
+        """Find the synthesis with the best killer CLI application.
 
-        Enforces that paired fields come from DIFFERENT mathematical traditions
-        (e.g. cannot pair two algebra fields) and requires genuinely empty
-        intersections — the LLM must confirm no named theorems exist at
-        the bridge.
+        Two-phase evaluation:
+        1. Pre-filter to cross-tradition pairs (different mathematical traditions)
+        2. Ask the LLM to find the KILLER APP — a CLI tool that a specific
+           group of practitioners (physicists, ML engineers, economists, etc.)
+           would immediately want to use, enabled by a novel field synthesis.
 
-        Falls back to random selection when --no-llm is set.
+        The scoring heavily weights UTILITY (who needs this? what can't they
+        do today?) and NOVELTY (no existing named theorems at the bridge).
         """
         import itertools
 
@@ -1673,7 +1676,6 @@ class FoundationPipeline:
         pairs = cross_tradition_pairs[:20]
 
         if self._no_llm:
-            # Even without LLM, enforce cross-tradition
             if cross_tradition_pairs:
                 best_i, best_j = cross_tradition_pairs[0]
                 selected = [candidates[best_i], candidates[best_j]]
@@ -1691,44 +1693,56 @@ class FoundationPipeline:
             )
 
         prompt = (
-            "You are a research mathematician AND software architect evaluating\n"
-            "proposed cross-field syntheses. For each pair, rate THREE dimensions (1-5):\n\n"
-            "NOVELTY — Is this intersection genuinely unexplored?\n"
-            "  1 = Well-known subfield or essentially the same field\n"
-            "      (e.g. Algebraic Geometry × Number Theory = Arithmetic Geometry)\n"
-            "  2 = Established connection with named theorems/papers at the bridge\n"
-            "  3 = Some known links, but large unexplored computational territory\n"
-            "  4 = Very sparse connections; you cannot name more than 1-2 papers\n"
-            "  5 = No existing literature bridging these; genuinely terra incognita\n\n"
-            "  CRITICAL: If you can name ANY theorem, textbook, or well-known\n"
-            "  researcher who worked specifically on this intersection, score ≤ 2.\n"
-            "  If they share a Wikipedia article or named subfield, score 1.\n\n"
-            "UTILITY — Could this synthesis power a *concrete, useful* CLI tool?\n"
-            "  Think: what data would it take as input, what would it compute,\n"
-            "  who would use it? Not 'a tool that does math' but a tool that\n"
-            "  solves a real problem no single-field tool can.\n"
-            "  1 = No obvious computational application\n"
-            "  3 = Plausible tool with moderate audience\n"
-            "  5 = Killer app: solves an important problem, obvious demand\n\n"
-            "FOUNDATIONAL — Could this become a genuine new area of mathematics?\n"
-            "  1 = Superficial connection, one field trivially subsumes the other\n"
-            "  3 = Bidirectional structure, a few deep bridge theorems possible\n"
-            "  5 = Clearly a new field: own objects, own questions, own methods\n\n"
-            "BE VERY STRICT on novelty. We want pairs where there are NO NAMED\n"
-            "THEOREMS in the intersection. Most well-known pairs should score 1-2.\n"
-            "Only score ≥4 if you genuinely cannot think of prior work connecting them.\n\n"
-            "Pairs to evaluate:\n"
+            "You are finding the KILLER APPLICATION — a CLI tool that real\n"
+            "practitioners desperately need but can't build with either field alone.\n\n"
+            "For each pair of mathematical fields below, answer:\n\n"
+            "1. NOVELTY (1-5): Are there named theorems/papers at this intersection?\n"
+            "   1 = Well-known subfield (Algebraic Geometry × Number Theory = Arithmetic Geometry)\n"
+            "   2 = Established bridge with named results\n"
+            "   3 = Sparse links, mostly unexplored computationally\n"
+            "   4 = Cannot name more than 1-2 papers connecting them\n"
+            "   5 = No existing literature at this bridge\n"
+            "   If you can name a theorem/textbook/researcher at the intersection, score ≤2.\n\n"
+            "2. KILLER_APP: Describe a CLI tool that would make a specific group\n"
+            "   of practitioners say 'I need this yesterday'. Be VERY concrete:\n"
+            "   - WHO uses it? (e.g. 'experimental particle physicists fitting\n"
+            "     detector calibration curves', NOT 'scientists')\n"
+            "   - WHAT does it take as input? (e.g. 'a CSV of detector readings\n"
+            "     and a YAML model spec')\n"
+            "   - WHAT does it output? (e.g. 'a ranked list of systematic biases\n"
+            "     with confidence intervals')\n"
+            "   - WHY can't they do this today? What breaks without BOTH fields?\n"
+            "   Score UTILITY 1-5:\n"
+            "   1 = No one would download this\n"
+            "   2 = Theoretically useful, unclear who'd use it in practice\n"
+            "   3 = A niche group would find it helpful\n"
+            "   4 = A clear professional audience with a real unsolved workflow problem\n"
+            "   5 = Obvious demand: practitioners currently waste days doing this manually\n\n"
+            "3. FOUNDATIONAL (1-5): Could this become a real area of mathematics?\n"
+            "   1 = Superficial, one-directional application\n"
+            "   3 = Bidirectional, several deep theorems possible\n"
+            "   5 = New field with its own objects and questions\n\n"
+            "TARGET USERS to think about: experimental physicists, ML researchers,\n"
+            "quantitative finance teams, control engineers, bioinformaticians,\n"
+            "climate modelers, drug discovery chemists, robotics engineers,\n"
+            "econometricians, signal processing engineers, materials scientists.\n"
+            "The tool must solve a REAL problem these people face TODAY.\n\n"
+            "Pairs:\n"
             + "\n".join(pair_lines) + "\n\n"
             "Return ONLY a JSON array:\n"
-            '[{"pair": 1, "novelty": 4, "utility": 5, "foundational": 4,\n'
-            '  "tool_idea": "one-line tool concept",\n'
-            '  "known_work": "name any known theorems/papers at this intersection, or NONE",\n'
-            '  "reason": "why novel+useful+deep"}, ...]\n'
+            '[{"pair": 1, "novelty": 4, "utility": 5, "foundational": 3,\n'
+            '  "tool_name": "short-cli-name",\n'
+            '  "who": "specific practitioners (be precise)",\n'
+            '  "input": "what files/data the tool takes",\n'
+            '  "output": "what it produces",\n'
+            '  "why_both_fields": "why neither field alone can do this",\n'
+            '  "known_work": "named theorems/papers at intersection, or NONE",\n'
+            '  "killer_app": "2-3 sentence pitch for the tool"}]\n'
             "One object per pair. Return ONLY valid JSON.\n"
         )
 
         try:
-            raw = self._call_llm(prompt, max_tokens=4096)
+            raw = self._call_llm(prompt, max_tokens=8192)
             raw = re.sub(r"^```json\s*\n?", "", raw.strip())
             raw = re.sub(r"\n?```\s*$", "", raw.strip())
             ratings = json.loads(raw)
@@ -1744,7 +1758,7 @@ class FoundationPipeline:
             self._rng.shuffle(candidates)
             return candidates[:n_keep]
 
-        # Score each pair: REQUIRE novelty ≥ 3, strongly prefer ≥ 4
+        # Score: utility-weighted composite. Novelty is a floor, utility is king.
         scored: list[tuple[int, int, float, dict]] = []
         for entry in ratings:
             try:
@@ -1754,32 +1768,33 @@ class FoundationPipeline:
                 found = int(entry.get("foundational", 1))
                 if 0 <= pair_idx < len(pairs):
                     i, j = pairs[pair_idx]
-                    # Composite scoring with novelty floor
-                    composite = (nov + util + found) / 3.0
-                    # Hard penalty: if novelty ≤ 2, this pair is not novel enough
+                    # Utility-weighted: 50% utility, 30% novelty, 20% foundational
+                    composite = 0.5 * util + 0.3 * nov + 0.2 * found
+                    # Hard floor: novelty must be ≥ 3 (no well-known intersections)
                     if nov <= 2:
-                        composite *= 0.4
-                    # Penalty if any dimension is terrible
-                    if min(nov, util, found) <= 1:
+                        composite *= 0.3
+                    # Penalty if utility is low — no point in novel but useless
+                    if util <= 2:
                         composite *= 0.5
-                    # Bonus for genuinely empty intersections
+                    # Bonus for empty intersection
                     known = entry.get("known_work", "")
                     if known.upper().strip() in ("NONE", "NONE.", "N/A", ""):
-                        composite *= 1.2
+                        composite *= 1.15
                     scored.append((i, j, composite, entry))
             except (ValueError, TypeError):
                 continue
 
         scored.sort(key=lambda x: x[2], reverse=True)
 
-        # Always print viability scores
-        print("\n  Synthesis viability scores (novelty / utility / foundational):")
+        # Print viability scores with killer app descriptions
+        print("\n  Synthesis viability (utility-weighted: 50% U, 30% N, 20% F):")
         for i, j, comp, e in scored[:10]:
             nov = e.get("novelty", "?")
             util = e.get("utility", "?")
             found = e.get("foundational", "?")
-            tool = e.get("tool_idea", "")[:60]
-            known = e.get("known_work", "")[:40]
+            who = e.get("who", "")[:60]
+            app = e.get("killer_app", e.get("tool_idea", ""))[:80]
+            known = e.get("known_work", "")[:50]
             marker = "★" if comp >= 3.5 else "✓" if comp >= 2.5 else "✗"
             trad_i = _FIELD_TRADITION.get(names[i], "?")
             trad_j = _FIELD_TRADITION.get(names[j], "?")
@@ -1787,7 +1802,10 @@ class FoundationPipeline:
                   f"  N={nov} U={util} F={found}")
             if known and known.upper().strip() not in ("NONE", "NONE.", "N/A"):
                 print(f"         known: {known}")
-            print(f"         → {tool}")
+            if who:
+                print(f"         who: {who}")
+            if app:
+                print(f"         app: {app}")
         print()
 
         # Select: prefer composite ≥ 3.5, relax to ≥ 2.5, then best
@@ -1803,11 +1821,21 @@ class FoundationPipeline:
             self._log("  No viable pairs; using best available.")
             good = scored[:3] if scored else []
 
-        # Store the winning tool idea for downstream use
+        # Store the winning killer app details for downstream stages
         if good:
             best = good[0]
-            self._novelty_tool_hint = best[3].get("tool_idea", "")
-            self._novelty_reason = best[3].get("reason", "")
+            e = best[3]
+            self._novelty_tool_hint = e.get("killer_app", e.get("tool_idea", ""))
+            self._novelty_reason = e.get("why_both_fields", e.get("reason", ""))
+            # Also store rich killer app hint for _stage1b
+            self._novelty_killer_app_hint = {
+                "tool_name": e.get("tool_name", ""),
+                "who": e.get("who", ""),
+                "input": e.get("input", ""),
+                "output": e.get("output", ""),
+                "why_both_fields": e.get("why_both_fields", ""),
+                "killer_app": e.get("killer_app", ""),
+            }
 
         # Select fields from the best-scoring pairs
         used_indices: set[int] = set()
@@ -2034,14 +2062,19 @@ class FoundationPipeline:
 
             {f'Preliminary tool idea from viability analysis: {self._novelty_tool_hint}' if self._novelty_tool_hint else ''}
             {f'Rationale: {self._novelty_reason}' if self._novelty_reason else ''}
+            {self._format_killer_hint()}
 
             What is the single most impactful SOFTWARE TOOL that this synthesis uniquely enables?
-            Not a toy or demo — a tool that practitioners in computational science, software engineering,
-            or applied mathematics would actually use. The tool should:
+            Not a toy or demo — a tool that a SPECIFIC group of practitioners would actually download
+            and use regularly. Think: experimental physicists, ML engineers, quantitative analysts,
+            bioinformaticians, control engineers, materials scientists, econometricians.
+
+            The tool should:
             - Do something that was NOT possible (or was much harder) without the bridge between these fields
             - Have concrete input/output (files, data, computations)
             - Be useful to people who don't know the underlying math
-            - Solve a specific, real problem — not just "apply math" generically
+            - Solve a specific, real problem — name the EXACT practitioner who needs it
+            - NOT be about 'verification' or 'bridge computation' in the abstract
 
             Respond in JSON:
             {{
@@ -2072,6 +2105,26 @@ class FoundationPipeline:
         except Exception as exc:
             self._log("  Killer app determination failed (%s); using template.", exc)
             return self._template_killer_app(name, constituents)
+
+    def _format_killer_hint(self) -> str:
+        """Format the rich killer app hint from the novelty filter."""
+        h = self._novelty_killer_app_hint
+        if not h:
+            return ""
+        parts = []
+        if h.get("who"):
+            parts.append(f"Target users: {h['who']}")
+        if h.get("input"):
+            parts.append(f"Input: {h['input']}")
+        if h.get("output"):
+            parts.append(f"Output: {h['output']}")
+        if h.get("why_both_fields"):
+            parts.append(f"Why both fields: {h['why_both_fields']}")
+        if h.get("killer_app"):
+            parts.append(f"Pitch: {h['killer_app']}")
+        if parts:
+            return "HINT from viability gate:\n            " + "\n            ".join(parts)
+        return ""
 
     def _template_killer_app(self, name: str, constituents: list) -> dict:
         """Template fallback for killer app when LLM is unavailable."""
