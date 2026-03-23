@@ -244,11 +244,11 @@ def main():
                 rec_dict = record.to_dict() if hasattr(record, "to_dict") else (
                     record if isinstance(record, dict) else {})
 
-                if rec_dict.get("success", rec_dict.get("completed", True)):
+                if rec_dict.get("is_successful", rec_dict.get("success", rec_dict.get("completed", True))):
                     prog_success += 1
                     success_count += 1
 
-                obs = rec_dict.get("obstructions", rec_dict.get("obstruction_count", 0))
+                obs = rec_dict.get("obstruction_count", rec_dict.get("obstructions", 0))
                 if isinstance(obs, list):
                     obs = len(obs)
                 prog_obstruct += int(obs) if obs else 0
@@ -275,7 +275,7 @@ def main():
             metrics = coord.get_metrics()
             m_dict = metrics.to_dict() if hasattr(metrics, "to_dict") else (
                 metrics if isinstance(metrics, dict) else {})
-            cycle_trust = m_dict.get("mean_trust", m_dict.get("trust", 0.0))
+            cycle_trust = m_dict.get("mean_trust_score", m_dict.get("mean_trust", m_dict.get("trust", 0.0)))
             if isinstance(cycle_trust, dict):
                 cycle_trust = cycle_trust.get("mean", 0.0)
             trust_scores.append(float(cycle_trust) if cycle_trust else 0.0)
@@ -288,10 +288,16 @@ def main():
         actual_coverage = 0.0
         if eval_objs:
             ev = eval_objs[0]
-            cov = ev.get("coverage", ev.get("cover_quality", {}).get("score", 0.0))
-            if isinstance(cov, dict):
-                cov = cov.get("score", 0.0)
-            actual_coverage = float(cov) if not isinstance(cov, str) else 0.0
+            per_coords = ev.get("per_coordinate", [])
+            if per_coords:
+                actual_coverage = max(
+                    float(pc.get("quality", 0.0)) for pc in per_coords
+                )
+            else:
+                cov = ev.get("coverage", ev.get("cover_quality", {}).get("total_score", 0.0))
+                if isinstance(cov, dict):
+                    cov = cov.get("total_score", 0.0)
+                actual_coverage = float(cov) if not isinstance(cov, str) else 0.0
             actual_verified = actual_coverage > 0
 
         # Prediction accuracy: did cycles agree with evaluate?
