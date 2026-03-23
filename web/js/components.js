@@ -101,6 +101,8 @@ function renderDocsSidebar(activePage) {
         { href: 'evidence.html', label: 'Evidence Channels', id: 'evidence' },
         { href: 'obstructions.html', label: 'Obstructions', id: 'obstructions' },
         { href: 'effects.html', label: 'Python Effects', id: 'effects' },
+        { href: 'concept-ideation.html', label: 'Geometry of Ideation', id: 'concept-ideation' },
+        { href: 'concept-orchestration.html', label: 'Geometry of Orchestration', id: 'concept-orchestration' },
       ]
     },
     {
