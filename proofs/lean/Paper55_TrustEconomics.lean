@@ -182,21 +182,11 @@ theorem greedyAlloc_feasible (items : List JudgmentItem) (budget : Nat) :
     isFeasible (greedyAlloc items budget) budget :=
   greedyPack_feasible budget (sortByROI items)
 
-/-- Greedy packing with zero budget yields empty portfolio. -/
+/-- Greedy packing with zero budget yields empty or zero-cost portfolio. -/
 theorem greedyPack_zero (items : List JudgmentItem) :
-    greedyPack 0 items = [] ∨ portfolioCost (greedyPack 0 items) = 0 := by
-  induction items with
-  | nil => exact Or.inl rfl
-  | cons j js ih =>
-    simp only [greedyPack]
-    by_cases h : verifCost j ≤ 0
-    · rw [if_pos h]; right; simp [portfolioCost_cons]
-      have : verifCost j = 0 := Nat.le_zero.mp h
-      constructor
-      · exact this
-      · have := greedyPack_feasible (0 - verifCost j) js
-        omega
-    · rw [if_neg h]; exact ih
+    portfolioCost (greedyPack 0 items) = 0 := by
+  have := greedyPack_feasible 0 items
+  omega
 
 -- ════════════════════════════════════════════════════════════════════
 -- § 7  Dynamic Programming Allocation
