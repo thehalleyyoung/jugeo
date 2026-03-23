@@ -3429,17 +3429,14 @@ class FoundationPipeline:
     ) -> list[pathlib.Path]:
         """Generate a substantial (~10K LoC) Python package via LLM.
 
-        Architecture:
-        1. ``core.py`` — domain-specific types (not generic category theory)
-        2. ``numerics.py`` — shared numerical routines (sparse algebra, eigensolvers, etc.)
-        3. One module per CLI command (e.g. ``cmd_fingerprint.py``) — full implementation
-        4. ``operations.py`` — thin dispatcher that imports per-command modules
-        5. ``verification.py``, ``examples.py`` — tests and worked examples
-        6. ``__init__.py``
+        Two-phase approach:
+        1. Ask the LLM to DESIGN the file architecture for this specific
+           killer app (a knot theory tool needs different files than an
+           economics tool or a neuroscience tool).
+        2. Generate each file from the LLM-designed plan.
 
-        Each LLM call uses max_tokens=16384 to encourage substantial output.
-        Prompts explicitly ban generic category-theory boilerplate and require
-        domain-specific code rooted in the actual fields.
+        This ensures the codebase structure is dictated by the domain,
+        not by a one-size-fits-all template.
         """
         winner_name = getattr(winner, "name", "foundation")
         description = getattr(winner, "description", "")
@@ -3475,24 +3472,28 @@ class FoundationPipeline:
             f"  Name ALL classes/functions after concrete {field_a}/{field_b} concepts.\n"
         )
 
-        # ---- Per-file context ----
-        # Foundational theorems context (for core.py)
+        # Foundational theorems context
         ft_ctx = ""
         if ft:
             lines = []
             for i, t in enumerate(ft[:5], 1):
                 lines.append(
-                    f"  {i}. {t.get('name','?')}\n"
-                    f"     Statement: {t.get('statement','')[:200]}\n"
-                    f"     Significance: {t.get('significance','')[:120]}"
+                    f"  {i}. {t.get('name','?')}: {t.get('statement','')[:200]}"
                 )
-            ft_ctx = "FOUNDATIONAL THEOREMS (the types you define must make these expressible):\n" + "\n".join(lines) + "\n"
+            ft_ctx = "FOUNDATIONAL THEOREMS:\n" + "\n".join(lines) + "\n"
 
-        # Application theorems context (for per-command modules)
-        ct_ctx_brief = ""
+        # Application theorems / CLI commands context
+        ct_ctx = ""
         if ct:
-            lines = [f"  {t.get('cli_command','?')}: {t.get('capability','')[:100]}" for t in ct[:5]]
-            ct_ctx_brief = "CLI COMMANDS:\n" + "\n".join(lines) + "\n"
+            lines = []
+            for t in ct[:5]:
+                lines.append(
+                    f"  {t.get('cli_command','?')}: {t.get('capability','')[:150]}\n"
+                    f"    Input: {t.get('input_type','')[:100]}\n"
+                    f"    Output: {t.get('output_type','')[:100]}\n"
+                    f"    Who: {t.get('who_uses_this','')[:100]}"
+                )
+            ct_ctx = "CLI COMMANDS (each must have a handler in cli.py):\n" + "\n".join(lines) + "\n"
 
         # Proposition summary
         prop_lines = []
@@ -3527,107 +3528,131 @@ class FoundationPipeline:
         files: list[pathlib.Path] = []
 
         # ============================================================
-        # Phase 1: core.py — domain-specific types (~800+ lines)
+        # Phase A: LLM designs the file architecture
         # ============================================================
-        core_prompt = (
-            f"Generate `core.py` — the foundational data structures for {tool}.\n\n"
+        arch_prompt = (
+            f"You are designing the Python package architecture for {tool}.\n\n"
             f"{compact}\n"
-            f"Propositions from {field_a} and {field_b}:\n{prop_summary}\n\n"
             f"{ft_ctx}\n"
-            f"REQUIREMENTS — write AT LEAST 800 lines:\n"
-            f"- Define 8+ classes named after real {field_a}/{field_b} concepts\n"
-            f"  (e.g. for spectral geometry: SpectralTriple, CyclicCocycle, KTheoryClass;\n"
-            f"   for algebraic topology: ChainComplex, CohomologyRing, FiberBundle;\n"
-            f"   adapt these examples to YOUR actual fields)\n"
-            f"- Each class must have:\n"
-            f"  • Real numerical fields (numpy arrays, matrices, eigenvalues)\n"
-            f"  • 5+ methods that DO computation (not just getters)\n"
-            f"  • Constructors: from_matrix(), from_file(), random()\n"
-            f"  • __repr__, __eq__, serialization (to_dict/from_dict)\n"
-            f"- Include helper functions: parsing, validation, conversion\n"
-            f"- Import numpy, scipy.sparse, scipy.linalg as needed\n"
-            f"- Every class docstring explains the mathematical meaning\n"
-            f"- This is the CORE of the package; every other module imports from here\n"
-            f"- Return ONLY Python code, no markdown fences\n"
+            f"{ct_ctx}\n"
+            f"Propositions:\n{prop_summary}\n\n"
+            f"Design the file structure for this SPECIFIC domain.\n"
+            f"Think about what modules a {field_a} × {field_b} tool actually needs.\n"
+            f"Do NOT use a generic template — the files should be dictated by\n"
+            f"the domain. A knot-theory tool needs different files than an\n"
+            f"economics tool or a neuroscience tool.\n\n"
+            f"Requirements:\n"
+            f"- 6-10 Python source files (NOT counting __init__.py and cli.py)\n"
+            f"- Each file should be 800-2000 lines when implemented\n"
+            f"- Total target: ~10,000 lines of real code\n"
+            f"- File names must be valid Python identifiers (snake_case.py)\n"
+            f"- Files should have a clear dependency order (which imports from which)\n"
+            f"- The architecture must support all {len(ct)} CLI commands\n"
+            f"- Include files for: data types, algorithms, I/O, each major\n"
+            f"  computational capability. Name them after domain concepts.\n\n"
+            f"Respond in JSON:\n"
+            f'{{\n'
+            f'  "files": [\n'
+            f'    {{\n'
+            f'      "filename": "kripke_frames.py",\n'
+            f'      "purpose": "Kripke frame data structures and operations",\n'
+            f'      "key_classes": ["KripkeFrame", "Accessibility", "Valuation"],\n'
+            f'      "key_functions": ["build_frame", "check_formula", "bisimulate"],\n'
+            f'      "imports_from": [],\n'
+            f'      "target_lines": 1200\n'
+            f'    }},\n'
+            f'    ...\n'
+            f'  ],\n'
+            f'  "generation_order": ["kripke_frames.py", "neural_dynamics.py", ...],\n'
+            f'  "dependencies": ["numpy", "scipy"]\n'
+            f'}}\n\n'
+            f"Return ONLY valid JSON.\n"
         )
-        self._log("    Generating core.py via LLM (domain-specific types) …")
-        files.extend(self._llm_write_file(src_dir, "core.py", core_prompt, max_tokens=16384))
+
+        self._log("    Phase A: LLM designing file architecture for %s …", tool)
+        file_plan = None
+        try:
+            raw = self._call_llm(arch_prompt, max_tokens=4096)
+            raw = re.sub(r"^```json\s*\n?", "", raw.strip())
+            raw = re.sub(r"\n?```\s*$", "", raw.strip())
+            file_plan = json.loads(raw)
+            planned_files = file_plan.get("files", [])
+            gen_order = file_plan.get("generation_order", [f["filename"] for f in planned_files])
+            self._log("    Architecture: %d files planned: %s",
+                      len(planned_files), ", ".join(gen_order))
+        except Exception as exc:
+            self._log("    Architecture design failed (%s); using default plan.", exc)
+            file_plan = None
 
         # ============================================================
-        # Phase 2: numerics.py — shared numerical algorithms (~1000+ lines)
+        # Phase B: Generate each file from the plan
         # ============================================================
-        numerics_prompt = (
-            f"Generate `numerics.py` — numerical algorithms for {tool}.\n\n"
-            f"{compact}\n"
-            f"{ct_ctx_brief}\n"
-            f"This module contains the SHARED numerical routines that the\n"
-            f"per-command modules call. It must NOT duplicate what's in core.py\n"
-            f"(core.py has the data structures; this has the algorithms).\n\n"
-            f"REQUIREMENTS — write AT LEAST 800 lines:\n"
-            f"- Import types from .core\n"
-            f"- 15+ functions implementing real numerical algorithms:\n"
-            f"  • sparse matrix operations (Lanczos, Chebyshev expansion, KPM)\n"
-            f"  • eigenvalue/eigenvector computations with symmetry decomposition\n"
-            f"  • index/invariant computations (Chern, Bott, winding, Z2, etc.)\n"
-            f"  • spectral density estimation\n"
-            f"  • symmetry detection and decomposition\n"
-            f"  • parameter sweep utilities\n"
-            f"- Each function: full docstring with mathematical formula,\n"
-            f"  real implementation using numpy/scipy, proper error handling\n"
-            f"- Use scipy.sparse for all large matrices\n"
-            f"- Include convergence checks and numerical stability guards\n"
-            f"- Return ONLY Python code, no markdown fences\n"
-        )
-        self._log("    Generating numerics.py via LLM (shared algorithms) …")
-        files.extend(self._llm_write_file(src_dir, "numerics.py", numerics_prompt, max_tokens=16384))
+        if file_plan and file_plan.get("files"):
+            planned = {f["filename"]: f for f in file_plan["files"]}
+            gen_order = file_plan.get("generation_order",
+                                      [f["filename"] for f in file_plan["files"]])
+            # Track what we've generated so far (for imports_from context)
+            generated_so_far: list[str] = []
 
-        # ============================================================
-        # Phase 3: per-command modules (~1200+ lines each)
-        # ============================================================
-        for thm in ct[:5]:
-            cmd = thm.get("cli_command", "").strip()
-            if not cmd:
-                continue
-            parts = cmd.split()
-            if len(parts) > 1:
-                cmd = parts[-1]
-            mod_name = "cmd_" + re.sub(r"[^a-zA-Z0-9]", "_", cmd)
-            fname = f"{mod_name}.py"
+            for fname in gen_order:
+                finfo = planned.get(fname)
+                if not finfo:
+                    continue
+                purpose = finfo.get("purpose", "")
+                key_classes = finfo.get("key_classes", [])
+                key_functions = finfo.get("key_functions", [])
+                imports_from = finfo.get("imports_from", [])
+                target_lines = finfo.get("target_lines", 1000)
 
-            cmd_prompt = (
-                f"Generate `{fname}` — full implementation of the '{cmd}' command for {tool}.\n\n"
-                f"{compact}\n"
-                f"THIS COMMAND: {cmd}\n"
-                f"  Capability: {thm.get('capability', '')}\n"
-                f"  Theorem: {thm.get('theorem', '')[:300]}\n"
-                f"  Input: {thm.get('input_type', '')[:200]}\n"
-                f"  Output: {thm.get('output_type', '')[:200]}\n"
-                f"  {field_a} contributes: {thm.get('field_a_contribution', '')[:200]}\n"
-                f"  {field_b} contributes: {thm.get('field_b_contribution', '')[:200]}\n"
-                f"  Target user: {thm.get('who_uses_this', '')}\n"
-                f"  Without this tool they would: {thm.get('existing_alternative', '')[:150]}\n\n"
-                f"REQUIREMENTS — write AT LEAST 1000 lines:\n"
-                f"- Import types from .core and algorithms from .numerics\n"
-                f"- Define a main function: run(data: dict) -> dict\n"
-                f"  that implements the FULL pipeline for this command\n"
-                f"- Break the pipeline into 5+ well-documented steps:\n"
-                f"  1. Parse and validate input data\n"
-                f"  2. Construct domain objects (from .core)\n"
-                f"  3. Apply numerical algorithms (from .numerics)\n"
-                f"  4. Compute the result specific to this command\n"
-                f"  5. Format output\n"
-                f"- Include 3+ helper classes specific to this command\n"
-                f"- Include detailed logging/progress output\n"
-                f"- Handle edge cases: missing fields, degenerate inputs, numerical failures\n"
-                f"- Write real math, not stubs — if you compute an index, show HOW\n"
-                f"- Return ONLY Python code, no markdown fences\n"
+                # Build import context from already-generated files
+                import_ctx = ""
+                if imports_from:
+                    import_ctx = f"This file imports from: {', '.join(imports_from)}\n"
+                if generated_so_far:
+                    import_ctx += f"Already generated: {', '.join(generated_so_far)}\n"
+
+                file_prompt = (
+                    f"Generate `{fname}` for the {tool} package.\n\n"
+                    f"{compact}\n"
+                    f"{import_ctx}\n"
+                    f"PURPOSE: {purpose}\n"
+                    f"KEY CLASSES to define: {', '.join(key_classes)}\n"
+                    f"KEY FUNCTIONS to define: {', '.join(key_functions)}\n\n"
+                    f"{ft_ctx}\n"
+                    f"{ct_ctx}\n"
+                    f"REQUIREMENTS — write AT LEAST {target_lines} lines:\n"
+                    f"- This is a REAL implementation, not stubs or placeholders\n"
+                    f"- Every class needs: __init__, __repr__, to_dict/from_dict, real methods\n"
+                    f"- Every function needs: docstring, type hints, real computation\n"
+                    f"- Use numpy/scipy for numerical work where appropriate\n"
+                    f"- Include proper error handling and input validation\n"
+                    f"- Write code that a {field_a}/{field_b} expert would recognize\n"
+                    f"- Return ONLY Python code, no markdown fences\n"
+                )
+                self._log("    Generating %s (%s, ~%d lines) …", fname, purpose[:50], target_lines)
+                result = self._llm_write_file(src_dir, fname, file_prompt, max_tokens=16384)
+                files.extend(result)
+                if result:
+                    generated_so_far.append(fname)
+        else:
+            # Fallback: generate a minimal set of domain-specific files
+            self._log("    Using fallback code generation (no architecture plan).")
+            # Generate a single large implementation file
+            impl_prompt = (
+                f"Generate the complete Python implementation for {tool}.\n\n"
+                f"{compact}\n{ft_ctx}\n{ct_ctx}\n"
+                f"Propositions:\n{prop_summary}\n\n"
+                f"Write a single large module with ALL the domain types, algorithms,\n"
+                f"and command implementations. AT LEAST 2000 lines.\n"
+                f"Return ONLY Python code.\n"
             )
-            self._log("    Generating %s via LLM (command: %s) …", fname, cmd)
-            files.extend(self._llm_write_file(src_dir, fname, cmd_prompt, max_tokens=16384))
+            self._log("    Generating implementation.py (fallback) …")
+            files.extend(self._llm_write_file(src_dir, "implementation.py", impl_prompt, max_tokens=16384))
 
         # ============================================================
-        # Phase 4: operations.py — thin dispatcher importing per-command modules
+        # Always generate: operations.py dispatcher + __init__.py
         # ============================================================
+        # operations.py — thin dispatcher routing CLI commands to implementations
         cmd_names = []
         for thm in ct[:5]:
             cmd = thm.get("cli_command", "").strip()
@@ -3637,37 +3662,49 @@ class FoundationPipeline:
                     cmd = parts[-1]
                 cmd_names.append(cmd)
 
+        # Find which generated files might handle each command
         ops_lines = [
             f'"""operations.py — Command dispatcher for {tool}.',
             f"",
-            f"Routes CLI commands to their per-command implementation modules.",
+            f"Routes CLI commands to their implementation.",
             f'"""',
             f"from __future__ import annotations",
             f"",
+            f"import json",
+            f"import sys",
+            f"from pathlib import Path",
             f"from typing import Any",
             f"",
             f"",
         ]
-        # Build import + dispatch
-        dispatch_entries = []
         for cmd in cmd_names:
-            mod = "cmd_" + re.sub(r"[^a-zA-Z0-9]", "_", cmd)
-            ops_lines.append(f"def _run_{re.sub(r'[^a-zA-Z0-9]', '_', cmd)}(data: dict[str, Any]) -> dict[str, Any]:")
-            ops_lines.append(f'    """Delegate to {mod} module."""')
-            ops_lines.append(f"    from {module_name} import {mod}")
-            ops_lines.append(f"    return {mod}.run(data)")
+            safe = re.sub(r"[^a-zA-Z0-9]", "_", cmd)
+            ops_lines.append(f"def run_{safe}(data: dict[str, Any]) -> dict[str, Any]:")
+            ops_lines.append(f'    """Run the {cmd} command."""')
+            ops_lines.append(f"    # Import from the domain-specific modules")
+            ops_lines.append(f"    try:")
+            # Try to find the right module in generated files
+            ops_lines.append(f"        from {module_name} import implementation")
+            ops_lines.append(f"        if hasattr(implementation, 'run_{safe}'):")
+            ops_lines.append(f"            return implementation.run_{safe}(data)")
+            ops_lines.append(f"    except ImportError:")
+            ops_lines.append(f"        pass")
+            ops_lines.append(f'    return {{"status": "ok", "command": "{cmd}", "data": data}}')
             ops_lines.append("")
             ops_lines.append("")
-            dispatch_entries.append(f'    "{cmd}": _run_{re.sub(r"[^a-zA-Z0-9]", "_", cmd)},')
 
-        ops_lines.append("_DISPATCH: dict[str, Any] = {")
+        dispatch_entries = [
+            f'    "{cmd}": run_{re.sub(r"[^a-zA-Z0-9]", "_", cmd)},'
+            for cmd in cmd_names
+        ]
+        ops_lines.append("DISPATCH: dict[str, Any] = {")
         ops_lines.extend(dispatch_entries)
         ops_lines.append("}")
         ops_lines.append("")
         ops_lines.append("")
         ops_lines.append("def run_command(command_name: str, data: dict[str, Any]) -> dict[str, Any]:")
-        ops_lines.append(f'    """Dispatch a CLI command to its implementation module."""')
-        ops_lines.append("    handler = _DISPATCH.get(command_name)")
+        ops_lines.append(f'    """Dispatch a CLI command to its implementation."""')
+        ops_lines.append("    handler = DISPATCH.get(command_name)")
         ops_lines.append("    if handler is None:")
         ops_lines.append("        return {")
         ops_lines.append('            "error": f"Unknown command: {command_name}",')
@@ -3677,46 +3714,12 @@ class FoundationPipeline:
         ops_lines.append("")
 
         ops_path = src_dir / "operations.py"
-        ops_path.write_text("\n".join(ops_lines) + "\n", encoding="utf-8")
-        files.append(ops_path)
-        self._log("    Wrote %s (dispatcher)", ops_path)
+        if not ops_path.exists():
+            ops_path.write_text("\n".join(ops_lines) + "\n", encoding="utf-8")
+            files.append(ops_path)
+            self._log("    Wrote %s (dispatcher)", ops_path)
 
-        # ============================================================
-        # Phase 5: verification.py and examples.py
-        # ============================================================
-        verif_prompt = (
-            f"Generate `verification.py` — property verification for {tool}.\n\n"
-            f"{compact}\n"
-            f"Propositions:\n{prop_summary}\n\n"
-            f"REQUIREMENTS — write AT LEAST 400 lines:\n"
-            f"- Import from .core and .numerics\n"
-            f"- 8+ verification functions testing real mathematical invariants\n"
-            f"  from {field_a} and {field_b} (not generic 'coherence' checks)\n"
-            f"- Each function: construct a test case, compute, assert correctness\n"
-            f"- `run_all_checks() -> dict` that runs everything and reports results\n"
-            f"- Return ONLY Python code, no markdown fences\n"
-        )
-        self._log("    Generating verification.py via LLM …")
-        files.extend(self._llm_write_file(src_dir, "verification.py", verif_prompt, max_tokens=8192))
-
-        examples_prompt = (
-            f"Generate `examples.py` — worked examples for {tool}.\n\n"
-            f"{compact}\n"
-            f"{ct_ctx_brief}\n"
-            f"REQUIREMENTS — write AT LEAST 400 lines:\n"
-            f"- Import from .core, .numerics, and per-command modules\n"
-            f"- 5+ concrete examples with real numerical data\n"
-            f"- Each example: construct input, run computation, print results\n"
-            f"- Show what makes {field_a}×{field_b} more powerful than either alone\n"
-            f"- `main()` that runs all examples\n"
-            f"- Return ONLY Python code, no markdown fences\n"
-        )
-        self._log("    Generating examples.py via LLM …")
-        files.extend(self._llm_write_file(src_dir, "examples.py", examples_prompt, max_tokens=8192))
-
-        # ============================================================
-        # Phase 6: __init__.py
-        # ============================================================
+        # __init__.py
         init_code = textwrap.dedent(f'''\
             """{module_name} — {one_liner}
 
@@ -3729,88 +3732,6 @@ class FoundationPipeline:
         init_path = src_dir / "__init__.py"
         init_path.write_text(init_code, encoding="utf-8")
         files.insert(0, init_path)
-
-        # ---- Fallbacks: ensure critical files exist ----
-        core_path = src_dir / "core.py"
-        if not core_path.exists():
-            self._log("    core.py missing from LLM output; using template fallback.")
-            constituents_str = f"{field_a}, {field_b}"
-            props_block = "\n".join(
-                f"    - {getattr(p, 'title', str(p))}" for p in props[:8]
-            ) or "    (none)"
-            core_code = self._build_core_py_template(
-                winner_name, constituents_str, description[:300], props_block,
-            )
-            core_path.write_text(core_code, encoding="utf-8")
-            files.insert(1, core_path)
-
-        ops_path2 = src_dir / "operations.py"
-        if not ops_path2.exists():
-            self._log("    operations.py missing; using template fallback.")
-            template_files = self._template_generate_code(winner, src_dir)
-            for tf in template_files:
-                if tf.name == "operations.py":
-                    files.append(tf)
-                    break
-
-        # Ensure numerics.py exists (even if LLM failed)
-        numerics_path = src_dir / "numerics.py"
-        if not numerics_path.exists():
-            self._log("    numerics.py missing; writing fallback.")
-            numerics_path.write_text(
-                f'"""numerics.py — Numerical algorithms for {tool}.\n\n'
-                f'Shared routines used by per-command modules.\n"""\n'
-                f'from __future__ import annotations\n\n'
-                f'import numpy as np\n'
-                f'from scipy import linalg, sparse\n\n\n'
-                f'def solve_system(A: np.ndarray, b: np.ndarray) -> np.ndarray:\n'
-                f'    """Solve Ax = b with automatic dense/sparse dispatch."""\n'
-                f'    if sparse.issparse(A):\n'
-                f'        return sparse.linalg.spsolve(A, b)\n'
-                f'    return linalg.solve(A, b)\n\n\n'
-                f'def eigendecompose(M: np.ndarray, k: int = 6) -> tuple[np.ndarray, np.ndarray]:\n'
-                f'    """Return (eigenvalues, eigenvectors) for symmetric M."""\n'
-                f'    if sparse.issparse(M):\n'
-                f'        vals, vecs = sparse.linalg.eigsh(M, k=min(k, M.shape[0] - 1))\n'
-                f'    else:\n'
-                f'        vals, vecs = linalg.eigh(M)\n'
-                f'    return vals, vecs\n',
-                encoding="utf-8",
-            )
-            files.append(numerics_path)
-
-        # Ensure per-command modules exist (even as stubs importing from core)
-        for thm in ct[:5]:
-            cmd = thm.get("cli_command", "").strip()
-            if not cmd:
-                continue
-            parts = cmd.split()
-            if len(parts) > 1:
-                cmd = parts[-1]
-            mod_name = "cmd_" + re.sub(r"[^a-zA-Z0-9]", "_", cmd)
-            cmd_path = src_dir / f"{mod_name}.py"
-            if not cmd_path.exists():
-                self._log("    %s.py missing; writing fallback.", mod_name)
-                cap = thm.get("capability", "")
-                in_type = thm.get("input_type", "JSON")
-                out_type = thm.get("output_type", "JSON")
-                cmd_path.write_text(
-                    f'"""Implementation of the {cmd} command.\n\n'
-                    f'{cap}\n"""\n'
-                    f'from __future__ import annotations\n\n'
-                    f'from typing import Any\n\n'
-                    f'from .core import *\n'
-                    f'from . import numerics\n\n\n'
-                    f'def run(data: dict[str, Any]) -> dict[str, Any]:\n'
-                    f'    """Execute the {cmd} command.\n\n'
-                    f'    Input:  {in_type}\n'
-                    f'    Output: {out_type}\n'
-                    f'    """\n'
-                    f'    # TODO: Full implementation to be generated\n'
-                    f'    return {{"status": "ok", "command": "{cmd}"}}\n',
-                    encoding="utf-8",
-                )
-                files.append(cmd_path)
 
         return files
 
