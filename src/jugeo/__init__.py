@@ -25,12 +25,24 @@ try:
 except ImportError:  # pragma: no cover
     solve = None
 
+try:
+    from jugeo.easy import prove, bugs, equiv, ideate, carry, spec  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover
+    prove = bugs = equiv = ideate = carry = spec = None
+
 __all__ = [
     "GeometricSite",
     "TrustAlgebra",
     "construct_judgment",
     "validate_judgment_form",
     "solve",
+    # Easy API — one function per capability
+    "prove",
+    "bugs",
+    "equiv",
+    "spec",
+    "ideate",
+    "carry",
 ]
 
 
