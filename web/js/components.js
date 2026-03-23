@@ -28,7 +28,7 @@ function renderNav(activePage) {
           <kbd>&#x2318;K</kbd>
         </div>
         <button class="theme-toggle" title="Toggle theme">&#x2600;</button>
-        <a href="https://github.com/halleyyoung/jugeo" class="btn btn-ghost btn-sm" target="_blank">GitHub</a>
+        <a href="https://github.com/thehalleyyoung/jugeo" class="btn btn-ghost btn-sm" target="_blank">GitHub</a>
       </div>
       <button class="nav-toggle" aria-label="Menu">&#x2630;</button>
     </div>
@@ -66,7 +66,7 @@ function renderFooter() {
         </div>
         <div class="footer-section">
           <h4>Community</h4>
-          <a href="https://github.com/halleyyoung/jugeo" target="_blank">GitHub</a>
+          <a href="https://github.com/thehalleyyoung/jugeo" target="_blank">GitHub</a>
           <a href="pages/contributing.html">Contributing</a>
           <a href="pages/faq.html">FAQ</a>
           <a href="pages/changelog.html">Changelog</a>
