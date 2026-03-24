@@ -561,7 +561,7 @@ class DirectedResearch:
         """)
 
         section = _llm_call(prompt, surface=SurfaceKind.THEORY,
-                            coordinate="theory.foundations")
+                            coordinate="theory.foundations", timeout=600)
         self.theory_text = section.content
         path = self.output_dir / "context.md"
         path.write_text(f"# {self.approach}\n\n{section.content}\n")
