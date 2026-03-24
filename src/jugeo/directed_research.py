@@ -342,7 +342,7 @@ class DirectedResearch:
         self.seed = seed
         self.verbose = verbose
         self.output_dir = pathlib.Path(
-            output_dir or f"outputs/research_{time.strftime('%Y%m%d_%H%M%S')}")
+            output_dir or f"outputs/research_{time.strftime('%Y%m%d_%H%M%S')}").resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # The workspace site
