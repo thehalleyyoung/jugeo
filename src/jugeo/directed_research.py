@@ -167,7 +167,7 @@ def _clean_copilot_output(raw: str) -> str:
 
 
 def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
-              max_tokens: int = 16384, timeout: int = 0) -> LLMSection:
+              max_tokens: int = 16384, timeout: Optional[int] = None) -> LLMSection:
     """Call the LLM and return a typed, trust-annotated section.
 
     This is THE interface between the LLM and the geometry. Every LLM
@@ -178,48 +178,49 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
     "read file X and follow the instructions inside" — this avoids
     massive argv and makes calls much faster.
     """
-    import hashlib, shutil, tempfile
+    import hashlib
+    import shutil
+    import tempfile as _tempfile
 
     t0 = time.time()
     prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
     text = ""
 
-    # 1. Copilot CLI — ask it to write directly to a temp file
+    # 1. Copilot CLI — write to file, then read back
     if shutil.which("copilot"):
-        out_path = os.path.join(tempfile.gettempdir(), f"jugeo_out_{prompt_hash}.txt")
-        # Clear the file
-        with open(out_path, "w") as f:
-            f.write("")
-
-        file_prompt = (
-            f"Write the following content to {out_path} — write ONLY the "
-            f"requested content, no explanations:\n\n{prompt}"
-        )
+        out_path = os.path.join(_tempfile.gettempdir(), f"jugeo_out_{prompt_hash}.txt")
 
         for attempt in range(3):
             try:
-                # Try 1: write to file via copilot
-                r = subprocess.run(
+                # Clear file
+                with open(out_path, "w") as _f:
+                    _f.write("")
+
+                file_prompt = (
+                    f"Write the following content to {out_path} — write ONLY the "
+                    f"requested content, no explanations:\n\n{prompt}"
+                )
+
+                subprocess.run(
                     ["copilot", "-p", file_prompt, "--model", "claude-sonnet-4.6",
                      "--allow-all-tools", "--allow-all-paths"],
                     capture_output=True, text=True, timeout=timeout)
                 time.sleep(1)
+
+                # Check file
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 20:
-                    with open(out_path, errors="replace") as f:
-                        text = f.read().strip()
-                    break
-                # Try 2: read from stdout of same call
-                if r.returncode == 0 and r.stdout.strip():
-                    cleaned = _clean_copilot_output(r.stdout)
-                    if len(cleaned) > 20:
-                        text = cleaned
+                    with open(out_path, errors="replace") as _f:
+                        text = _f.read().strip()
+                    if len(text) > 20:
                         break
-                # Try 3: plain stdin (no file writing)
-                r2 = subprocess.run(
+                    text = ""
+
+                # Fallback: stdin
+                r = subprocess.run(
                     ["copilot", "--model", "claude-sonnet-4.6", "--available-tools"],
                     input=prompt, capture_output=True, text=True, timeout=timeout)
-                if r2.returncode == 0 and r2.stdout.strip():
-                    cleaned = _clean_copilot_output(r2.stdout)
+                if r.returncode == 0 and r.stdout.strip():
+                    cleaned = _clean_copilot_output(r.stdout)
                     if len(cleaned) > 20:
                         text = cleaned
                         break
@@ -228,7 +229,7 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
             except Exception:
                 pass
             if attempt < 2:
-                time.sleep(2)
+                time.sleep(3)
 
         try:
             os.unlink(out_path)
@@ -640,7 +641,7 @@ class DirectedResearch:
         """)
 
         section = _llm_call(prompt, surface=SurfaceKind.THEORY,
-                            coordinate="theory.foundations", timeout=600)
+                            coordinate="theory.foundations", )
         self.theory_text = section.content
         path = self.output_dir / "context.md"
         path.write_text(f"# {self.approach}\n\n{section.content}\n")
@@ -1013,7 +1014,7 @@ class DirectedResearch:
                 hyperref, algorithm2e. Include at least 3 tables and 2 algorithm blocks.
                 Return raw LaTeX, no markdown fences.
             """), surface=SurfaceKind.CLAIMS, coordinate="claims.paper",
-                 timeout=600)
+                 )
             paper = section.content
             self.sections.append(section)
         if paper.startswith("```"):
