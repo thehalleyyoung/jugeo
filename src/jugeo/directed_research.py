@@ -468,55 +468,146 @@ class DirectedResearch:
             if winner:
                 return
 
-        # Fallback: LLM-guided ideation with cross-tradition constraint
-        ideation_prompt = textwrap.dedent(f"""\
-            You are a research mathematician and software architect. Given this prompt:
+        # Phase 1a: Domain analysis — understand what the domain actually needs
+        self._log("  Phase 1a: Analyzing what the domain needs...")
+        domain_prompt = textwrap.dedent(f"""\
+            You are an expert software architect. Analyze this product request:
 
             "{self.prompt}"
 
-            Propose a NOVEL mathematical approach that:
-            1. Combines two DISTANT mathematical fields — they must be from different
-               traditions (e.g., algebra × geometry, logic × analysis, topology × probability).
-               Do NOT combine fields that are already closely related.
-            2. Identifies 3-5 specific theorems/structures from each field that create bridges
-            3. Explains concretely how these bridges enable a software tool that doesn't exist yet
-            4. Names the synthesized field and states the key bridge theorem formally
-            5. Describes what data structures and algorithms the bridge theorem implies
-            6. Explains what existing tools/baselines this would compete against
+            I need you to figure out what MATHEMATICAL TOOLS would make this
+            product dramatically better than anything that exists today.
 
-            Be SPECIFIC about the mathematics. Name actual theorems, not vague "connections."
+            DO NOT default to trendy/exotic math. Think about what ACTUALLY
+            works in this domain. Consider:
 
-            Respond as JSON:
+            1. What specific computational problems does this product need to solve?
+               (e.g., optimization under uncertainty, forecasting, anomaly detection,
+               risk quantification, pattern recognition, causal inference, etc.)
+            2. What are the 3 best existing tools/libraries that do something similar?
+               What math do they use? Where do they fail?
+            3. What mathematical framework would let us do something these tools CAN'T?
+               This could be well-established math applied in a new way, or a genuine
+               novel combination. The key is: it has to produce BETTER RESULTS, not
+               just be more theoretically elegant.
+            4. What datasets, APIs, and file formats are standard in this domain?
+            5. What metrics would a practitioner use to judge this tool?
+
+            Be extremely concrete. Name actual Python libraries, actual datasets,
+            actual metrics, actual mathematical theorems.
+
+            Respond as JSON with these fields:
             {{
-                "synthesized_field": "Name of the new combined field",
-                "field_a": "First mathematical field",
-                "field_b": "Second mathematical field",
-                "bridge_theorem": "Formal statement of the key theorem connecting them",
-                "theory_summary": "3-paragraph description: (1) what each field contributes, (2) the bridge, (3) what it enables computationally",
-                "approach_name": "short-kebab-case-name",
-                "why_novel": "Why this specific combination hasn't been tried and why it should work",
-                "key_structures_from_a": ["structure1", "structure2", "structure3"],
-                "key_structures_from_b": ["structure4", "structure5", "structure6"],
-                "bridge_structures": ["bridge1", "bridge2"],
-                "competing_baselines": ["baseline1", "baseline2"],
-                "metrics_to_beat": ["metric1", "metric2"]
+                "domain_analysis": "3-paragraph analysis of the domain and its needs",
+                "computational_problems": ["problem1", "problem2", "problem3"],
+                "existing_tools": [
+                    {{"name": "tool1", "math": "what math it uses", "weakness": "where it fails"}},
+                    ...
+                ],
+                "best_math_approach": {{
+                    "name": "Name of the mathematical framework",
+                    "field_a": "Primary mathematical field",
+                    "field_b": "Secondary mathematical field (if applicable)",
+                    "why": "Why this math is the best choice for this specific domain",
+                    "key_theorems": ["theorem1 and what it does for us", "theorem2", ...],
+                    "key_algorithms": ["algorithm1", "algorithm2", ...],
+                    "data_structures": ["structure1", "structure2", ...]
+                }},
+                "standard_datasets": ["dataset/API 1", "dataset/API 2"],
+                "standard_libraries": ["pandas", "numpy", "yfinance", ...],
+                "evaluation_metrics": ["metric1", "metric2", "metric3"],
+                "baselines_to_beat": [
+                    {{"name": "baseline1", "metric": "metric1", "value": "approximate value"}}
+                ]
             }}
         """)
 
-        result = _call_llm_json(ideation_prompt, max_tokens=8192)
-        self.theory = result.get("theory_summary", f"Framework for: {self.prompt}")
-        self.approach = result.get("approach_name", "novel-synthesis")
+        domain = _call_llm_json(domain_prompt, max_tokens=8192)
 
-        # Store ideation details for downstream use
-        self._ideation_result = result
+        # Phase 1b: Deep theory elaboration — produce a 30KB+ theory document
+        self._log("  Phase 1b: Elaborating the mathematical framework...")
+        math_approach = domain.get("best_math_approach", {})
+        field_a = math_approach.get("field_a", "applied mathematics")
+        field_b = math_approach.get("field_b", "")
+        approach_name = math_approach.get("name", "novel-approach")
+        key_theorems = math_approach.get("key_theorems", [])
+        key_algorithms = math_approach.get("key_algorithms", [])
+
+        elaboration_prompt = textwrap.dedent(f"""\
+            Write a COMPREHENSIVE mathematical framework document (at least 5000 words)
+            for a software tool based on this approach:
+
+            PRODUCT: {self.prompt}
+            MATHEMATICAL APPROACH: {approach_name}
+            PRIMARY FIELD: {field_a}
+            SECONDARY FIELD: {field_b or 'N/A'}
+            KEY THEOREMS: {json.dumps(key_theorems)}
+            KEY ALGORITHMS: {json.dumps(key_algorithms)}
+            DOMAIN ANALYSIS: {domain.get('domain_analysis', '')}
+            EXISTING TOOLS AND THEIR WEAKNESSES: {json.dumps(domain.get('existing_tools', []))}
+
+            Structure the document as:
+
+            1. INTRODUCTION (500+ words)
+               - The problem this tool solves
+               - Why existing tools fail
+               - The mathematical insight that changes everything
+
+            2. MATHEMATICAL FOUNDATIONS (1500+ words)
+               - Formal definitions of the key mathematical objects
+               - Statement and explanation of each key theorem
+               - How these theorems translate to algorithms
+               - Worked examples showing the math in action
+
+            3. COMPUTATIONAL FRAMEWORK (1000+ words)
+               - Data structures and their mathematical meaning
+               - Algorithms with complexity analysis
+               - How the math maps to Python code patterns
+
+            4. APPLICATION TO THE DOMAIN (1000+ words)
+               - Concrete examples with real data
+               - How to use standard datasets/APIs ({json.dumps(domain.get('standard_datasets', []))})
+               - Integration with standard libraries ({json.dumps(domain.get('standard_libraries', []))})
+
+            5. EVALUATION STRATEGY (500+ words)
+               - Metrics: {json.dumps(domain.get('evaluation_metrics', []))}
+               - Baselines to beat: {json.dumps(domain.get('baselines_to_beat', []))}
+               - How to demonstrate the tool is better
+
+            6. KEY PROPOSITIONS (500+ words)
+               - 5-10 formal mathematical propositions that the code must satisfy
+               - Each with: statement, proof sketch, computational implication
+
+            Write in a technical but accessible style. Use LaTeX notation for math.
+            This document will guide code generation, so be SPECIFIC about data
+            structures, algorithms, and API designs.
+
+            Return the raw text (Markdown format), no JSON wrapping.
+        """)
+
+        theory_text = _call_llm(elaboration_prompt, max_tokens=16384)
+
+        # Save the full theory document
+        theory_path = self.output_dir / "context.md"
+        full_context = f"# {approach_name}\n\n{theory_text}\n"
+        theory_path.write_text(full_context)
+        self._log(f"  Wrote context.md ({len(full_context)} bytes, {len(full_context.splitlines())} lines)")
+
+        self.theory = theory_text
+        self.approach = approach_name.lower().replace(" ", "-").replace("/", "-")
+
+        # Store ideation details
+        self._ideation_result = domain
+        self._ideation_result["theory_length"] = len(theory_text)
 
         self._record(IterationKind.IDEATE,
-                     f"Ideated: {result.get('synthesized_field', 'novel approach')}",
-                     SurfaceKind.THEORY, 0.0, 0.3, 0, 0, time.time() - start,
-                     detail=result)
+                     f"Ideated: {approach_name} ({len(theory_text)} bytes theory)",
+                     SurfaceKind.THEORY, 0.0, 0.4, 0, 0, time.time() - start,
+                     detail=domain)
 
-        self._log(f"  Approach: {result.get('synthesized_field', '?')}")
-        self._log(f"  Bridge: {result.get('bridge_theorem', '?')[:80]}...")
+        self._log(f"  Approach: {approach_name}")
+        self._log(f"  Fields: {field_a}" + (f" × {field_b}" if field_b else ""))
+        self._log(f"  Theory: {len(theory_text)} bytes")
 
     def _ideate_via_tournament(self) -> bool:
         """Use the real synthesis frontier tournament for ideation.
@@ -681,17 +772,8 @@ class DirectedResearch:
         if not self.plan:
             return
 
-        # Try using the full FoundationPipeline for heavy code generation
-        if not self.no_llm:
-            foundation_files = self._implement_via_foundation()
-            if foundation_files:
-                self.code_files.extend(str(f) for f in foundation_files)
-                self._record(IterationKind.IMPLEMENT,
-                             f"Generated {len(foundation_files)} files via foundation pipeline",
-                             SurfaceKind.CODE, 0.2, 0.6, 0, 0, time.time() - start)
-                return
-
-        # Fallback: generate per-module via direct LLM calls
+        # Generate per-module via direct LLM calls (more reliable than
+        # foundation pipeline delegation which can timeout)
         pkg_dir = self.output_dir / "src" / self.plan.package_name.replace("-", "_")
         pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -813,8 +895,8 @@ class DirectedResearch:
     def _generate_module(self, mod: dict, generated_so_far: list[str] = None) -> str:
         """Generate a single module's code via LLM.
 
-        Uses detailed prompts with 1000+ line requirements, domain-specific
-        naming, and context from previously generated files.
+        Uses the full theory context (up to 4000 chars) so the LLM generates
+        code that actually implements the mathematical framework, not generic stubs.
         """
         name = mod.get("name", "module")
         purpose = mod.get("purpose", "")
@@ -829,40 +911,61 @@ class DirectedResearch:
         if generated_so_far:
             import_ctx += f"Already generated: {', '.join(generated_so_far)}\n"
 
+        # Use domain-specific info from ideation if available
+        domain_info = ""
+        if hasattr(self, '_ideation_result') and self._ideation_result:
+            ir = self._ideation_result
+            libs = ir.get("standard_libraries", [])
+            datasets = ir.get("standard_datasets", [])
+            if libs:
+                domain_info += f"STANDARD LIBRARIES to use: {', '.join(libs)}\n"
+            if datasets:
+                domain_info += f"STANDARD DATA SOURCES: {', '.join(datasets)}\n"
+            existing = ir.get("existing_tools", [])
+            if existing:
+                domain_info += "EXISTING TOOLS (beat these):\n"
+                for t in existing[:3]:
+                    domain_info += f"  - {t.get('name','?')}: uses {t.get('math','?')}, weak at {t.get('weakness','?')}\n"
+
         prompt = textwrap.dedent(f"""\
             Generate `{name}.py` for the {pkg} package.
 
             PACKAGE: {pkg}
-            THEORY: {self.theory[:500]}
             PROMPT: {self.prompt}
             {import_ctx}
+            {domain_info}
 
-            PURPOSE: {purpose}
+            MATHEMATICAL FRAMEWORK (use this to guide the implementation):
+            {self.theory[:4000]}
+
+            PURPOSE OF THIS FILE: {purpose}
             KEY CLASSES to define: {', '.join(key_classes) if key_classes else 'domain-specific types'}
             KEY FUNCTIONS to define: {', '.join(key_functions) if key_functions else 'core algorithms'}
 
             REQUIREMENTS — write AT LEAST 1000 lines:
-            - Python 3.10+, from __future__ import annotations
-            - Every class needs: __init__, __repr__, to_dict/from_dict, real methods
-            - Every function needs: docstring, type hints, real computation
-            - Use numpy/scipy for numerical work where appropriate
-            - Include proper error handling and input validation
-            - Name ALL classes/functions after concrete domain concepts
-            - This is a REAL implementation, not stubs or placeholders
+            - Python 3.10+, from __future__ import annotations, numpy+scipy+pandas allowed
+            - Every class needs: __init__, __repr__, to_dict/from_dict, real methods with real math
+            - Every function needs: docstring, type hints, real computation (not stubs!)
+            - Use the standard libraries listed above where appropriate
+            - Name ALL classes/functions after concrete domain concepts (not generic math)
+            - Include proper error handling, input validation, logging
             - Include 3+ helper classes specific to this module
-            - Include detailed logging/progress output
-            - Handle edge cases: missing fields, degenerate inputs, numerical failures
-            - Write real math, not stubs — if you compute an index, show HOW
-            - No jugeo imports — this is standalone domain code
+            - If computing a mathematical quantity, show the ACTUAL FORMULA
+            - Handle edge cases: missing data, NaN, empty inputs, degenerate cases
             - Return ONLY Python code, no markdown fences
         """)
 
+        self._log(f"    Calling LLM for {name}.py (~1000+ lines)...")
+        t0 = time.time()
         code = _call_llm(prompt, max_tokens=16384)
+        elapsed = time.time() - t0
         # Clean up
         if code.startswith("```"):
             lines = code.split("\n")
             code = "\n".join(l for l in lines if not l.startswith("```"))
-        return code.strip() + "\n"
+        code = code.strip() + "\n"
+        self._log(f"    Generated {name}.py: {len(code.splitlines())} lines in {elapsed:.0f}s")
+        return code
 
     # ── Phase 4: BENCHMARK ───────────────────────────────────────────
 
