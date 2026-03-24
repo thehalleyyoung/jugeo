@@ -415,8 +415,14 @@ For each proposition:
   exists under another name)
 - relevance_score: 0.0-1.0 (how directly it improves outcomes for the problem)
 - relevance_level: 1=tangential, 2=partial, 3=direct, 4=transformative
-- existing_near_misses: what's the closest existing tool and why does it fall short?
+- existing_near_misses: what's the closest existing tool and why does it falls short?
 - concrete_improvement: what specific metric would improve by roughly how much?
+- covering_dimension: how many INDEPENDENT, NON-TRIVIAL components does this idea
+  need? Each component is a distinct module/subsystem that addresses a different
+  aspect of the overlap. A small tweak has covdim 1-2. A substantial system has
+  covdim 6-12. List the components. We need covdim >= 10 for a 15K+ LOC system
+  where every line is justified by a distinct region of the idea.
+- components: list of the independent components (each becomes a module)
 - proof_sketch: key steps for validating that this actually works
 - open_obligations: what needs to happen to confirm it works
 
@@ -429,6 +435,8 @@ Respond as JSON:
           "relevance_level": 3,
           "existing_near_misses": "closest existing tool and why it falls short",
           "concrete_improvement": "metric X improves by ~Y%",
+          "covering_dimension": 10,
+          "components": ["component_1: what it does", "component_2: what it does", ...],
           "proof_sketch": "...",
           "open_obligations": ["obligation1", ...]}}
     ]
@@ -444,6 +452,7 @@ Respond as JSON:
     for bp in data.get("bridge_propositions", []):
         level_val = int(bp.get("relevance_level", 3))
         level = RelevanceFiltrationLevel(min(4, max(1, level_val)))
+        covdim = int(bp.get("covering_dimension", 1))
         propositions.append(BridgeProposition(
             title=bp.get("title", "Untitled"),
             description=bp.get("description", ""),
@@ -453,6 +462,8 @@ Respond as JSON:
             novelty_score=float(bp.get("novelty_score", 0.5)),
             relevance_score=float(bp.get("relevance_score", 0.5)),
             relevance_level=level,
+            covering_dimension=covdim,
+            components=bp.get("components", []),
             proof_sketch=bp.get("proof_sketch", ""),
             open_obligations=bp.get("open_obligations", []),
             trust=TRUST_COPILOT,
@@ -546,10 +557,20 @@ Respond as JSON:
         primary, best_partner_name, partner_desc,
         morphisms, problem, locus, n_propositions=n_propositions)
 
-    # Step 7: Select best approach (highest UNS)
+    # Step 7: Select best approach (Theorem 10.4: useful, novel, AND substantial)
+    # Score = UNS * min(covdim, 15) — scale matters, but caps at 15 to avoid
+    # rewarding artificial inflation of components
     if propositions:
-        propositions.sort(key=lambda bp: bp.useful_novelty_score, reverse=True)
+        propositions.sort(
+            key=lambda bp: bp.useful_novelty_score * min(bp.covering_dimension, 15),
+            reverse=True)
         selected = propositions[0]
+        if verbose:
+            for bp in propositions[:3]:
+                print(f"  Candidate: {bp.title} "
+                      f"(UNS={bp.useful_novelty_score:.2f}, "
+                      f"covdim={bp.covering_dimension}, "
+                      f"~{bp.estimated_loc} LOC)", flush=True)
     else:
         selected = None
 

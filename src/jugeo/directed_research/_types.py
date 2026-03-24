@@ -905,6 +905,8 @@ class BridgeProposition:
     novelty_score: float = 0.0
     relevance_score: float = 0.0
     relevance_level: RelevanceFiltrationLevel = RelevanceFiltrationLevel.DIRECT
+    covering_dimension: int = 1  # Definition 10.2: min covering family cardinality
+    components: list[str] = field(default_factory=list)  # what the covering elements are
     proof_sketch: str = ""
     open_obligations: list[str] = field(default_factory=list)
     trust: float = TRUST_COPILOT
@@ -914,6 +916,17 @@ class BridgeProposition:
     def useful_novelty_score(self) -> float:
         """UNS = novelty * relevance * filtration_level (Definition 9.6 graded)."""
         return self.novelty_score * self.relevance_score * self.relevance_level.value
+
+    @property
+    def estimated_loc(self) -> int:
+        """Estimated LOC from covering dimension (Proposition 10.2)."""
+        L_MIN = 1500  # empirical minimum lines per nontrivial local section
+        return self.covering_dimension * L_MIN
+
+    @property
+    def is_substantial(self) -> bool:
+        """Whether the idea justifies a large-scale implementation (Theorem 10.4)."""
+        return self.covering_dimension >= 6
 
     @property
     def is_novel(self) -> bool:
