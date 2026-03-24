@@ -167,7 +167,7 @@ def _clean_copilot_output(raw: str) -> str:
 
 
 def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
-              max_tokens: int = 16384, timeout: int = 180) -> LLMSection:
+              max_tokens: int = 16384, timeout: int = 0) -> LLMSection:
     """Call the LLM and return a typed, trust-annotated section.
 
     This is THE interface between the LLM and the geometry. Every LLM
@@ -189,7 +189,7 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
         for attempt in range(3):
             try:
                 result = subprocess.run(
-                    ["copilot", "--model", "claude-sonnet-4.6", "--autopilot", "--available-tools"],
+                    ["copilot", "--model", "claude-sonnet-4.6", "--available-tools"],
                     input=prompt, capture_output=True, text=True,
                     timeout=timeout, cwd=_ROOT)
                 if result.returncode == 0 and result.stdout.strip():
