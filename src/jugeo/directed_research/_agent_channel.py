@@ -217,7 +217,6 @@ def _call_copilot(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
             r = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
-                timeout=config.timeout,
                 cwd=config.working_dir,
             )
             time.sleep(1)
@@ -237,9 +236,6 @@ def _call_copilot(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
                 if len(cleaned) > 20:
                     text = cleaned
                     break
-
-        except subprocess.TimeoutExpired:
-            pass
         except Exception:
             pass
         if attempt < config.max_retries - 1:
@@ -275,7 +271,6 @@ def _call_claude(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
             r = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
-                timeout=config.timeout,
                 cwd=config.working_dir,
             )
 
@@ -285,8 +280,6 @@ def _call_claude(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
                     text = cleaned
                     break
 
-        except subprocess.TimeoutExpired:
-            pass
         except Exception:
             pass
         if attempt < config.max_retries - 1:
@@ -312,7 +305,6 @@ def _call_codex(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
             r = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
-                timeout=config.timeout,
                 cwd=config.working_dir,
             )
 
@@ -321,9 +313,6 @@ def _call_codex(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
                 if len(cleaned) > 20:
                     text = cleaned
                     break
-
-        except subprocess.TimeoutExpired:
-            pass
         except Exception:
             pass
         if attempt < config.max_retries - 1:

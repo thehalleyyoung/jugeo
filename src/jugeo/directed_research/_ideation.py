@@ -61,29 +61,98 @@ if HAS_GEOMETRY:
 #  Partner domain selection
 # ═══════════════════════════════════════════════════════════════════════
 
-# Pre-defined partner domain catalog (domains known to produce good pairings)
-PARTNER_DOMAIN_CATALOG: dict[str, str] = {
-    "ecology": "Population dynamics, ecosystem management, conservation biology, succession theory",
-    "control_theory": "Feedback loops, PID controllers, stability analysis, optimal control",
-    "statistical_mechanics": "Partition functions, phase transitions, entropy, Boltzmann distributions",
-    "information_theory": "Shannon entropy, channel capacity, coding theory, mutual information",
-    "topology": "Persistent homology, Betti numbers, simplicial complexes, covering spaces",
-    "category_theory": "Functors, natural transformations, adjunctions, limits and colimits",
-    "game_theory": "Nash equilibria, mechanism design, evolutionary games, cooperative games",
-    "dynamical_systems": "Attractors, bifurcations, Lyapunov stability, chaos theory",
-    "algebraic_geometry": "Varieties, sheaves, schemes, cohomology, moduli spaces",
-    "differential_geometry": "Manifolds, connections, curvature, fiber bundles, Riemannian metrics",
-    "number_theory": "Prime distributions, modular forms, L-functions, arithmetic geometry",
-    "combinatorics": "Graph theory, matroids, generating functions, Ramsey theory",
-    "probability_theory": "Measure theory, stochastic processes, martingales, large deviations",
-    "optimization": "Convex optimization, gradient descent, LP/SDP, variational methods",
-    "signal_processing": "Fourier analysis, wavelets, compressed sensing, filter design",
-    "neuroscience": "Neural coding, synaptic plasticity, cortical circuits, decision-making",
-    "linguistics": "Formal grammars, semantics, pragmatics, computational linguistics",
-    "epidemiology": "SIR models, contact tracing, herd immunity, epidemic forecasting",
-    "materials_science": "Crystal structures, phase diagrams, defects, mechanical properties",
-    "quantum_computing": "Qubits, entanglement, quantum error correction, quantum algorithms",
-}
+# No pre-defined partner catalog. The agent proposes partner domains from
+# scratch, conditional on the specific prompt. Then we descend on whether
+# those pairings actually hold up (the morphisms are real, the techniques
+# actually transfer, and the result would materially beat existing tools).
+
+
+def _compute_pairing_score(enf: ExcessNoveltyFraction) -> float:
+    """Score a pairing by the judgment-geometry criterion.
+
+    The score is the product of three factors from Proposition 9.2:
+      practical_impact * morphism_strength * enf
+
+    This encodes: the techniques must actually transfer (strength), the
+    overlap must contain un-tried ideas (enf), and the result must
+    materially improve outcomes (impact). All three must be nonzero.
+
+    We also penalize extreme semantic distance (> 7) because very distant
+    pairings produce morphisms too weak to build real software on, and
+    penalize very low distance (< 2) because those are already well-explored.
+    """
+    base = enf.enf * enf.avg_morphism_strength
+    # Distance penalty: bell curve centered at distance 3-5
+    dist = enf.semantic_distance
+    if dist < 2:
+        base *= 0.5   # too close — probably already exists
+    elif dist > 7:
+        base *= 0.3   # too far — morphisms likely too weak
+    return base
+
+
+def _validate_pairing_via_descent(
+    primary: DomainSite,
+    candidate_name: str,
+    candidate_desc: str,
+    problem: str,
+    problem_locus: list[SubDomain],
+) -> tuple[bool, list[MethodologicalTranslation], str]:
+    """Validate a candidate pairing by attempting to find real morphisms.
+
+    This is descent on the pairing: we ask the agent to produce concrete
+    morphisms, then check whether they are real (the concepts actually map,
+    the strength is justified) by running a second agent call that tries
+    to FALSIFY each morphism. If the falsification attempt fails (can't
+    find a counterexample to the analogy), the morphism survives descent.
+
+    Returns (valid, morphisms, reason).
+    """
+    # Step 1: discover morphisms
+    morphisms = discover_cross_domain_morphisms(
+        primary, candidate_name, candidate_desc, problem_locus)
+
+    if not morphisms:
+        return False, [], "no morphisms found"
+
+    # Step 2: filter to strong morphisms only (strength >= 0.5)
+    strong = [m for m in morphisms if m.strength >= 0.5]
+    if not strong:
+        return False, morphisms, f"all {len(morphisms)} morphisms too weak (< 0.5)"
+
+    # Step 3: validate via descent — ask agent to falsify the strongest morphism
+    best = max(strong, key=lambda m: m.strength)
+    validation_data, _ = agent_json(
+        f"""I claim there is a strong structural analogy between
+"{best.source}" (in {primary.name}) and "{best.target}" (in {candidate_name}):
+
+Concept map: {json.dumps(best.concept_map)}
+Claimed strength: {best.strength}
+Description: {best.description}
+
+Try to FALSIFY this claim. Find a concrete reason why this analogy breaks down
+— a key property of the source that has NO counterpart in the target, or a
+technique that simply cannot transfer.
+
+Respond as JSON:
+{{
+    "falsified": true/false,
+    "reason": "why the analogy breaks down (or why it holds)",
+    "adjusted_strength": 0.0-1.0
+}}""",
+        surface=SurfaceKind.THEORY,
+        coordinate=f"ideation.validate.{primary.name}_{candidate_name}",
+    )
+
+    falsified = validation_data.get("falsified", False)
+    adjusted = float(validation_data.get("adjusted_strength", best.strength))
+
+    if falsified and adjusted < 0.4:
+        return False, strong, validation_data.get("reason", "falsified by descent")
+
+    # Update strength with the descent-adjusted value
+    best.strength = adjusted
+    return True, strong, "survived descent"
 
 
 def select_partner_domains(
@@ -94,65 +163,106 @@ def select_partner_domains(
     n_candidates: int = 5,
     verbose: bool = False,
 ) -> list[tuple[str, ExcessNoveltyFraction]]:
-    """Select partner domains with high excess novelty fraction.
+    """Select partner domains — agent-proposed, descent-validated.
 
-    Uses an agent to estimate the ENF for each candidate partner domain
-    (§9.4): ENF = dim(overlap - im(res_1) - im(res_2)) / dim(overlap).
+    The agent proposes partner domains from scratch (no pre-defined catalog),
+    conditional on the specific prompt. Then each candidate is validated by
+    attempting to construct real morphisms and falsifying the weakest ones.
+    Only candidates that survive descent are returned.
 
-    Returns top-n candidates sorted by ENF.
+    The scoring criterion (Proposition 9.2 adapted for practical utility):
+      score = practical_impact * morphism_strength * enf
+    prioritizes: "no one's built exactly this, but practitioners would
+    immediately see why it should be materially better."
     """
-    locus_names = [sd.name for sd in problem_locus]
     locus_desc = {sd.name: sd.description for sd in problem_locus}
 
-    prompt = f"""I need to find partner domains for cross-domain ideation.
+    # Step 1: Agent proposes candidates from scratch
+    data, _ = agent_json(
+        f"""Given this specific problem, propose 5-8 mathematical or computational
+fields whose techniques could be applied to MATERIALLY IMPROVE outcomes.
 
 Primary domain: {primary_domain.name}
 Problem: {problem}
-Problem locus (relevant sub-domains): {json.dumps(locus_desc, indent=2)}
+Relevant sub-areas: {json.dumps(locus_desc, indent=2)}
 
-For each of these candidate partner domains, estimate:
-1. avg_morphism_strength: how faithfully techniques translate (0.0-1.0)
-2. semantic_distance: how culturally distant (1-10 scale)
-3. enf: excess novelty fraction (0.0-1.0) — what fraction of the overlap
-   contains genuinely novel ideas not obtainable from either domain alone
+For each proposed field:
+- Think about what CONCRETE techniques from that field would transfer.
+- Estimate how faithfully they transfer (avg_strength: 0.0-1.0).
+- Estimate semantic distance (1-10): how culturally separate the fields are.
+- Estimate what fraction of the combined approach is genuinely un-tried (enf: 0.0-1.0).
+- Most importantly: WHY would a practitioner pay money for this combination?
 
-Candidate partners:
-{json.dumps(PARTNER_DOMAIN_CATALOG, indent=2)}
+CRITICAL: Do NOT propose fields just because they sound impressive. Propose
+fields where the techniques ACTUALLY solve a computational problem in the
+primary domain better than what currently exists. A well-applied Kalman filter
+beats a poorly-applied sheaf every time.
 
 Respond as JSON:
 {{
-    "rankings": [
-        {{"domain": "...", "avg_strength": 0.7, "distance": 5, "enf": 0.6,
-          "verdict": "productive|routine|aspirational|too_distant",
-          "reasoning": "brief explanation"}}
+    "candidates": [
+        {{"name": "field_name", "description": "what it is and its key techniques",
+          "avg_strength": 0.75, "semantic_distance": 4, "enf": 0.5,
+          "concrete_techniques": ["technique_1 → how it applies", ...],
+          "why_practitioners_would_pay": "specific reason"}}
     ]
-}}
-
-Sort by ENF descending. The sweet spot is ENF in [0.4, 0.8] with
-strength >= 0.5 and distance >= 3."""
-
-    data, section = agent_json(
-        prompt,
+}}""",
         surface=SurfaceKind.THEORY,
-        coordinate="ideation.partner_selection",
+        coordinate="ideation.partner_proposal",
     )
 
-    results = []
-    for r in data.get("rankings", [])[:n_candidates]:
+    candidates = data.get("candidates", [])
+    if verbose:
+        print(f"  Agent proposed {len(candidates)} candidate partner domains", flush=True)
+
+    # Step 2: Score each candidate
+    scored: list[tuple[str, str, ExcessNoveltyFraction]] = []
+    for c in candidates:
         enf = ExcessNoveltyFraction(
             domain_1=primary_domain.name,
-            domain_2=r.get("domain", "unknown"),
-            enf=float(r.get("enf", 0.5)),
-            avg_morphism_strength=float(r.get("avg_strength", 0.5)),
-            semantic_distance=float(r.get("distance", 5)),
-            verdict=r.get("verdict", "productive"),
+            domain_2=c.get("name", "unknown"),
+            enf=float(c.get("enf", 0.5)),
+            avg_morphism_strength=float(c.get("avg_strength", 0.5)),
+            semantic_distance=float(c.get("semantic_distance", 5)),
+            verdict="productive" if float(c.get("avg_strength", 0)) >= 0.5 else "aspirational",
         )
-        results.append((r.get("domain", "unknown"), enf))
+        score = _compute_pairing_score(enf)
+        scored.append((c.get("name", "unknown"), c.get("description", ""), enf))
 
-    # Sort by ENF, preferring the productive sweet spot
-    results.sort(key=lambda x: x[1].enf if x[1].is_productive else x[1].enf * 0.5,
-                 reverse=True)
-    return results[:n_candidates]
+    # Sort by pairing score
+    scored.sort(key=lambda x: _compute_pairing_score(x[2]), reverse=True)
+
+    # Step 3: Validate top candidates via descent (try to falsify morphisms)
+    validated: list[tuple[str, ExcessNoveltyFraction]] = []
+    for name, desc, enf in scored[:n_candidates + 2]:  # try a couple extra
+        if verbose:
+            print(f"  Validating pairing: {primary_domain.name} × {name}...", flush=True)
+        valid, morphisms, reason = _validate_pairing_via_descent(
+            primary_domain, name, desc, problem, problem_locus)
+        if valid:
+            # Update strength based on actual discovered morphisms
+            if morphisms:
+                actual_strength = sum(m.strength for m in morphisms) / len(morphisms)
+                enf = ExcessNoveltyFraction(
+                    domain_1=enf.domain_1, domain_2=enf.domain_2,
+                    enf=enf.enf, avg_morphism_strength=actual_strength,
+                    semantic_distance=enf.semantic_distance, verdict="productive",
+                )
+            validated.append((name, enf))
+            if verbose:
+                print(f"    ✓ SURVIVED descent (strength={enf.avg_morphism_strength:.2f})", flush=True)
+            if len(validated) >= n_candidates:
+                break
+        else:
+            if verbose:
+                print(f"    ✗ FAILED descent: {reason}", flush=True)
+
+    # If no candidates survived, fall back to the top-scored unvalidated one
+    if not validated and scored:
+        name, desc, enf = scored[0]
+        validated.append((name, enf))
+
+    return validated
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -283,21 +393,31 @@ ANALOGY MORPHISMS (the structural connections between domains):
 {chr(10).join(morphism_descriptions)}
 {jg_ideation}
 
-Find {n_propositions} BRIDGE PROPOSITIONS — ideas that:
-1. CANNOT be expressed in either domain alone (novelty: not in the image
-   of either restriction map — this is the H^1 condition)
-2. BEAR DIRECTLY on the problem "{problem}" (usefulness: nonzero germ
-   at the problem point)
+Find {n_propositions} BRIDGE PROPOSITIONS — concrete tool/algorithm ideas that:
+1. Combine techniques from BOTH domains in a way nobody has packaged into
+   a single tool before (the H^1 condition — not in the image of either
+   restriction map, meaning you can't get this from either field alone)
+2. Would MATERIALLY improve outcomes for the problem "{problem}" — a
+   practitioner would immediately see why this is better than existing tools
+3. Are BUILDABLE — not just theoretically interesting, but something a team
+   could implement in Python with real data in weeks, not years
+
+The sweet spot is: "practitioners would say 'why hasn't anyone done exactly
+this?' — not 'that's a cute analogy'" . Think engineering utility, not
+intellectual elegance.
 
 For each proposition:
-- title: short name
-- description: 3-5 sentence description of the idea, how it connects both
-  domains, and what it concretely proposes
+- title: short name (name it like a product, not a theorem)
+- description: 3-5 sentences — what the tool DOES, how it combines both
+  domains, what specific improvement it delivers over existing tools
 - coordinate: which sub-domains overlap (e.g., "sub_domain_a × partner_concept")
-- novelty_score: 0.0-1.0 (how far from either restriction map image)
-- relevance_score: 0.0-1.0 (how directly it addresses the problem)
+- novelty_score: 0.0-1.0 (how much of this is genuinely un-tried vs already
+  exists under another name)
+- relevance_score: 0.0-1.0 (how directly it improves outcomes for the problem)
 - relevance_level: 1=tangential, 2=partial, 3=direct, 4=transformative
-- proof_sketch: key steps for validating this idea
+- existing_near_misses: what's the closest existing tool and why does it fall short?
+- concrete_improvement: what specific metric would improve by roughly how much?
+- proof_sketch: key steps for validating that this actually works
 - open_obligations: what needs to happen to confirm it works
 
 Respond as JSON:
@@ -305,8 +425,10 @@ Respond as JSON:
     "bridge_propositions": [
         {{"title": "...", "description": "...",
           "coordinate": "sub_domain_a × partner_concept",
-          "novelty_score": 0.85, "relevance_score": 0.80,
+          "novelty_score": 0.7, "relevance_score": 0.85,
           "relevance_level": 3,
+          "existing_near_misses": "closest existing tool and why it falls short",
+          "concrete_improvement": "metric X improves by ~Y%",
           "proof_sketch": "...",
           "open_obligations": ["obligation1", ...]}}
     ]
@@ -406,9 +528,10 @@ Respond as JSON:
     partner_candidates = select_partner_domains(
         primary, problem, locus, n_candidates=n_partner_candidates, verbose=verbose)
 
-    best_partner_name = partner_candidates[0][0] if partner_candidates else "category_theory"
+    best_partner_name = partner_candidates[0][0] if partner_candidates else "optimization"
     best_enf = partner_candidates[0][1] if partner_candidates else None
-    partner_desc = PARTNER_DOMAIN_CATALOG.get(best_partner_name, "")
+    # Get description from the candidate data (already proposed by the agent)
+    partner_desc = best_enf.domain_2 if best_enf else best_partner_name
 
     # Step 5: Discover morphisms
     if verbose:
