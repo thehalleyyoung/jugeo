@@ -118,8 +118,8 @@ def generate_module(
             f.write(f'"""{approach}"""\n__version__ = "0.1.0"\n')
 
     libs = domain_analysis.get("standard_libraries", [])
-    datasets = domain_analysis.get("standard_datasets", [])
     deps = mod.get('dependencies', [])
+    path = os.path.join(pkg_dir, f"{name}.py")
 
     import_hint = ""
     if deps:
@@ -127,30 +127,55 @@ def generate_module(
     if existing_modules:
         import_hint += f"ALREADY GENERATED (import and USE these): {', '.join(existing_modules.keys())}\n"
 
+    # Tell the agent to WRITE the file to disk at the exact path.
+    # The agent has file-write tools — it should use them, not return text.
     prompt_text = (
-        f"Generate `{name}.py` for the {pkg_name_clean} package.\n"
+        f"Write a Python module to the file {path}\n\n"
+        f"Module: {name}.py for the {pkg_name_clean} package.\n"
         f"PURPOSE: {mod.get('purpose', '')}\n"
         f"KEY CLASSES: {', '.join(mod.get('key_classes', []))}\n"
         f"KEY FUNCTIONS: {', '.join(mod.get('key_functions', []))}\n"
         f"{import_hint}"
-        f"LIBRARIES: {', '.join(libs[:5])}\n"
-        f"Write 200+ lines of real Python 3.10+ code with type hints, "
-        f"docstrings, numpy/pandas/scipy usage. No stubs. Return ONLY code."
+        f"LIBRARIES: {', '.join(libs[:5])}\n\n"
+        f"Write 500+ lines of real, production-quality Python 3.10+ code "
+        f"with type hints and docstrings. No stubs, no placeholders. "
+        f"Write the complete file to {path} using your file-write tool."
     )
 
     section = agent_call(
         prompt_text,
         surface=SurfaceKind.CODE,
         coordinate=f"code.{name}",
+        working_dir=output_dir,
     )
-    code = section.content
-    if code.startswith("```"):
-        code = "\n".join(l for l in code.split("\n") if not l.startswith("```"))
-    code = code.strip() + "\n"
 
-    path = os.path.join(pkg_dir, f"{name}.py")
-    with open(path, "w") as f:
-        f.write(code)
+    # The agent should have written the file. Read it back.
+    if os.path.exists(path) and os.path.getsize(path) > 50:
+        with open(path) as f:
+            code = f.read()
+    else:
+        # Fallback: agent returned code as text instead of writing
+        code = section.content
+        if code.startswith("```"):
+            code = "\n".join(l for l in code.split("\n") if not l.startswith("```"))
+        code = code.strip() + "\n"
+        with open(path, "w") as f:
+            f.write(code)
+
+    # Update the section content to reflect what's actually on disk
+    section = LLMSection(
+        surface=section.surface,
+        coordinate=section.coordinate,
+        content=code,
+        trust=section.trust,
+        provenance=section.provenance,
+        prompt_hash=section.prompt_hash,
+        elapsed=section.elapsed,
+        token_count=len(code.split()),
+        agent_backend=section.agent_backend,
+        files_touched=[path],
+        commands_run=section.commands_run,
+    )
 
     return path, section
 
@@ -170,9 +195,14 @@ def generate_tests(
     pkg_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', pkg_name).strip('_').lower()
     mod_names = [m.get("name", "module") for m in modules]
 
-    section = agent_call(
-        f"""Generate a comprehensive pytest test suite for the {pkg_name_clean} package.
+    test_dir = os.path.join(output_dir, "tests")
+    os.makedirs(test_dir, exist_ok=True)
+    test_path = os.path.join(test_dir, f"test_{pkg_name_clean}.py")
 
+    section = agent_call(
+        f"""Write a comprehensive pytest test suite to the file {test_path}
+
+Package to test: {pkg_name_clean}
 Modules to test: {', '.join(mod_names)}
 
 Write tests that:
@@ -182,23 +212,24 @@ Write tests that:
 4. Use pytest fixtures
 5. Include at least 3 tests per module
 
-Return ONLY Python code (no markdown fences).
-The tests should be runnable with: pytest tests/
+Write the complete test file to {test_path} using your file-write tool.
 """,
         surface=SurfaceKind.EVIDENCE,
         coordinate="evidence.tests",
+        working_dir=output_dir,
     )
 
-    test_dir = os.path.join(output_dir, "tests")
-    os.makedirs(test_dir, exist_ok=True)
-    test_path = os.path.join(test_dir, f"test_{pkg_name_clean}.py")
-
-    code = section.content
-    if code.startswith("```"):
-        code = "\n".join(l for l in code.split("\n") if not l.startswith("```"))
-
-    with open(test_path, "w") as f:
-        f.write(code.strip() + "\n")
+    # Read back what the agent wrote
+    if os.path.exists(test_path) and os.path.getsize(test_path) > 50:
+        with open(test_path) as f:
+            code = f.read()
+    else:
+        # Fallback
+        code = section.content
+        if code.startswith("```"):
+            code = "\n".join(l for l in code.split("\n") if not l.startswith("```"))
+        with open(test_path, "w") as f:
+            f.write(code.strip() + "\n")
 
     return test_path, section
 

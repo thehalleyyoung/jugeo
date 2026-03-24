@@ -171,11 +171,12 @@ def generate_paper(
     # Format the manifest as constraints for the agent
     manifest_text = _format_manifest_for_prompt(manifest, domain_analysis)
 
+    path = os.path.join(output_dir, "conference_tool_track.tex")
+
     section = agent_call(
         textwrap.dedent(f"""\
-            Write a COMPREHENSIVE conference paper in LaTeX — at least 12 pages
-            when compiled. This is a tool-track paper for a top venue (ICSE, KDD,
-            NeurIPS tools track, or similar).
+            Write a COMPREHENSIVE conference paper in LaTeX to the file {path}.
+            At least 12 pages when compiled. Tool-track paper for a top venue.
 
             TOOL: {approach}
             PRODUCT: {prompt}
@@ -230,15 +231,23 @@ def generate_paper(
             graphicx, hyperref, algorithm2e. Include at least 2 tables
             and 1 algorithm block.
 
-            Return raw LaTeX, no markdown fences.
+            Write the complete .tex file to {path} using your file-write tool.
+            Do NOT return the LaTeX as text — write it to the file.
         """),
         surface=SurfaceKind.CLAIMS,
         coordinate="claims.paper",
+        working_dir=output_dir,
     )
 
-    paper = section.content
-    if paper.startswith("```"):
-        paper = "\n".join(l for l in paper.split("\n") if not l.startswith("```"))
+    # Read back what the agent wrote
+    if os.path.exists(path) and os.path.getsize(path) > 200:
+        with open(path) as f:
+            paper = f.read()
+    else:
+        # Fallback: agent returned text instead of writing
+        paper = section.content
+        if paper.startswith("```"):
+            paper = "\n".join(l for l in paper.split("\n") if not l.startswith("```"))
 
     # Post-generation: scan for fabricated numbers
     fabrication_warnings = _scan_for_fabricated_claims(paper, manifest)

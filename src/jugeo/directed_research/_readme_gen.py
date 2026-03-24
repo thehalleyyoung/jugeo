@@ -34,9 +34,12 @@ def generate_readme(
         for name, code in module_code.items()
     )
 
+    path = os.path.join(output_dir, "README.md")
+
     section = agent_call(
         textwrap.dedent(f"""\
-            Write a comprehensive, professional README.md (at least 2000 words).
+            Write a comprehensive, professional README.md to the file {path}.
+            At least 2000 words.
 
             TOOL NAME: {approach}
             PRODUCT VISION: {prompt}
@@ -66,15 +69,22 @@ def generate_readme(
             12. Citation (BibTeX)
             13. License
 
-            Return raw Markdown, no JSON, no fences.
+            Write the complete README.md to {path} using your file-write tool.
+            Do NOT return the markdown as text — write it to the file.
         """),
         surface=SurfaceKind.CLAIMS,
         coordinate="claims.readme",
+        working_dir=output_dir,
     )
 
-    readme = section.content
-    path = os.path.join(output_dir, "README.md")
-    with open(path, "w") as f:
-        f.write(readme.strip() + "\n")
+    # Read back what the agent wrote
+    if os.path.exists(path) and os.path.getsize(path) > 200:
+        with open(path) as f:
+            readme = f.read()
+    else:
+        # Fallback
+        readme = section.content
+        with open(path, "w") as f:
+            f.write(readme.strip() + "\n")
 
     return path, section

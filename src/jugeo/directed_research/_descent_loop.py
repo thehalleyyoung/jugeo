@@ -387,9 +387,11 @@ Use this as the foundation for the domain analysis.
             return
 
         ma = self.domain_analysis.get("best_math_approach", {})
+        context_path = str(self.output_dir / "context.md")
         section = agent_call(
             textwrap.dedent(f"""\
-                Write a COMPREHENSIVE mathematical framework document (5000+ words):
+                Write a COMPREHENSIVE mathematical framework document (5000+ words)
+                to the file {context_path}.
 
                 PRODUCT: {self.prompt}
                 APPROACH: {ma.get('name', self.approach)}
@@ -404,14 +406,19 @@ Use this as the foundation for the domain analysis.
                 (6) Key Propositions — 5-10 formal propositions (500+ words).
 
                 Use LaTeX notation. Be specific about algorithms.
-                Return raw Markdown.
+                Write the complete document to {context_path} using your file-write tool.
             """),
             surface=SurfaceKind.THEORY,
             coordinate="theory.foundations",
+            working_dir=str(self.output_dir),
         )
-        self.theory_text = section.content
-        (self.output_dir / "context.md").write_text(
-            f"# {self.approach}\n\n{section.content}\n")
+        # Read back what the agent wrote
+        if os.path.exists(context_path) and os.path.getsize(context_path) > 200:
+            self.theory_text = open(context_path).read()
+        else:
+            self.theory_text = section.content
+            (self.output_dir / "context.md").write_text(
+                f"# {self.approach}\n\n{section.content}\n")
         self._record_section(section)
 
     def _move_design_architecture(self):
@@ -501,24 +508,33 @@ Use this as the foundation for the domain analysis.
             return
 
         pkg = self.architecture.get("package_name", self.approach)
-        section = agent_call(
-            f"Generate `integration.py` for {pkg}. "
-            f"Connect to {json.dumps(self.domain_analysis.get('standard_libraries', []))} "
-            f"and {json.dumps(self.domain_analysis.get('standard_datasets', []))}. "
-            f"Existing modules: {list(self.module_code.keys())}. "
-            f"500+ lines of real code. Return ONLY Python code.",
-            surface=SurfaceKind.CODE,
-            coordinate="code.integration",
-        )
-        code = section.content
-        if code.startswith("```"):
-            code = "\n".join(l for l in code.split("\n") if not l.startswith("```"))
-
         pkg_clean = re.sub(r'[^a-zA-Z0-9_]', '_', pkg).strip('_').lower() or "output"
         pkg_dir = self.output_dir / "src" / pkg_clean
         pkg_dir.mkdir(parents=True, exist_ok=True)
         path = pkg_dir / "integration.py"
-        path.write_text(code.strip() + "\n")
+
+        section = agent_call(
+            f"Write an integration module to the file {path}\n\n"
+            f"Package: {pkg_clean}\n"
+            f"Connect to {json.dumps(self.domain_analysis.get('standard_libraries', []))} "
+            f"and {json.dumps(self.domain_analysis.get('standard_datasets', []))}.\n"
+            f"Existing modules: {list(self.module_code.keys())}.\n"
+            f"Write 500+ lines of real, working Python code to {path} "
+            f"using your file-write tool.",
+            surface=SurfaceKind.CODE,
+            coordinate="code.integration",
+            working_dir=str(self.output_dir),
+        )
+
+        # Read back what the agent wrote
+        if path.exists() and path.stat().st_size > 50:
+            code = path.read_text()
+        else:
+            code = section.content
+            if code.startswith("```"):
+                code = "\n".join(l for l in code.split("\n") if not l.startswith("```"))
+            path.write_text(code.strip() + "\n")
+
         self.code_files.append(str(path))
         self.module_code["integration"] = code
         self._record_section(section)
