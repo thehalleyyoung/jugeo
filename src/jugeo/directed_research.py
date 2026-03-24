@@ -713,33 +713,16 @@ class DirectedResearch:
         if existing_modules:
             import_hint += f"ALREADY GENERATED (import and USE these): {', '.join(existing_modules)}\n"
 
-        prompt = textwrap.dedent(f"""\
-            Generate `{name}.py` for the {pkg_name} package.
-
-            PRODUCT: {self.prompt}
-            MATHEMATICAL APPROACH: {self.theory_text[:500]}
-            {import_hint}
-
-            PURPOSE OF THIS MODULE: {mod.get('purpose', '')}
-            KEY CLASSES: {', '.join(mod.get('key_classes', []))}
-            KEY FUNCTIONS: {', '.join(mod.get('key_functions', []))}
-            STANDARD LIBRARIES: {', '.join(libs[:8])}
-            DATA SOURCES: {', '.join(datasets[:3])}
-
-            REQUIREMENTS — write AT LEAST {mod.get('target_lines', 800)} lines of REAL code:
-            - Python 3.10+, from __future__ import annotations
-            - Use {', '.join(libs[:5])} extensively — don't reinvent what they provide
-            - INTEGRATE with other modules: import types from core, call functions from
-              other modules, share data structures. The modules must work TOGETHER as a
-              unified system, not as isolated scripts.
-            - Real implementations: if you compute a statistic, show the formula.
-              If you optimize, show the objective function. If you estimate, show
-              the likelihood. No placeholders, no "pass", no "TODO".
-            - Include at least 5 classes with real methods and 10 functions
-            - Include proper error handling, logging, input validation
-            - Include docstrings that explain the MATHEMATICAL content
-            - Return ONLY Python code, no markdown fences
-        """)
+        prompt = (
+            f"Generate `{name}.py` for the {pkg_name} package.\n"
+            f"PURPOSE: {mod.get('purpose', '')}\n"
+            f"KEY CLASSES: {', '.join(mod.get('key_classes', []))}\n"
+            f"KEY FUNCTIONS: {', '.join(mod.get('key_functions', []))}\n"
+            f"{import_hint}"
+            f"LIBRARIES: {', '.join(libs[:5])}\n"
+            f"Write 200+ lines of real Python 3.10+ code with type hints, "
+            f"docstrings, numpy/pandas/scipy usage. No stubs. Return ONLY code."
+        )
 
         section = _llm_call(prompt, surface=SurfaceKind.CODE,
                             coordinate=f"code.{name}")
