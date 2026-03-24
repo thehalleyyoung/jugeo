@@ -147,29 +147,30 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
     prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
     text = ""
 
-    # 1. Copilot CLI with claude-sonnet-4.6
-    #    Use -p for short prompts, stdin for long ones
+    # 1. Copilot CLI with claude-sonnet-4.6 — ALWAYS via stdin
+    #    The -p flag is unreliable for both long prompts and long outputs.
+    #    Stdin piping is fast and reliable when no orphaned copilot processes
+    #    are consuming the rate limit.
     if shutil.which("copilot"):
         try:
-            if len(prompt) < 4000:
-                # Short prompt: pass via -p flag (most reliable)
-                cmd = ["copilot", "-p", prompt, "--model", "claude-sonnet-4.6",
-                       "--available-tools", ""]
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True,
-                    timeout=timeout, cwd=_ROOT)
-            else:
-                # Long prompt: pipe via stdin
-                cmd = ["copilot", "--model", "claude-sonnet-4.6",
-                       "--available-tools", ""]
-                result = subprocess.run(
-                    cmd, input=prompt, capture_output=True, text=True,
-                    timeout=timeout, cwd=_ROOT)
+            result = subprocess.run(
+                ["copilot", "--model", "claude-sonnet-4.6", "--available-tools", ""],
+                input=prompt, capture_output=True, text=True,
+                timeout=timeout, cwd=_ROOT)
             if result.returncode == 0 and result.stdout.strip():
                 lines = result.stdout.split("\n")
                 cleaned = [l for l in lines if not l.strip().startswith(("●", "✗", "│", "└"))]
                 while cleaned and not cleaned[0].strip():
                     cleaned.pop(0)
+                # Also strip trailing copilot stats
+                while cleaned and ("Total usage" in cleaned[-1] or
+                                   "API time" in cleaned[-1] or
+                                   "Total session" in cleaned[-1] or
+                                   "Total code" in cleaned[-1] or
+                                   "Breakdown" in cleaned[-1] or
+                                   "claude-sonnet" in cleaned[-1] or
+                                   cleaned[-1].strip() == ""):
+                    cleaned.pop()
                 text = "\n".join(cleaned).strip()
         except Exception:
             pass
@@ -341,8 +342,8 @@ class DirectedResearch:
         self.no_llm = no_llm
         self.seed = seed
         self.verbose = verbose
-        self.output_dir = pathlib.Path(
-            output_dir or f"outputs/research_{time.strftime('%Y%m%d_%H%M%S')}").resolve()
+        default_dir = pathlib.Path(_ROOT) / "outputs" / f"research_{time.strftime('%Y%m%d_%H%M%S')}"
+        self.output_dir = pathlib.Path(output_dir or str(default_dir)).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # The workspace site
@@ -611,10 +612,12 @@ class DirectedResearch:
             THEORY (first 2000 chars): {self.theory_text[:500]}
             STANDARD LIBRARIES: {json.dumps(libs)}
 
-            Design 5-8 Python modules. Name them after DOMAIN concepts, not generic
-            math. Include an integration module that connects to real libraries
-            ({', '.join(libs[:5])}) and real data sources
-            ({', '.join(self.domain_analysis.get('standard_datasets', [])[:3])}).
+            Design 8-12 Python modules that form an INTEGRATED system — modules
+            must share types, call each other, and form a coherent pipeline.
+            Name them after DOMAIN concepts. Include data ingestion, core types,
+            algorithms, evaluation/benchmarking, a CLI, and integration with
+            {', '.join(libs[:5])} and {', '.join(self.domain_analysis.get('standard_datasets', [])[:3])}.
+            Each module should be 800-1500 lines. Target: 10,000+ total lines.
 
             Respond as JSON:
             {{
@@ -673,25 +676,38 @@ class DirectedResearch:
         datasets = self.domain_analysis.get("standard_datasets", [])
         existing_modules = list(self.module_code.keys())
 
+        deps = mod.get('dependencies', [])
+        import_hint = ""
+        if deps:
+            import_hint = f"IMPORTS FROM OTHER MODULES: from .{' import ..., from .'.join(deps)} import ...\n"
+        if existing_modules:
+            import_hint += f"ALREADY GENERATED (import and USE these): {', '.join(existing_modules)}\n"
+
         prompt = textwrap.dedent(f"""\
             Generate `{name}.py` for the {pkg_name} package.
 
             PRODUCT: {self.prompt}
-            THEORY (key section): {self.theory_text[:500]}
-            {"ALREADY GENERATED: " + ", ".join(existing_modules) if existing_modules else ""}
+            MATHEMATICAL APPROACH: {self.theory_text[:500]}
+            {import_hint}
 
-            PURPOSE: {mod.get('purpose', '')}
+            PURPOSE OF THIS MODULE: {mod.get('purpose', '')}
             KEY CLASSES: {', '.join(mod.get('key_classes', []))}
             KEY FUNCTIONS: {', '.join(mod.get('key_functions', []))}
-            STANDARD LIBRARIES TO USE: {', '.join(libs[:8])}
+            STANDARD LIBRARIES: {', '.join(libs[:8])}
             DATA SOURCES: {', '.join(datasets[:3])}
 
-            REQUIREMENTS — write AT LEAST {mod.get('target_lines', 1000)} lines:
+            REQUIREMENTS — write AT LEAST {mod.get('target_lines', 800)} lines of REAL code:
             - Python 3.10+, from __future__ import annotations
-            - Use {', '.join(libs[:5])} where appropriate
-            - Real implementations with real math, not stubs
-            - Name classes/functions after domain concepts
-            - Include docstrings, type hints, error handling
+            - Use {', '.join(libs[:5])} extensively — don't reinvent what they provide
+            - INTEGRATE with other modules: import types from core, call functions from
+              other modules, share data structures. The modules must work TOGETHER as a
+              unified system, not as isolated scripts.
+            - Real implementations: if you compute a statistic, show the formula.
+              If you optimize, show the objective function. If you estimate, show
+              the likelihood. No placeholders, no "pass", no "TODO".
+            - Include at least 5 classes with real methods and 10 functions
+            - Include proper error handling, logging, input validation
+            - Include docstrings that explain the MATHEMATICAL content
             - Return ONLY Python code, no markdown fences
         """)
 
@@ -851,20 +867,45 @@ class DirectedResearch:
                          None, TRUST_COPILOT, True, "grounded", 0)
 
     def _move_write_readme(self):
-        """CONSTRUCT on P: write README grounded in evidence."""
+        """CONSTRUCT on P: write a comprehensive README grounded in evidence."""
         self._log("MOVE: write_readme → P")
         if self.no_llm:
             readme = f"# {self.approach}\n\n{self.prompt}\n"
         else:
+            modules_detail = "\n".join(
+                f"- **{name}**: {len(code.splitlines())} lines"
+                for name, code in self.module_code.items()
+            )
             section = _llm_call(textwrap.dedent(f"""\
-                Write a README.md for this research tool.
-                TOOL: {self.approach}
-                THEORY: {self.theory_text[:500]}
-                MODULES: {list(self.module_code.keys())}
-                BENCHMARKS: {json.dumps(self.benchmark_results)[:500]}
-                Include: title, description, installation, quickstart, module overview, benchmarks.
-                Return raw Markdown.
-            """), surface=SurfaceKind.CLAIMS, coordinate="claims.readme")
+                Write a comprehensive, professional README.md (at least 2000 words) for this research tool.
+
+                TOOL NAME: {self.approach}
+                PRODUCT VISION: {self.prompt}
+                MATHEMATICAL APPROACH: {self.theory_text[:800]}
+                MODULES:
+                {modules_detail}
+                BENCHMARKS: {json.dumps(self.benchmark_results)[:400]}
+                STANDARD LIBRARIES: {json.dumps(self.domain_analysis.get('standard_libraries', []))}
+                EVALUATION METRICS: {json.dumps(self.domain_analysis.get('evaluation_metrics', []))}
+
+                The README must include ALL of these sections:
+                1. Title with badges (Python version, license, build status)
+                2. One-paragraph elevator pitch (what it does and why it's better)
+                3. Key features list (5-8 bullet points with concrete capabilities)
+                4. Mathematical approach summary (2 paragraphs with key theorems named)
+                5. Installation instructions (pip install, dependencies, environment setup)
+                6. Quickstart example (complete runnable Python code, 20+ lines)
+                7. CLI usage (3-5 commands with examples)
+                8. Module reference (every module with purpose and key classes/functions)
+                9. Benchmarks table (metrics, our results, baseline comparison)
+                10. Architecture diagram (ASCII)
+                11. Contributing guide
+                12. Citation (BibTeX)
+                13. License
+
+                Return raw Markdown, no JSON, no fences.
+            """), surface=SurfaceKind.CLAIMS, coordinate="claims.readme",
+                 timeout=300)
             readme = section.content
             self.sections.append(section)
         path = self.output_dir / "README.md"
@@ -891,16 +932,45 @@ class DirectedResearch:
                 \\end{{document}}
             """)
         else:
+            modules_list = ", ".join(self.module_code.keys())
+            metrics = json.dumps(self.domain_analysis.get("evaluation_metrics", []))
+            baselines = json.dumps(self.domain_analysis.get("baselines_to_beat", []))
             section = _llm_call(textwrap.dedent(f"""\
-                Write a 4-page conference tool-track paper in LaTeX.
+                Write a COMPREHENSIVE conference paper in LaTeX — at least 12 pages
+                when compiled. This is a tool-track paper for a top venue (ICSE, SIGMOD,
+                KDD, NeurIPS tools track).
+
                 TOOL: {self.approach}
-                THEORY: {self.theory_text[:500]}
-                MODULES: {list(self.module_code.keys())}
-                BENCHMARKS: {json.dumps(self.benchmark_results)[:500]}
-                Structure: Abstract, Introduction, Approach, Implementation, Evaluation, Conclusion.
-                Use \\documentclass{{article}}, \\usepackage{{amsmath,booktabs}}.
-                Return raw LaTeX.
-            """), surface=SurfaceKind.CLAIMS, coordinate="claims.paper")
+                PRODUCT: {self.prompt}
+                MATHEMATICAL APPROACH: {self.theory_text[:800]}
+                MODULES: {modules_list}
+                EVALUATION METRICS: {metrics}
+                BASELINES: {baselines}
+
+                Structure (EVERY section is REQUIRED and must be SUBSTANTIAL):
+
+                1. ABSTRACT (200+ words) — problem, approach, key results
+                2. INTRODUCTION (2+ pages) — motivation, gap in existing tools,
+                   our contribution, paper outline
+                3. BACKGROUND & RELATED WORK (1.5+ pages) — existing tools with
+                   citations, mathematical prerequisites
+                4. MATHEMATICAL FRAMEWORK (2+ pages) — formal definitions, theorems
+                   with proof sketches, key algorithms with pseudocode
+                5. SYSTEM ARCHITECTURE (1.5+ pages) — module diagram, data flow,
+                   design decisions
+                6. IMPLEMENTATION (1+ pages) — key data structures, integration with
+                   standard libraries, code examples
+                7. EVALUATION (2+ pages) — experimental setup, metrics, baseline
+                   comparison tables, ablation studies, performance analysis
+                8. DISCUSSION (0.5+ pages) — limitations, threats to validity
+                9. CONCLUSION & FUTURE WORK (0.5+ pages)
+                10. REFERENCES (20+ entries)
+
+                Use \\documentclass[11pt]{{article}} with amsmath, booktabs, graphicx,
+                hyperref, algorithm2e. Include at least 3 tables and 2 algorithm blocks.
+                Return raw LaTeX, no markdown fences.
+            """), surface=SurfaceKind.CLAIMS, coordinate="claims.paper",
+                 timeout=600)
             paper = section.content
             self.sections.append(section)
         if paper.startswith("```"):
