@@ -147,22 +147,13 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
     prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
     text = ""
 
-    # 1. Copilot CLI with claude-sonnet-4.6
+    # 1. Copilot CLI with claude-sonnet-4.6 via stdin pipe (fast)
     if shutil.which("copilot"):
-        # Write prompt to a temp file so copilot reads it instead of
-        # receiving a huge argv (which is slow and can exceed OS limits)
-        prompt_file = tempfile.NamedTemporaryFile(
-            suffix=".md", mode="w", delete=False, prefix="jugeo_prompt_")
-        prompt_file.write(prompt)
-        prompt_file.close()
-
-        short_prompt = f"Read the file {prompt_file.name} and follow ALL the instructions inside it exactly. Return ONLY the requested output."
-
         try:
             result = subprocess.run(
-                ["copilot", "-p", short_prompt, "--model", "claude-sonnet-4.6",
-                 "--available-tools", ""],
-                capture_output=True, text=True, timeout=timeout, cwd=_ROOT,
+                ["copilot", "--model", "claude-sonnet-4.6", "--available-tools", ""],
+                input=prompt, capture_output=True, text=True,
+                timeout=timeout, cwd=_ROOT,
             )
             if result.returncode == 0 and result.stdout.strip():
                 lines = result.stdout.split("\n")
@@ -172,11 +163,6 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
                 text = "\n".join(cleaned).strip()
         except Exception:
             pass
-        finally:
-            try:
-                os.unlink(prompt_file.name)
-            except OSError:
-                pass
 
     # 2. Anthropic SDK (fallback if copilot unavailable)
     if not text:
