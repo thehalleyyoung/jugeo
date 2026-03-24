@@ -748,6 +748,8 @@ Use this as the foundation for the domain analysis.
             benchmark_results=self.benchmark_results,
             ideation_metadata=self.ideation_result.metadata if self.ideation_result else {},
             output_dir=str(self.output_dir),
+            sections=self.sections,
+            code_files=self.code_files,
         ) if not self.no_llm else (str(self.output_dir / "paper.tex"), None)
         if paper_section:
             self._record_section(paper_section)
