@@ -184,17 +184,26 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
     prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
     text = ""
 
-    # 1. Copilot CLI with claude-sonnet-4.6 via stdin
+    # 1. Copilot CLI with claude-sonnet-4.6 via stdin (with retry)
     if shutil.which("copilot"):
-        try:
-            result = subprocess.run(
-                ["copilot", "--model", "claude-sonnet-4.6", "--available-tools"],
-                input=prompt, capture_output=True, text=True,
-                timeout=timeout, cwd=_ROOT)
-            if result.returncode == 0 and result.stdout.strip():
-                text = _clean_copilot_output(result.stdout)
-        except Exception:
-            pass
+        for attempt in range(3):
+            try:
+                result = subprocess.run(
+                    ["copilot", "--model", "claude-sonnet-4.6", "--available-tools"],
+                    input=prompt, capture_output=True, text=True,
+                    timeout=timeout, cwd=_ROOT)
+                if result.returncode == 0 and result.stdout.strip():
+                    cleaned = _clean_copilot_output(result.stdout)
+                    if len(cleaned) > 20:  # non-trivial response
+                        text = cleaned
+                        break
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
+            # Brief pause before retry
+            if attempt < 2:
+                time.sleep(2)
 
     # 2. Anthropic SDK (fallback if copilot unavailable)
     if not text:
