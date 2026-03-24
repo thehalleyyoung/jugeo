@@ -595,15 +595,23 @@ Use this as the foundation for the domain analysis.
             self._rebuild_workspace()
             report = self.workspace.check_consistency() if self.workspace else None
 
-            # Step f: check convergence
-            criterion = ConvergenceCriterion(
-                workspace_consistent=report.consistent if report else False,
-                frontier_dominated=self.frontier.dominates() if self.frontier else False,
-                code_verified=code_verified,
-                claims_grounded=report.consistent if report else False,
-                minimum_trust_met=syntax_ok and import_ok,
-                trust_floor=self.trust_floor,
-            )
+            # Step f: check convergence via DESCENT ON THE QUALITY SITE
+            # Every dimension of "is this good?" is a local section with trust
+            criterion = ConvergenceCriterion()
+            criterion.set_workspace_consistency(
+                report.consistent if report else False,
+                report.H1 if report else "no workspace")
+            criterion.set_sota_domination(self.frontier)
+            criterion.set_code_correctness(
+                jg_results=jg_results, syntax_ok=syntax_ok, import_ok=import_ok)
+            criterion.set_claims_grounding(report.consistent if report else False)
+            criterion.set_code_scale(
+                self.benchmark_results.get("total_lines", 0), target=5000)
+            criterion.set_test_coverage(
+                tests_exist=os.path.exists(str(self.output_dir / "tests")),
+                tests_pass=self.benchmark_results.get("tests_passed", False))
+            criterion.set_theory_code_alignment(
+                report.consistent if report else False)
 
             self._log(f"  {criterion.diagnosis()}")
 

@@ -345,52 +345,272 @@ def update_frontier_with_results(
 # ═══════════════════════════════════════════════════════════════════════
 
 @dataclass
-class ConvergenceCriterion:
-    """The formal convergence criterion for directed research.
+class QualitySection:
+    """A local section on the quality site — one dimension of 'is this good?'
 
-    A research project has CONVERGED when ALL of these hold:
-    1. workspace_consistent: H^1 = 0 on the 4-surface site
-    2. frontier_dominated: our metrics dominate the SOTA frontier
-    3. code_verified: all code passes jg prove / jg bugs
-    4. claims_grounded: all claims match actual evidence
-    5. minimum_trust: all surfaces have trust >= floor
+    Every dimension of research quality is modeled as a local section at a
+    coordinate in a *quality site*, with a trust level from the trust algebra.
+    The section is either evidenced (trust >= some floor) or obstructed
+    (trust below floor, indicating descent failure on that dimension).
 
-    If workspace is consistent but frontier is not dominated, the project
-    is PARTIAL — internally coherent but not competitive. The loop must
-    continue with either refinement or pivoting.
+    The quality site has the following coordinates (objects):
+
+        WORKSPACE_CONSISTENCY   — H^1 = 0 on the 4-surface workspace
+        SOTA_DOMINATION         — metrics Pareto-dominate known baselines
+        CODE_CORRECTNESS        — jg prove / jg bugs pass on all code
+        CLAIMS_GROUNDING        — all paper claims match evidence surface
+        PAPER_COMPLETENESS      — paper has all required sections, >= 12 pages
+        PAPER_HONESTY           — no fabricated numbers (E∩P overlap clean)
+        CODE_SCALE              — code is large-scale (>= target LOC)
+        TEST_COVERAGE           — tests exist and pass
+        REPRODUCIBILITY         — README instructions actually work
+        THEORY_CODE_ALIGNMENT   — T→R morphism: code implements the theory
+
+    The morphisms between these coordinates express dependencies:
+        CLAIMS_GROUNDING requires WORKSPACE_CONSISTENCY
+        PAPER_HONESTY requires CLAIMS_GROUNDING
+        SOTA_DOMINATION requires CODE_CORRECTNESS
+        REPRODUCIBILITY requires CODE_CORRECTNESS + TEST_COVERAGE
+        THEORY_CODE_ALIGNMENT requires CODE_CORRECTNESS
+
+    Descent on this quality site checks all overlaps. A research project
+    CONVERGES when descent succeeds — all local sections are present,
+    all overlaps agree, and all trust levels are above their floors.
     """
-    workspace_consistent: bool = False
-    frontier_dominated: bool = False
-    code_verified: bool = False
-    claims_grounded: bool = False
-    minimum_trust_met: bool = False
+    coordinate: str
+    description: str
+    trust: float = 0.0
     trust_floor: float = 0.5
+    evidence: str = ""
+    obstructions: list[str] = field(default_factory=list)
+
+    @property
+    def satisfied(self) -> bool:
+        return self.trust >= self.trust_floor and not self.obstructions
+
+    @property
+    def obstruction_summary(self) -> str:
+        if self.satisfied:
+            return f"✓ {self.coordinate} (trust={self.trust:.2f})"
+        issues = "; ".join(self.obstructions) if self.obstructions else f"trust {self.trust:.2f} < floor {self.trust_floor:.2f}"
+        return f"✗ {self.coordinate}: {issues}"
+
+
+# Quality site coordinates with their trust floors
+QUALITY_COORDINATES: dict[str, tuple[str, float]] = {
+    "workspace_consistency": ("H^1 = 0 on the 4-surface workspace site", 0.7),
+    "sota_domination": ("Metrics Pareto-dominate SOTA baselines", 0.7),
+    "code_correctness": ("All code passes jg prove and jg bugs", 0.9),
+    "claims_grounding": ("All paper/README claims match evidence", 0.7),
+    "paper_completeness": ("Paper has all sections, >= 12 pages", 0.5),
+    "paper_honesty": ("No fabricated numbers (E∩P overlap clean)", 0.9),
+    "code_scale": ("Codebase >= target LOC", 0.7),
+    "test_coverage": ("Tests exist and pass", 0.7),
+    "reproducibility": ("README instructions produce expected output", 0.7),
+    "theory_code_alignment": ("Code implements the theory (T→R morphism)", 0.5),
+}
+
+# Morphisms: (source, target) — source must be satisfied for target to be meaningful
+QUALITY_MORPHISMS: list[tuple[str, str]] = [
+    ("workspace_consistency", "claims_grounding"),
+    ("claims_grounding", "paper_honesty"),
+    ("code_correctness", "sota_domination"),
+    ("code_correctness", "reproducibility"),
+    ("test_coverage", "reproducibility"),
+    ("code_correctness", "theory_code_alignment"),
+]
+
+
+@dataclass
+class ConvergenceCriterion:
+    """The formal convergence criterion as DESCENT on the quality site.
+
+    Each dimension of "is this a good research paper and large-scale tool?"
+    is a local section at a coordinate in the quality site, carrying a trust
+    level from the trust algebra. The morphisms between coordinates express
+    dependencies (e.g., paper honesty requires claims grounding).
+
+    The research project CONVERGES when descent on the quality site succeeds:
+    all local sections are present, all satisfy their trust floors, and all
+    morphism-connected pairs are compatible (if the source is satisfied,
+    the target must also be satisfied — the sheaf condition).
+
+    This is the same descent computation as the workspace site, but over
+    quality dimensions instead of artifact surfaces.
+    """
+    sections: dict[str, QualitySection] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # Initialize all coordinates if empty
+        if not self.sections:
+            for coord, (desc, floor) in QUALITY_COORDINATES.items():
+                self.sections[coord] = QualitySection(
+                    coordinate=coord, description=desc, trust_floor=floor)
+
+    # ── Builders: set evidence for each quality dimension ──────────
+
+    def set_workspace_consistency(self, consistent: bool, h1: str = ""):
+        s = self.sections["workspace_consistency"]
+        s.trust = 0.9 if consistent else 0.0
+        s.evidence = f"H1={h1}"
+        if not consistent:
+            s.obstructions = [f"H^1 ≠ 0: {h1}"]
+        else:
+            s.obstructions = []
+
+    def set_sota_domination(self, frontier: Optional['MetricFrontier'] = None):
+        s = self.sections["sota_domination"]
+        if frontier and frontier.dominates():
+            s.trust = 0.8
+            s.evidence = "Pareto-dominates frontier"
+            s.obstructions = []
+        elif frontier:
+            weakest = frontier.weakest_metric()
+            gap = frontier.gap_analysis()
+            s.trust = 0.3
+            s.obstructions = [
+                f"Does not dominate frontier; weakest: {weakest} "
+                f"(gap: {gap.get(weakest, {}).get('gap_pct', '?'):.1f}%)"
+                if weakest else "No metrics to compare"
+            ]
+        else:
+            s.trust = 0.0
+            s.obstructions = ["No frontier established"]
+
+    def set_code_correctness(self, jg_results: list = None,
+                             syntax_ok: bool = False, import_ok: bool = False):
+        s = self.sections["code_correctness"]
+        issues = []
+        if not syntax_ok:
+            issues.append("syntax errors in generated code")
+        if not import_ok:
+            issues.append("import errors in generated package")
+        if jg_results:
+            jg_failures = [r for r in jg_results if not r.verified]
+            if jg_failures:
+                issues.extend(f"jg: {r.claim}" for r in jg_failures[:3])
+        s.obstructions = issues
+        s.trust = 0.9 if not issues else (0.5 if syntax_ok else 0.0)
+        s.evidence = f"syntax={'OK' if syntax_ok else 'FAIL'}, import={'OK' if import_ok else 'FAIL'}"
+
+    def set_claims_grounding(self, consistent: bool):
+        s = self.sections["claims_grounding"]
+        s.trust = 0.8 if consistent else 0.2
+        s.obstructions = [] if consistent else ["claims diverge from evidence"]
+
+    def set_paper_completeness(self, paper_path: str):
+        s = self.sections["paper_completeness"]
+        if not paper_path or not os.path.exists(paper_path):
+            s.trust = 0.0
+            s.obstructions = ["paper not generated"]
+            return
+        with open(paper_path) as f:
+            text = f.read()
+        # Check required sections
+        required = ["abstract", "introduction", "background", "framework",
+                     "architecture", "implementation", "evaluation",
+                     "discussion", "conclusion", "references"]
+        missing = [sec for sec in required
+                   if sec not in text.lower() and f"\\section{{{sec}" not in text.lower()]
+        line_count = len(text.splitlines())
+        issues = []
+        if missing:
+            issues.append(f"missing sections: {', '.join(missing)}")
+        if line_count < 400:  # ~12 pages is ~400+ lines of LaTeX
+            issues.append(f"too short ({line_count} lines, need ~400+)")
+        s.obstructions = issues
+        s.trust = 0.8 if not issues else 0.3
+        s.evidence = f"{line_count} lines, {len(required) - len(missing)}/{len(required)} sections"
+
+    def set_paper_honesty(self, fabrication_count: int = 0):
+        s = self.sections["paper_honesty"]
+        s.trust = 0.95 if fabrication_count == 0 else max(0.0, 0.5 - fabrication_count * 0.1)
+        s.obstructions = [f"{fabrication_count} potentially fabricated claims"] if fabrication_count else []
+
+    def set_code_scale(self, total_lines: int, target: int = 5000):
+        s = self.sections["code_scale"]
+        ratio = total_lines / max(target, 1)
+        s.trust = min(1.0, ratio)
+        s.evidence = f"{total_lines}/{target} lines ({ratio:.0%})"
+        if total_lines < target * 0.5:
+            s.obstructions = [f"only {total_lines} lines (target: {target})"]
+        else:
+            s.obstructions = []
+
+    def set_test_coverage(self, tests_exist: bool, tests_pass: bool):
+        s = self.sections["test_coverage"]
+        if tests_exist and tests_pass:
+            s.trust = 0.8
+        elif tests_exist:
+            s.trust = 0.4
+            s.obstructions = ["tests exist but fail"]
+        else:
+            s.trust = 0.2
+            s.obstructions = ["no test suite"]
+
+    def set_reproducibility(self, readme_verification_rate: float):
+        s = self.sections["reproducibility"]
+        s.trust = readme_verification_rate
+        if readme_verification_rate < 0.5:
+            s.obstructions = [f"only {readme_verification_rate:.0%} of README claims verified"]
+        else:
+            s.obstructions = []
+
+    def set_theory_code_alignment(self, consistent: bool):
+        s = self.sections["theory_code_alignment"]
+        s.trust = 0.7 if consistent else 0.2
+        s.obstructions = [] if consistent else ["T→R morphism: code does not implement theory"]
+
+    # ── Descent on the quality site ───────────────────────────────
+
+    def run_descent(self) -> tuple[bool, list[str]]:
+        """Run descent on the quality site.
+
+        Checks:
+        1. Every local section satisfies its trust floor
+        2. Every morphism is compatible: if source satisfied, target must be too
+           (the sheaf condition on the quality site)
+
+        Returns (converged, list_of_obstruction_descriptions).
+        """
+        obstructions: list[str] = []
+
+        # Check each local section against its trust floor
+        for coord, section in self.sections.items():
+            if not section.satisfied:
+                obstructions.append(section.obstruction_summary)
+
+        # Check morphisms (sheaf condition: compatible on overlaps)
+        for source_coord, target_coord in QUALITY_MORPHISMS:
+            source = self.sections.get(source_coord)
+            target = self.sections.get(target_coord)
+            if source and target:
+                if source.satisfied and not target.satisfied:
+                    obstructions.append(
+                        f"Morphism {source_coord}→{target_coord}: "
+                        f"source satisfied but target obstructed "
+                        f"({target.obstruction_summary})")
+
+        return len(obstructions) == 0, obstructions
 
     @property
     def converged(self) -> bool:
-        return (self.workspace_consistent and
-                self.frontier_dominated and
-                self.claims_grounded and
-                self.minimum_trust_met)
+        ok, _ = self.run_descent()
+        return ok
 
     @property
     def partially_converged(self) -> bool:
-        """Consistent but not competitive."""
-        return self.workspace_consistent and not self.frontier_dominated
+        """Workspace consistent but not SOTA-dominating."""
+        ws = self.sections.get("workspace_consistency")
+        sota = self.sections.get("sota_domination")
+        return (ws and ws.satisfied) and (sota and not sota.satisfied)
 
     def diagnosis(self) -> str:
-        """Human-readable diagnosis of what's blocking convergence."""
-        issues = []
-        if not self.workspace_consistent:
-            issues.append("workspace has H^1 obstructions")
-        if not self.frontier_dominated:
-            issues.append("metrics do not dominate SOTA frontier")
-        if not self.code_verified:
-            issues.append("code has jg bugs/prove failures")
-        if not self.claims_grounded:
-            issues.append("claims don't match evidence")
-        if not self.minimum_trust_met:
-            issues.append(f"some surfaces below trust floor {self.trust_floor}")
-        if not issues:
-            return "CONVERGED — all criteria satisfied"
-        return "NOT CONVERGED: " + "; ".join(issues)
+        """Full descent report on the quality site."""
+        ok, obstructions = self.run_descent()
+        if ok:
+            return "CONVERGED — all quality sections satisfied, descent clean"
+        lines = [f"NOT CONVERGED — {len(obstructions)} obstruction(s):"]
+        for obs in obstructions:
+            lines.append(f"  {obs}")
+        return "\n".join(lines)
