@@ -130,7 +130,7 @@ class LLMSection:
 
 
 def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
-              max_tokens: int = 16384, timeout: int = 600) -> LLMSection:
+              max_tokens: int = 16384, timeout: int = 180) -> LLMSection:
     """Call the LLM and return a typed, trust-annotated section.
 
     This is THE interface between the LLM and the geometry. Every LLM
@@ -590,7 +590,7 @@ class DirectedResearch:
 
             PRODUCT: {self.prompt}
             APPROACH: {self.approach}
-            THEORY (first 2000 chars): {self.theory_text[:2000]}
+            THEORY (first 2000 chars): {self.theory_text[:500]}
             STANDARD LIBRARIES: {json.dumps(libs)}
 
             Design 5-8 Python modules. Name them after DOMAIN concepts, not generic
@@ -655,7 +655,7 @@ class DirectedResearch:
             Generate `{name}.py` for the {pkg_name} package.
 
             PRODUCT: {self.prompt}
-            THEORY (key section): {self.theory_text[:3000]}
+            THEORY (key section): {self.theory_text[:500]}
             {"ALREADY GENERATED: " + ", ".join(existing_modules) if existing_modules else ""}
 
             PURPOSE: {mod.get('purpose', '')}
@@ -836,7 +836,7 @@ class DirectedResearch:
             section = _llm_call(textwrap.dedent(f"""\
                 Write a README.md for this research tool.
                 TOOL: {self.approach}
-                THEORY: {self.theory_text[:1000]}
+                THEORY: {self.theory_text[:500]}
                 MODULES: {list(self.module_code.keys())}
                 BENCHMARKS: {json.dumps(self.benchmark_results)[:500]}
                 Include: title, description, installation, quickstart, module overview, benchmarks.
@@ -871,7 +871,7 @@ class DirectedResearch:
             section = _llm_call(textwrap.dedent(f"""\
                 Write a 4-page conference tool-track paper in LaTeX.
                 TOOL: {self.approach}
-                THEORY: {self.theory_text[:2000]}
+                THEORY: {self.theory_text[:500]}
                 MODULES: {list(self.module_code.keys())}
                 BENCHMARKS: {json.dumps(self.benchmark_results)[:500]}
                 Structure: Abstract, Introduction, Approach, Implementation, Evaluation, Conclusion.
@@ -934,7 +934,7 @@ class DirectedResearch:
             return
         section = _llm_call(textwrap.dedent(f"""\
             The current approach isn't working well enough. Propose a PIVOT:
-            CURRENT: {self.theory_text[:1000]}
+            CURRENT: {self.theory_text[:500]}
             PROMPT: {self.prompt}
             Change ONE thing about the mathematical framework that might produce
             better results. Keep what works, fix what doesn't.
