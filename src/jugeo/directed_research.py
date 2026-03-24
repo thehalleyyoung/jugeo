@@ -378,7 +378,15 @@ class DirectedResearch:
         self._move_design_architecture()
 
         # GENERATE phase: produce code sections
-        for mod in self.architecture.get("modules", []):
+        modules = self.architecture.get("modules", [])
+        if not modules:
+            # Fallback if architecture design returned no modules
+            modules = [
+                {"name": "core", "purpose": "Core types and data structures"},
+                {"name": "algorithms", "purpose": "Main algorithms and computations"},
+                {"name": "cli", "purpose": "Command-line interface"},
+            ]
+        for mod in modules:
             self._move_generate_module(mod)
         self._move_generate_integration()
         self._write_pyproject()
@@ -742,7 +750,8 @@ class DirectedResearch:
         if code.startswith("```"):
             code = "\n".join(l for l in code.split("\n") if not l.startswith("```"))
 
-        pkg_dir = self.output_dir / "src" / pkg_name
+        pkg_dir = self.output_dir / "src" / re.sub(r'[^a-zA-Z0-9_]', '_', pkg_name).strip('_').lower()
+        pkg_dir.mkdir(parents=True, exist_ok=True)
         path = pkg_dir / "integration.py"
         path.write_text(code.strip() + "\n")
         self.code_files.append(str(path))
