@@ -628,6 +628,10 @@ class DirectedResearch:
         self._log(f"MOVE: generate_module({name}) → R")
 
         pkg_name = self.architecture.get("package_name", self.approach.replace("-", "_"))
+        # Sanitize package name
+        pkg_name = re.sub(r'[^a-zA-Z0-9_]', '_', pkg_name).strip('_').lower()
+        if not pkg_name:
+            pkg_name = "research_output"
         pkg_dir = self.output_dir / "src" / pkg_name
         pkg_dir.mkdir(parents=True, exist_ok=True)
 
