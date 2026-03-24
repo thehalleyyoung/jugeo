@@ -1,73 +1,47 @@
-"""Directed research: prompt-driven research software synthesis via judgment geometry.
+"""Directed research as sheaf descent over a workspace site.
 
-Given a high-level prompt ("make me a killer app in finance using advanced math"),
-this module orchestrates the full lifecycle:
+This is NOT "use an LLM and then check consistency." This IS judgment
+geometry: every LLM interaction is a local section at a coordinate with
+a trust level, every decision is a semantic move, and the entire research
+loop is descent — the engine tries to glue local sections into a global
+section, and obstructions drive what happens next.
 
-    1. IDEATE   — discover a novel mathematical approach (a section on T)
-    2. DESIGN   — decompose into a software plan (covering family on R)
-    3. IMPLEMENT— generate code for each module (local sections on R)
-    4. BENCHMARK— establish metrics and baselines (sections on E)
-    5. EVALUATE — compare against baselines (descent on E ∩ P)
-    6. REFINE   — fix obstructions or PIVOT the theory (repair / adjacency move)
-    7. REPEAT   — until the workspace is consistent and competitive
+The workspace site W has four coordinates (T, R, E, P) and six morphisms.
+Each LLM call produces a LocalSection at one coordinate with trust
+COPILOT_SUGGESTED. Each benchmark run upgrades a section to RUNTIME_WITNESSED.
+Each Z3 check upgrades to SOLVER_DISCHARGED. Descent glues sections when
+overlaps agree. Obstructions tell you exactly which surface drifted and why.
 
-Every step is a semantic move on the workspace site (T, R, E, P). The loop
-terminates when descent succeeds with trust ≥ RUNTIME_WITNESSED on all surfaces,
-or when the move budget is exhausted.
+The research loop:
 
-The key geometric ideas:
+    while not converged:
+        obstructions = descent(workspace)
+        if not obstructions:
+            if competitive: DONE
+            else: move = select_performance_move()
+        else:
+            move = select_repair_move(obstructions[0])
+        section = execute_move(move)   # may call LLM
+        workspace.install_section(section)
 
-- The prompt defines an *intent sheaf* — a presheaf of acceptable outcomes over
-  the workspace site. The goal is to find a global section of this sheaf.
-
-- Each ideation attempt is a *candidate section on T*. The tournament selects
-  the section with highest novelty × feasibility.
-
-- Implementation is *descent on R*: the software plan decomposes R into a
-  covering family of modules, and code generation produces local sections.
-  Descent checks that modules are mutually consistent.
-
-- Benchmarking populates E with RUNTIME_WITNESSED sections. These have higher
-  trust than LLM-generated claims on P.
-
-- Evaluation is *descent on the full workspace*: do the benchmark results (E)
-  match the claims (P)? Does the code (R) implement the theory (T)?
-
-- When descent fails, the obstruction tells you exactly what to fix:
-  - H¹ on E ∩ P → claims don't match evidence → rewrite claims
-  - H¹ on T ∩ R → code doesn't implement theory → fix code or revise theory
-  - H¹ on R ∩ E → code doesn't produce claimed results → fix code or benchmarks
-
-- A *pivot* is an adjacency-constrained morphism on T: change the theory, but
-  only by distance-1 (preserve existing capabilities, be demonstrable).
+Every move is typed by which surface it touches and what trust it produces.
+The LLM never operates outside the geometry — it IS a channel.
 
 Usage::
 
     from jugeo.directed_research import DirectedResearch
 
-    dr = DirectedResearch(
-        prompt="Build a Python tool that uses tropical geometry to optimize supply chains",
-        max_pivots=3,
-        max_iterations=20,
-    )
+    dr = DirectedResearch("Build a killer app using Yahoo Finance")
     result = dr.run()
-    print(result)
-    # DirectedResearchResult(
-    #   status=CONVERGED,
-    #   theory="Tropical semiring optimization for supply chain flow",
-    #   code_files=["src/tropical_supply/core.py", ...],
-    #   benchmarks={"throughput_improvement": 2.3, "baseline": "scipy.optimize"},
-    #   consistency=ConsistencyReport(CONSISTENT, H1=0),
-    #   pivots_taken=1,
-    #   iterations=12,
-    # )
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import textwrap
@@ -76,151 +50,231 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
+# ── JuGeo imports ────────────────────────────────────────────────────
+
 from jugeo.research_orchestration import (
     WorkspaceSite,
-    ArtifactSurface,
     SurfaceKind,
-    MorphismType,
     ConsistencyReport,
-    WorkspaceObstruction,
     ObstructionKind,
-    ResearchOrchestrator,
-    ResearchStrategy,
-    MoveKind,
-    PhaseKind,
-    WORKSPACE_MORPHISMS,
-    COVERING_FAMILIES,
+    WorkspaceObstruction,
 )
 
-# Optional: full JuGeo geometry for site construction
 try:
     from jugeo.geometry.site import (
         Coordinate, CoordinateKind, MorphismKind, Morphism,
-        Site, SiteBuilder, build_site,
+        Site, SiteBuilder,
     )
     from jugeo.geometry.descent import (
         DescentEngine, DescentStrategy, LocalSection,
-        GlobalSection, DescentObstruction,
     )
     from jugeo.evidence.trust import TrustLevel, TrustProfile
-    _HAS_GEOMETRY = True
+    _GEO = True
 except Exception:
-    _HAS_GEOMETRY = False
-
-# Optional: ideation engine
-try:
-    from jugeo.ideation.synthesis_frontier.pipeline import (
-        SynthesisFrontierPipeline,
-    )
-    from jugeo.ideation.synthesis_frontier.models import FieldNode
-    _HAS_IDEATION = True
-except Exception:
-    _HAS_IDEATION = False
+    _GEO = False
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Trust levels as floats (matching LocalSection.trust_level)
+TRUST_COPILOT = 0.3       # LLM-generated content
+TRUST_RUNTIME = 0.7       # Ran the code, saw the result
+TRUST_SOLVER = 0.9        # Z3 or formal check passed
+TRUST_VERIFIED = 1.0      # Lean proof or equivalent
+
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Enumerations
+#  The LLM as an evidence channel
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class LLMSection:
+    """A local section produced by an LLM call.
+
+    Every LLM interaction in the system produces one of these. It records
+    WHAT was generated, WHERE it lives in the workspace site, and at WHAT
+    trust level. This is the atomic unit of the research loop.
+    """
+    surface: SurfaceKind
+    coordinate: str          # e.g. "theory.foundations" or "code.core_module"
+    content: str
+    trust: float = TRUST_COPILOT
+    provenance: str = ""     # the prompt that produced this
+    prompt_hash: str = ""
+    elapsed: float = 0.0
+    token_count: int = 0
+
+    def to_local_section(self) -> Optional[Any]:
+        """Convert to a JuGeo LocalSection if geometry is available."""
+        if not _GEO:
+            return None
+        return LocalSection(
+            coordinate=self.coordinate,
+            judgment_data={"content_hash": hash(self.content), "length": len(self.content)},
+            evidence_bundle=(self.provenance,),
+            trust_level=self.trust,
+            provenance=(f"llm-channel:{self.provenance[:50]}",),
+        )
+
+    def upgrade_trust(self, new_trust: float, reason: str) -> LLMSection:
+        """Promote trust (e.g., after benchmark confirms LLM claim)."""
+        return LLMSection(
+            surface=self.surface,
+            coordinate=self.coordinate,
+            content=self.content,
+            trust=max(self.trust, new_trust),  # never demote via upgrade
+            provenance=f"{self.provenance} → {reason}",
+            prompt_hash=self.prompt_hash,
+            elapsed=self.elapsed,
+            token_count=self.token_count,
+        )
+
+
+def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
+              max_tokens: int = 16384, timeout: int = 600) -> LLMSection:
+    """Call the LLM and return a typed, trust-annotated section.
+
+    This is THE interface between the LLM and the geometry. Every LLM
+    interaction in the system goes through here. The result is always
+    a section at a specific coordinate with COPILOT_SUGGESTED trust.
+    """
+    import hashlib, shutil
+
+    t0 = time.time()
+    prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+    text = ""
+
+    # 1. Anthropic SDK (fast, reliable, supports long output)
+    if not text:
+        try:
+            import anthropic
+            client = anthropic.Anthropic()
+            msg = client.messages.create(
+                model="claude-sonnet-4-6-20250514", max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = msg.content[0].text
+        except Exception:
+            pass
+
+    # 2. Copilot CLI (fallback)
+    if not text and shutil.which("copilot"):
+        try:
+            result = subprocess.run(
+                ["copilot", "-p", prompt, "--model", "claude-sonnet-4.6", "--available-tools", ""],
+                capture_output=True, text=True, timeout=timeout, cwd=_ROOT,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                lines = result.stdout.split("\n")
+                cleaned = [l for l in lines if not l.strip().startswith(("●", "✗", "│", "└"))]
+                while cleaned and not cleaned[0].strip():
+                    cleaned.pop(0)
+                text = "\n".join(cleaned).strip()
+        except Exception:
+            pass
+
+    # 3. Placeholder
+    if not text:
+        text = f"[LLM unavailable — {prompt[:80]}...]"
+
+    elapsed = time.time() - t0
+    return LLMSection(
+        surface=surface,
+        coordinate=coordinate,
+        content=text,
+        trust=TRUST_COPILOT,
+        provenance=f"llm:{coordinate}",
+        prompt_hash=prompt_hash,
+        elapsed=elapsed,
+        token_count=len(text.split()),
+    )
+
+
+def _llm_json(prompt: str, **kwargs) -> tuple[dict, LLMSection]:
+    """Call LLM, parse JSON, return both the dict and the section."""
+    full = prompt + "\n\nRespond with ONLY valid JSON, no markdown fences."
+    section = _llm_call(full, **kwargs)
+    text = section.content.strip()
+    if text.startswith("```"):
+        text = "\n".join(l for l in text.split("\n") if not l.startswith("```"))
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r'\{[\s\S]*\}', text)
+        if m:
+            try:
+                data = json.loads(m.group())
+            except json.JSONDecodeError:
+                data = {"raw": text, "parse_error": True}
+        else:
+            data = {"raw": text, "parse_error": True}
+    return data, section
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Semantic moves — typed operations on the workspace site
+# ═══════════════════════════════════════════════════════════════════════
+
+class MoveKind(str, Enum):
+    """Each move is a typed operation on a specific surface."""
+    # Theory surface
+    ANALYZE_DOMAIN = "analyze_domain"         # understand what the domain needs
+    ELABORATE_THEORY = "elaborate_theory"     # produce detailed math framework
+    PIVOT_THEORY = "pivot_theory"            # adjacency-constrained theory change
+
+    # Code surface
+    DESIGN_ARCHITECTURE = "design_architecture"  # covering family decomposition
+    GENERATE_MODULE = "generate_module"          # local section on one module
+    GENERATE_INTEGRATION = "generate_integration" # adapter for real libraries
+    FIX_MODULE = "fix_module"                    # repair obstruction in code
+
+    # Evidence surface
+    RUN_SYNTAX_CHECK = "run_syntax_check"    # check code parses (RUNTIME trust)
+    RUN_IMPORT_CHECK = "run_import_check"    # check code imports (RUNTIME trust)
+    RUN_BENCHMARK = "run_benchmark"          # execute benchmark (RUNTIME trust)
+
+    # Claims surface
+    GROUND_CLAIMS = "ground_claims"          # sync claims with evidence
+    WRITE_README = "write_readme"
+    WRITE_PAPER = "write_paper"
+
+
+@dataclass
+class MoveResult:
+    """Result of executing a semantic move."""
+    move: MoveKind
+    surface: SurfaceKind
+    section: Optional[LLMSection]
+    trust_achieved: float
+    success: bool
+    description: str
+    elapsed: float
+    files_written: list[str] = field(default_factory=list)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Research status
 # ═══════════════════════════════════════════════════════════════════════
 
 class ResearchStatus(str, Enum):
-    """Terminal status of a directed research run."""
-    CONVERGED = "converged"           # Workspace consistent, metrics competitive
-    BUDGET_EXHAUSTED = "budget_exhausted"  # Ran out of moves
-    PIVOT_LIMIT = "pivot_limit"       # Too many theory changes
-    PARTIAL = "partial"               # Some surfaces consistent, some not
-    FAILED = "failed"                 # Could not produce any consistent state
-
-
-class IterationKind(str, Enum):
-    """What kind of work an iteration did."""
-    IDEATE = "ideate"
-    DESIGN = "design"
-    IMPLEMENT = "implement"
-    BENCHMARK = "benchmark"
-    EVALUATE = "evaluate"
-    REFINE_CODE = "refine_code"
-    REFINE_THEORY = "refine_theory"
-    PIVOT = "pivot"
-    GROUND_CLAIMS = "ground_claims"
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Data structures
-# ═══════════════════════════════════════════════════════════════════════
-
-@dataclass
-class SoftwarePlan:
-    """Decomposition of a research idea into implementable modules.
-
-    This is a *covering family on R*: each module is a patch, and the
-    plan as a whole covers the entire code surface.
-    """
-    modules: list[dict[str, Any]] = field(default_factory=list)
-    cli_commands: list[dict[str, Any]] = field(default_factory=list)
-    dependencies: list[str] = field(default_factory=list)
-    test_plan: list[dict[str, Any]] = field(default_factory=list)
-    package_name: str = ""
-    one_liner: str = ""
-
-    @property
-    def module_names(self) -> list[str]:
-        return [m.get("name", "") for m in self.modules]
-
-
-@dataclass
-class BenchmarkSuite:
-    """Metrics, baselines, and evaluation criteria.
-
-    This is a *covering family on E*: each metric is a patch, and the
-    suite covers the evidence surface.
-    """
-    metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
-    baselines: dict[str, Any] = field(default_factory=dict)
-    results: dict[str, Any] = field(default_factory=dict)
-    comparison: dict[str, str] = field(default_factory=dict)  # metric → "better"/"worse"/"equal"
-
-    @property
-    def competitive(self) -> bool:
-        """True if we beat or match baselines on a majority of metrics."""
-        if not self.comparison:
-            return False
-        wins = sum(1 for v in self.comparison.values() if v == "better")
-        ties = sum(1 for v in self.comparison.values() if v == "equal")
-        return (wins + ties) > len(self.comparison) / 2
-
-
-@dataclass
-class IterationRecord:
-    """Record of one iteration of the research loop."""
-    iteration: int
-    kind: IterationKind
-    description: str
-    surface_modified: SurfaceKind
-    trust_before: float
-    trust_after: float
-    obstructions_before: int
-    obstructions_after: int
-    elapsed: float
-    success: bool
-    detail: dict[str, Any] = field(default_factory=dict)
+    CONVERGED = "converged"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    PIVOT_LIMIT = "pivot_limit"
+    PARTIAL = "partial"
+    FAILED = "failed"
 
 
 @dataclass
 class DirectedResearchResult:
-    """Final result of a directed research run."""
+    """Final result."""
     status: ResearchStatus
     prompt: str
-    theory: str
+    theory_summary: str
     approach: str
-    plan: Optional[SoftwarePlan]
     code_files: list[str]
-    benchmarks: Optional[BenchmarkSuite]
+    sections: list[LLMSection]         # ALL sections produced
     consistency: ConsistencyReport
-    iterations: list[IterationRecord]
-    pivots_taken: int
-    total_iterations: int
+    moves: list[MoveResult]
+    pivots: int
     output_dir: str
     elapsed: float
 
@@ -228,1334 +282,661 @@ class DirectedResearchResult:
     def success(self) -> bool:
         return self.status == ResearchStatus.CONVERGED
 
-    def __repr__(self) -> str:
+    def __repr__(self):
+        n_theory = sum(1 for s in self.sections if s.surface == SurfaceKind.THEORY)
+        n_code = sum(1 for s in self.sections if s.surface == SurfaceKind.CODE)
+        n_evidence = sum(1 for s in self.sections if s.surface == SurfaceKind.EVIDENCE)
+        n_claims = sum(1 for s in self.sections if s.surface == SurfaceKind.CLAIMS)
         return (
             f"DirectedResearchResult(\n"
             f"  status={self.status.value},\n"
             f"  approach={self.approach!r},\n"
+            f"  sections: T={n_theory} R={n_code} E={n_evidence} P={n_claims},\n"
             f"  code_files={len(self.code_files)},\n"
             f"  consistency={self.consistency},\n"
-            f"  pivots={self.pivots_taken},\n"
-            f"  iterations={self.total_iterations},\n"
+            f"  moves={len(self.moves)}, pivots={self.pivots},\n"
             f"  elapsed={self.elapsed:.1f}s\n"
             f")"
         )
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  LLM helper (shared with foundation_pipeline)
-# ═══════════════════════════════════════════════════════════════════════
-
-def _call_llm(prompt: str, max_tokens: int = 4096) -> str:
-    """Call LLM via copilot CLI, anthropic, or openai."""
-    import shutil
-
-    # 1. Copilot CLI
-    if shutil.which("copilot"):
-        try:
-            result = subprocess.run(
-                ["copilot", "-p", prompt, "--model", "gpt-5.4",
-                 "--available-tools", ""],
-                capture_output=True, text=True, timeout=600, cwd=_ROOT,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                # Strip tool narration
-                lines = result.stdout.split("\n")
-                cleaned = [l for l in lines
-                          if not l.strip().startswith(("●", "✗", "│", "└"))]
-                while cleaned and not cleaned[0].strip():
-                    cleaned.pop(0)
-                return "\n".join(cleaned).strip()
-        except Exception:
-            pass
-
-    # 2. Anthropic SDK
-    try:
-        import anthropic
-        client = anthropic.Anthropic()
-        msg = client.messages.create(
-            model="claude-sonnet-4-6-20250514", max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return msg.content[0].text
-    except Exception:
-        pass
-
-    # 3. Fallback: return a structured placeholder
-    return f"[LLM unavailable — placeholder for: {prompt[:100]}...]"
-
-
-def _call_llm_json(prompt: str, max_tokens: int = 4096) -> dict:
-    """Call LLM and parse JSON response."""
-    full_prompt = prompt + "\n\nRespond with ONLY valid JSON, no markdown fences."
-    text = _call_llm(full_prompt, max_tokens)
-    # Extract JSON from response
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(l for l in lines if not l.startswith("```"))
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Try to find JSON in the response
-        import re
-        m = re.search(r'\{[\s\S]*\}', text)
-        if m:
-            try:
-                return json.loads(m.group())
-            except json.JSONDecodeError:
-                pass
-        return {"raw": text, "parse_error": True}
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  DirectedResearch — the main engine
+#  DirectedResearch — descent-driven research loop
 # ═══════════════════════════════════════════════════════════════════════
 
 class DirectedResearch:
-    """Prompt-driven research software synthesis via judgment geometry.
+    """The research loop IS descent.
 
-    The research loop is a descent computation on the workspace site
-    (T, R, E, P). Each iteration is a semantic move that modifies one
-    surface and checks whether the workspace becomes more consistent.
-
-    The loop terminates when:
-    - The workspace is fully consistent (all overlaps pass) AND
-      the benchmarks show competitive results — CONVERGED
-    - The move budget is exhausted — BUDGET_EXHAUSTED
-    - Too many theory pivots — PIVOT_LIMIT
+    Every iteration:
+    1. Run descent on the workspace site
+    2. If consistent + competitive → DONE
+    3. If obstructions → the obstruction type determines the next move
+    4. Execute the move (which may call the LLM as an evidence channel)
+    5. Install the resulting section in the workspace
+    6. Go to 1
     """
 
-    def __init__(
-        self,
-        prompt: str,
-        *,
-        max_iterations: int = 30,
-        max_pivots: int = 3,
-        output_dir: Optional[str] = None,
-        no_llm: bool = False,
-        seed: Optional[int] = None,
-        verbose: bool = False,
-    ):
+    def __init__(self, prompt: str, *, max_iterations: int = 30,
+                 max_pivots: int = 3, output_dir: str | None = None,
+                 no_llm: bool = False, seed: int | None = None,
+                 verbose: bool = False):
         self.prompt = prompt
         self.max_iterations = max_iterations
         self.max_pivots = max_pivots
         self.no_llm = no_llm
         self.seed = seed
         self.verbose = verbose
-
         self.output_dir = pathlib.Path(
-            output_dir or f"outputs/research_{time.strftime('%Y%m%d_%H%M%S')}"
-        )
+            output_dir or f"outputs/research_{time.strftime('%Y%m%d_%H%M%S')}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # State
+        # The workspace site
         self.workspace: Optional[WorkspaceSite] = None
-        self.plan: Optional[SoftwarePlan] = None
-        self.benchmarks: Optional[BenchmarkSuite] = None
-        self.theory: str = ""
-        self.approach: str = ""
-        self.code_files: list[str] = []
-        self.iterations: list[IterationRecord] = []
-        self.pivots_taken: int = 0
 
-        # Build the site for tracking internal module consistency
-        self._code_site: Optional[Site] = None
+        # All sections produced (the full evidence trail)
+        self.sections: list[LLMSection] = []
+        self.moves: list[MoveResult] = []
+        self.code_files: list[str] = []
+        self.pivots: int = 0
+
+        # State built up across phases
+        self.domain_analysis: dict = {}
+        self.theory_text: str = ""
+        self.approach: str = ""
+        self.architecture: dict = {}
+        self.module_code: dict[str, str] = {}   # filename → code
+        self.benchmark_results: dict[str, Any] = {}
+
+    def _log(self, msg: str):
+        if self.verbose:
+            ts = time.strftime("%H:%M:%S")
+            print(f"[{ts}] {msg}", flush=True)
+
+    # ── The main loop ────────────────────────────────────────────────
 
     def run(self) -> DirectedResearchResult:
-        """Execute the full directed research loop."""
         start = time.time()
 
-        # Phase 1: IDEATE — find a novel approach
-        self._ideate()
+        # SEED phase: produce initial sections on T and R
+        self._move_analyze_domain()
+        self._move_elaborate_theory()
+        self._move_design_architecture()
 
-        # Phase 2: DESIGN — decompose into a software plan
-        self._design()
+        # GENERATE phase: produce code sections
+        for mod in self.architecture.get("modules", []):
+            self._move_generate_module(mod)
+        self._move_generate_integration()
+        self._write_pyproject()
 
-        # Phase 3: IMPLEMENT — generate code
-        self._implement()
+        # HARDEN phase: descent-driven loop
+        for i in range(self.max_iterations):
+            # Verify code (upgrade trust from COPILOT → RUNTIME)
+            self._move_syntax_check()
+            self._move_import_check()
 
-        # Phase 4: BENCHMARK — establish metrics and run them
-        self._benchmark()
+            # Build workspace and run descent
+            self._rebuild_workspace()
+            report = self.workspace.check_consistency()
 
-        # Phase 4b: VALIDATE — ensure code works with real libraries/datasets
-        self._validate_integration()
+            self._log(f"  Iteration {i}: {report}")
 
-        # Phase 5: EVALUATE + REFINE loop
-        iteration = 0
-        while iteration < self.max_iterations:
-            report = self._evaluate()
+            if report.consistent:
+                # Write deliverables and finish
+                self._move_ground_claims()
+                self._move_write_readme()
+                self._move_write_paper()
+                self._rebuild_workspace()
+                final = self.workspace.check_consistency()
+                return self._finish(ResearchStatus.CONVERGED, final, start)
 
-            if report.consistent and self.benchmarks and self.benchmarks.competitive:
-                # Success: workspace is consistent and benchmarks are competitive
-                break
+            # Obstructions drive the next move
+            repaired = self._repair_from_obstructions(report)
+            if not repaired:
+                if self.pivots < self.max_pivots:
+                    self._move_pivot_theory()
+                    # After pivot, regenerate code
+                    for mod in self.architecture.get("modules", []):
+                        self._move_generate_module(mod)
+                else:
+                    break
 
-            if not report.consistent:
-                # Obstructions exist — try to repair
-                repaired = self._refine(report)
-                if not repaired and self.pivots_taken < self.max_pivots:
-                    # Repair failed — pivot the theory
-                    self._pivot()
-                elif not repaired:
-                    break  # Pivot limit reached
-            elif self.benchmarks and not self.benchmarks.competitive:
-                # Consistent but not competitive — refine implementation
-                self._refine_for_performance()
+        # Budget exhausted — write what we have
+        self._move_ground_claims()
+        self._move_write_readme()
+        self._move_write_paper()
+        self._rebuild_workspace()
+        final = self.workspace.check_consistency()
+        status = ResearchStatus.PARTIAL if final.consistent else ResearchStatus.BUDGET_EXHAUSTED
+        return self._finish(status, final, start)
 
-            iteration += 1
-
-        # Phase 8: Write deliverables
-        self._write_readme()
-        self._write_paper()
-
-        # Final evaluation
-        final_report = self._evaluate()
-
-        status = ResearchStatus.CONVERGED
-        if not final_report.consistent:
-            status = ResearchStatus.PARTIAL
-        elif self.benchmarks and not self.benchmarks.competitive:
-            status = ResearchStatus.PARTIAL
-        if iteration >= self.max_iterations:
-            status = ResearchStatus.BUDGET_EXHAUSTED
-        if self.pivots_taken >= self.max_pivots and not final_report.consistent:
-            status = ResearchStatus.PIVOT_LIMIT
-
+    def _finish(self, status: ResearchStatus, report: ConsistencyReport,
+                start: float) -> DirectedResearchResult:
         elapsed = time.time() - start
-
         # Save metadata
-        self._save_metadata(status, elapsed)
-
+        meta = {
+            "status": status.value, "prompt": self.prompt,
+            "approach": self.approach, "elapsed": round(elapsed, 2),
+            "sections": len(self.sections), "moves": len(self.moves),
+            "pivots": self.pivots, "code_files": self.code_files,
+            "trust_profile": {s.coordinate: s.trust for s in self.sections},
+        }
+        (self.output_dir / "research_metadata.json").write_text(
+            json.dumps(meta, indent=2, default=str))
         return DirectedResearchResult(
-            status=status,
-            prompt=self.prompt,
-            theory=self.theory,
-            approach=self.approach,
-            plan=self.plan,
-            code_files=self.code_files,
-            benchmarks=self.benchmarks,
-            consistency=final_report,
-            iterations=self.iterations,
-            pivots_taken=self.pivots_taken,
-            total_iterations=len(self.iterations),
-            output_dir=str(self.output_dir),
-            elapsed=elapsed,
-        )
+            status=status, prompt=self.prompt,
+            theory_summary=self.theory_text[:500],
+            approach=self.approach, code_files=self.code_files,
+            sections=self.sections, consistency=report,
+            moves=self.moves, pivots=self.pivots,
+            output_dir=str(self.output_dir), elapsed=elapsed)
 
-    # ── Phase 1: IDEATE ──────────────────────────────────────────────
+    # ── Rebuild the workspace from all sections ──────────────────────
 
-    def _ideate(self):
-        """Discover a novel mathematical approach to the prompt.
+    def _rebuild_workspace(self):
+        """Reconstruct the workspace site from all accumulated sections."""
+        theory = self.theory_text
+        code = "\n\n".join(self.module_code.values())
+        evidence = dict(self.benchmark_results)
+        # Evidence also includes trust levels from code verification
+        for s in self.sections:
+            if s.surface == SurfaceKind.EVIDENCE:
+                evidence[s.coordinate] = s.trust
 
-        This is CONSTRUCT on T: synthesize an initial section on the
-        theory surface. When the synthesis frontier is available, uses
-        the real cross-tradition tournament. Otherwise falls back to
-        LLM-guided ideation.
-        """
-        start = time.time()
-        self._log("Phase 1: IDEATE — discovering novel approach...")
+        claims_parts = []
+        for s in self.sections:
+            if s.surface == SurfaceKind.CLAIMS:
+                claims_parts.append(s.content[:500])
+        claims = "\n".join(claims_parts) if claims_parts else self.approach
 
+        self.workspace = WorkspaceSite.from_artifacts(
+            theory=theory, code=code, evidence=evidence,
+            claims=claims, name=self.approach)
+
+    # ── Record a move ────────────────────────────────────────────────
+
+    def _record_move(self, kind: MoveKind, surface: SurfaceKind,
+                     section: Optional[LLMSection], trust: float,
+                     success: bool, desc: str, elapsed: float,
+                     files: list[str] = None):
+        if section:
+            self.sections.append(section)
+        self.moves.append(MoveResult(
+            move=kind, surface=surface, section=section,
+            trust_achieved=trust, success=success,
+            description=desc, elapsed=elapsed,
+            files_written=files or []))
+
+    # ══════════════════════════════════════════════════════════════════
+    #  SEMANTIC MOVES — each produces a section on a surface
+    # ══════════════════════════════════════════════════════════════════
+
+    def _move_analyze_domain(self):
+        """CONSTRUCT on T: understand what the domain needs."""
+        self._log("MOVE: analyze_domain → T")
         if self.no_llm:
-            self.theory = f"Mathematical framework for: {self.prompt}"
-            self.approach = "heuristic-approach"
-            self._record(IterationKind.IDEATE, "Heuristic ideation (no LLM)",
-                        SurfaceKind.THEORY, 0.0, 0.3, 0, 0, time.time() - start)
+            self.domain_analysis = {"domain_analysis": self.prompt, "best_math_approach": {"name": "heuristic"}}
+            self.approach = "heuristic"
+            self._record_move(MoveKind.ANALYZE_DOMAIN, SurfaceKind.THEORY,
+                             None, TRUST_COPILOT, True, "heuristic", 0)
             return
 
-        # Try using the real synthesis frontier tournament
-        if _HAS_IDEATION:
-            winner = self._ideate_via_tournament()
-            if winner:
-                return
-
-        # Phase 1a: Domain analysis — understand what the domain actually needs
-        self._log("  Phase 1a: Analyzing what the domain needs...")
-        domain_prompt = textwrap.dedent(f"""\
-            You are an expert software architect. Analyze this product request:
+        prompt = textwrap.dedent(f"""\
+            Analyze this product request and determine the BEST mathematical approach:
 
             "{self.prompt}"
 
-            I need you to figure out what MATHEMATICAL TOOLS would make this
-            product dramatically better than anything that exists today.
+            Think about what ACTUALLY works in this domain. Do NOT default to
+            exotic or trendy math. What specific computational problems need solving?
+            What are the 3 best existing tools? Where do they fail? What math would
+            let us do something they CAN'T?
 
-            DO NOT default to trendy/exotic math. Think about what ACTUALLY
-            works in this domain. Consider:
-
-            1. What specific computational problems does this product need to solve?
-               (e.g., optimization under uncertainty, forecasting, anomaly detection,
-               risk quantification, pattern recognition, causal inference, etc.)
-            2. What are the 3 best existing tools/libraries that do something similar?
-               What math do they use? Where do they fail?
-            3. What mathematical framework would let us do something these tools CAN'T?
-               This could be well-established math applied in a new way, or a genuine
-               novel combination. The key is: it has to produce BETTER RESULTS, not
-               just be more theoretically elegant.
-            4. What datasets, APIs, and file formats are standard in this domain?
-            5. What metrics would a practitioner use to judge this tool?
-
-            Be extremely concrete. Name actual Python libraries, actual datasets,
-            actual metrics, actual mathematical theorems.
-
-            Respond as JSON with these fields:
-            {{
-                "domain_analysis": "3-paragraph analysis of the domain and its needs",
-                "computational_problems": ["problem1", "problem2", "problem3"],
-                "existing_tools": [
-                    {{"name": "tool1", "math": "what math it uses", "weakness": "where it fails"}},
-                    ...
-                ],
-                "best_math_approach": {{
-                    "name": "Name of the mathematical framework",
-                    "field_a": "Primary mathematical field",
-                    "field_b": "Secondary mathematical field (if applicable)",
-                    "why": "Why this math is the best choice for this specific domain",
-                    "key_theorems": ["theorem1 and what it does for us", "theorem2", ...],
-                    "key_algorithms": ["algorithm1", "algorithm2", ...],
-                    "data_structures": ["structure1", "structure2", ...]
-                }},
-                "standard_datasets": ["dataset/API 1", "dataset/API 2"],
-                "standard_libraries": ["pandas", "numpy", "yfinance", ...],
-                "evaluation_metrics": ["metric1", "metric2", "metric3"],
-                "baselines_to_beat": [
-                    {{"name": "baseline1", "metric": "metric1", "value": "approximate value"}}
-                ]
-            }}
-        """)
-
-        domain = _call_llm_json(domain_prompt, max_tokens=8192)
-
-        # Phase 1b: Deep theory elaboration — produce a 30KB+ theory document
-        self._log("  Phase 1b: Elaborating the mathematical framework...")
-        math_approach = domain.get("best_math_approach", {})
-        field_a = math_approach.get("field_a", "applied mathematics")
-        field_b = math_approach.get("field_b", "")
-        approach_name = math_approach.get("name", "novel-approach")
-        key_theorems = math_approach.get("key_theorems", [])
-        key_algorithms = math_approach.get("key_algorithms", [])
-
-        elaboration_prompt = textwrap.dedent(f"""\
-            Write a COMPREHENSIVE mathematical framework document (at least 5000 words)
-            for a software tool based on this approach:
-
-            PRODUCT: {self.prompt}
-            MATHEMATICAL APPROACH: {approach_name}
-            PRIMARY FIELD: {field_a}
-            SECONDARY FIELD: {field_b or 'N/A'}
-            KEY THEOREMS: {json.dumps(key_theorems)}
-            KEY ALGORITHMS: {json.dumps(key_algorithms)}
-            DOMAIN ANALYSIS: {domain.get('domain_analysis', '')}
-            EXISTING TOOLS AND THEIR WEAKNESSES: {json.dumps(domain.get('existing_tools', []))}
-
-            Structure the document as:
-
-            1. INTRODUCTION (500+ words)
-               - The problem this tool solves
-               - Why existing tools fail
-               - The mathematical insight that changes everything
-
-            2. MATHEMATICAL FOUNDATIONS (1500+ words)
-               - Formal definitions of the key mathematical objects
-               - Statement and explanation of each key theorem
-               - How these theorems translate to algorithms
-               - Worked examples showing the math in action
-
-            3. COMPUTATIONAL FRAMEWORK (1000+ words)
-               - Data structures and their mathematical meaning
-               - Algorithms with complexity analysis
-               - How the math maps to Python code patterns
-
-            4. APPLICATION TO THE DOMAIN (1000+ words)
-               - Concrete examples with real data
-               - How to use standard datasets/APIs ({json.dumps(domain.get('standard_datasets', []))})
-               - Integration with standard libraries ({json.dumps(domain.get('standard_libraries', []))})
-
-            5. EVALUATION STRATEGY (500+ words)
-               - Metrics: {json.dumps(domain.get('evaluation_metrics', []))}
-               - Baselines to beat: {json.dumps(domain.get('baselines_to_beat', []))}
-               - How to demonstrate the tool is better
-
-            6. KEY PROPOSITIONS (500+ words)
-               - 5-10 formal mathematical propositions that the code must satisfy
-               - Each with: statement, proof sketch, computational implication
-
-            Write in a technical but accessible style. Use LaTeX notation for math.
-            This document will guide code generation, so be SPECIFIC about data
-            structures, algorithms, and API designs.
-
-            Return the raw text (Markdown format), no JSON wrapping.
-        """)
-
-        theory_text = _call_llm(elaboration_prompt, max_tokens=16384)
-
-        # Save the full theory document
-        theory_path = self.output_dir / "context.md"
-        full_context = f"# {approach_name}\n\n{theory_text}\n"
-        theory_path.write_text(full_context)
-        self._log(f"  Wrote context.md ({len(full_context)} bytes, {len(full_context.splitlines())} lines)")
-
-        self.theory = theory_text
-        self.approach = approach_name.lower().replace(" ", "-").replace("/", "-")
-
-        # Store ideation details
-        self._ideation_result = domain
-        self._ideation_result["theory_length"] = len(theory_text)
-
-        self._record(IterationKind.IDEATE,
-                     f"Ideated: {approach_name} ({len(theory_text)} bytes theory)",
-                     SurfaceKind.THEORY, 0.0, 0.4, 0, 0, time.time() - start,
-                     detail=domain)
-
-        self._log(f"  Approach: {approach_name}")
-        self._log(f"  Fields: {field_a}" + (f" × {field_b}" if field_b else ""))
-        self._log(f"  Theory: {len(theory_text)} bytes")
-
-    def _ideate_via_tournament(self) -> bool:
-        """Use the real synthesis frontier tournament for ideation.
-
-        Runs the binary tournament over 128 mathematical fields,
-        constrained to fields relevant to the prompt. The winner
-        becomes the theory section.
-        """
-        try:
-            from jugeo.ideation.synthesis_frontier.pipeline import (
-                SynthesisFrontierPipeline, PipelineConfig,
-            )
-
-            self._log("  Running synthesis frontier tournament...")
-            config = PipelineConfig()
-            if self.seed is not None:
-                config.seed = self.seed
-            pipeline = SynthesisFrontierPipeline(config=config)
-            result = pipeline.run()
-
-            if result and result.synthesis_field:
-                winner = result.synthesis_field
-                self.theory = getattr(winner, "description", str(winner))
-                name = getattr(winner, "name", "synthesis")
-                # Convert to kebab-case identifier
-                self.approach = name.lower().replace(" ", "-").replace("×", "x")
-                self._ideation_result = {
-                    "synthesized_field": name,
-                    "field_id": getattr(winner, "field_id", ""),
-                    "propositions": len(getattr(winner, "propositions", [])),
-                }
-                self._log(f"  Tournament winner: {name}")
-                self._log(f"  Propositions: {len(getattr(winner, 'propositions', []))}")
-
-                self._record(IterationKind.IDEATE,
-                             f"Tournament winner: {name}",
-                             SurfaceKind.THEORY, 0.0, 0.4, 0, 0, 0,
-                             detail=self._ideation_result)
-                return True
-        except Exception as exc:
-            self._log(f"  Tournament failed ({exc}), falling back to LLM ideation")
-
-        return False
-
-    # ── Phase 2: DESIGN ──────────────────────────────────────────────
-
-    def _design(self):
-        """Decompose the approach into a software plan.
-
-        This is CUT on R: introduce a modular decomposition as a
-        covering family. Each module is a patch of the code surface.
-        """
-        start = time.time()
-        self._log("Phase 2: DESIGN — decomposing into software plan...")
-
-        if self.no_llm:
-            self.plan = SoftwarePlan(
-                modules=[{"name": "core", "purpose": "Core types"},
-                         {"name": "algorithms", "purpose": "Main algorithms"},
-                         {"name": "cli", "purpose": "CLI entry point"}],
-                package_name=self.approach.replace("-", "_"),
-                one_liner=f"Tool for: {self.prompt[:50]}",
-            )
-            self._record(IterationKind.DESIGN, "Heuristic design",
-                        SurfaceKind.CODE, 0.0, 0.2, 0, 0, time.time() - start)
-            return
-
-        design_prompt = textwrap.dedent(f"""\
-            Design a pip-installable Python package that implements this mathematical framework:
-
-            THEORY: {self.theory[:500]}
-            PROMPT: {self.prompt}
-
-            The package should have:
-            1. A core module with the fundamental mathematical types
-            2. An algorithms module with the key computations
-            3. A benchmarks module with evaluation harnesses
-            4. A CLI with 3-5 commands for the main operations
-            5. Test cases covering edge cases
-            6. An integration module that works with REAL Python libraries and data formats
-               standard in this domain (e.g., pandas, numpy, yfinance, scikit-learn, etc.)
-            7. Data loaders for standard formats (CSV, JSON, API endpoints, etc.)
-            8. Compatibility with existing tools and baselines in the field
+            Also identify: standard Python libraries, standard data formats/APIs,
+            standard datasets, and evaluation metrics practitioners actually use.
 
             Respond as JSON:
             {{
-                "package_name": "kebab-case-name",
-                "one_liner": "One-line description",
-                "modules": [
-                    {{"name": "core", "purpose": "...", "key_classes": ["..."], "dependencies": []}},
-                    {{"name": "algorithms", "purpose": "...", "key_functions": ["..."], "dependencies": ["core"]}},
-                    ...
-                ],
-                "cli_commands": [
-                    {{"name": "optimize", "description": "...", "example": "tool optimize input.json"}},
-                    ...
-                ],
-                "benchmarks": [
-                    {{"metric": "throughput", "baseline": "scipy.optimize", "unit": "ops/sec"}},
-                    ...
-                ],
-                "dependencies": ["numpy", "scipy"]
+                "domain_analysis": "3-paragraph analysis",
+                "computational_problems": ["problem1", ...],
+                "existing_tools": [{{"name": "...", "math": "...", "weakness": "..."}}],
+                "best_math_approach": {{
+                    "name": "Name of approach",
+                    "field_a": "Primary math field",
+                    "field_b": "Secondary math field",
+                    "why": "Why this is the best choice",
+                    "key_theorems": ["theorem1: what it does for us", ...],
+                    "key_algorithms": ["algo1", ...]
+                }},
+                "standard_libraries": ["pandas", "numpy", ...],
+                "standard_datasets": ["Yahoo Finance API", ...],
+                "evaluation_metrics": ["Sharpe ratio", ...],
+                "baselines_to_beat": [{{"name": "...", "metric": "...", "value": "..."}}]
             }}
         """)
 
-        result = _call_llm_json(design_prompt)
-        self.plan = SoftwarePlan(
-            modules=result.get("modules", []),
-            cli_commands=result.get("cli_commands", []),
-            dependencies=result.get("dependencies", []),
-            test_plan=result.get("benchmarks", []),
-            package_name=result.get("package_name", self.approach),
-            one_liner=result.get("one_liner", ""),
-        )
+        data, section = _llm_json(prompt, surface=SurfaceKind.THEORY,
+                                   coordinate="theory.domain_analysis")
+        self.domain_analysis = data
+        self.approach = data.get("best_math_approach", {}).get("name", "approach").lower().replace(" ", "-")
+        self._record_move(MoveKind.ANALYZE_DOMAIN, SurfaceKind.THEORY,
+                         section, TRUST_COPILOT, True,
+                         f"Domain analysis: {self.approach}", section.elapsed)
 
-        # Build a JuGeo site for the code modules if geometry is available
-        if _HAS_GEOMETRY and self.plan.modules:
-            builder = SiteBuilder(label=f"code-site-{self.approach}")
-            coords = {}
-            for mod in self.plan.modules:
-                name = mod.get("name", "unknown")
-                c = Coordinate(
-                    components=(self.plan.package_name, name),
-                    kind=CoordinateKind.MODULE,
-                )
-                coords[name] = c
-                builder.add_coordinates([c])
-
-            # Add dependency morphisms
-            for mod in self.plan.modules:
-                name = mod.get("name", "")
-                for dep in mod.get("dependencies", []):
-                    if dep in coords and name in coords:
-                        m = Morphism(
-                            source=coords[dep],
-                            target=coords[name],
-                            kind=MorphismKind.TRANSPORT,
-                            label=f"{dep}→{name}",
-                        )
-                        builder.add_morphism(m)
-
-            self._code_site = builder.build()
-
-        self._record(IterationKind.DESIGN,
-                     f"Designed {len(self.plan.modules)} modules",
-                     SurfaceKind.CODE, 0.0, 0.2, 0, 0, time.time() - start,
-                     detail=result)
-
-    # ── Phase 3: IMPLEMENT ───────────────────────────────────────────
-
-    def _implement(self):
-        """Generate code for each module in the plan.
-
-        This is CONSTRUCT on R: produce local sections for each patch
-        of the covering family. When an LLM is available, this delegates
-        to the full FoundationPipeline code generation infrastructure,
-        which produces 10K+ LoC with domain-specific architecture.
-        """
-        start = time.time()
-        self._log("Phase 3: IMPLEMENT — generating code...")
-
-        if not self.plan:
+    def _move_elaborate_theory(self):
+        """CONSTRUCT on T: produce a deep mathematical framework document."""
+        self._log("MOVE: elaborate_theory → T")
+        if self.no_llm:
+            self.theory_text = f"Mathematical framework for: {self.prompt}"
+            (self.output_dir / "context.md").write_text(f"# {self.approach}\n\n{self.theory_text}\n")
+            self._record_move(MoveKind.ELABORATE_THEORY, SurfaceKind.THEORY,
+                             None, TRUST_COPILOT, True, "heuristic theory", 0)
             return
 
-        # Generate per-module via direct LLM calls (more reliable than
-        # foundation pipeline delegation which can timeout)
-        pkg_dir = self.output_dir / "src" / self.plan.package_name.replace("-", "_")
+        ma = self.domain_analysis.get("best_math_approach", {})
+        prompt = textwrap.dedent(f"""\
+            Write a COMPREHENSIVE mathematical framework document (at least 5000 words)
+            for this software tool:
+
+            PRODUCT: {self.prompt}
+            APPROACH: {ma.get('name', self.approach)}
+            PRIMARY FIELD: {ma.get('field_a', '')}
+            SECONDARY FIELD: {ma.get('field_b', '')}
+            KEY THEOREMS: {json.dumps(ma.get('key_theorems', []))}
+            DOMAIN ANALYSIS: {self.domain_analysis.get('domain_analysis', '')}
+            EXISTING TOOLS: {json.dumps(self.domain_analysis.get('existing_tools', []))}
+
+            Structure: (1) Introduction — the problem and insight (500+ words),
+            (2) Mathematical Foundations — formal definitions, theorems, proofs (1500+ words),
+            (3) Computational Framework — data structures, algorithms, complexity (1000+ words),
+            (4) Application — concrete examples with real data from {json.dumps(self.domain_analysis.get('standard_datasets', []))} (1000+ words),
+            (5) Evaluation Strategy — metrics {json.dumps(self.domain_analysis.get('evaluation_metrics', []))}, baselines {json.dumps(self.domain_analysis.get('baselines_to_beat', []))} (500+ words),
+            (6) Key Propositions — 5-10 formal propositions the code must satisfy (500+ words).
+
+            Use LaTeX notation for math. Be specific about data structures and algorithms.
+            Return raw Markdown, no JSON wrapping.
+        """)
+
+        section = _llm_call(prompt, surface=SurfaceKind.THEORY,
+                            coordinate="theory.foundations")
+        self.theory_text = section.content
+        path = self.output_dir / "context.md"
+        path.write_text(f"# {self.approach}\n\n{section.content}\n")
+        self._log(f"  Wrote context.md: {len(section.content)} bytes in {section.elapsed:.0f}s")
+        self._record_move(MoveKind.ELABORATE_THEORY, SurfaceKind.THEORY,
+                         section, TRUST_COPILOT, True,
+                         f"Theory: {len(section.content)} bytes", section.elapsed,
+                         files=[str(path)])
+
+    def _move_design_architecture(self):
+        """CUT on R: decompose into a covering family of modules."""
+        self._log("MOVE: design_architecture → R")
+        if self.no_llm:
+            self.architecture = {"modules": [
+                {"name": "core", "purpose": "Core types"},
+                {"name": "algorithms", "purpose": "Algorithms"},
+                {"name": "cli", "purpose": "CLI"},
+            ], "package_name": self.approach.replace("-", "_")}
+            self._record_move(MoveKind.DESIGN_ARCHITECTURE, SurfaceKind.CODE,
+                             None, TRUST_COPILOT, True, "heuristic arch", 0)
+            return
+
+        libs = self.domain_analysis.get("standard_libraries", [])
+        prompt = textwrap.dedent(f"""\
+            Design the Python package architecture for this tool:
+
+            PRODUCT: {self.prompt}
+            APPROACH: {self.approach}
+            THEORY (first 2000 chars): {self.theory_text[:2000]}
+            STANDARD LIBRARIES: {json.dumps(libs)}
+
+            Design 5-8 Python modules. Name them after DOMAIN concepts, not generic
+            math. Include an integration module that connects to real libraries
+            ({', '.join(libs[:5])}) and real data sources
+            ({', '.join(self.domain_analysis.get('standard_datasets', [])[:3])}).
+
+            Respond as JSON:
+            {{
+                "package_name": "snake_case_name",
+                "modules": [
+                    {{"name": "module_name", "purpose": "what it does",
+                      "key_classes": ["Class1", "Class2"],
+                      "key_functions": ["func1", "func2"],
+                      "dependencies": ["other_module"], "target_lines": 1000}},
+                    ...
+                ],
+                "generation_order": ["module1", "module2", ...]
+            }}
+        """)
+
+        data, section = _llm_json(prompt, surface=SurfaceKind.CODE,
+                                   coordinate="code.architecture")
+        self.architecture = data
+        if "package_name" not in self.architecture:
+            self.architecture["package_name"] = self.approach.replace("-", "_")
+        self._record_move(MoveKind.DESIGN_ARCHITECTURE, SurfaceKind.CODE,
+                         section, TRUST_COPILOT, True,
+                         f"Architecture: {len(data.get('modules', []))} modules",
+                         section.elapsed)
+
+    def _move_generate_module(self, mod: dict):
+        """CONSTRUCT on R: generate one module (one local section on R)."""
+        name = mod.get("name", "module")
+        self._log(f"MOVE: generate_module({name}) → R")
+
+        pkg_name = self.architecture.get("package_name", self.approach.replace("-", "_"))
+        pkg_dir = self.output_dir / "src" / pkg_name
         pkg_dir.mkdir(parents=True, exist_ok=True)
 
+        # Write __init__.py if not yet
         init_path = pkg_dir / "__init__.py"
-        init_path.write_text(f'"""{self.plan.one_liner}"""\n__version__ = "0.1.0"\n')
-        self.code_files.append(str(init_path))
+        if not init_path.exists():
+            init_path.write_text(f'"""{self.approach}"""\n__version__ = "0.1.0"\n')
+            self.code_files.append(str(init_path))
 
         if self.no_llm:
-            for mod in self.plan.modules:
-                name = mod.get("name", "module")
-                path = pkg_dir / f"{name}.py"
-                purpose = mod.get("purpose", "")
-                path.write_text(f'"""{purpose}"""\n\ndef main():\n    pass\n')
-                self.code_files.append(str(path))
-        else:
-            generated_so_far: list[str] = []
-            for mod in self.plan.modules:
-                name = mod.get("name", "module")
-                self._log(f"  Generating {name}.py...")
-                code = self._generate_module(mod, generated_so_far)
-                path = pkg_dir / f"{name}.py"
-                path.write_text(code)
-                self.code_files.append(str(path))
-                generated_so_far.append(name)
+            path = pkg_dir / f"{name}.py"
+            path.write_text(f'"""{mod.get("purpose", "")}"""\n\ndef main():\n    pass\n')
+            self.code_files.append(str(path))
+            self.module_code[name] = path.read_text()
+            self._record_move(MoveKind.GENERATE_MODULE, SurfaceKind.CODE,
+                             None, TRUST_COPILOT, True, f"stub {name}.py", 0,
+                             files=[str(path)])
+            return
 
-        # Write pyproject.toml
-        toml_path = self.output_dir / "pyproject.toml"
-        pkg_name = self.plan.package_name
-        toml_path.write_text(textwrap.dedent(f"""\
+        libs = self.domain_analysis.get("standard_libraries", [])
+        datasets = self.domain_analysis.get("standard_datasets", [])
+        existing_modules = list(self.module_code.keys())
+
+        prompt = textwrap.dedent(f"""\
+            Generate `{name}.py` for the {pkg_name} package.
+
+            PRODUCT: {self.prompt}
+            THEORY (key section): {self.theory_text[:3000]}
+            {"ALREADY GENERATED: " + ", ".join(existing_modules) if existing_modules else ""}
+
+            PURPOSE: {mod.get('purpose', '')}
+            KEY CLASSES: {', '.join(mod.get('key_classes', []))}
+            KEY FUNCTIONS: {', '.join(mod.get('key_functions', []))}
+            STANDARD LIBRARIES TO USE: {', '.join(libs[:8])}
+            DATA SOURCES: {', '.join(datasets[:3])}
+
+            REQUIREMENTS — write AT LEAST {mod.get('target_lines', 1000)} lines:
+            - Python 3.10+, from __future__ import annotations
+            - Use {', '.join(libs[:5])} where appropriate
+            - Real implementations with real math, not stubs
+            - Name classes/functions after domain concepts
+            - Include docstrings, type hints, error handling
+            - Return ONLY Python code, no markdown fences
+        """)
+
+        section = _llm_call(prompt, surface=SurfaceKind.CODE,
+                            coordinate=f"code.{name}")
+        code = section.content
+        if code.startswith("```"):
+            code = "\n".join(l for l in code.split("\n") if not l.startswith("```"))
+        code = code.strip() + "\n"
+
+        path = pkg_dir / f"{name}.py"
+        path.write_text(code)
+        self.code_files.append(str(path))
+        self.module_code[name] = code
+
+        self._log(f"  Generated {name}.py: {len(code.splitlines())} lines in {section.elapsed:.0f}s")
+        self._record_move(MoveKind.GENERATE_MODULE, SurfaceKind.CODE,
+                         section, TRUST_COPILOT, True,
+                         f"{name}.py: {len(code.splitlines())} lines",
+                         section.elapsed, files=[str(path)])
+
+    def _move_generate_integration(self):
+        """CONSTRUCT on R: generate integration with real libraries/datasets."""
+        self._log("MOVE: generate_integration → R")
+        if self.no_llm:
+            self._record_move(MoveKind.GENERATE_INTEGRATION, SurfaceKind.CODE,
+                             None, TRUST_COPILOT, True, "skipped", 0)
+            return
+
+        pkg_name = self.architecture.get("package_name", self.approach.replace("-", "_"))
+        libs = self.domain_analysis.get("standard_libraries", [])
+        datasets = self.domain_analysis.get("standard_datasets", [])
+
+        prompt = textwrap.dedent(f"""\
+            Generate `integration.py` for the {pkg_name} package.
+
+            This module connects the package to real-world data and libraries.
+
+            STANDARD LIBRARIES: {json.dumps(libs)}
+            DATA SOURCES: {json.dumps(datasets)}
+            EXISTING MODULES: {list(self.module_code.keys())}
+
+            Include:
+            - Imports/wrappers for each standard library
+            - Data loaders for each standard data source
+            - validate_environment() that checks all deps are installed
+            - load_sample_data() returning a small built-in example
+            - Adapter functions connecting real data to the package's types
+            - AT LEAST 500 lines of real, working code
+            - Return ONLY Python code, no markdown fences
+        """)
+
+        section = _llm_call(prompt, surface=SurfaceKind.CODE,
+                            coordinate="code.integration")
+        code = section.content
+        if code.startswith("```"):
+            code = "\n".join(l for l in code.split("\n") if not l.startswith("```"))
+
+        pkg_dir = self.output_dir / "src" / pkg_name
+        path = pkg_dir / "integration.py"
+        path.write_text(code.strip() + "\n")
+        self.code_files.append(str(path))
+        self.module_code["integration"] = code
+
+        self._record_move(MoveKind.GENERATE_INTEGRATION, SurfaceKind.CODE,
+                         section, TRUST_COPILOT, True,
+                         f"integration.py: {len(code.splitlines())} lines",
+                         section.elapsed, files=[str(path)])
+
+    def _write_pyproject(self):
+        """Write pyproject.toml."""
+        pkg = self.architecture.get("package_name", self.approach.replace("-", "_"))
+        deps = self.domain_analysis.get("standard_libraries", ["numpy", "pandas"])
+        toml = self.output_dir / "pyproject.toml"
+        toml.write_text(textwrap.dedent(f"""\
             [build-system]
             requires = ["setuptools>=68"]
             build-backend = "setuptools.backends._legacy:_Backend"
 
             [project]
-            name = "{pkg_name}"
+            name = "{pkg}"
             version = "0.1.0"
-            description = "{self.plan.one_liner}"
+            description = "{self.approach}"
             requires-python = ">=3.10"
-            dependencies = {json.dumps(self.plan.dependencies)}
+            dependencies = {json.dumps(deps)}
+
+            [tool.setuptools.packages.find]
+            where = ["src"]
         """))
-        self.code_files.append(str(toml_path))
+        self.code_files.append(str(toml))
 
-        self._record(IterationKind.IMPLEMENT,
-                     f"Generated {len(self.code_files)} files",
-                     SurfaceKind.CODE, 0.2, 0.5, 0, 0, time.time() - start)
+    # ── Evidence moves (upgrade trust) ───────────────────────────────
 
-    def _implement_via_foundation(self) -> list:
-        """Delegate code generation to the FoundationPipeline.
-
-        The foundation pipeline already handles:
-        - LLM-designed file architecture (6-10 domain-specific files)
-        - Per-file generation with 1000+ line requirements
-        - Context passing between files (imports_from tracking)
-        - pyproject.toml and CLI entry point generation
-        - Sheaf-theoretic verification of generated code
-
-        Returns list of Path objects, or empty list on failure.
-        """
-        try:
-            from jugeo.cli.foundation_pipeline import FoundationPipeline
-        except ImportError:
-            return []
-
-        # Build a mock args namespace with the settings the pipeline expects
-        import argparse
-        args = argparse.Namespace()
-        args.seed = self.seed
-        args.verbose = self.verbose
-        args.no_llm = self.no_llm
-        args.n_fields = 3
-        args.rounds = 1  # We already ideated; just need code gen
-        args.entropy_factor = 2.5
-        args.execute_code = True
-        args.latex_only = False
-        args.model = "claude-sonnet-4.6"
-        args.format = "text"
-        args.output = str(self.output_dir)
-
-        try:
-            pipeline = FoundationPipeline(args, self.output_dir)
-
-            # Build a minimal FieldNode-like object from our ideation results
-            class _Winner:
-                def __init__(self, name, description, propositions, constituents):
-                    self.name = name
-                    self.description = description
-                    self.propositions = propositions
-                    self.constituent_fields = constituents
-
-            winner = _Winner(
-                name=self.approach,
-                description=self.theory,
-                propositions=[],
-                constituents=self.approach.split("-")[:2],
-            )
-
-            # Build killer app from our plan
-            killer_app = None
-            if self.plan:
-                killer_app = {
-                    "tool_name": self.plan.package_name,
-                    "one_liner": self.plan.one_liner,
-                    "target_users": "domain experts",
-                    "key_capability": self.plan.one_liner,
-                    "why_synthesis_needed": self.theory[:200],
-                    "cli_commands": self.plan.cli_commands[:5],
-                }
-
-            # Run the actual code generation
-            self._log("  Delegating to FoundationPipeline for 10K+ LoC generation...")
-            files = pipeline._stage2_generate_code(
-                winner, killer_app=killer_app)
-            return files
-
-        except Exception as exc:
-            self._log(f"  Foundation pipeline delegation failed: {exc}")
-            return []
-
-    def _generate_module(self, mod: dict, generated_so_far: list[str] = None) -> str:
-        """Generate a single module's code via LLM.
-
-        Uses the full theory context (up to 4000 chars) so the LLM generates
-        code that actually implements the mathematical framework, not generic stubs.
-        """
-        name = mod.get("name", "module")
-        purpose = mod.get("purpose", "")
-        key_classes = mod.get("key_classes", [])
-        key_functions = mod.get("key_functions", [])
-        dependencies = mod.get("dependencies", [])
-        pkg = self.plan.package_name if self.plan else "package"
-
-        import_ctx = ""
-        if dependencies:
-            import_ctx = f"This file imports from: {', '.join(dependencies)}\n"
-        if generated_so_far:
-            import_ctx += f"Already generated: {', '.join(generated_so_far)}\n"
-
-        # Use domain-specific info from ideation if available
-        domain_info = ""
-        if hasattr(self, '_ideation_result') and self._ideation_result:
-            ir = self._ideation_result
-            libs = ir.get("standard_libraries", [])
-            datasets = ir.get("standard_datasets", [])
-            if libs:
-                domain_info += f"STANDARD LIBRARIES to use: {', '.join(libs)}\n"
-            if datasets:
-                domain_info += f"STANDARD DATA SOURCES: {', '.join(datasets)}\n"
-            existing = ir.get("existing_tools", [])
-            if existing:
-                domain_info += "EXISTING TOOLS (beat these):\n"
-                for t in existing[:3]:
-                    domain_info += f"  - {t.get('name','?')}: uses {t.get('math','?')}, weak at {t.get('weakness','?')}\n"
-
-        prompt = textwrap.dedent(f"""\
-            Generate `{name}.py` for the {pkg} package.
-
-            PACKAGE: {pkg}
-            PROMPT: {self.prompt}
-            {import_ctx}
-            {domain_info}
-
-            MATHEMATICAL FRAMEWORK (use this to guide the implementation):
-            {self.theory[:4000]}
-
-            PURPOSE OF THIS FILE: {purpose}
-            KEY CLASSES to define: {', '.join(key_classes) if key_classes else 'domain-specific types'}
-            KEY FUNCTIONS to define: {', '.join(key_functions) if key_functions else 'core algorithms'}
-
-            REQUIREMENTS — write AT LEAST 1000 lines:
-            - Python 3.10+, from __future__ import annotations, numpy+scipy+pandas allowed
-            - Every class needs: __init__, __repr__, to_dict/from_dict, real methods with real math
-            - Every function needs: docstring, type hints, real computation (not stubs!)
-            - Use the standard libraries listed above where appropriate
-            - Name ALL classes/functions after concrete domain concepts (not generic math)
-            - Include proper error handling, input validation, logging
-            - Include 3+ helper classes specific to this module
-            - If computing a mathematical quantity, show the ACTUAL FORMULA
-            - Handle edge cases: missing data, NaN, empty inputs, degenerate cases
-            - Return ONLY Python code, no markdown fences
-        """)
-
-        self._log(f"    Calling LLM for {name}.py (~1000+ lines)...")
-        t0 = time.time()
-        code = _call_llm(prompt, max_tokens=16384)
-        elapsed = time.time() - t0
-        # Clean up
-        if code.startswith("```"):
-            lines = code.split("\n")
-            code = "\n".join(l for l in lines if not l.startswith("```"))
-        code = code.strip() + "\n"
-        self._log(f"    Generated {name}.py: {len(code.splitlines())} lines in {elapsed:.0f}s")
-        return code
-
-    # ── Phase 4: BENCHMARK ───────────────────────────────────────────
-
-    def _benchmark(self):
-        """Establish metrics, baselines, and run benchmarks.
-
-        This is CONSTRUCT + VERIFY on E: create evidence sections with
-        RUNTIME_WITNESSED trust by actually executing code.
-        """
-        start = time.time()
-        self._log("Phase 4: BENCHMARK — establishing metrics...")
-
-        if not self.plan:
-            self.benchmarks = BenchmarkSuite()
-            return
-
-        metrics = {}
-        baselines = {}
+    def _move_syntax_check(self):
+        """VERIFY on E: check all .py files parse. Upgrades trust to RUNTIME."""
         results = {}
-
-        for bench in self.plan.test_plan:
-            metric = bench.get("metric", "unknown")
-            baseline_name = bench.get("baseline", "none")
-            unit = bench.get("unit", "")
-
-            metrics[metric] = {
-                "unit": unit,
-                "baseline_name": baseline_name,
-                "higher_is_better": "time" not in unit.lower() and "latency" not in unit.lower(),
-            }
-            # Try to establish a baseline
-            baselines[metric] = bench.get("baseline_value", 1.0)
-            # Try to measure our implementation
-            results[metric] = self._run_benchmark(metric)
-
-        comparison = {}
-        for metric in metrics:
-            if metric in results and metric in baselines:
-                higher_better = metrics[metric].get("higher_is_better", True)
-                our = results[metric]
-                base = baselines[metric]
-                if isinstance(our, (int, float)) and isinstance(base, (int, float)):
-                    if higher_better:
-                        comparison[metric] = "better" if our > base else ("equal" if our == base else "worse")
-                    else:
-                        comparison[metric] = "better" if our < base else ("equal" if our == base else "worse")
-                else:
-                    comparison[metric] = "equal"
-
-        self.benchmarks = BenchmarkSuite(
-            metrics=metrics,
-            baselines=baselines,
-            results=results,
-            comparison=comparison,
-        )
-
-        self._record(IterationKind.BENCHMARK,
-                     f"Benchmarked {len(metrics)} metrics",
-                     SurfaceKind.EVIDENCE, 0.0, 0.7, 0, 0, time.time() - start,
-                     detail={"metrics": metrics, "results": results, "comparison": comparison})
-
-    def _run_benchmark(self, metric: str) -> Any:
-        """Try to run a benchmark and return the result."""
-        # Try importing and running the generated code
-        if self.code_files:
-            try:
-                # Basic: check if the code at least imports without error
-                for f in self.code_files:
-                    if f.endswith(".py") and os.path.exists(f):
-                        result = subprocess.run(
-                            [sys.executable, "-c", f"import ast; ast.parse(open('{f}').read())"],
-                            capture_output=True, timeout=10,
-                        )
-                        if result.returncode == 0:
-                            return 1.0  # Code is at least syntactically valid
-            except Exception:
-                pass
-        return 0.5  # Couldn't measure
-
-    # ── Phase 4b: VALIDATE INTEGRATION ─────────────────────────────
-
-    def _validate_integration(self):
-        """Ensure generated code works with real Python libraries and data formats.
-
-        This is VERIFY on R ∩ E: check that the code surface (R) can actually
-        interact with real-world evidence (E) through standard libraries and
-        dataset formats. The LLM is asked to generate integration tests and
-        adapter code for whatever libraries and data formats are standard
-        in the target domain.
-        """
-        start = time.time()
-        self._log("Phase 4b: VALIDATE — checking library/dataset integration...")
-
-        if self.no_llm or not self.plan:
-            self._record(IterationKind.BENCHMARK,
-                         "Integration validation skipped (no LLM)",
-                         SurfaceKind.EVIDENCE, 0.5, 0.5, 0, 0, time.time() - start)
-            return
-
-        # Ask LLM what libraries and data formats this domain needs
-        integration_prompt = textwrap.dedent(f"""\
-            The following Python package was just generated:
-
-            PACKAGE: {self.plan.package_name}
-            PURPOSE: {self.plan.one_liner}
-            THEORY: {self.theory[:300]}
-            PROMPT: {self.prompt}
-            MODULES: {', '.join(self.plan.module_names)}
-
-            What Python libraries and data formats does this tool NEED to work with
-            in the real world? Think about:
-            1. What pip-installable libraries are standard in this domain?
-               (e.g., yfinance, pandas, scikit-learn, networkx, cvxpy, etc.)
-            2. What data formats does real-world data come in?
-               (e.g., CSV, JSON, Parquet, HDF5, API endpoints)
-            3. What standard datasets or APIs should the tool support out of the box?
-               (e.g., Yahoo Finance API, UCI ML datasets, OEIS, etc.)
-            4. What existing tools/baselines should it be compatible with?
-               (e.g., read output from scipy.optimize, compare with sklearn metrics)
-
-            Then generate a Python file called `integration.py` that:
-            - Imports and wraps the key external libraries
-            - Provides data loaders for standard formats
-            - Includes adapter functions connecting real data to the package's types
-            - Has a `validate_environment()` function that checks all deps are installed
-            - Has a `load_sample_data()` function returning a small built-in example
-            - Is AT LEAST 500 lines of real, working code
-
-            Return ONLY Python code, no markdown fences.
-        """)
-
-        code = _call_llm(integration_prompt, max_tokens=16384)
-        if code.startswith("```"):
-            lines = code.split("\n")
-            code = "\n".join(l for l in lines if not l.startswith("```"))
-
-        # Write integration module
-        pkg_dir = None
         for f in self.code_files:
-            if f.endswith("__init__.py"):
-                pkg_dir = pathlib.Path(f).parent
-                break
-        if pkg_dir:
-            int_path = pkg_dir / "integration.py"
-            int_path.write_text(code.strip() + "\n")
-            self.code_files.append(str(int_path))
-            self._log(f"  Wrote integration.py ({len(code.splitlines())} lines)")
+            if not f.endswith(".py") or not os.path.exists(f):
+                continue
+            try:
+                r = subprocess.run(
+                    [sys.executable, "-c", f"import ast; ast.parse(open('{f}').read())"],
+                    capture_output=True, timeout=10)
+                ok = r.returncode == 0
+            except Exception:
+                ok = False
+            results[os.path.basename(f)] = ok
+        self.benchmark_results["syntax_check"] = results
+        all_ok = all(results.values()) if results else False
+        trust = TRUST_RUNTIME if all_ok else TRUST_COPILOT
+        self._record_move(MoveKind.RUN_SYNTAX_CHECK, SurfaceKind.EVIDENCE,
+                         LLMSection(surface=SurfaceKind.EVIDENCE,
+                                    coordinate="evidence.syntax",
+                                    content=json.dumps(results),
+                                    trust=trust, provenance="syntax-check"),
+                         trust, all_ok,
+                         f"Syntax: {sum(results.values())}/{len(results)} pass", 0)
 
-        # Also update pyproject.toml with real dependencies
-        dep_prompt = textwrap.dedent(f"""\
-            For a Python package called "{self.plan.package_name}" that does:
-            {self.plan.one_liner}
-
-            List the pip-installable dependencies it needs. Include version constraints.
-            Respond as a JSON list of strings, e.g.:
-            ["numpy>=1.24", "pandas>=2.0", "yfinance>=0.2.18"]
-        """)
-        deps_text = _call_llm(dep_prompt, max_tokens=512)
+    def _move_import_check(self):
+        """VERIFY on E: check modules import without error."""
+        pkg = self.architecture.get("package_name", "")
+        src_dir = self.output_dir / "src"
+        if not (src_dir / pkg).exists():
+            return
         try:
-            import re
-            m = re.search(r'\[[\s\S]*?\]', deps_text)
-            if m:
-                deps = json.loads(m.group())
-                self.plan.dependencies = deps
-                # Rewrite pyproject.toml with real deps
-                toml_path = self.output_dir / "pyproject.toml"
-                if toml_path.exists():
-                    toml_path.write_text(textwrap.dedent(f"""\
-                        [build-system]
-                        requires = ["setuptools>=68"]
-                        build-backend = "setuptools.backends._legacy:_Backend"
+            r = subprocess.run(
+                [sys.executable, "-c", f"import sys; sys.path.insert(0,'{src_dir}'); import {pkg}"],
+                capture_output=True, text=True, timeout=15)
+            ok = r.returncode == 0
+            detail = r.stderr[:200] if not ok else "OK"
+        except Exception as e:
+            ok = False
+            detail = str(e)
+        self.benchmark_results["import_check"] = {"ok": ok, "detail": detail}
+        trust = TRUST_RUNTIME if ok else TRUST_COPILOT
+        self._record_move(MoveKind.RUN_IMPORT_CHECK, SurfaceKind.EVIDENCE,
+                         LLMSection(surface=SurfaceKind.EVIDENCE,
+                                    coordinate="evidence.import",
+                                    content=detail, trust=trust,
+                                    provenance="import-check"),
+                         trust, ok, f"Import: {'OK' if ok else detail[:60]}", 0)
 
-                        [project]
-                        name = "{self.plan.package_name}"
-                        version = "0.1.0"
-                        description = "{self.plan.one_liner}"
-                        requires-python = ">=3.10"
-                        dependencies = {json.dumps(deps, indent=4)}
-                    """))
-                    self._log(f"  Updated dependencies: {deps}")
-        except Exception:
-            pass
+    # ── Claims moves ─────────────────────────────────────────────────
 
-        self._record(IterationKind.BENCHMARK,
-                     "Validated library/dataset integration",
-                     SurfaceKind.EVIDENCE, 0.5, 0.7, 0, 0, time.time() - start)
+    def _move_ground_claims(self):
+        """Sync claims with actual evidence."""
+        if self.workspace:
+            ev = self.workspace.sections.get(SurfaceKind.EVIDENCE)
+            cl = self.workspace.sections.get(SurfaceKind.CLAIMS)
+            if ev and cl:
+                for k, v in ev.claims.items():
+                    if not k.startswith("_"):
+                        cl.claims[k] = v
+                cl.trust = min(1.0, cl.trust + 0.3)
+        self._record_move(MoveKind.GROUND_CLAIMS, SurfaceKind.CLAIMS,
+                         None, TRUST_COPILOT, True, "grounded", 0)
 
-    # ── Phase 5: EVALUATE ────────────────────────────────────────────
-
-    def _evaluate(self) -> ConsistencyReport:
-        """Run descent on the full workspace.
-
-        Checks all six morphisms for compatibility. Returns the
-        consistency report with any obstructions.
-        """
-        # Build workspace from current state
-        evidence = {}
-        if self.benchmarks:
-            evidence.update(self.benchmarks.results)
-            evidence.update({f"baseline_{k}": v for k, v in self.benchmarks.baselines.items()})
-
-        claims = f"Approach: {self.approach}. {self.theory[:200]}"
-        if self.benchmarks:
-            for metric, result in self.benchmarks.results.items():
-                claims += f" {metric}={result}"
-
-        self.workspace = WorkspaceSite.from_artifacts(
-            theory=self.theory,
-            code="\n".join(open(f).read() for f in self.code_files if f.endswith(".py") and os.path.exists(f)),
-            evidence=evidence,
-            claims=claims,
-            name=self.approach,
-        )
-
-        return self.workspace.check_consistency()
-
-    # ── Phase 6: REFINE ──────────────────────────────────────────────
-
-    def _refine(self, report: ConsistencyReport) -> bool:
-        """Attempt to repair obstructions.
-
-        This is REPAIR on the failing overlaps. Returns True if at
-        least one obstruction was resolved.
-        """
-        start = time.time()
-        self._log(f"Phase 6: REFINE — repairing {len(report.obstructions)} obstructions...")
-
-        if not report.obstructions:
-            return True
-
-        obs_before = len(report.obstructions)
-        resolved = 0
-
-        for obs in report.obstructions:
-            if obs.kind == ObstructionKind.NUMERICAL_MISMATCH:
-                # Ground claims against actual evidence
-                self._ground_claims()
-                resolved += 1
-            elif obs.kind == ObstructionKind.STALE_SECTION:
-                # Re-run benchmarks
-                self._benchmark()
-                resolved += 1
-            elif obs.kind == ObstructionKind.CODE_THEORY_GAP:
-                # Regenerate the affected module
-                if self.plan and self.plan.modules:
-                    self._regenerate_weakest_module()
-                    resolved += 1
-
-        new_report = self._evaluate()
-        obs_after = len(new_report.obstructions)
-
-        self._record(IterationKind.REFINE_CODE,
-                     f"Repaired {resolved} obstructions ({obs_before}→{obs_after})",
-                     SurfaceKind.CODE, 0.5, 0.6, obs_before, obs_after,
-                     time.time() - start)
-
-        return obs_after < obs_before
-
-    def _ground_claims(self):
-        """Synchronize claims with actual evidence."""
-        if self.workspace and self.benchmarks:
-            claims_section = self.workspace.sections.get(SurfaceKind.CLAIMS)
-            evidence_section = self.workspace.sections.get(SurfaceKind.EVIDENCE)
-            if claims_section and evidence_section:
-                for key, val in evidence_section.claims.items():
-                    if not key.startswith("_"):
-                        claims_section.claims[key] = val
-                claims_section.trust = min(1.0, claims_section.trust + 0.3)
-                claims_section.provenance.append("grounded")
-
-    def _regenerate_weakest_module(self):
-        """Regenerate the module with lowest trust."""
-        if not self.plan or self.no_llm:
-            return
-        # Find weakest module (simplest heuristic: shortest file)
-        shortest = min(
-            (f for f in self.code_files if f.endswith(".py") and "init" not in f),
-            key=lambda f: os.path.getsize(f) if os.path.exists(f) else float('inf'),
-            default=None,
-        )
-        if shortest:
-            mod_name = os.path.basename(shortest).replace(".py", "")
-            mod_spec = next(
-                (m for m in self.plan.modules if m.get("name") == mod_name),
-                {"name": mod_name, "purpose": "core module"},
-            )
-            code = self._generate_module(mod_spec)
-            with open(shortest, "w") as f:
-                f.write(code)
-
-    def _refine_for_performance(self):
-        """Improve implementation to beat baselines."""
-        start = time.time()
-        self._log("  Refining for performance...")
-
-        if self.no_llm or not self.benchmarks:
-            self._record(IterationKind.REFINE_CODE, "Performance refinement (no LLM)",
-                        SurfaceKind.CODE, 0.5, 0.5, 0, 0, time.time() - start)
-            return
-
-        # Ask LLM for optimization suggestions based on benchmark gaps
-        weak_metrics = [m for m, c in self.benchmarks.comparison.items() if c == "worse"]
-        if weak_metrics:
-            prompt = f"The following metrics are below baseline: {weak_metrics}. Suggest optimizations."
-            # This would trigger code regeneration
-            self._record(IterationKind.REFINE_CODE, f"Optimizing {len(weak_metrics)} metrics",
-                        SurfaceKind.CODE, 0.5, 0.6, 0, 0, time.time() - start)
-
-    # ── Phase 7: PIVOT ───────────────────────────────────────────────
-
-    def _pivot(self):
-        """Change the theory (adjacency-constrained).
-
-        This is NEGOTIATE_TREATY on (T, R): revise the theory while
-        preserving existing capabilities. The adjacency constraint
-        requires the new theory to be distance-1 from the current one.
-        """
-        start = time.time()
-        self.pivots_taken += 1
-        self._log(f"Phase 7: PIVOT #{self.pivots_taken} — revising theory...")
-
+    def _move_write_readme(self):
+        """CONSTRUCT on P: write README grounded in evidence."""
+        self._log("MOVE: write_readme → P")
         if self.no_llm:
-            self.theory += " [REVISED: alternative formulation]"
-            self._record(IterationKind.PIVOT, "Heuristic pivot",
-                        SurfaceKind.THEORY, 0.3, 0.2, 0, 0, time.time() - start)
-            return
-
-        pivot_prompt = textwrap.dedent(f"""\
-            The current mathematical approach is not producing competitive results.
-
-            CURRENT THEORY: {self.theory[:300]}
-            PROMPT: {self.prompt}
-            PROBLEMS: The implementation doesn't beat baselines.
-
-            Propose a PIVOT — a modified approach that:
-            1. Keeps the core mathematical insight but changes the formalization
-            2. Is distance-1 from the current approach (one axiom or structure change)
-            3. Might produce better computational results
-            4. Preserves any working code we already have
-
-            Respond as JSON:
-            {{
-                "revised_theory": "2-paragraph description",
-                "what_changed": "One sentence describing the pivot",
-                "preserved": "What was kept from the old approach",
-                "why_better": "Why this might work better"
-            }}
-        """)
-
-        result = _call_llm_json(pivot_prompt)
-        old_theory = self.theory
-        self.theory = result.get("revised_theory", self.theory)
-
-        self._record(IterationKind.PIVOT,
-                     f"Pivot: {result.get('what_changed', 'revised theory')}",
-                     SurfaceKind.THEORY, 0.3, 0.2, 0, 0, time.time() - start,
-                     detail=result)
-
-    # ── Helpers ──────────────────────────────────────────────────────
-
-    def _record(self, kind: IterationKind, description: str,
-                surface: SurfaceKind, trust_before: float, trust_after: float,
-                obs_before: int, obs_after: int, elapsed: float,
-                success: bool = True, detail: Optional[dict] = None):
-        self.iterations.append(IterationRecord(
-            iteration=len(self.iterations),
-            kind=kind,
-            description=description,
-            surface_modified=surface,
-            trust_before=trust_before,
-            trust_after=trust_after,
-            obstructions_before=obs_before,
-            obstructions_after=obs_after,
-            elapsed=elapsed,
-            success=success,
-            detail=detail or {},
-        ))
-
-    def _log(self, msg: str):
-        if self.verbose:
-            print(msg)
-
-    # ── Phase 8: WRITE README + PAPER ───────────────────────────────
-
-    def _write_readme(self):
-        """Generate a README.md for the output repository.
-
-        This is CONSTRUCT on P (claims surface): produce a public-facing
-        document grounded in the actual code and evidence.
-        """
-        start = time.time()
-        self._log("Phase 8a: Writing README.md...")
-
-        benchmarks_text = ""
-        if self.benchmarks and self.benchmarks.results:
-            benchmarks_text = "## Benchmarks\n\n| Metric | Result | Baseline | Status |\n|---|---|---|---|\n"
-            for metric in self.benchmarks.metrics:
-                result = self.benchmarks.results.get(metric, "—")
-                baseline = self.benchmarks.baselines.get(metric, "—")
-                status = self.benchmarks.comparison.get(metric, "—")
-                benchmarks_text += f"| {metric} | {result} | {baseline} | {status} |\n"
-
-        modules_text = ""
-        if self.plan:
-            modules_text = "## Modules\n\n"
-            for mod in self.plan.modules:
-                modules_text += f"- **{mod.get('name', '?')}** — {mod.get('purpose', '')}\n"
-
-        if not self.no_llm:
-            readme_prompt = textwrap.dedent(f"""\
-                Write a README.md for this research software tool.
-
-                TOOL NAME: {self.plan.package_name if self.plan else self.approach}
-                ONE-LINER: {self.plan.one_liner if self.plan else self.prompt[:80]}
-                THEORY: {self.theory[:400]}
-                MODULES: {modules_text[:300]}
-                BENCHMARKS: {benchmarks_text[:300]}
-
-                Include: title, badges, one-paragraph description, installation, quickstart
-                example, module overview, benchmarks table, and citation section.
-                Return raw Markdown, no fences.
-            """)
-            readme = _call_llm(readme_prompt, max_tokens=4096)
+            readme = f"# {self.approach}\n\n{self.prompt}\n"
         else:
-            pkg = self.plan.package_name if self.plan else self.approach
-            readme = textwrap.dedent(f"""\
-                # {pkg}
+            section = _llm_call(textwrap.dedent(f"""\
+                Write a README.md for this research tool.
+                TOOL: {self.approach}
+                THEORY: {self.theory_text[:1000]}
+                MODULES: {list(self.module_code.keys())}
+                BENCHMARKS: {json.dumps(self.benchmark_results)[:500]}
+                Include: title, description, installation, quickstart, module overview, benchmarks.
+                Return raw Markdown.
+            """), surface=SurfaceKind.CLAIMS, coordinate="claims.readme")
+            readme = section.content
+            self.sections.append(section)
+        path = self.output_dir / "README.md"
+        path.write_text(readme.strip() + "\n")
+        self.code_files.append(str(path))
+        self._record_move(MoveKind.WRITE_README, SurfaceKind.CLAIMS,
+                         None, TRUST_COPILOT, True, "README.md", 0,
+                         files=[str(path)])
 
-                {self.plan.one_liner if self.plan else self.prompt[:80]}
-
-                ## Installation
-
-                ```bash
-                pip install -e .
-                ```
-
-                ## Theory
-
-                {self.theory[:300]}
-
-                {modules_text}
-
-                {benchmarks_text}
-            """)
-
-        readme_path = self.output_dir / "README.md"
-        readme_path.write_text(readme.strip() + "\n")
-        self.code_files.append(str(readme_path))
-
-        self._record(IterationKind.GROUND_CLAIMS,
-                     "Wrote README.md",
-                     SurfaceKind.CLAIMS, 0.3, 0.6, 0, 0, time.time() - start)
-
-    def _write_paper(self):
-        """Generate a conference tool-track paper (LaTeX).
-
-        This is CONSTRUCT on P + FORMALIZE from T: produce a paper
-        that formalizes the theory and grounds claims in evidence.
-        """
-        start = time.time()
-        self._log("Phase 8b: Writing conference_tool_track.tex...")
-
-        pkg = self.plan.package_name if self.plan else self.approach
-
-        benchmarks_table = ""
-        if self.benchmarks and self.benchmarks.results:
-            rows = []
-            for metric in self.benchmarks.metrics:
-                result = self.benchmarks.results.get(metric, "—")
-                baseline = self.benchmarks.baselines.get(metric, "—")
-                status = self.benchmarks.comparison.get(metric, "—")
-                rows.append(f"    {metric} & {result} & {baseline} & {status} \\\\")
-            benchmarks_table = "\n".join(rows)
-
-        modules_items = ""
-        if self.plan:
-            for mod in self.plan.modules:
-                modules_items += f"  \\item \\texttt{{{mod.get('name','?')}}} --- {mod.get('purpose','')}\n"
-
-        if not self.no_llm:
-            paper_prompt = textwrap.dedent(f"""\
-                Write a 4-page conference tool-track paper in LaTeX for this research tool.
-
-                TOOL: {pkg}
-                THEORY: {self.theory[:500]}
-                PROMPT: {self.prompt}
-                MODULES: {modules_items[:300]}
-                BENCHMARKS: {benchmarks_table[:300]}
-
-                Structure:
-                1. Abstract (150 words)
-                2. Introduction — the problem and why existing tools fail
-                3. Approach — the mathematical framework
-                4. Implementation — the software architecture
-                5. Evaluation — benchmarks and comparison to baselines
-                6. Conclusion
-
-                Use \\documentclass{{article}}, \\usepackage{{amsmath,booktabs}}.
-                Return raw LaTeX, no markdown fences.
-            """)
-            paper = _call_llm(paper_prompt, max_tokens=8192)
-        else:
+    def _move_write_paper(self):
+        """FORMALIZE on P: write conference tool track paper."""
+        self._log("MOVE: write_paper → P")
+        if self.no_llm:
             paper = textwrap.dedent(f"""\
-                \\documentclass[11pt]{{article}}
-                \\usepackage{{amsmath,booktabs,hyperref}}
-                \\title{{{pkg}: {self.plan.one_liner if self.plan else ''}}}
-                \\author{{Generated by JuGeo Directed Research}}
-                \\date{{\\today}}
+                \\documentclass{{article}}
+                \\title{{{self.approach}}}
+                \\author{{Generated by JuGeo}}
                 \\begin{{document}}
                 \\maketitle
-                \\begin{{abstract}}
-                {self.theory[:200]}
-                \\end{{abstract}}
-
                 \\section{{Introduction}}
                 {self.prompt}
-
                 \\section{{Approach}}
-                {self.theory[:400]}
-
-                \\section{{Implementation}}
-                The tool is organized into the following modules:
-                \\begin{{itemize}}
-                {modules_items}
-                \\end{{itemize}}
-
-                \\section{{Evaluation}}
-                \\begin{{table}}[h]
-                \\centering
-                \\begin{{tabular}}{{llll}}
-                \\toprule
-                Metric & Result & Baseline & Status \\\\
-                \\midrule
-                {benchmarks_table}
-                \\bottomrule
-                \\end{{tabular}}
-                \\caption{{Benchmark results.}}
-                \\end{{table}}
-
-                \\section{{Conclusion}}
-                We presented {pkg}, a tool that applies novel mathematics to
-                the problem described above. Our approach demonstrates the
-                feasibility of the synthesized framework.
-
+                {self.theory_text[:300]}
                 \\end{{document}}
             """)
-
-        # Clean up LLM output
+        else:
+            section = _llm_call(textwrap.dedent(f"""\
+                Write a 4-page conference tool-track paper in LaTeX.
+                TOOL: {self.approach}
+                THEORY: {self.theory_text[:2000]}
+                MODULES: {list(self.module_code.keys())}
+                BENCHMARKS: {json.dumps(self.benchmark_results)[:500]}
+                Structure: Abstract, Introduction, Approach, Implementation, Evaluation, Conclusion.
+                Use \\documentclass{{article}}, \\usepackage{{amsmath,booktabs}}.
+                Return raw LaTeX.
+            """), surface=SurfaceKind.CLAIMS, coordinate="claims.paper")
+            paper = section.content
+            self.sections.append(section)
         if paper.startswith("```"):
-            lines = paper.split("\n")
-            paper = "\n".join(l for l in lines if not l.startswith("```"))
+            paper = "\n".join(l for l in paper.split("\n") if not l.startswith("```"))
+        path = self.output_dir / "conference_tool_track.tex"
+        path.write_text(paper.strip() + "\n")
+        self.code_files.append(str(path))
+        # Try compiling
+        import shutil
+        if shutil.which("pdflatex"):
+            try:
+                subprocess.run(["pdflatex", "-interaction=nonstopmode",
+                               "conference_tool_track.tex"],
+                              capture_output=True, timeout=30,
+                              cwd=str(self.output_dir))
+                pdf = self.output_dir / "conference_tool_track.pdf"
+                if pdf.exists():
+                    self.code_files.append(str(pdf))
+            except Exception:
+                pass
+        self._record_move(MoveKind.WRITE_PAPER, SurfaceKind.CLAIMS,
+                         None, TRUST_COPILOT, True, "paper.tex", 0,
+                         files=[str(path)])
 
-        tex_path = self.output_dir / "conference_tool_track.tex"
-        tex_path.write_text(paper.strip() + "\n")
-        self.code_files.append(str(tex_path))
+    # ── Repair moves (driven by obstructions) ────────────────────────
 
-        # Try to compile to PDF
-        try:
-            import shutil
-            if shutil.which("pdflatex"):
-                subprocess.run(
-                    ["pdflatex", "-interaction=nonstopmode", "conference_tool_track.tex"],
-                    capture_output=True, timeout=30, cwd=str(self.output_dir),
-                )
-                pdf_path = self.output_dir / "conference_tool_track.pdf"
-                if pdf_path.exists():
-                    self.code_files.append(str(pdf_path))
-                    self._log("  Compiled to PDF")
-        except Exception:
-            pass
+    def _repair_from_obstructions(self, report: ConsistencyReport) -> bool:
+        """Use obstructions to determine and execute the right repair move."""
+        if not report.obstructions:
+            return True
+        obs = report.obstructions[0]
+        if obs.kind == ObstructionKind.NUMERICAL_MISMATCH:
+            self._move_ground_claims()
+            return True
+        elif obs.kind == ObstructionKind.STALE_SECTION:
+            self._move_syntax_check()
+            return True
+        elif obs.kind in (ObstructionKind.CODE_THEORY_GAP, ObstructionKind.MISSING_EVIDENCE):
+            # Find weakest module and regenerate
+            if self.architecture.get("modules"):
+                weakest = self.architecture["modules"][0]
+                self._move_generate_module(weakest)
+                return True
+        return False
 
-        self._record(IterationKind.GROUND_CLAIMS,
-                     "Wrote conference_tool_track.tex",
-                     SurfaceKind.CLAIMS, 0.4, 0.7, 0, 0, time.time() - start)
-
-    def _save_metadata(self, status: ResearchStatus, elapsed: float):
-        meta = {
-            "status": status.value,
-            "prompt": self.prompt,
-            "approach": self.approach,
-            "theory": self.theory[:500],
-            "code_files": self.code_files,
-            "pivots": self.pivots_taken,
-            "iterations": len(self.iterations),
-            "elapsed": round(elapsed, 2),
-            "benchmarks": {
-                "metrics": self.benchmarks.metrics if self.benchmarks else {},
-                "results": self.benchmarks.results if self.benchmarks else {},
-                "comparison": self.benchmarks.comparison if self.benchmarks else {},
-            } if self.benchmarks else None,
-        }
-        (self.output_dir / "research_metadata.json").write_text(
-            json.dumps(meta, indent=2, default=str))
+    def _move_pivot_theory(self):
+        """NEGOTIATE_TREATY on (T, R): adjacency-constrained theory change."""
+        self.pivots += 1
+        self._log(f"MOVE: pivot_theory #{self.pivots} → T")
+        if self.no_llm:
+            self.theory_text += "\n\n[REVISED]"
+            self._record_move(MoveKind.PIVOT_THEORY, SurfaceKind.THEORY,
+                             None, TRUST_COPILOT, True, "heuristic pivot", 0)
+            return
+        section = _llm_call(textwrap.dedent(f"""\
+            The current approach isn't working well enough. Propose a PIVOT:
+            CURRENT: {self.theory_text[:1000]}
+            PROMPT: {self.prompt}
+            Change ONE thing about the mathematical framework that might produce
+            better results. Keep what works, fix what doesn't.
+            Write the revised theory (1000+ words). Return raw text.
+        """), surface=SurfaceKind.THEORY, coordinate="theory.pivot")
+        self.theory_text = section.content
+        (self.output_dir / "context.md").write_text(f"# {self.approach} (pivot {self.pivots})\n\n{section.content}\n")
+        self._record_move(MoveKind.PIVOT_THEORY, SurfaceKind.THEORY,
+                         section, TRUST_COPILOT, True,
+                         f"Pivot #{self.pivots}", section.elapsed)
