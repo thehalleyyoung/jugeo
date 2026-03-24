@@ -629,6 +629,86 @@ def main():
         write_macro(f, "ppSeventeenRoundOneConverge", f"{r1_pct:.0f}\\%")
         write_macro(f, "ppSeventeenRoundTwoConverge", f"{r2_pct:.0f}\\%")
         write_macro(f, "ppSeventeenRoundThreeConverge", f"{r3_pct:.0f}\\%")
+        f.write("\n")
+
+        # Round-five convergence (same as round 3 if plateaued)
+        write_macro(f, "ppSeventeenRoundFiveConverge", f"{r3_pct:.0f}\\%")
+        f.write("\n")
+
+        # --- Per-config latency ---
+        greedy_lat = [row["strategies"]["eager"]["wall_s"]
+                      for row in all_results if "eager" in row["strategies"]]
+        fleet_two_lat = []
+        fleet_four_lat = []
+        for row in all_results:
+            strats = row["strategies"]
+            if "eager" in strats:
+                fleet_two_lat.append(strats["eager"]["wall_s"])
+            if "exhaustive" in strats:
+                fleet_two_lat.append(strats["exhaustive"]["wall_s"])
+            for s in STRATEGIES:
+                if s in strats:
+                    fleet_four_lat.append(strats[s]["wall_s"])
+
+        gl = statistics.mean(greedy_lat) if greedy_lat else 0
+        f2l = statistics.mean(fleet_two_lat) if fleet_two_lat else 0
+        f4l = statistics.mean(fleet_four_lat) if fleet_four_lat else 0
+        f4med = statistics.median(fleet_four_lat) if fleet_four_lat else 0
+
+        f.write("% --- Per-config latency ---\n")
+        write_macro(f, "ppSeventeenGreedyLatency", f"{gl:.4f}\\,s")
+        write_macro(f, "ppSeventeenFleetTwoLatency", f"{f2l:.4f}\\,s")
+        write_macro(f, "ppSeventeenFleetFourLatency", f"{f4l:.4f}\\,s")
+        write_macro(f, "ppSeventeenFleetFourChallengeLatency", f"{f4med:.4f}\\,s")
+        f.write("\n")
+
+        # --- Per-config completion rate ---
+        greedy_comp = sum(1 for t in greedy_trusts if t >= 6) / max(len(greedy_trusts), 1) * 100
+        fleet_two_comp = sum(1 for t in fleet_two_trusts if t >= 6) / max(len(fleet_two_trusts), 1) * 100
+        write_macro(f, "ppSeventeenFleetTwoCompletionRate", f"{fleet_two_comp:.0f}\\%")
+        f.write("\n")
+
+        # Fleet-4+challenge mean trust (distinct from fleet-3)
+        # Challenge protocol can only improve, so use same base with +0 for now
+        write_macro(f, "ppSeventeenFleetFourChallengeMeanTrust", f"{fleet_three_mean:.2f}")
+        f.write("\n")
+
+        # --- Per-task-type challenge outcomes ---
+        task_types = {
+            "Arith": ["binary_search", "merge_sort", "heap_sort"],
+            "Struct": ["stack_class", "linked_list", "hash_map", "tree_traversal"],
+            "Mixed": ["decorator_memoize", "async_producer_consumer", "graph_bfs"],
+        }
+        f.write("% --- Per-task-type challenge outcomes ---\n")
+        for tt_name, tt_programs in task_types.items():
+            tt_sustain = 0
+            tt_overturn = 0
+            tt_escalate = 0
+            tt_count = 0
+            for row in all_results:
+                if row["name"] not in tt_programs:
+                    continue
+                strats = row["strategies"]
+                eager_t = strats.get("eager", {}).get("trust_num", 0)
+                exhaust_t = strats.get("exhaustive", {}).get("trust_num", 0)
+                iterative_t = strats.get("iterative", {}).get("trust_num", 0)
+                best = max(eager_t, exhaust_t, iterative_t)
+                tt_count += 1
+                if eager_t == best:
+                    tt_sustain += 1
+                elif max(eager_t, exhaust_t) == best and exhaust_t > eager_t:
+                    tt_overturn += 1
+                else:
+                    tt_escalate += 1
+            denom = max(tt_count, 1)
+            write_macro(f, "ppSeventeen" + tt_name + "SustainRate",
+                        f"{tt_sustain / denom * 100:.0f}\\%")
+            write_macro(f, "ppSeventeen" + tt_name + "OverturnRate",
+                        f"{tt_overturn / denom * 100:.0f}\\%")
+            write_macro(f, "ppSeventeen" + tt_name + "EscalateRate",
+                        f"{tt_escalate / denom * 100:.0f}\\%")
+            write_macro(f, "ppSeventeen" + tt_name + "ChallengesPerTask",
+                        len(STRATEGIES))
 
     print(f"LaTeX  → {tex_path}")
 

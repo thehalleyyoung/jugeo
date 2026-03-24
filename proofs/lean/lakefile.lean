@@ -42,4 +42,5 @@ lean_lib «JudgmentGeometry» where
              `Paper55_TrustEconomics,
              `Paper56_AnalogyTransport, `Paper57_SemanticSearch,
              `Paper58_RefactoringGuidance, `Paper59_DocumentationGeneration,
-             `Paper60_TestGeneration]
+             `Paper60_TestGeneration,
+             `Paper80_AgentMemorySheaves]

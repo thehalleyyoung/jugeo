@@ -508,3 +508,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Also write results JSON
+import json as _json
+_results_path = os.path.join(os.path.dirname(__file__), "results_paper24.json")
+with open(_results_path, "w") as _f:
+    _json.dump({"paper": 24, "status": "completed"}, _f, indent=2)
+print(f"Wrote {_results_path}")

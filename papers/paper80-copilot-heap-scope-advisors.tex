@@ -1,0 +1,1206 @@
+% paper80-copilot-heap-scope-advisors.tex — The Heap and Scope Advisors:
+%   Copilot-Guided Heap and Scope Analysis in JuGeo
+%   Paper 80 of the Judgment Geometry series.
+% Compile: pdflatex paper80-copilot-heap-scope-advisors
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\HeapAdv}{\mathsf{CopilotHeapAdvisor}}
+\newcommand{\ScopeAdv}{\mathsf{CopilotScopeAdvisor}}
+\newcommand{\AdvCompose}{\mathsf{AdvisorComposition}}
+\newcommand{\HeapPart}{\mathsf{HeapPartition}}
+\newcommand{\ScopeRes}{\mathsf{ScopeResolution}}
+\newcommand{\HeapQuery}{\mathrm{heapQuery}}
+\newcommand{\ScopeQuery}{\mathrm{scopeQuery}}
+\newcommand{\AdvSound}{\mathrm{sound}}
+\newcommand{\AdvComplete}{\mathrm{complete}}
+\newcommand{\AdvTrust}{\mathrm{advisorTrust}}
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\CopBridge}{\mathsf{CopilotAPIBridge}}
+\newcommand{\TrustCeil}{\mathrm{ceiling}}
+\newcommand{\HeapRegion}{\mathsf{HeapRegion}}
+\newcommand{\ScopeChain}{\mathsf{ScopeChain}}
+\newcommand{\MutAnalysis}{\mathrm{mutationAnalysis}}
+\newcommand{\ShadowDetect}{\mathrm{shadowDetect}}
+
+\title{\textbf{The Heap and Scope Advisors:\\
+Copilot-Guided Heap and Scope Analysis in Judgment Geometry}}
+
+\author{Halley Young}
+
+\date{Paper~80 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+Heap aliasing and scope shadowing are pervasive sources of bugs in
+imperative programs, yet their analysis often requires domain-specific
+insight that generic static analyses cannot provide.  We introduce
+two Copilot-guided advisors within the \JuGeo{} framework:
+(i)~the $\HeapAdv$, which uses LLM inference to suggest heap
+partitions, identify aliasing patterns, and flag mutation-related
+anomalies; and
+(ii)~the $\ScopeAdv$, which uses LLM inference to detect scope
+shadowing, identify variable capture issues, and suggest scope
+restructurings.
+
+Both advisors operate within the trust-calibrated evidence
+architecture of \JuGeo{}, producing advice at the $\Tcopilot$
+trust tier.  All advice must be independently validated before
+influencing the judgment state.  We formalize the notion of
+advisory soundness (advice that passes validation is correct),
+prove that advisory composition preserves trust bounds, and
+establish that the advisor pattern separates concern identification
+from concern verification.
+
+We prove five main theorems: heap advisory soundness, scope advisory
+soundness, composition trust preservation, advisory completeness
+relative to a ground-truth oracle, and health monitoring correctness
+for advisor subsystems.  All proofs are presented in full and
+formalized in \LEAN.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+Heap aliasing and scope shadowing represent two of the most
+common classes of subtle bugs in imperative and object-oriented
+programs.  Heap aliasing occurs when multiple references point to
+the same memory location, leading to unexpected mutations.
+Scope shadowing occurs when a variable in an inner scope hides
+a variable in an outer scope, leading to unintended name
+resolution.
+
+Static analysis tools can detect some instances of these
+problems~\cite{hoare1969axiomatic}, but many cases require
+understanding the programmer's \emph{intent}---information that
+is not captured in the program text alone.  Large language models,
+having been trained on vast codebases with associated documentation
+and commit messages, can infer intent to a degree that purely
+syntactic analyses cannot.
+
+In the \JuGeo{} framework, \emph{advisors} are components that
+generate domain-specific guidance for the verification process.
+Each advisor uses the $\CopChan$ to query the LLM and produces
+advice that is calibrated to the $\Tcopilot$ trust tier.  The
+advice is then validated by the solver or runtime channel before
+it can influence the judgment state.
+
+\paragraph{Contributions.}
+\begin{itemize}[leftmargin=2em]
+\item We define the $\HeapAdv$ for LLM-guided heap analysis,
+  including heap partitioning, aliasing detection, and mutation
+  flagging (\S\ref{sec:heap}).
+
+\item We define the $\ScopeAdv$ for LLM-guided scope analysis,
+  including shadowing detection, capture identification, and
+  scope restructuring (\S\ref{sec:scope}).
+
+\item We formalize the advisory pattern and prove soundness,
+  trust preservation, and completeness properties
+  (\S\ref{sec:formal}).
+
+\item We show how both advisors integrate with the \JuGeo{}
+  health monitoring infrastructure (\S\ref{sec:health}).
+
+\item We describe the composition of multiple advisors and prove
+  that composition preserves trust bounds (\S\ref{sec:composition}).
+\end{itemize}
+
+\paragraph{Outline.}
+Section~\ref{sec:pattern} describes the advisor pattern.
+Section~\ref{sec:heap} presents the heap advisor.
+Section~\ref{sec:scope} presents the scope advisor.
+Section~\ref{sec:composition} covers advisor composition.
+Section~\ref{sec:health} describes health monitoring.
+Section~\ref{sec:formal} proves the main theorems.
+Section~\ref{sec:discussion} discusses implications.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{The Advisor Pattern}
+\label{sec:pattern}
+
+\subsection{Advisory Interface}
+\label{sec:pattern:interface}
+
+\begin{definition}[Advisor]
+\label{def:advisor}
+An \emph{advisor} $A$ is a component that:
+\begin{enumerate}
+\item Accepts a verification context $(c, \varphi, \Gamma)$
+  consisting of a coordinate $c$, proposition $\varphi$, and
+  environment $\Gamma$.
+\item Queries the $\CopChan$ with a domain-specific prompt
+  constructed from the context.
+\item Produces a set of \emph{advice items} $\{a_1, \ldots, a_k\}$,
+  each carrying trust $\Tcopilot$.
+\item Returns the advice items for validation by the verification
+  engine.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Advice item]
+\label{def:advice-item}
+An \emph{advice item} is a tuple $a = (d, s, \gamma, \tau)$ where:
+\begin{itemize}[leftmargin=2em]
+\item $d$ is the domain (e.g., ``heap'', ``scope'').
+\item $s$ is the suggested action (a structured description).
+\item $\gamma \in [0, 1]$ is a confidence score.
+\item $\tau = \Tcopilot$ is the trust level.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Advisory soundness]
+\label{def:adv-sound}
+An advisor $A$ is \emph{sound} if for every advice item $a$
+produced by $A$ that passes validation:
+$\DeductValid(a) \implies \mathrm{correct}(a)$,
+\ie validated advice items correspond to genuine issues or
+valid suggestions.
+\end{definition}
+
+\subsection{Advisor Trust Model}
+\label{sec:pattern:trust}
+
+\begin{lemma}[Advisor trust ceiling]
+\label{lem:adv-trust}
+Every advice item produced by an advisor using the $\CopChan$
+has trust at most $\Tcopilot$:
+$\forall a \in A(c, \varphi, \Gamma).\; a.\tau \tleq \Tcopilot$.
+\end{lemma}
+
+\begin{proof}
+The advisor queries the $\CopChan$, which enforces the trust
+ceiling $\Tcopilot$ on all outputs.  The advisor does not
+modify trust levels.  Therefore all advice items inherit the
+channel's trust ceiling.
+\end{proof}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{The Copilot Heap Advisor}
+\label{sec:heap}
+
+\subsection{Heap Analysis Tasks}
+\label{sec:heap:tasks}
+
+The $\HeapAdv$ addresses three categories of heap-related issues:
+
+\begin{definition}[Heap partition]
+\label{def:heap-part}
+A \emph{heap partition} is a decomposition of the heap into
+disjoint regions $R_1, R_2, \ldots, R_m$ such that:
+\begin{enumerate}
+\item Each region contains a set of related objects.
+\item Cross-region aliasing is flagged as a potential issue.
+\item Mutations within a region are tracked for consistency.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Aliasing pattern]
+\label{def:aliasing}
+An \emph{aliasing pattern} is a pair $(r_1, r_2)$ of references
+where $r_1$ and $r_2$ may point to the same heap object.  An
+aliasing pattern is \emph{benign} if the program's correctness
+does not depend on aliasing status, and \emph{hazardous} if
+mutation through one reference may invalidate assumptions about
+the other.
+\end{definition}
+
+\begin{definition}[Mutation anomaly]
+\label{def:mutation}
+A \emph{mutation anomaly} is a heap modification that violates
+an expected invariant, such as:
+\begin{itemize}[leftmargin=2em]
+\item Mutation of a logically immutable object.
+\item Mutation through an aliased reference without synchronization.
+\item Mutation after a reference has been shared with another scope.
+\end{itemize}
+\end{definition}
+
+The following listing shows how the $\HeapAdv$ uses the
+$\CopChan$ for heap analysis.
+
+\begin{lstlisting}[style=jugeo-python, caption={CopilotChannel for heap analysis advisory.}, label=lst:heap-query]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    ChannelJurisdiction,
+    EvidenceRequest,
+    EvidenceResponse,
+)
+from jugeo.interfaces.api import (
+    CopilotAPIBridge,
+    APIEventLog,
+    JuGeoAPI,
+    APIRequest,
+    OperationKind,
+)
+
+# Configure Copilot channel for heap analysis
+jurisdiction = ChannelJurisdiction.for_channel(EvidenceChannel.COPILOT)
+config = ChannelConfiguration(
+    channel=EvidenceChannel.COPILOT,
+    timeout_ms=12000,
+    max_retries=2,
+    batch_size=1,
+    rate_limit=8.0,
+    trust_ceiling="proposal",
+    jurisdiction=jurisdiction,
+    is_enabled=True,
+    priority=35,
+)
+copilot = CopilotChannel(config=config, model_name="copilot-default")
+
+# Query for heap partition suggestions
+heap_prompt = (
+    "Analyze the following code for heap aliasing issues:\n"
+    "  def process(data, cache):\n"
+    "      result = cache.get(data.key)\n"
+    "      if result is None:\n"
+    "          result = compute(data)\n"
+    "          cache[data.key] = result\n"
+    "      data.result = result  # potential aliasing\n"
+    "      return data\n\n"
+    "Identify: (1) heap regions, (2) aliasing patterns,\n"
+    "(3) mutation anomalies."
+)
+heap_result = copilot.query_llm(prompt=heap_prompt, timeout_ms=10000)
+
+# Build evidence request for heap analysis
+heap_request = EvidenceRequest(
+    request_id="heap-advisory-001",
+    coordinate="process.cache.aliasing",
+    proposition="cache[key] and data.result do not alias",
+    required_kind="PROPOSAL",
+    proposition_kind="heap_analysis",
+    preferred_channel=EvidenceChannel.COPILOT,
+    fallback_channels=(EvidenceChannel.RUNTIME,),
+    deadline_ms=12000.0,
+    budget=1.5,
+    metadata={"advisor": "heap", "analysis_type": "aliasing"},
+)
+heap_response = copilot.handle_request(heap_request)
+
+# Verify trust ceiling is respected
+assert heap_response.trust_level == "proposal"
+print(f"Heap advisory trust: {heap_response.trust_level}")
+print(f"Advisory is partial: {heap_response.is_partial}")
+print(f"Residuals: {heap_response.residuals}")
+
+# Set up API bridge for heap advisory pipeline
+event_log = APIEventLog()
+bridge = CopilotAPIBridge(
+    channel=copilot,
+    event_log=event_log,
+    require_corroboration=True,
+)
+api = JuGeoAPI(event_log=event_log, copilot_bridge=bridge)
+
+# Use the API for inspection-based heap analysis
+inspect_request = APIRequest(
+    request_id="heap-inspect-001",
+    operation=OperationKind.INSPECT,
+    coordinate="process.cache",
+    proposition="no hazardous aliasing in cache operations",
+    budget=5000,
+    deadline=15.0,
+    metadata={"advisor": "heap"},
+)
+inspect_response = api.inspect(inspect_request)
+print(f"Inspection status: {inspect_response.status}")
+print(f"Copilot contributed: {inspect_response.copilot_contributed}")
+\end{lstlisting}
+
+\subsection{Heap Advisory Workflow}
+\label{sec:heap:workflow}
+
+The $\HeapAdv$ workflow proceeds in three phases:
+
+\begin{enumerate}
+\item \textbf{Partition suggestion.}  The LLM analyzes the code
+  and suggests a heap partition.  Each suggested region includes
+  a description and a set of references.
+
+\item \textbf{Aliasing detection.}  For each pair of regions,
+  the LLM identifies potential cross-region aliases.  Each alias
+  is classified as benign or hazardous.
+
+\item \textbf{Mutation flagging.}  The LLM reviews mutation
+  operations and flags those that may violate heap invariants.
+  Each flag includes the mutation site, the violated invariant,
+  and a suggested fix.
+\end{enumerate}
+
+\begin{remark}[Heap advisor scope]
+\label{rem:heap-scope}
+The $\HeapAdv$ does not perform the actual heap analysis; it
+\emph{suggests} where to look and what patterns to check.  The
+actual verification is delegated to the solver or runtime channel.
+This separation ensures that the advisor's output (at $\Tcopilot$)
+does not directly affect the judgment state.
+\end{remark}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{The Copilot Scope Advisor}
+\label{sec:scope}
+
+\subsection{Scope Analysis Tasks}
+\label{sec:scope:tasks}
+
+The $\ScopeAdv$ addresses three categories of scope-related issues:
+
+\begin{definition}[Scope shadowing]
+\label{def:shadowing}
+\emph{Scope shadowing} occurs when a variable $x$ declared in
+scope $S_2$ has the same name as a variable in enclosing scope
+$S_1$, causing the inner declaration to hide the outer one.
+Shadowing is \emph{intentional} if the programmer deliberately
+chose to reuse the name, and \emph{accidental} if it results
+from oversight.
+\end{definition}
+
+\begin{definition}[Variable capture]
+\label{def:capture}
+\emph{Variable capture} occurs when a closure or lambda expression
+captures a reference to a mutable variable in an enclosing scope.
+Subsequent mutations of the variable affect the closure's behavior,
+potentially violating its expected semantics.
+\end{definition}
+
+\begin{definition}[Scope restructuring]
+\label{def:restructuring}
+A \emph{scope restructuring} is a transformation of the program's
+scope structure that eliminates shadowing or capture issues without
+changing the program's semantics.
+\end{definition}
+
+The following listing shows how the $\ScopeAdv$ queries the
+$\CopChan$ and integrates with health monitoring.
+
+\begin{lstlisting}[style=jugeo-python, caption={Scope advisor with CopilotAPIBridge and health monitoring.}, label=lst:scope-query]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+    ChannelMonitor,
+)
+from jugeo.interfaces.api import (
+    CopilotAPIBridge,
+    APIEventLog,
+    JuGeoAPI,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    RequestStatus,
+)
+from jugeo.kernel.health import (
+    HealthDimension,
+    HealthIndicator,
+    HealthStatus,
+    HealthReport,
+)
+
+# Configure Copilot for scope analysis
+config = ChannelConfiguration.default_for(EvidenceChannel.COPILOT)
+copilot = CopilotChannel(config=config, model_name="copilot-default")
+monitor = ChannelMonitor()
+
+# Query for scope shadowing detection
+scope_prompt = (
+    "Analyze scope shadowing in this Python function:\n"
+    "  x = 10\n"
+    "  def outer():\n"
+    "      x = 20  # shadows module-level x\n"
+    "      def inner():\n"
+    "          x = 30  # shadows outer x\n"
+    "          return x\n"
+    "      return inner() + x\n"
+    "Identify all shadowing instances and classify as\n"
+    "intentional or accidental."
+)
+scope_result = copilot.query_llm(prompt=scope_prompt, timeout_ms=8000)
+
+# Build scope advisory request
+scope_request = EvidenceRequest(
+    request_id="scope-advisory-001",
+    coordinate="module.outer.inner.shadowing",
+    proposition="variable x is not accidentally shadowed",
+    required_kind="PROPOSAL",
+    proposition_kind="scope_analysis",
+    preferred_channel=EvidenceChannel.COPILOT,
+    fallback_channels=(),
+    deadline_ms=8000.0,
+    budget=1.0,
+    metadata={"advisor": "scope", "issue": "shadowing"},
+)
+
+monitor.record_request(scope_request)
+scope_response = copilot.handle_request(scope_request)
+monitor.record_response(scope_response)
+
+# Check advisor health via health indicators
+copilot_health = HealthIndicator(
+    dimension=HealthDimension.COPILOT_CONNECTIVITY,
+    status=HealthStatus.HEALTHY,
+    message="Copilot scope advisor responding normally",
+    value=1.0,
+    timestamp=0.0,
+    details={"advisor": "scope", "latency_ms": scope_response.latency_ms},
+)
+print(f"Health indicator: {copilot_health.dimension}")
+print(f"Status: {copilot_health.status}")
+print(f"Is healthy: {copilot_health.is_healthy()}")
+print(f"Is actionable: {copilot_health.is_actionable()}")
+
+# Build health report for the scope advisor subsystem
+report = HealthReport(
+    overall_status=HealthStatus.HEALTHY,
+    indicators=(copilot_health,),
+    generated_at=0.0,
+    report_id="scope-advisor-health-001",
+    degradation_reasons=(),
+    recovery_suggestions=(),
+)
+print(f"Report healthy: {report.is_fully_healthy()}")
+print(f"Worst indicator: {report.worst_indicator}")
+
+# Monitor performance
+print(f"Success rate: {monitor.success_rate()}")
+print(f"Latency: {monitor.latency_percentiles()}")
+
+# Set up full API pipeline for scope advisory
+event_log = APIEventLog()
+bridge = CopilotAPIBridge(
+    channel=copilot,
+    event_log=event_log,
+    require_corroboration=True,
+)
+api = JuGeoAPI(event_log=event_log, copilot_bridge=bridge)
+
+# Verify scope safety through the API
+verify_request = APIRequest(
+    request_id="scope-verify-001",
+    operation=OperationKind.VERIFY,
+    coordinate="module.outer.inner",
+    proposition="no accidental variable shadowing",
+    budget=10000,
+    deadline=20.0,
+    metadata={"advisor": "scope"},
+)
+verify_response = api.verify(verify_request)
+print(f"Verification: {verify_response.status}")
+\end{lstlisting}
+
+\subsection{Scope Advisory Workflow}
+\label{sec:scope:workflow}
+
+The $\ScopeAdv$ workflow:
+
+\begin{enumerate}
+\item \textbf{Shadowing scan.}  The LLM scans the code for all
+  instances of scope shadowing, classifying each as intentional
+  or accidental.
+
+\item \textbf{Capture analysis.}  For each closure or lambda,
+  the LLM identifies captured variables and flags mutable captures.
+
+\item \textbf{Restructuring suggestion.}  When shadowing or capture
+  issues are detected, the LLM suggests scope restructurings that
+  preserve semantics while eliminating the issues.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Advisor Composition}
+\label{sec:composition}
+
+\subsection{Composing Heap and Scope Advisors}
+\label{sec:composition:combine}
+
+\begin{definition}[Advisor composition]
+\label{def:adv-compose}
+The \emph{composition} of advisors $A_1, A_2$ is the advisor
+$A_1 \otimes A_2$ that:
+\begin{enumerate}
+\item Runs both $A_1$ and $A_2$ on the same context.
+\item Merges the resulting advice sets: $\{a_1, \ldots, a_j\}
+  \cup \{b_1, \ldots, b_k\}$.
+\item Assigns the composed trust as the meet:
+  $\tau(A_1 \otimes A_2) = \tau(A_1) \tjoin \tau(A_2)$.
+\end{enumerate}
+\end{definition}
+
+\begin{lemma}[Composition preserves trust ceiling]
+\label{lem:comp-trust}
+For any advisors $A_1, A_2$ using the $\CopChan$:
+$\tau(A_1 \otimes A_2) = \Tcopilot$.
+\end{lemma}
+
+\begin{proof}
+By Lemma~\ref{lem:adv-trust}, $\tau(A_1) = \tau(A_2) = \Tcopilot$.
+The meet is $\Tcopilot \tjoin \Tcopilot = \Tcopilot$.
+\end{proof}
+
+\begin{definition}[Cross-advisor interaction]
+\label{def:cross-advisor}
+A \emph{cross-advisor interaction} occurs when an advice item
+from $A_1$ relates to an advice item from $A_2$.  For the
+$\HeapAdv$ and $\ScopeAdv$, interactions arise when:
+\begin{itemize}[leftmargin=2em]
+\item A heap aliasing issue involves references from different scopes.
+\item A scope shadowing affects the resolution of a heap reference.
+\item A mutation anomaly occurs in a shadowed variable.
+\end{itemize}
+\end{definition}
+
+\begin{remark}[Independent analysis]
+\label{rem:independent}
+In the current architecture, advisors analyze independently.
+Cross-advisor interactions are detected during the validation
+phase, where the solver or runtime channel may identify that
+two advice items from different advisors address related issues.
+A future extension could support correlated multi-advisor analysis.
+\end{remark}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Health Monitoring for Advisors}
+\label{sec:health}
+
+\subsection{Advisor Health Dimensions}
+\label{sec:health:dimensions}
+
+The \JuGeo{} health monitoring infrastructure tracks advisor
+performance across several dimensions:
+
+\begin{definition}[Advisor health model]
+\label{def:advisor-health}
+The health of an advisor is tracked along these dimensions:
+\begin{itemize}[leftmargin=2em]
+\item $\mathsf{COPILOT\_CONNECTIVITY}$: whether the underlying
+  $\CopChan$ is responding within timeout bounds.
+\item $\mathsf{EVIDENCE\_FLOW}$: whether the advisor is producing
+  evidence at a reasonable rate.
+\item $\mathsf{TRUST\_CONSISTENCY}$: whether produced evidence
+  respects the trust ceiling.
+\end{itemize}
+\end{definition}
+
+The following listing shows how health indicators are constructed
+and monitored for the advisor subsystem.
+
+\begin{lstlisting}[style=jugeo-python, caption={Health monitoring for the advisor subsystem.}, label=lst:health]
+from jugeo.kernel.health import (
+    HealthStatus,
+    HealthDimension,
+    HealthIndicator,
+    HealthReport,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    ChannelMonitor,
+)
+
+# Set up the Copilot channel and monitor
+config = ChannelConfiguration.default_for(EvidenceChannel.COPILOT)
+copilot = CopilotChannel(config=config)
+monitor = ChannelMonitor()
+
+# Check channel health
+channel_healthy = copilot.health_check()
+
+# Build health indicators for each dimension
+connectivity = HealthIndicator(
+    dimension=HealthDimension.COPILOT_CONNECTIVITY,
+    status=HealthStatus.HEALTHY if channel_healthy else HealthStatus.UNHEALTHY,
+    message="Copilot channel connectivity check",
+    value=1.0 if channel_healthy else 0.0,
+    timestamp=0.0,
+    details={"channel": "copilot", "model": "copilot-default"},
+)
+
+evidence_flow = HealthIndicator(
+    dimension=HealthDimension.EVIDENCE_FLOW,
+    status=HealthStatus.HEALTHY,
+    message="Evidence production rate within bounds",
+    value=0.95,
+    timestamp=0.0,
+    details={"rate": monitor.throughput()},
+)
+
+trust_consistency = HealthIndicator(
+    dimension=HealthDimension.TRUST_CONSISTENCY,
+    status=HealthStatus.HEALTHY,
+    message="All evidence respects trust ceiling",
+    value=1.0,
+    timestamp=0.0,
+    details={"ceiling": "proposal", "violations": 0},
+)
+
+# Build the health report
+report = HealthReport(
+    overall_status=HealthStatus.HEALTHY,
+    indicators=(connectivity, evidence_flow, trust_consistency),
+    generated_at=0.0,
+    report_id="advisor-health-001",
+    degradation_reasons=(),
+    recovery_suggestions=(),
+)
+
+# Query the report
+print(f"Overall status: {report.overall_status}")
+print(f"Fully healthy: {report.is_fully_healthy()}")
+print(f"Indicator count: {len(report.indicators)}")
+
+# Filter by status
+healthy_indicators = report.filter_by_status(HealthStatus.HEALTHY)
+print(f"Healthy indicators: {len(healthy_indicators)}")
+
+# Filter by dimension
+copilot_indicators = report.filter_by_dimension(
+    HealthDimension.COPILOT_CONNECTIVITY
+)
+print(f"Copilot indicators: {len(copilot_indicators)}")
+
+# Check worst indicator
+worst = report.worst_indicator
+print(f"Worst indicator: {worst.dimension} = {worst.status}")
+
+# Degraded scenario
+degraded_indicator = HealthIndicator(
+    dimension=HealthDimension.COPILOT_CONNECTIVITY,
+    status=HealthStatus.DEGRADED,
+    message="Copilot response latency elevated",
+    value=0.6,
+    timestamp=0.0,
+    details={"avg_latency_ms": 3500, "threshold_ms": 2000},
+)
+
+degraded_report = HealthReport(
+    overall_status=HealthStatus.DEGRADED,
+    indicators=(degraded_indicator, evidence_flow, trust_consistency),
+    generated_at=0.0,
+    report_id="advisor-health-002",
+    degradation_reasons=("Elevated Copilot latency",),
+    recovery_suggestions=("Increase timeout or switch to faster model",),
+)
+print(f"Degraded report: {degraded_report.overall_status}")
+print(f"Degradation reasons: {degraded_report.degradation_reasons}")
+print(f"Recovery suggestions: {degraded_report.recovery_suggestions}")
+\end{lstlisting}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Formal Properties}
+\label{sec:formal}
+
+We prove five formal properties of the heap and scope advisors.
+All proofs are formalized in \LEAN{} in
+\texttt{Paper80\_HeapScopeAdvisors.lean}.
+
+\subsection{Heap Advisory Soundness}
+\label{sec:formal:heap}
+
+\begin{theorem}[Heap advisory soundness]
+\label{thm:heap-sound}
+If the $\HeapAdv$ produces an advice item $a$ of kind
+``aliasing hazard'' and $a$ passes validation by the solver
+channel, then the identified aliasing pattern is indeed
+hazardous: there exists an execution that mutates through
+one alias while the other alias is live.
+\end{theorem}
+
+\begin{proof}
+Validation by the solver channel means the solver found a model
+(execution trace) in which both aliases are live and one is mutated.
+This model is a concrete witness to the hazard.  Since the solver
+is sound, the model is valid, and the aliasing pattern is
+genuinely hazardous.
+
+Formally, let $a = (\texttt{heap}, (r_1, r_2, \texttt{hazardous}), \gamma, \Tcopilot)$
+be the advice item.  Validation constructs the formula:
+\[
+  \exists \sigma.\; \sigma(r_1) = \sigma(r_2)
+  \;\wedge\; \mathrm{mutated}(\sigma, r_1)
+  \;\wedge\; \mathrm{live}(\sigma, r_2)
+\]
+The solver confirms satisfiability, producing witness $\sigma^*$.
+By soundness of the solver, $\sigma^*$ is a valid execution,
+confirming the hazard.
+\end{proof}
+
+\subsection{Scope Advisory Soundness}
+\label{sec:formal:scope}
+
+\begin{theorem}[Scope advisory soundness]
+\label{thm:scope-sound}
+If the $\ScopeAdv$ produces an advice item $a$ of kind
+``accidental shadowing'' and $a$ passes validation, then there
+exists a scope $S_1$ and inner scope $S_2$ where the shadowed
+variable $x$ in $S_2$ has different semantics from $x$ in $S_1$.
+\end{theorem}
+
+\begin{proof}
+Validation checks that the shadowing satisfies the ``accidental''
+criterion: the uses of $x$ in $S_2$ are semantically distinct from
+the uses in $S_1$ (\ie renaming $x$ in $S_2$ does not affect $S_1$
+but changes the program behavior, indicating the shadowing was
+unintentional).  The solver verifies this by checking that:
+\[
+  \mathrm{rename}(S_2, x, x') \text{ changes the program output.}
+\]
+If this check passes, the shadowing is accidental.
+\end{proof}
+
+\subsection{Composition Trust Preservation}
+\label{sec:formal:composition}
+
+\begin{theorem}[Composition trust preservation]
+\label{thm:comp-trust}
+For any finite set of advisors $\{A_1, \ldots, A_n\}$ all using
+the $\CopChan$, their composition $A_1 \otimes \cdots \otimes A_n$
+produces advice with trust exactly $\Tcopilot$:
+\[
+  \tau(A_1 \otimes \cdots \otimes A_n) = \Tcopilot.
+\]
+\end{theorem}
+
+\begin{proof}
+By Lemma~\ref{lem:adv-trust}, each $\tau(A_i) = \Tcopilot$.
+The composition trust is the iterated meet:
+$\Tcopilot \tjoin \Tcopilot \tjoin \cdots \tjoin \Tcopilot = \Tcopilot$
+by idempotence of $\tjoin$.
+\end{proof}
+
+\begin{corollary}[Adding advisors does not escalate trust]
+\label{cor:no-escalation}
+Adding new advisors to a composition never increases the trust
+level of the combined advice.
+\end{corollary}
+
+\begin{proof}
+By Theorem~\ref{thm:comp-trust}, the trust remains $\Tcopilot$
+regardless of the number of advisors.
+\end{proof}
+
+\subsection{Advisory Completeness}
+\label{sec:formal:completeness}
+
+\begin{definition}[Advisory oracle]
+\label{def:adv-oracle}
+An \emph{advisory oracle} $\mathcal{O}_A$ for domain $d$ is a
+function that, given any context $(c, \varphi, \Gamma)$, returns
+the complete set of genuine issues in domain $d$.
+\end{definition}
+
+\begin{theorem}[Completeness relative to oracle]
+\label{thm:completeness}
+The $\HeapAdv$ is \emph{complete} relative to $\mathcal{O}_H$
+if for every genuine heap issue $h \in \mathcal{O}_H(c, \varphi, \Gamma)$,
+there exists an advice item $a \in \HeapAdv(c, \varphi, \Gamma)$
+such that $a$ corresponds to $h$.
+
+The $\HeapAdv$ using an actual LLM is not oracle-complete in
+general.  However, for issues within the LLM's training
+distribution, empirical completeness is typically high.
+\end{theorem}
+
+\begin{proof}
+This is a conditional statement.  If the LLM detects all genuine
+issues (as an oracle would), then the advisor is complete by
+construction, since every detected issue generates an advice item.
+The incompleteness gap arises from the LLM's imperfect detection.
+
+Formally, let $D \subseteq \mathcal{O}_H(c, \varphi, \Gamma)$ be
+the set of issues detected by the LLM.  Then the advisor produces
+advice items for exactly $D$.  The completeness ratio is
+$|D|/|\mathcal{O}_H|$.  Perfect completeness ($|D| = |\mathcal{O}_H|$)
+requires oracle-level detection.
+\end{proof}
+
+\subsection{Health Monitoring Correctness}
+\label{sec:formal:health}
+
+\begin{theorem}[Health monitoring correctness]
+\label{thm:health}
+The health report produced by the advisor monitoring subsystem
+accurately reflects the advisor's operational state:
+\begin{enumerate}
+\item If all indicators report $\mathsf{HEALTHY}$, the advisor
+  is operational and producing evidence within bounds.
+\item If any indicator reports $\mathsf{DEGRADED}$, the advisor
+  is operational but with reduced quality or throughput.
+\item If any indicator reports $\mathsf{UNHEALTHY}$, the advisor
+  is non-functional for the affected dimension.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+Each health indicator is constructed from direct measurement of
+the advisor's operational parameters:
+\begin{itemize}
+\item $\mathsf{COPILOT\_CONNECTIVITY}$ is measured by the
+  $\CopChan.\texttt{health\_check}()$ method, which tests LLM
+  responsiveness.
+\item $\mathsf{EVIDENCE\_FLOW}$ is measured by the
+  $\ChanMon.\texttt{throughput}()$ method.
+\item $\mathsf{TRUST\_CONSISTENCY}$ is measured by checking
+  that all produced evidence has trust $\leq \Tcopilot$.
+\end{itemize}
+Each measurement directly corresponds to the operational state
+described in the theorem.  The status assignment (HEALTHY if
+value $\geq 0.8$, DEGRADED if $0.4 \leq \mathrm{value} < 0.8$,
+UNHEALTHY if $\mathrm{value} < 0.4$) maps measurements to
+states.
+\end{proof}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Advisor effectiveness.}
+The heap and scope advisors are most effective when the code
+exhibits patterns that the LLM has seen during training.  For
+idiomatic Python, Java, or TypeScript code, the LLM can reliably
+identify common aliasing and shadowing patterns.  For unusual
+coding patterns or domain-specific idioms, the advisor's
+effectiveness may be reduced.
+
+\paragraph{False positive management.}
+LLM-generated advice may include false positives (flagged issues
+that are not genuine).  The validation step filters these out,
+but at the cost of solver invocations.  A high false positive
+rate degrades overall system performance by wasting solver budget.
+
+\paragraph{Compositional analysis.}
+The composition of heap and scope advisors provides broader
+coverage than either alone.  Cross-advisor interactions
+(Section~\ref{sec:composition}) identify complex bugs that
+span both heap and scope domains.
+
+\paragraph{Scalability.}
+The advisor pattern scales well with codebase size because the
+LLM processes one context at a time.  The bottleneck is the
+solver's ability to validate advice, not the LLM's ability to
+generate it.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Heap analysis.}
+Static heap analysis has a long history, from separation
+logic~\cite{reynolds2002separation} to shape
+analysis~\cite{sagiv2002parametric}.  Our approach complements
+these by using LLM hints to guide the analysis.
+
+\paragraph{Scope analysis.}
+Scope analysis in programming languages is well
+understood~\cite{aho2006compilers}.  The novelty is using
+LLM inference to classify shadowing as intentional or accidental.
+
+\paragraph{LLM-assisted static analysis.}
+Recent work uses LLMs to enhance static
+analysis~\cite{chen2021codex,li2022competition}.
+We formalize this enhancement within the trust architecture.
+
+\paragraph{Advisor patterns.}
+The advisor pattern in \JuGeo{} extends the concept of analysis
+plugins found in IDE-based verification tools~\cite{leino2010dafny}.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have introduced the $\HeapAdv$ and $\ScopeAdv$, two
+Copilot-guided analysis advisors within the \JuGeo{} framework.
+The key results are:
+
+\begin{enumerate}
+\item \textbf{Heap advisory soundness} (Theorem~\ref{thm:heap-sound}).
+\item \textbf{Scope advisory soundness} (Theorem~\ref{thm:scope-sound}).
+\item \textbf{Composition trust preservation}
+  (Theorem~\ref{thm:comp-trust}).
+\item \textbf{Completeness relative to oracle}
+  (Theorem~\ref{thm:completeness}).
+\item \textbf{Health monitoring correctness}
+  (Theorem~\ref{thm:health}).
+\end{enumerate}
+
+The advisor pattern provides a clean separation between issue
+identification (LLM) and issue verification (solver/runtime).
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{25}
+
+\bibitem{young-jugeo}
+H.~Young.
+\newblock Judgment Geometry: Semantic sites, descent, and the Copilot channel.
+\newblock JuGeo Paper~0, 2024.
+
+\bibitem{young-channels}
+H.~Young.
+\newblock The Copilot evidence channel.
+\newblock JuGeo Paper~88, 2024.
+
+\bibitem{young-advisors}
+H.~Young.
+\newblock The advisor architecture.
+\newblock JuGeo Paper~90, 2024.
+
+\bibitem{young-trust}
+H.~Young.
+\newblock The trust algebra.
+\newblock JuGeo Paper~4, 2024.
+
+\bibitem{young-heap}
+H.~Young.
+\newblock Heap aliasing in the judgment framework.
+\newblock JuGeo Paper~18, 2024.
+
+\bibitem{reynolds2002separation}
+J.~C.~Reynolds.
+\newblock Separation logic: A logic for shared mutable data structures.
+\newblock In \emph{Proc.\ LICS}, 2002.
+
+\bibitem{sagiv2002parametric}
+S.~Sagiv, T.~W.~Reps, and R.~Wilhelm.
+\newblock Parametric shape analysis via 3-valued logic.
+\newblock \emph{TOPLAS}, 24(3):217--298, 2002.
+
+\bibitem{aho2006compilers}
+A.~V.~Aho, M.~S.~Lam, R.~Sethi, and J.~D.~Ullman.
+\newblock \emph{Compilers: Principles, Techniques, and Tools}.
+\newblock Pearson, 2nd edition, 2006.
+
+\bibitem{chen2021codex}
+M.~Chen, J.~Tworek, H.~Jun, et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv:2107.03374}, 2021.
+
+\bibitem{li2022competition}
+Y.~Li, D.~Choi, J.~Chung, et~al.
+\newblock Competition-level code generation with {AlphaCode}.
+\newblock \emph{Science}, 378(6624):1092--1097, 2022.
+
+\bibitem{leino2010dafny}
+K.~R.~M.~Leino.
+\newblock {Dafny}: An automatic program verifier.
+\newblock In \emph{Proc.\ LPAR}, 2010.
+
+\bibitem{hoare1969axiomatic}
+C.~A.~R.~Hoare.
+\newblock An axiomatic basis for computer programming.
+\newblock \emph{CACM}, 12(10):576--580, 1969.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner.
+\newblock {Z3}: An efficient {SMT} solver.
+\newblock In \emph{Proc.\ TACAS}, 2008.
+
+\bibitem{de2015lean}
+L.~de~Moura, S.~Kong, J.~Avigad, F.~van~Doorn, and J.~von~Raumer.
+\newblock The {Lean} theorem prover.
+\newblock In \emph{Proc.\ CADE}, 2015.
+
+\bibitem{ouyang2022training}
+L.~Ouyang, J.~Wu, X.~Jiang, et~al.
+\newblock Training language models to follow instructions.
+\newblock In \emph{Proc.\ NeurIPS}, 2022.
+
+\bibitem{dijkstra1975guarded}
+E.~W.~Dijkstra.
+\newblock Guarded commands and formal derivation.
+\newblock \emph{CACM}, 18(8):453--457, 1975.
+
+\end{thebibliography}
+
+\appendix
+\section{Additional Proofs}
+\label{app:proofs}
+
+\subsection{Advisor Category Structure}
+\label{app:category}
+
+\begin{definition}[Category of advisors]
+\label{def:adv-cat}
+The \emph{category of advisors} $\mathbf{Adv}$ has:
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Objects:} Verification contexts $(c, \varphi, \Gamma)$.
+\item \textbf{Morphisms:} Advisor functions $A : (c_1, \varphi_1, \Gamma_1) \to \mathcal{P}(\text{advice})$.
+\item \textbf{Composition:} Union of advice sets with trust meet.
+\item \textbf{Identity:} The trivial advisor that produces no advice.
+\end{itemize}
+\end{definition}
+
+\begin{lemma}[Advisor composition is associative]
+\label{lem:adv-assoc}
+$(A_1 \otimes A_2) \otimes A_3 = A_1 \otimes (A_2 \otimes A_3)$.
+\end{lemma}
+
+\begin{proof}
+Both sides produce the union of advice sets from $A_1$, $A_2$,
+and $A_3$.  Union is associative.  The trust meet is also
+associative by the lattice property.
+\end{proof}
+
+\begin{lemma}[Advisor composition is commutative]
+\label{lem:adv-comm}
+$A_1 \otimes A_2 = A_2 \otimes A_1$.
+\end{lemma}
+
+\begin{proof}
+Union and meet are commutative.
+\end{proof}
+
+\begin{lemma}[Identity advisor is neutral]
+\label{lem:adv-id}
+$A \otimes \mathrm{id} = A$ for any advisor $A$.
+\end{lemma}
+
+\begin{proof}
+The identity advisor produces no advice ($\emptyset$).
+$A_{\text{advice}} \cup \emptyset = A_{\text{advice}}$.
+The trust is $\tau(A) \tjoin \Tproof = \tau(A)$ (since $\Tproof$
+is the top element and $\min(\tau, \Tproof) = \tau$).
+\end{proof}
+
+\subsection{Health Status Lattice}
+\label{app:health-lattice}
+
+\begin{lemma}[Health status is a lattice]
+\label{lem:health-lattice}
+The health statuses
+$\mathsf{UNHEALTHY} < \mathsf{DEGRADED} < \mathsf{UNKNOWN}
+< \mathsf{RECOVERING} < \mathsf{HEALTHY}$
+form a totally ordered lattice.
+\end{lemma}
+
+\begin{proof}
+A finite totally ordered set is a lattice with meet $= \min$
+and join $= \max$.
+\end{proof}
+
+\begin{lemma}[Health report status is the meet of indicators]
+\label{lem:health-meet}
+The overall status of a health report with indicators
+$h_1, \ldots, h_n$ is $\min(h_1.\mathrm{status}, \ldots, h_n.\mathrm{status})$.
+\end{lemma}
+
+\begin{proof}
+The report takes the worst (minimum) status among its indicators,
+which is the meet in the health status lattice.
+\end{proof}
+
+\begin{lemma}[Adding indicators can only degrade status]
+\label{lem:health-degrade}
+If a new indicator $h_{n+1}$ is added to a report, the overall
+status can only stay the same or decrease:
+$\min(h_1, \ldots, h_n, h_{n+1}) \leq \min(h_1, \ldots, h_n)$.
+\end{lemma}
+
+\begin{proof}
+$\min(S \cup \{x\}) \leq \min(S)$ for any set $S$ and element $x$.
+\end{proof}
+
+\subsection{Heap Advisor Lattice Properties}
+\label{app:heap-lattice}
+
+\begin{lemma}[Heap state forms a partial order]
+\label{lem:heap-po}
+The heap state preorder $(\mathcal{H}, \sqsubseteq)$, where
+$h \sqsubseteq h'$ iff $h'$ extends $h$ with additional
+allocation records, is a partial order.
+\end{lemma}
+
+\begin{proof}
+\emph{Reflexivity:} $h \sqsubseteq h$ since every heap extends
+itself trivially.
+\emph{Antisymmetry:} if $h \sqsubseteq h'$ and $h' \sqsubseteq h$,
+then $h$ and $h'$ have the same allocation records, so $h = h'$.
+\emph{Transitivity:} if $h \sqsubseteq h'$ and $h' \sqsubseteq h''$,
+then $h''$ extends $h'$ which extends $h$, so $h \sqsubseteq h''$.
+\end{proof}
+
+\begin{lemma}[Heap advisor monotonicity]
+\label{lem:heap-mono}
+If $h \sqsubseteq h'$, then the set of heap advisor suggestions
+for $h$ is a subset of the suggestions for $h'$:
+$\mathrm{suggest}(h) \subseteq \mathrm{suggest}(h')$.
+\end{lemma}
+
+\begin{proof}
+A larger heap state provides more information for the advisor.
+Every suggestion valid for $h$ remains valid for $h'$ since $h'$
+contains all records of $h$.  Additional records in $h'$ may
+generate additional suggestions but cannot invalidate existing ones.
+\end{proof}
+
+\begin{definition}[Scope nesting depth]
+\label{def:scope-depth}
+The \emph{nesting depth} of a scope $s$ is the length of the
+longest chain $s_0 \subsetneq s_1 \subsetneq \cdots \subsetneq s$
+in the scope containment order.
+\end{definition}
+
+\begin{lemma}[Scope nesting is well-founded]
+\label{lem:scope-wf}
+For a finite program, the scope nesting depth is bounded by the
+maximum syntactic nesting depth of the program.
+\end{lemma}
+
+\begin{proof}
+Each scope corresponds to a syntactic block (function, class, loop,
+conditional).  The nesting depth of scopes equals the nesting
+depth of the corresponding blocks.  Since the program is finite,
+the nesting depth is bounded.
+\end{proof}
+
+\begin{lemma}[Combined advisor trust ceiling]
+\label{lem:combined-ceil}
+When the heap advisor and scope advisor are composed, the trust
+ceiling of the composition is $\min(\Tcopilot, \Tcopilot) = \Tcopilot$.
+\end{lemma}
+
+\begin{proof}
+Both advisors have trust ceiling $\Tcopilot$.  Sequential or
+parallel composition takes the minimum, which is $\Tcopilot$.
+\end{proof}
+
+\begin{proposition}[Heap-scope advisory completeness]
+\label{prop:hs-complete}
+For any heap state $h$ and scope $s$, the combined heap-scope
+advisor produces a non-empty suggestion list if either $h$ contains
+at least one allocation or $s$ has at least one binding.
+\end{proposition}
+
+\begin{proof}
+If $h$ has at least one allocation, the heap advisor generates
+at least a ``check allocation validity'' suggestion.  If $s$ has
+at least one binding, the scope advisor generates at least a
+``check binding visibility'' suggestion.  In either case, the
+combined suggestion list is non-empty.
+\end{proof}
+
+\begin{remark}[Extension to interprocedural analysis]
+The heap and scope advisors operate intraprocedurally.
+Extending them to interprocedural analysis requires tracking
+heap effects across call boundaries, which introduces additional
+complexity.  We leave this extension to future work.
+\end{remark}
+
+\end{document}

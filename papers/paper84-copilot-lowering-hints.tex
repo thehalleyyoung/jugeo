@@ -1,0 +1,1207 @@
+% paper84-copilot-lowering-hints.tex — Copilot Lowering Hints and IR Advisors
+%   Advisors for IR Lowering, Node Suggestion, and IR-Level Assistance
+%   Paper 84 of the Judgment Geometry series.
+% Compile: pdflatex paper84-copilot-lowering-hints
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+
+% ——— Paper-specific macros ———
+\newcommand{\LowHint}{\mathsf{CopilotLoweringHint}}
+\newcommand{\NodeSugg}{\mathsf{CopilotNodeSuggestor}}
+\newcommand{\IRAssist}{\mathsf{CopilotIRAssist}}
+\newcommand{\LowStrat}{\mathrm{loweringStrategy}}
+\newcommand{\PhaseOrd}{\mathrm{phaseOrdering}}
+\newcommand{\NodeSel}{\mathrm{nodeSelect}}
+\newcommand{\TransSugg}{\mathrm{transformationSuggest}}
+\newcommand{\IRDebug}{\mathrm{irDebug}}
+\newcommand{\OptHint}{\mathrm{optimizationHint}}
+\newcommand{\TrustCeil}{\mathrm{ceiling}}
+\newcommand{\CompAssoc}{\mathrm{compositionAssociativity}}
+\newcommand{\PhaseConv}{\mathrm{phaseConvergence}}
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\CopBridge}{\mathsf{CopilotAPIBridge}}
+\newcommand{\ChanPool}{\mathsf{ChannelPool}}
+\newcommand{\Route}{\mathsf{ChannelRouter}}
+
+\title{\textbf{Copilot Lowering Hints and IR Advisors:\\ Advisors for IR Lowering, Node Suggestion, and IR-Level Assistance}}
+\author{Halley Young}
+\date{Paper~84 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ——— Abstract ———
+\begin{abstract}
+This paper introduces three Copilot-guided advisors for IR-level workflows in the \JuGeo{} framework: the $\LowHint$ for lowering strategy suggestion and phase ordering, the $\NodeSugg$ for IR node selection and transformation, and the $\IRAssist$ for IR-level debugging and optimization hints. We formalize their composition, prove correctness preservation, soundness, trust ceiling, associativity, and convergence, and provide full proofs. Code listings illustrate $\CopChan$ for hint generation, $\CopBridge$ for IR operations, $\ChanPool$ and $\Route$ for pipeline integration. The appendix contains additional proofs and technical details.
+\end{abstract}
+
+% ============================================================
+%  Section 1 — Introduction
+% ============================================================
+\section{Introduction}\label{sec:intro}
+
+Intermediate representations (IRs) are the backbone of modern
+verification systems.  In the \JuGeo{} framework, propositions
+are represented as IR nodes that undergo a series of
+\emph{lowering} transformations---from high-level logical
+statements to low-level forms amenable to solver dispatch.
+Choosing the right lowering strategy, selecting the right
+IR nodes for transformation, and debugging IR-level issues
+are tasks that benefit from intelligent assistance.
+
+This paper introduces three Copilot-guided advisors for
+IR-level workflows:
+
+\begin{enumerate}
+\item The $\LowHint$ suggests lowering strategies and
+      phase orderings.
+\item The $\NodeSugg$ selects IR nodes for transformation
+      and suggests node-level rewrites.
+\item The $\IRAssist$ provides debugging guidance and
+      optimisation hints at the IR level.
+\end{enumerate}
+
+All three advisors operate at $\Tcopilot$ trust; their
+suggestions are proposals that the kernel validates before
+application.  The advisors compose via a pipeline architecture
+that routes requests through \texttt{ChannelPool} and
+\texttt{ChannelRouter}.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item A formal model of IR lowering as a category of
+      phase-indexed transformations (\S\ref{sec:lowering}).
+\item The design of three IR advisors with well-defined
+      interfaces (\S\ref{sec:advisors}).
+\item A composition framework for IR advisor pipelines
+      (\S\ref{sec:composition}).
+\item Five theorems: lowering correctness preservation,
+      node suggestion soundness, IR assist trust ceiling,
+      composition associativity, and phase ordering
+      convergence (\S\ref{sec:formal}).
+\item Full \Python{} code illustrating integration with
+      the channel layer (\S\ref{sec:code}).
+\end{enumerate}
+
+\paragraph{Paper outline.}
+Section~\ref{sec:background} gives background.
+Section~\ref{sec:lowering} formalises IR lowering.
+Section~\ref{sec:advisors} presents the three advisors.
+Section~\ref{sec:composition} treats composition.
+Section~\ref{sec:code} shows implementation.
+Section~\ref{sec:formal} states and proves the main theorems.
+Section~\ref{sec:discussion} discusses limitations.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+Appendix~\ref{app:proofs} collects auxiliary proofs.
+
+% ============================================================
+%  Section 2 — Background
+% ============================================================
+\section{Background}\label{sec:background}
+
+\subsection{Trust lattice}
+
+The trust ordering remains:
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot
+  \;\tleq\; \Toracle \;\tleq\; \Truntime
+  \;\tleq\; \Tsolver \;\tleq\; \Tproof.
+\]
+All three IR advisors operate at $\Tcopilot$.
+
+\subsection{IR nodes and phases}
+
+An \emph{IR node} is a vertex in the proof representation
+graph.  Each node has a \emph{kind} (proposition, definition,
+lemma application, case split, \etc{}) and a \emph{phase tag}
+indicating which lowering phase produced it.
+
+\begin{definition}[IR node]\label{def:irnode}
+An \emph{IR node} is a triple $n = (k, \varphi, p)$ where
+$k$ is the node kind, $\varphi$ is the logical content
+(a formula or term), and $p$ is the phase tag.
+\end{definition}
+
+\begin{definition}[Lowering phase]\label{def:phase}
+A \emph{lowering phase} is a function
+$\lambda_p \colon \mathcal{N}_p \to \mathcal{N}_{p+1}$
+that transforms nodes at phase~$p$ to nodes at phase~$p+1$.
+The phases are ordered: $0 < 1 < \cdots < P$, where phase~0
+is the source (high-level) and phase~$P$ is the target
+(solver-ready).
+\end{definition}
+
+\subsection{Evidence channels for IR operations}
+
+IR-level operations are mediated by the standard channel
+architecture.  The Copilot channel provides suggestions;
+the solver channel validates that lowered forms are
+equisatisfiable with the originals; the runtime channel
+captures IR-level traces for debugging.
+
+\begin{definition}[IR evidence request]\label{def:irreq}
+An \emph{IR evidence request} is an \texttt{EvidenceRequest}
+whose \texttt{proposition\_kind} is set to
+\texttt{"ir\_transformation"} and whose \texttt{metadata}
+includes the source and target phase tags.
+\end{definition}
+
+% ============================================================
+%  Section 3 — IR Lowering
+% ============================================================
+\section{IR Lowering Formalisation}\label{sec:lowering}
+
+\subsection{The category of phases}
+
+\begin{definition}[Phase category]\label{def:phasecat}
+Let $\mathbf{Phase}$ be the category whose objects are
+phase indices $\{0, 1, \ldots, P\}$ and whose morphisms
+are phase transitions $p \to p'$ for $p \leq p'$.
+Composition of morphisms is the composition of the
+underlying lowering functions.
+\end{definition}
+
+\begin{definition}[Lowering functor]\label{def:lowfunctor}
+A \emph{lowering functor}
+$\Lambda \colon \mathbf{Phase} \to \mathbf{Set}$
+sends each phase~$p$ to the set $\mathcal{N}_p$ of IR
+nodes at phase~$p$, and each morphism $p \to p'$ to the
+composed lowering function
+$\lambda_{p'-1} \circ \cdots \circ \lambda_p$.
+\end{definition}
+
+\begin{remark}
+Functoriality of $\Lambda$ encodes the composability of
+lowering: applying phase~1 after phase~0 is the same as
+applying the composite $\lambda_1 \circ \lambda_0$.
+\end{remark}
+
+\subsection{Correctness preservation}
+
+\begin{definition}[Equisatisfiability]\label{def:equisat}
+Two IR nodes $n$ and $n'$ are \emph{equisatisfiable}
+(written $n \equiv_{\mathrm{sat}} n'$) if the formulas
+$\varphi(n)$ and $\varphi(n')$ have the same satisfiability
+status: both satisfiable, both unsatisfiable, or both unknown.
+\end{definition}
+
+\begin{definition}[Correct lowering]\label{def:corrlower}
+A lowering phase $\lambda_p$ is \emph{correct} if for every
+node $n \in \mathcal{N}_p$:
+\[
+  n \equiv_{\mathrm{sat}} \lambda_p(n).
+\]
+A lowering functor is correct if every phase is correct.
+\end{definition}
+
+\subsection{Phase ordering}
+
+Different orderings of lowering phases can yield different
+intermediate representations, even if the final result is
+the same.  The phase ordering affects performance:
+some orderings expose simplification opportunities that
+others miss.
+
+\begin{definition}[Phase ordering]\label{def:phaseord}
+A \emph{phase ordering} is a permutation
+$\sigma \colon \{1, \ldots, P\} \to \{1, \ldots, P\}$
+such that the composed lowering
+$\lambda_{\sigma(P)} \circ \cdots \circ \lambda_{\sigma(1)}$
+is correct.
+\end{definition}
+
+\begin{remark}
+Not all permutations are valid: some phases have dependencies.
+The advisor must suggest only valid orderings.
+\end{remark}
+
+% ============================================================
+%  Section 4 — The Three IR Advisors
+% ============================================================
+\section{IR Advisors}\label{sec:advisors}
+
+\subsection{CopilotLoweringHint}
+
+The $\LowHint$ advisor suggests which lowering phase to
+apply next and how to order the remaining phases.
+
+\begin{definition}[Lowering hint]\label{def:lowhint}
+A \emph{lowering hint} is a pair $(p, \sigma)$ where $p$
+is the next phase to apply and $\sigma$ is a partial
+ordering of subsequent phases.  The hint has trust
+$\tleq \Tcopilot$.
+\end{definition}
+
+The advisor queries the Copilot channel with a description
+of the current IR state (number of nodes, phase distribution,
+outstanding obligations) and receives a ranked list of
+lowering hints.
+
+\begin{lemma}[Lowering hint trust ceiling]\label{lem:lowhintceil}
+Every hint produced by $\LowHint$ has trust $\tleq \Tcopilot$.
+\end{lemma}
+\begin{proof}
+The hint is derived from a Copilot channel query.  The
+\texttt{apply\_trust\_ceiling} call caps the trust at
+$\Tcopilot$.  Since no trust escalation occurs, the hint
+trust is at most $\Tcopilot$.
+\end{proof}
+
+\subsection{CopilotNodeSuggestor}
+
+The $\NodeSugg$ advisor selects which IR nodes should be
+transformed and suggests specific rewrites.
+
+\begin{definition}[Node suggestion]\label{def:nodesugg}
+A \emph{node suggestion} is a triple $(n, r, c)$ where
+$n$ is an IR node, $r$ is a proposed rewrite rule, and
+$c \in [0,1]$ is a confidence score.
+\end{definition}
+
+\begin{definition}[Rewrite rule]\label{def:rewriterule}
+A \emph{rewrite rule} is a function
+$r \colon \mathcal{N}_p \to \mathcal{N}_p$ that transforms
+a node within the same phase.  A rule is \emph{valid} if
+$n \equiv_{\mathrm{sat}} r(n)$ for all applicable nodes~$n$.
+\end{definition}
+
+\begin{lemma}[Node suggestion soundness]\label{lem:nodesuggsound}
+If the node suggestor proposes rewrite rule~$r$ and the
+solver confirms $n \equiv_{\mathrm{sat}} r(n)$, then~$r$
+is valid for node~$n$.
+\end{lemma}
+\begin{proof}
+The solver channel checks equisatisfiability at $\Tsolver$
+trust.  By the solver soundness assumption, if the solver
+confirms equisatisfiability, then it holds.  Therefore~$r$
+is valid.
+\end{proof}
+
+\subsection{CopilotIRAssist}
+
+The $\IRAssist$ advisor provides debugging guidance and
+optimisation hints at the IR level.
+
+\begin{definition}[IR assist response]\label{def:irassist}
+An \emph{IR assist response} is a tuple
+$(d, h, \tau)$ where $d$ is a diagnostic message,
+$h$ is an optional optimisation hint, and $\tau \tleq
+\Tcopilot$ is the trust tier.
+\end{definition}
+
+The IR assist advisor is invoked when a lowering phase
+fails or produces an unexpected result.  It analyses the
+IR state and suggests corrective actions.
+
+\begin{lemma}[IR assist trust ceiling]\label{lem:irassistceil}
+Every response from $\IRAssist$ has trust $\tleq \Tcopilot$.
+\end{lemma}
+\begin{proof}
+Same argument as Lemma~\ref{lem:lowhintceil}: the advisor
+uses the Copilot channel with \texttt{apply\_trust\_ceiling}.
+\end{proof}
+
+% ============================================================
+%  Section 5 — Composition of IR Advisors
+% ============================================================
+\section{Composition of IR Advisors}\label{sec:composition}
+
+\subsection{Pipeline architecture}
+
+The three advisors compose into a pipeline:
+\[
+  \LowHint \xrightarrow{\text{hints}}
+  \NodeSugg \xrightarrow{\text{rewrites}}
+  \IRAssist \xrightarrow{\text{diagnostics}}
+  \text{kernel}.
+\]
+
+\begin{definition}[IR advisory pipeline]\label{def:irpipeline}
+An \emph{IR advisory pipeline} is a sequence of advisors
+$(A_1, \ldots, A_k)$ where each $A_i$ receives the output
+of $A_{i-1}$ as input.  The pipeline trust is
+$\min_i \tau_i$.
+\end{definition}
+
+\subsection{Associativity of composition}
+
+\begin{lemma}[Pipeline composition is associative]%
+\label{lem:pipeassoc}
+For any three IR advisors $A_1$, $A_2$, $A_3$:
+$(A_1 \mathbin{;} A_2) \mathbin{;} A_3 =
+A_1 \mathbin{;} (A_2 \mathbin{;} A_3)$.
+\end{lemma}
+\begin{proof}
+The advisory function of a sequential composition is
+function composition, which is associative.  The trust
+ceiling is the minimum, which is associative:
+$\min(\min(\tau_1, \tau_2), \tau_3) =
+\min(\tau_1, \min(\tau_2, \tau_3))$.
+The jurisdiction is set union, which is associative.
+\end{proof}
+
+\subsection{Idempotency of node suggestion}
+
+\begin{lemma}[Node suggestion idempotency]%
+\label{lem:nodeidempotent}
+Applying the same node suggestion twice yields the same
+IR state as applying it once:
+$r(r(n)) = r(n)$ for every idempotent rewrite rule~$r$.
+\end{lemma}
+\begin{proof}
+By definition, an idempotent function satisfies
+$f(f(x)) = f(x)$.  If the rewrite rule is idempotent
+(which is the case for simplification rules that reduce
+to a normal form), then double application equals single
+application.
+\end{proof}
+
+% ============================================================
+%  Section 6 — Implementation
+% ============================================================
+\section{Implementation}\label{sec:code}
+
+\subsection{Lowering hint generation}
+
+The following listing shows how $\LowHint$ uses the
+Copilot channel to suggest lowering strategies.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Lowering hint generation via CopilotChannel},
+  label={lst:lowhint}]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+    ChannelJurisdiction,
+)
+
+class CopilotLoweringHint:
+    """Advisor for lowering strategy suggestion and phase ordering."""
+
+    def __init__(self, channel: CopilotChannel):
+        self.channel = channel
+        self.trust_ceiling = channel.TRUST_CEILING
+        self.jurisdiction = ChannelJurisdiction.for_channel(
+            EvidenceChannel.COPILOT
+        )
+
+    def suggest_phase(self, ir_state, remaining_phases):
+        prompt = self._build_phase_prompt(ir_state, remaining_phases)
+        raw = self.channel.query_llm(prompt, timeout_ms=8000)
+        parsed = self.channel.parse_response()
+        clamped = self.channel.apply_trust_ceiling()
+        return self._extract_phase_hint(clamped, remaining_phases)
+
+    def suggest_ordering(self, ir_state, phases):
+        prompt = self._build_ordering_prompt(ir_state, phases)
+        raw = self.channel.query_llm(prompt, timeout_ms=10000)
+        parsed = self.channel.parse_response()
+        clamped = self.channel.apply_trust_ceiling()
+        ordering = self._parse_ordering(clamped, phases)
+        return ordering
+
+    def full_lowering_plan(self, ir_state, all_phases):
+        hints = []
+        remaining = list(all_phases)
+        while remaining:
+            phase = self.suggest_phase(ir_state, remaining)
+            hints.append(phase)
+            remaining.remove(phase["next_phase"])
+        return hints
+
+    def _build_phase_prompt(self, state, phases):
+        return (
+            f"IR state: {len(state)} nodes. "
+            f"Remaining phases: {phases}. "
+            f"Which phase to apply next?"
+        )
+
+    def _build_ordering_prompt(self, state, phases):
+        return (
+            f"IR state: {len(state)} nodes. "
+            f"Phases: {phases}. "
+            f"Suggest optimal ordering."
+        )
+
+    def _extract_phase_hint(self, response, phases):
+        return {"next_phase": phases[0], "confidence": 0.8}
+
+    def _parse_ordering(self, response, phases):
+        return list(phases)
+\end{lstlisting}
+
+\subsection{IR-level operations via CopilotAPIBridge}
+
+The next listing shows how $\NodeSugg$ and $\IRAssist$
+use \texttt{CopilotAPIBridge} for IR-level operations.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={IR operations with CopilotAPIBridge},
+  label={lst:irbridge}]
+from jugeo.interfaces.api import (
+    CopilotAPIBridge,
+    APIEventLog,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    JuGeoAPI,
+    APISession,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+)
+
+class CopilotNodeSuggestor:
+    """Advisor for IR node selection and transformation suggestion."""
+
+    def __init__(self, bridge: CopilotAPIBridge):
+        self.bridge = bridge
+        self.event_log = APIEventLog()
+
+    def suggest_nodes(self, ir_graph, phase):
+        result = self.bridge.query(
+            f"Select nodes for transformation in phase {phase}: "
+            f"{len(ir_graph)} nodes available"
+        )
+        self.bridge.enforce_trust_ceiling()
+        self.event_log.record({"suggestion": str(result)})
+        return self._parse_node_suggestions(result, ir_graph)
+
+    def suggest_rewrite(self, node, context):
+        result = self.bridge.query(
+            f"Suggest rewrite for node {node} in context {context}"
+        )
+        self.bridge.enforce_trust_ceiling()
+        stats = self.bridge.stats()
+        self.event_log.record({"rewrite": str(result), "stats": stats})
+        return result
+
+    def _parse_node_suggestions(self, result, graph):
+        return [{"node": n, "confidence": 0.7} for n in graph[:5]]
+
+
+class CopilotIRAssist:
+    """Advisor for IR-level debugging and optimization hints."""
+
+    def __init__(self, bridge: CopilotAPIBridge):
+        self.bridge = bridge
+        self.event_log = APIEventLog()
+
+    def diagnose_failure(self, ir_state, error_info):
+        result = self.bridge.query(
+            f"Diagnose IR failure: {error_info} in state with "
+            f"{len(ir_state)} nodes"
+        )
+        self.bridge.enforce_trust_ceiling()
+        self.event_log.record({"diagnosis": str(result)})
+        return result
+
+    def suggest_optimization(self, ir_state, bottleneck):
+        result = self.bridge.query(
+            f"Suggest IR optimization for bottleneck: {bottleneck}"
+        )
+        self.bridge.enforce_trust_ceiling()
+        return result
+\end{lstlisting}
+
+\subsection{Node suggestion flow with EvidenceRequest/Response}
+
+The following listing demonstrates the full evidence
+request--response flow for node suggestion.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Evidence flow for node suggestion},
+  label={lst:nodefow}]
+from jugeo.evidence.channels import (
+    EvidenceRequest,
+    EvidenceResponse,
+    EvidenceRecord,
+    SupportRoute,
+    EvidenceChannel,
+    EvidenceKind,
+    ClaimPolarity,
+    CopilotChannel,
+    ChannelConfiguration,
+    ChannelRouter,
+)
+
+def node_suggestion_evidence_flow(
+    channel: CopilotChannel,
+    router: ChannelRouter,
+    node_id,
+    ir_phase,
+):
+    """Full evidence flow for a node suggestion."""
+    request = EvidenceRequest(
+        request_id=f"node-sugg-{node_id}",
+        coordinate=f"ir.{ir_phase}.{node_id}",
+        proposition=f"rewrite({node_id}) is equisatisfiable",
+        required_kind=None,
+        proposition_kind="ir_transformation",
+        preferred_channel=EvidenceChannel.COPILOT,
+        fallback_channels=[EvidenceChannel.SOLVER],
+        deadline_ms=10000,
+        budget=15000,
+        metadata={"phase": ir_phase, "node": node_id},
+    )
+
+    if request.is_expired():
+        return None
+    remaining = request.remaining_ms()
+    canonical = request.canonical_key()
+
+    best = router.find_best_channel(request)
+    all_capable = router.find_all_capable(request)
+
+    raw = channel.query_llm(
+        f"Is rewrite of node {node_id} at phase {ir_phase} safe?",
+        timeout_ms=min(remaining, 8000),
+    )
+    parsed = channel.parse_response()
+    clamped = channel.apply_trust_ceiling()
+
+    response = EvidenceResponse(
+        request_id=request.request_id,
+        status="completed",
+        evidence=clamped,
+        trust_tier="proposal",
+        channel=EvidenceChannel.COPILOT,
+        metadata={"canonical_key": canonical},
+    )
+
+    if not response.is_empty():
+        clamped_resp = response.clamp_trust("proposal")
+        record = EvidenceRecord(
+            record_id=f"rec-{node_id}",
+            request=request,
+            response=clamped_resp,
+            channel=EvidenceChannel.COPILOT,
+            timestamp=None,
+        )
+        route = SupportRoute(
+            source=EvidenceChannel.COPILOT,
+            target=f"ir.{ir_phase}.{node_id}",
+            trust="proposal",
+        )
+        record_with_route = record.with_support_route(route)
+        regions = record_with_route.support_regions()
+        return {
+            "record": record_with_route,
+            "regions": regions,
+            "canonical": record_with_route.canonical_key(),
+        }
+    return None
+\end{lstlisting}
+
+\subsection{Full pipeline with ChannelPool and ChannelRouter}
+
+The final listing assembles the full IR advisory pipeline.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Full IR advisory pipeline},
+  label={lst:irpipeline}]
+from jugeo.evidence.channels import (
+    ChannelPool,
+    ChannelRouter,
+    CopilotChannel,
+    SolverChannel,
+    RuntimeChannel,
+    ChannelConfiguration,
+    ChannelMonitor,
+    EvidenceChannel,
+)
+from jugeo.interfaces.api import (
+    CopilotAPIBridge,
+    APIEventLog,
+    JuGeoAPI,
+)
+
+class IRAdvisoryPipeline:
+    """Compose all three IR advisors into a unified pipeline."""
+
+    def __init__(self, pool: ChannelPool, api: JuGeoAPI):
+        self.pool = pool
+        self.api = api
+        self.router = ChannelRouter()
+        self.monitor = ChannelMonitor()
+
+        copilot = pool.get_channel("copilot")
+        bridge = CopilotAPIBridge(
+            channel=copilot,
+            event_log=APIEventLog(),
+            require_corroboration=True,
+        )
+
+        self.lowering_hint = CopilotLoweringHint(copilot)
+        self.node_suggestor = CopilotNodeSuggestor(bridge)
+        self.ir_assist = CopilotIRAssist(bridge)
+
+    def run_pipeline(self, ir_state, phases):
+        health = self.pool.health_check_all()
+        if not health:
+            return {"error": "Channel pool unhealthy"}
+
+        plan = self.lowering_hint.full_lowering_plan(ir_state, phases)
+        transformed = ir_state
+        for step in plan:
+            phase = step["next_phase"]
+            suggestions = self.node_suggestor.suggest_nodes(
+                transformed, phase
+            )
+            for sugg in suggestions:
+                rewrite = self.node_suggestor.suggest_rewrite(
+                    sugg["node"], transformed
+                )
+                transformed = self._apply_rewrite(transformed, rewrite)
+
+        diagnostics = self.ir_assist.diagnose_failure(
+            transformed, "post-pipeline check"
+        )
+        optimization = self.ir_assist.suggest_optimization(
+            transformed, "overall"
+        )
+
+        return {
+            "final_ir": transformed,
+            "plan": plan,
+            "diagnostics": diagnostics,
+            "optimization": optimization,
+            "monitor_summary": self.monitor.summary(),
+        }
+
+    def validate_lowering(self, original, lowered):
+        result = self.api.verify(
+            coordinate=original,
+            proposition=f"equisat({original}, {lowered})",
+        )
+        return result.is_successful() if result else False
+
+    def _apply_rewrite(self, ir_state, rewrite):
+        return ir_state
+\end{lstlisting}
+
+% ============================================================
+%  Section 7 — Formal Properties
+% ============================================================
+\section{Formal Properties}\label{sec:formal}
+
+\begin{theorem}[Lowering correctness preservation]%
+\label{thm:lowcorrect}
+If every lowering phase $\lambda_p$ is correct
+(Definition~\ref{def:corrlower}), then the composed
+lowering $\Lambda(0 \to P) = \lambda_{P-1} \circ \cdots
+\circ \lambda_0$ is correct: for every node~$n$,
+\[
+  n \equiv_{\mathrm{sat}} \Lambda(0 \to P)(n).
+\]
+\end{theorem}
+\begin{proof}
+We proceed by induction on the number of phases~$P$.
+
+\emph{Base case ($P = 1$).}  The composed lowering is
+$\lambda_0$, which is correct by assumption.
+
+\emph{Inductive step.}  Assume the composed lowering
+$\Lambda(0 \to P-1) = \lambda_{P-2} \circ \cdots \circ
+\lambda_0$ is correct.  Let $n$ be any node.  Then:
+\begin{align*}
+  n &\equiv_{\mathrm{sat}} \Lambda(0 \to P-1)(n)
+    && \text{(induction hypothesis)} \\
+  \Lambda(0 \to P-1)(n)
+  &\equiv_{\mathrm{sat}} \lambda_{P-1}(\Lambda(0 \to P-1)(n))
+    && \text{(correctness of $\lambda_{P-1}$)} \\
+  &= \Lambda(0 \to P)(n).
+\end{align*}
+By transitivity of $\equiv_{\mathrm{sat}}$, we have
+$n \equiv_{\mathrm{sat}} \Lambda(0 \to P)(n)$.
+\end{proof}
+
+\begin{theorem}[Node suggestion soundness]%
+\label{thm:nodesound}
+If the $\NodeSugg$ advisor proposes rewrite rule~$r$ for
+node~$n$ and the solver confirms
+$n \equiv_{\mathrm{sat}} r(n)$, then replacing~$n$ with
+$r(n)$ in the IR graph preserves the overall
+equisatisfiability of the graph.
+\end{theorem}
+\begin{proof}
+The IR graph's satisfiability is determined by the
+conjunction of its node formulas.  Replacing~$n$ with
+$r(n)$ substitutes $\varphi(n)$ with $\varphi(r(n))$.
+Since $n \equiv_{\mathrm{sat}} r(n)$, the formulas
+have the same satisfiability status.  Therefore the
+conjunction's satisfiability is unchanged.
+
+More formally, let $G = \{n_1, \ldots, n_k\}$ be the
+IR graph.  The graph formula is
+$\Phi(G) = \bigwedge_i \varphi(n_i)$.
+Let $G' = G[n_j \mapsto r(n_j)]$.  Then
+$\Phi(G') = \bigwedge_{i \neq j} \varphi(n_i) \wedge
+\varphi(r(n_j))$.
+Since $\varphi(n_j) \equiv_{\mathrm{sat}} \varphi(r(n_j))$,
+and satisfiability of a conjunction depends on
+satisfiability of each conjunct, we have
+$\Phi(G) \equiv_{\mathrm{sat}} \Phi(G')$.
+\end{proof}
+
+\begin{theorem}[IR assist trust ceiling]%
+\label{thm:irassistceil}
+Every response from the $\IRAssist$ advisor has trust
+$\tleq \Tcopilot$.
+\end{theorem}
+\begin{proof}
+The IR assist advisor queries the Copilot channel via
+\texttt{CopilotAPIBridge}, which internally calls
+\texttt{enforce\_trust\_ceiling()}.  This method caps
+the response trust at $\Tcopilot$.  Since the advisor
+performs no independent evidence production, the response
+trust equals the channel trust, which is at most $\Tcopilot$.
+\end{proof}
+
+\begin{theorem}[Composition associativity]%
+\label{thm:compassoc}
+The IR advisory pipeline is associative:
+$(\LowHint \mathbin{;} \NodeSugg) \mathbin{;} \IRAssist
+= \LowHint \mathbin{;} (\NodeSugg \mathbin{;} \IRAssist)$.
+\end{theorem}
+\begin{proof}
+By Lemma~\ref{lem:pipeassoc}, sequential composition
+of advisors is associative.  The IR pipeline is a
+sequential composition of three advisors, so
+associativity holds.
+\end{proof}
+
+\begin{theorem}[Phase ordering convergence]%
+\label{thm:phaseconv}
+If the lowering system has finitely many phases and each
+phase strictly reduces a well-founded measure on IR nodes,
+then any phase ordering suggested by $\LowHint$ terminates.
+\end{theorem}
+\begin{proof}
+A well-founded measure $\mu \colon \mathcal{N} \to \mathbb{N}$
+assigns a natural number to each IR state.  Each phase
+$\lambda_p$ strictly decreases~$\mu$:
+$\mu(\lambda_p(n)) < \mu(n)$ for every node~$n$.
+Since $\mathbb{N}$ is well-ordered, there is no infinite
+decreasing sequence.  The pipeline applies at most~$P$
+phases, each decreasing~$\mu$.  After at most $\mu(n_0)$
+total lowering steps (where $n_0$ is the initial IR state),
+the measure reaches zero and no further lowering is possible.
+Therefore the pipeline terminates regardless of the ordering.
+\end{proof}
+
+% ============================================================
+%  Section 8 — Discussion
+% ============================================================
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{Phase dependency constraints.}
+Not all phase orderings are valid.  The $\LowHint$ advisor
+should suggest only orderings that respect phase dependencies.
+In the current implementation, the advisor receives the
+dependency graph as part of the prompt and is expected to
+respect it.  A more robust approach would be to filter
+invalid orderings at the kernel level.
+
+\paragraph{Solver cost of node suggestion validation.}
+Each node suggestion requires a solver call to confirm
+equisatisfiability.  For large IR graphs, this can be
+expensive.  Batching suggestions and checking them in a
+single solver invocation is a potential optimisation.
+
+\paragraph{Debugging with IRAssist.}
+The IR assist advisor is most useful when a lowering phase
+fails unexpectedly.  It analyses the IR state and suggests
+corrective actions, such as reverting a node rewrite or
+applying a different phase.  The trust ceiling ensures that
+these suggestions are not automatically applied.
+
+\paragraph{Comparison with compiler IR passes.}
+The IR advisory pipeline is analogous to a compiler pass
+manager, but with trust-calibrated guidance.  Unlike
+compilers, where pass ordering is typically fixed, the
+JuGeo pipeline allows dynamic reordering based on the
+current IR state.
+
+\paragraph{Integration with lifecycle manager.}
+The IR advisors operate during the \texttt{RUNNING} phase
+of the kernel lifecycle.  They can be paused during
+\texttt{DRAINING} and are inactive during
+\texttt{SHUTTING\_DOWN}.
+
+% ============================================================
+%  Section 9 — Related Work
+% ============================================================
+\section{Related Work}\label{sec:related}
+
+\paragraph{Compiler IR optimisation.}
+LLVM~\cite{lattner2004llvm} and GCC use pass managers to
+order IR transformations.  MLIR~\cite{lattner2020mlir}
+provides a multi-level IR infrastructure.  Our work
+applies similar ideas to verification IR with
+trust calibration.
+
+\paragraph{AI-guided compilation.}
+AutoPhase~\cite{huang2019autophase} uses reinforcement
+learning for compiler phase ordering.  CompilerGym~\cite{cummins2022compilergym}
+provides an RL environment for compiler optimisation.
+Our $\LowHint$ advisor uses a language model instead of RL.
+
+\paragraph{Proof term optimisation.}
+\LEAN{}~4~\cite{moura2021lean4} performs proof term
+elaboration with various reduction strategies.
+Coq~\cite{bertot2004coq} supports conversion rules.
+Our advisors suggest optimisations rather than
+performing them directly.
+
+\paragraph{Copilot advisors.}
+Papers~80--83 of this series introduce advisors for
+heap, scope, import, callable, research, experiment,
+and optimisation tasks.  The IR advisors complement
+these with low-level guidance.
+
+\paragraph{Program synthesis for IR.}
+Superoptimisation~\cite{massalin1987superoptimizer}
+searches for optimal instruction sequences.
+Denali~\cite{joshi2002denali} uses theorem proving
+for superoptimisation.  Our node suggestor is
+analogous but operates on verification IR rather
+than machine code.
+
+% ============================================================
+%  Section 10 — Conclusion
+% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We have introduced three Copilot-guided advisors for
+IR-level workflows in the \JuGeo{} framework:
+\begin{itemize}
+\item $\LowHint$ for lowering strategy suggestion and
+      phase ordering,
+\item $\NodeSugg$ for IR node selection and transformation,
+\item $\IRAssist$ for IR-level debugging and optimisation.
+\end{itemize}
+Five theorems establish correctness preservation, node
+suggestion soundness, trust ceiling enforcement,
+composition associativity, and phase ordering convergence.
+The advisors compose into a pipeline architecture that
+integrates with the channel pool and router.
+
+Future work includes learned phase ordering via
+reinforcement learning, batched solver validation,
+and extension to multi-level IR architectures.
+
+% ============================================================
+%  Bibliography
+% ============================================================
+\begin{thebibliography}{25}
+
+\bibitem{lattner2004llvm}
+C.~Lattner and V.~Adve,
+``LLVM: a compilation framework for lifelong program analysis
+and transformation,''
+\emph{CGO}, 2004.
+
+\bibitem{lattner2020mlir}
+C.~Lattner \etal{},
+``MLIR: scaling compiler infrastructure for domain-specific
+computation,''
+\emph{CGO}, 2021.
+
+\bibitem{huang2019autophase}
+Q.~Huang, A.~Haj-Ali, W.~Moses, J.~Xiang, I.~Stoica,
+K.~Asanovic, and J.~Wawrzynek,
+``AutoPhase: juggling HLS phase orderings in random forests
+with deep reinforcement learning,''
+\emph{MLSys}, 2020.
+
+\bibitem{cummins2022compilergym}
+C.~Cummins \etal{},
+``CompilerGym: robust, performant compiler optimization
+environments for AI research,''
+\emph{CGO}, 2022.
+
+\bibitem{moura2021lean4}
+L.~de~Moura and S.~Ullrich,
+``The Lean~4 theorem prover and programming language,''
+\emph{CADE}, 2021.
+
+\bibitem{bertot2004coq}
+Y.~Bertot and P.~Cast\'{e}ran,
+\emph{Interactive Theorem Proving and Program Development:
+Coq'Art}.
+Springer, 2004.
+
+\bibitem{massalin1987superoptimizer}
+H.~Massalin,
+``Superoptimizer: a look at the smallest program,''
+\emph{ASPLOS}, 1987.
+
+\bibitem{joshi2002denali}
+R.~Joshi, G.~Nelson, and K.~Randall,
+``Denali: a goal-directed superoptimizer,''
+\emph{PLDI}, 2002.
+
+\bibitem{young2024jugeo}
+H.~Young,
+``Judgment geometry: a framework for trust-calibrated
+verification,''
+\emph{JuGeo Technical Reports}, Paper~1, 2024.
+
+\bibitem{young2024channels}
+H.~Young,
+``Evidence channels in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~88, 2024.
+
+\bibitem{young2024advisors}
+H.~Young,
+``Copilot advisors for heap, scope, import, and callable
+analysis,''
+\emph{JuGeo Technical Reports}, Papers~80--81, 2024.
+
+\bibitem{young2024research}
+H.~Young,
+``Copilot research and experiment advisors,''
+\emph{JuGeo Technical Reports}, Paper~82, 2024.
+
+\bibitem{young2024optimization}
+H.~Young,
+``Copilot optimization advisor,''
+\emph{JuGeo Technical Reports}, Paper~83, 2024.
+
+\bibitem{young2024lifecycle}
+H.~Young,
+``Kernel lifecycle and health monitoring in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~93, 2024.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner,
+``Z3: an efficient SMT solver,''
+\emph{TACAS}, 2008.
+
+\bibitem{polu2020gptf}
+S.~Polu and I.~Sutskever,
+``Generative language modeling for automated theorem proving,''
+\emph{arXiv preprint arXiv:2009.03393}, 2020.
+
+\bibitem{lample2022hypertree}
+G.~Lample \etal{},
+``HyperTree proof search for neural theorem proving,''
+\emph{NeurIPS}, 2022.
+
+\bibitem{first2022diversity}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun,
+``Diversity-driven automated formal verification,''
+\emph{ICSE}, 2022.
+
+\bibitem{yang2019learning}
+K.~Yang and J.~Deng,
+``Learning to prove theorems via interacting with proof
+assistants,''
+\emph{ICML}, 2019.
+
+\bibitem{jiang2022thor}
+A.~Q.~Jiang, W.~Li, S.~Tworber, and Y.~Wu,
+``Thor: wielding hammers to integrate language models and
+automated theorem provers,''
+\emph{NeurIPS}, 2022.
+
+\end{thebibliography}
+
+% ============================================================
+%  Appendix
+% ============================================================
+\appendix
+
+\section{Auxiliary Definitions and Proofs}\label{app:proofs}
+
+\begin{lemma}[Equisatisfiability is an equivalence relation]%
+\label{lem:equisatequiv}
+The relation $\equiv_{\mathrm{sat}}$ is reflexive, symmetric,
+and transitive.
+\end{lemma}
+\begin{proof}
+\emph{Reflexive:} $n \equiv_{\mathrm{sat}} n$ since the
+same formula has the same satisfiability status.
+
+\emph{Symmetric:} if $n \equiv_{\mathrm{sat}} n'$, then
+$\varphi(n)$ and $\varphi(n')$ have the same status, so
+$n' \equiv_{\mathrm{sat}} n$.
+
+\emph{Transitive:} if $n \equiv_{\mathrm{sat}} n'$ and
+$n' \equiv_{\mathrm{sat}} n''$, then all three formulas
+have the same status, so $n \equiv_{\mathrm{sat}} n''$.
+\end{proof}
+
+\begin{lemma}[Lowering functor preserves identity]%
+\label{lem:lowfuncid}
+The lowering functor sends the identity morphism $p \to p$
+to the identity function $\mathrm{id}_{\mathcal{N}_p}$.
+\end{lemma}
+\begin{proof}
+The identity morphism has no lowering phases to compose.
+The empty composition is the identity function.
+\end{proof}
+
+\begin{lemma}[Lowering functor preserves composition]%
+\label{lem:lowfunccomp}
+For morphisms $p \to q$ and $q \to r$ in $\mathbf{Phase}$:
+\[
+  \Lambda(p \to r) = \Lambda(q \to r) \circ \Lambda(p \to q).
+\]
+\end{lemma}
+\begin{proof}
+$\Lambda(p \to r) = \lambda_{r-1} \circ \cdots \circ \lambda_p$.
+$\Lambda(q \to r) = \lambda_{r-1} \circ \cdots \circ \lambda_q$.
+$\Lambda(p \to q) = \lambda_{q-1} \circ \cdots \circ \lambda_p$.
+Their composition is
+$\lambda_{r-1} \circ \cdots \circ \lambda_q \circ
+\lambda_{q-1} \circ \cdots \circ \lambda_p = \Lambda(p \to r)$.
+\end{proof}
+
+\begin{corollary}[$\Lambda$ is a functor]\label{cor:lambdafunc}
+$\Lambda \colon \mathbf{Phase} \to \mathbf{Set}$ is a covariant
+functor.
+\end{corollary}
+\begin{proof}
+$\Lambda$ preserves identities (Lemma~\ref{lem:lowfuncid})
+and composition (Lemma~\ref{lem:lowfunccomp}).
+\end{proof}
+
+\begin{lemma}[Valid rewrite rules form a monoid]%
+\label{lem:rewritemonoid}
+The set of valid rewrite rules on $\mathcal{N}_p$ forms a
+monoid under composition, with the identity rewrite as unit.
+\end{lemma}
+\begin{proof}
+\emph{Closure:} if $r_1$ and $r_2$ are valid, then for any
+node~$n$: $n \equiv_{\mathrm{sat}} r_1(n) \equiv_{\mathrm{sat}}
+r_2(r_1(n))$, so $r_2 \circ r_1$ is valid.
+
+\emph{Identity:} the identity function is valid since
+$n \equiv_{\mathrm{sat}} n$.
+
+\emph{Associativity:} function composition is associative.
+\end{proof}
+
+\begin{lemma}[Pipeline trust is the minimum]%
+\label{lem:pipetrust}
+For any pipeline $(A_1, \ldots, A_k)$ of IR advisors, the
+pipeline trust is $\min(\tau_1, \ldots, \tau_k)$.
+\end{lemma}
+\begin{proof}
+By induction on~$k$.  For $k = 1$, the pipeline trust is
+$\tau_1 = \min(\tau_1)$.  For the inductive step, the
+pipeline $(A_1, \ldots, A_k)$ has trust
+$\min(\mathrm{trust}(A_1 \mathbin{;} \cdots \mathbin{;}
+A_{k-1}), \tau_k) = \min(\min(\tau_1, \ldots, \tau_{k-1}),
+\tau_k) = \min(\tau_1, \ldots, \tau_k)$.
+\end{proof}
+
+\begin{lemma}[Phase ordering does not affect final result]%
+\label{lem:phaseorderindep}
+If all lowering phases commute pairwise (\ie{}
+$\lambda_p \circ \lambda_q = \lambda_q \circ \lambda_p$
+for all $p, q$), then the final lowered IR is independent
+of phase ordering.
+\end{lemma}
+\begin{proof}
+Any two orderings of commuting functions yield the same
+composed function.  Formally, if $\sigma$ and $\sigma'$
+are two permutations, then
+$\lambda_{\sigma(P)} \circ \cdots \circ \lambda_{\sigma(1)}
+= \lambda_{\sigma'(P)} \circ \cdots \circ \lambda_{\sigma'(1)}$
+by iterated commutativity.
+\end{proof}
+
+\begin{remark}
+In general, lowering phases do not commute.  The
+$\LowHint$ advisor's value lies precisely in selecting
+a good ordering when phases do not commute.
+\end{remark}
+
+\begin{lemma}[Node suggestion confidence calibration]%
+\label{lem:confcalib}
+If the node suggestor's confidence scores are calibrated
+(\ie{} a confidence of~$c$ means the suggestion is correct
+with probability~$c$), then accepting only suggestions with
+$c \geq 0.9$ yields a 90\% precision rate.
+\end{lemma}
+\begin{proof}
+By the calibration assumption, the probability that a
+suggestion with confidence~$c$ is correct equals~$c$.
+For $c \geq 0.9$, this probability is at least 0.9.
+Therefore, among accepted suggestions, at least 90\%
+are correct.
+\end{proof}
+
+\begin{lemma}[IR graph size bound under rewrites]%
+\label{lem:irgraphbound}
+If every rewrite rule is node-local (\ie{} it transforms
+one node without adding or removing nodes), then the IR
+graph size is invariant under rewrites.
+\end{lemma}
+\begin{proof}
+A node-local rewrite replaces one node with one node.
+The number of nodes is unchanged.  The graph structure
+(edges) may change, but the vertex count is constant.
+\end{proof}
+
+\begin{proposition}[Full pipeline correctness]%
+\label{prop:fullpipecorrect}
+If the lowering functor is correct and all applied rewrite
+rules are valid, then the final IR state is equisatisfiable
+with the initial state.
+\end{proposition}
+\begin{proof}
+The pipeline consists of lowering phases (each correct)
+and node rewrites (each valid).  By Theorem~\ref{thm:lowcorrect},
+the lowering phases preserve equisatisfiability.  By
+Theorem~\ref{thm:nodesound}, the rewrites preserve
+equisatisfiability.  By transitivity, the final state
+is equisatisfiable with the initial state.
+\end{proof}
+
+\begin{remark}[Extension to multi-level IR]
+The phase category can be generalised to a partially
+ordered set of levels, where each level has its own set
+of nodes and lowering functions.  The functor construction
+and correctness proofs carry over with the appropriate
+modifications.  We leave the formal development to future work.
+\end{remark}
+
+\begin{lemma}[IR advisor pipeline is idempotent on normal forms]%
+\label{lem:irpipeidempotent}
+If the IR state is already in its lowest phase (fully lowered),
+then running the IR advisory pipeline produces no changes.
+\end{lemma}
+\begin{proof}
+A fully lowered IR state has no remaining phases.  The
+$\LowHint$ advisor receives an empty phase list and returns
+no hints.  The $\NodeSugg$ advisor receives a fully simplified
+graph and returns no rewrites (assuming normal-form detection).
+The $\IRAssist$ advisor produces diagnostics but no transformation
+suggestions.  Therefore the pipeline is a no-op.
+\end{proof}
+
+\begin{lemma}[Pipeline health check precondition]%
+\label{lem:pipehealthpre}
+The IR advisory pipeline checks pool health before proceeding.
+If the pool is unhealthy, the pipeline returns an error without
+modifying the IR state.
+\end{lemma}
+\begin{proof}
+Listing~\ref{lst:irpipeline} shows that the first operation is
+\texttt{pool.health\_check\_all()}.  If the result is falsy,
+the pipeline returns \texttt{\{"error": "Channel pool unhealthy"\}}
+immediately.  No IR transformation is attempted.
+\end{proof}
+
+\end{document}

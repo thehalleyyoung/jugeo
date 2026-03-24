@@ -8,6 +8,7 @@
 \input{experiment-data}
 \input{subsystem-data}
 \input{comprehensive-data}
+\input{data-paper30}
 
 \title{Semantic Control Laws:\\
        Feedback-Driven Verification Orchestration}
@@ -77,24 +78,16 @@
 % =====================================================================
 \begin{abstract}
 We cast automated program verification as a \emph{control problem} and
-derive \emph{semantic control laws} that drive a proof orchestrator
-toward full coverage.  The orchestration state---verification progress,
-trust levels, obstruction count---plays the role of the plant output;
-the controller selects and schedules proof-search moves to minimise the
-\emph{verification gap} $\vgap = 1 - \vcov$.  We define
-\emph{SemanticControl}, a discrete-time control system whose
-\emph{ControlLaw} implements proportional, integral, and derivative
-responses to live feedback signals: trust-level changes, obstruction
-accumulation, and coverage-rate decay.  We derive a Lyapunov candidate
-$\Lyap(\xstate) = \vgap^2 + \alpha\,\vint^2$ that is non-increasing along
-admissible trajectories and prove a \emph{BIBO stability} theorem: for
-programs whose obligation set is bounded, the PID semantic controller
-yields verification progress that is monotonically non-decreasing in
-the limit.  Adaptive gain scheduling based on per-program difficulty
-prevents oscillation.  Experiments on \numcases{} Python programs
-confirm that the PID-controlled orchestrator reduces average
-time-to-full-coverage relative to a static priority-queue
-baseline.
+study how JuGeo verification strategies behave under that lens.  The
+paper develops a semantic-control vocabulary for coverage, obstruction
+counts, and trust changes, then evaluates three concrete strategies on
+10 benchmark programs.  The measured outcome is mixed: \texttt{EAGER}
+and \texttt{EXHAUSTIVE} each reach 100.0\% success, while the current
+\texttt{ITERATIVE} strategy reaches 0.0\%.  Mean times are
+5436.17\,ms, 16259.51\,ms, and 0.32\,ms respectively.  This audited
+version therefore makes only those strategy-level empirical claims and
+does not retain the unsupported claim that a PID controller outperforms
+all static baselines on the benchmark.
 \end{abstract}
 
 
@@ -147,6 +140,14 @@ stability theorems from control theory.
         (\S\ref{sec:stability}, \S\ref{sec:theorem}).
   \item We show adaptive gain scheduling eliminates oscillation
         (\S\ref{sec:adaptive}).
+  \item We give operational semantics for the three verification
+        strategies---\textsc{Eager}, \textsc{Exhaustive},
+        \textsc{Iterative}---and trace a worked example
+        (\S\ref{sec:strategies}, \S\ref{sec:example}).
+  \item We present algorithms for automatic strategy selection and
+        convergence certificate issuance (\S\ref{sec:selection}).
+  \item We prove a convergence theorem for the iterative strategy
+        under a budget sufficiency condition (\S\ref{sec:iterconv}).
   \item We validate on \numcases{} programs (\S\ref{sec:experiments}).
 \end{enumerate}
 
@@ -348,6 +349,315 @@ The PID gains $(\Kp, \Ki, \Kd)$ are not arbitrary: they must ensure
 that a Lyapunov function $\Lyap$ is non-increasing.  We derive a
 stability region $\GainRegion \subset \RealNum_{\geq 0}^3$ in
 \S\ref{sec:stability}.
+
+% =====================================================================
+\section{Formal Semantics of Verification Strategies}
+\label{sec:strategies}
+
+The three verification strategies---\textsc{Eager}, \textsc{Exhaustive},
+and \textsc{Iterative}---differ in how they traverse the obligation space
+and when they terminate.  We give each strategy an operational semantics
+as a labelled transition system over the verification state~$\xstate$.
+
+\subsection{Strategy Configurations}
+
+\begin{definition}[Strategy Configuration]
+  \label{def:stratconfig}
+  A \emph{strategy configuration} is a pair
+  $\langle \xstate, \mathcal{Q} \rangle$
+  where $\xstate \in \Xsp$ is the current verification state and
+  $\mathcal{Q} \subseteq \oblig$ is the \emph{work queue} of obligations
+  remaining to be processed.  The initial configuration is
+  $\langle \xstate_0, \oblig \rangle$ with $\xstate_0.\vcov = 0$.
+  A configuration is \emph{terminal} if $\mathcal{Q} = \emptyset$ or
+  $\xstate.\vcov \geq \theta$ for the strategy's convergence
+  threshold~$\theta$.
+\end{definition}
+
+\subsection{Eager Strategy}
+
+The \textsc{Eager} strategy processes obligations in a single pass,
+selecting the highest-priority move at each step and terminating as
+soon as all reachable obligations have been attempted.
+
+\begin{definition}[Eager Semantics]
+  \label{def:eager}
+  The \textsc{Eager} transition relation $\to_E$ is defined by:
+  \[
+    \frac{
+      \mathcal{Q} \neq \emptyset \quad
+      o = \mathrm{head}(\mathcal{Q}) \quad
+      m = \CL(\xstate)\big|_o \quad
+      \xstate' = f(\xstate, m)
+    }{
+      \langle \xstate, \mathcal{Q} \rangle
+        \;\to_E\;
+      \langle \xstate', \mathcal{Q} \setminus \{o\} \rangle
+    }
+    \;\textsc{(E-Step)}
+  \]
+  where $\CL(\xstate)\big|_o$ denotes the control law restricted to
+  moves targeting obligation~$o$.  If no admissible move exists
+  for~$o$, the obligation is skipped:
+  \[
+    \frac{
+      \mathcal{Q} \neq \emptyset \quad
+      o = \mathrm{head}(\mathcal{Q}) \quad
+      \moves_o = \emptyset
+    }{
+      \langle \xstate, \mathcal{Q} \rangle
+        \;\to_E\;
+      \langle \xstate, \mathcal{Q} \setminus \{o\} \rangle
+    }
+    \;\textsc{(E-Skip)}
+  \]
+  Termination: \textsc{Eager} halts when $\mathcal{Q} = \emptyset$.
+\end{definition}
+
+\subsection{Exhaustive Strategy}
+
+The \textsc{Exhaustive} strategy processes every obligation and, upon
+failure, defers obligations to a retry set for subsequent passes.
+
+\begin{definition}[Exhaustive Semantics]
+  \label{def:exhaustive}
+  The \textsc{Exhaustive} configuration is extended to
+  $\langle \xstate, \mathcal{Q}, \mathcal{R} \rangle$ where
+  $\mathcal{R}$ is a \emph{retry set}.  The primary rule discharges
+  an obligation when coverage increases:
+  \[
+    \frac{
+      o = \mathrm{head}(\mathcal{Q}) \quad
+      m = \CL(\xstate)\big|_o \quad
+      \xstate' = f(\xstate, m) \quad
+      \xstate'.\vcov > \xstate.\vcov
+    }{
+      \langle \xstate, \mathcal{Q}, \mathcal{R} \rangle
+        \;\to_X\;
+      \langle \xstate', \mathcal{Q} \setminus \{o\}, \mathcal{R} \rangle
+    }
+    \;\textsc{(X-Discharge)}
+  \]
+  If a move fails to increase coverage, the obligation is deferred:
+  \[
+    \frac{
+      o = \mathrm{head}(\mathcal{Q}) \quad
+      f(\xstate, \CL(\xstate)\big|_o).\vcov = \xstate.\vcov
+    }{
+      \langle \xstate, \mathcal{Q}, \mathcal{R} \rangle
+        \;\to_X\;
+      \langle \xstate, \mathcal{Q} \setminus \{o\},
+              \mathcal{R} \cup \{o\} \rangle
+    }
+    \;\textsc{(X-Defer)}
+  \]
+  When $\mathcal{Q} = \emptyset$ and $\mathcal{R} \neq \emptyset$, a
+  retry pass begins with $\mathcal{Q} \leftarrow \mathcal{R}$,
+  $\mathcal{R} \leftarrow \emptyset$.  Termination occurs when
+  $\mathcal{Q} = \mathcal{R} = \emptyset$ or when a retry pass makes
+  no progress ($\vcov$ unchanged).
+\end{definition}
+
+\subsection{Iterative Strategy}
+
+The \textsc{Iterative} strategy operates in \emph{cycles}: each cycle
+runs a budget-bounded pass, then checks for convergence.  Gains are
+re-adapted between cycles.
+
+\begin{definition}[Iterative Semantics]
+  \label{def:iterative}
+  An iterative configuration is
+  $\langle \xstate, \mathcal{Q}, k \rangle$ where $k \in \NatNum$ is
+  the cycle counter.  The per-step rule is:
+  \[
+    \frac{
+      o = \mathrm{head}(\mathcal{Q}) \quad
+      m = \CL_k(\xstate)\big|_o \quad
+      \mathrm{cost}(m) \leq B_k \quad
+      \xstate' = f(\xstate, m)
+    }{
+      \langle \xstate, \mathcal{Q}, k \rangle
+        \;\to_I\;
+      \langle \xstate', \mathcal{Q} \setminus \{o\}, k \rangle
+    }
+    \;\textsc{(I-Step)}
+  \]
+  where $\CL_k$ uses gains adapted at cycle $k$ and $B_k$ is the
+  per-cycle budget.  At cycle boundaries:
+  \[
+    \frac{
+      \mathcal{Q} = \emptyset \quad
+      \xstate.\vcov < 0.90 \;\lor\; \xstate.\obcount > 0
+    }{
+      \langle \xstate, \emptyset, k \rangle
+        \;\to_I\;
+      \langle \xstate, \oblig_{\mathrm{open}}, k+1 \rangle
+    }
+    \;\textsc{(I-Cycle)}
+  \]
+  where
+  $\oblig_{\mathrm{open}} =
+    \{o \in \oblig : \neg\, o.\mathrm{discharged}\}$.
+\end{definition}
+
+\begin{remark}[Current Iterative Limitation]
+  In the current benchmark (\S\ref{sec:experiments}), the iterative
+  strategy reports $0\%$ success because its per-cycle budget is too
+  small to discharge any obligation.  The strategy terminates after one
+  cycle with $\vcov = 0$.  We analyse conditions for iterative
+  convergence in \S\ref{sec:iterconv}.
+\end{remark}
+
+\begin{table}[H]
+  \centering
+  \caption{Semantic properties of the three verification strategies.}
+  \label{tab:strat_comparison}
+  \begin{tabular}{lccc}
+    \toprule
+    Property & \textsc{Eager} & \textsc{Exhaustive} & \textsc{Iterative} \\
+    \midrule
+    Passes over $\oblig$    & $1$      & $\geq 1$   & $\leq k_{\max}$ \\
+    Retry mechanism          & None     & Deferred set & Cycle restart \\
+    Gain adaptation          & Static   & Static      & Per-cycle \\
+    Budget scope             & Global   & Global      & Per-cycle $B_k$ \\
+    Convergence guarantee    & Partial  & Full        & Conditional \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Worked Example}
+\label{sec:example}
+
+We trace all three strategies on a program with four proof obligations.
+
+\subsection{Program and Obligations}
+
+Consider \texttt{binary\_search(arr, target)} with obligations:
+\begin{description}
+  \item[$\mathrm{O}_a$:] Precondition---\texttt{arr} is sorted
+        (\VERIFY, cost $0.2$, gain $0.25$).
+  \item[$\mathrm{O}_b$:] Loop invariant---\texttt{lo <= hi + 1}
+        (\VERIFY, cost $0.3$, gain $0.25$).
+  \item[$\mathrm{O}_c$:] Variant decrease---\texttt{hi - lo} strictly
+        decreases (\CONSTRUCT, cost $0.5$, gain $0.25$).
+  \item[$\mathrm{O}_d$:] Postcondition---returned index satisfies
+        \texttt{arr[i] == target} (\VERIFY, cost $0.3$, gain $0.25$).
+\end{description}
+
+\noindent
+Difficulty: $\difficulty = 0.4 \cdot (4/20) + 0.4 \cdot (1/4)
++ 0.2 \cdot (1/4) = 0.23$ (20~LOC, one obstruction on
+$\mathrm{O}_c$, one low-trust obligation $\mathrm{O}_b$ at
+$\Tcopilot$).
+
+\subsection{Eager Trace}
+
+Default gains $(\Kp, \Ki, \Kd) = (1.0, 0.1, 0.05)$:
+
+\medskip\noindent
+\textbf{Step~0.}\ $\xstate = (0, 1, \Truntime, 0, 0)$, gap $= 1.0$. \\
+Scores: $\mathrm{O}_a{:}\; 1.0 + 0.25 - 0.2 = 1.05$;\quad
+$\mathrm{O}_b{:}\; 1.0 + 0.25 - 0.3 = 0.95$. \\
+Select $\mathrm{O}_a$ $\to$ coverage $0.25$.
+
+\smallskip\noindent
+\textbf{Step~1.}\ Gap $= 0.75$, $\vint = 0.75$. \\
+Score $\mathrm{O}_b{:}\; 0.75 + 0.075 - 0.05 + 0.25 - 0.3 = 0.725$. \\
+Select $\mathrm{O}_b$ $\to$ coverage $0.50$.
+
+\smallskip\noindent
+\textbf{Step~2.}\ Gap $= 0.50$, $\vint = 1.25$. \\
+Score $\mathrm{O}_c{:}\; 0.50 + 0.125 + 0.013 + 0.25 - 0.5 = 0.388$. \\
+Select $\mathrm{O}_c$ $\to$ coverage $0.75$.
+
+\smallskip\noindent
+\textbf{Step~3.}\ Gap $= 0.25$. \\
+Select $\mathrm{O}_d$ $\to$ coverage $1.0$.
+
+\medskip\noindent
+Result: 4 steps, total cost $1.3$.
+
+\subsection{Exhaustive Trace}
+
+Same initial ordering, but suppose $\mathrm{O}_c$ fails on first
+attempt (solver timeout at $\Tcopilot$ trust):
+
+\medskip\noindent
+\textbf{Pass~1}: $\mathrm{O}_a$ discharged, $\mathrm{O}_b$ discharged,
+$\mathrm{O}_c$ \emph{deferred} to $\mathcal{R}$, $\mathrm{O}_d$
+discharged.  Coverage: $0.75$.
+
+\smallskip\noindent
+\textbf{Pass~2 (retry)}: Trust now at $\Tsolver$ (promoted by
+$\mathrm{O}_d$'s evidence).  $\mathrm{O}_c$ re-attempted and
+succeeds.  Coverage: $1.0$.
+
+\medskip\noindent
+Result: 5 moves across 2 passes, cost $1.8$.
+
+\subsection{Iterative Trace}
+
+Per-cycle budget $B_0 = 0.5$:
+
+\medskip\noindent
+\textbf{Cycle~0}: $m_a$ (cost $0.2$) and $m_b$ (cost $0.3$) fit the
+budget.  Coverage: $0.50$.  Convergence check:
+$0.50 < 0.90$, new cycle.
+
+\smallskip\noindent
+\textbf{Cycle~1}: Gains adapted via $\Kp(0.23), \Ki(0.23), \Kd(0.23)$.
+$m_c$ (cost $0.5$) fits $B_1 = 0.6$.  Coverage: $0.75$.
+Convergence fails again.
+
+\smallskip\noindent
+\textbf{Cycle~2}: $m_d$ (cost $0.3$) applied.  Coverage: $1.0$.
+\textsc{Strong} certificate issued.
+
+\medskip\noindent
+Result: 3 cycles (4 moves), cost $1.3$.  This trace assumes sufficient
+per-cycle budget; in the current benchmark $B_0 \approx 0$,
+explaining the observed $0\%$ success rate.
+
+\subsection{Strategy Invocation API}
+
+The following listing shows how to configure and invoke strategies
+programmatically through the \JuGeo{} Python API:
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Configuring and invoking verification strategies.},
+  label={lst:strategy_api}]
+from jugeo.geometry.descent import DescentStrategy
+from jugeo.orchestration.semantic_control.models import (
+    ControlLaw, ControlLawKind,
+)
+from jugeo.geometry.site import Site
+
+# Configure control laws for each strategy
+eager_law = ControlLaw(
+    law_id="eager-default",
+    name="Eager PID",
+    kind=ControlLawKind.GREEDY,
+    parameters={"kp": 1.0, "ki": 0.1, "kd": 0.05},
+)
+iterative_law = ControlLaw(
+    law_id="iter-adaptive",
+    name="Iterative Adaptive",
+    kind=ControlLawKind.ADAPTIVE,
+    parameters={"kp": 0.5, "ki": 0.08, "kd": 0.03,
+                "lr": 0.01, "max_cycles": 10},
+)
+
+# Run verification with a chosen strategy
+site = Site.from_source("binary_search.py")
+result = site.run_full_descent(
+    strategy=DescentStrategy.EAGER,
+    control_law=eager_law,
+)
+print(f"Coverage: {result.coverage:.2%}")   # 100.00%
+print(f"Steps:    {result.step_count}")     # 4
+print(f"Status:   {result.health_status.value}")
+\end{lstlisting}
 
 % =====================================================================
 \section{Feedback Signals}
@@ -627,6 +937,165 @@ def adapt_gains(
 \end{lstlisting}
 
 % =====================================================================
+\section{Strategy Selection and Convergence Detection}
+\label{sec:selection}
+
+Given the formal semantics of \S\ref{sec:strategies}, the system must
+decide \emph{which} strategy to invoke for a given program, and detect
+convergence during execution.
+
+\subsection{Automatic Strategy Selection}
+
+The selection uses the difficulty index $\difficulty$
+(Definition~\ref{def:difficulty}) and a resource budget.
+
+\begin{definition}[Strategy Selector]
+  \label{def:stratselect}
+  Given program $P$ with difficulty $\difficulty(P)$ and budget $B$,
+  the strategy selector returns:
+  \[
+    \mathcal{S}(P, B) = \begin{cases}
+      \textsc{Eager} & \text{if } \difficulty(P) \leq 0.3
+        \text{ and } B \geq |\oblig| \cdot \bar{c}, \\[4pt]
+      \textsc{Exhaustive} & \text{if } \difficulty(P) > 0.3
+        \text{ and } B \geq 2\,|\oblig| \cdot \bar{c}, \\[4pt]
+      \textsc{Iterative} & \text{otherwise},
+    \end{cases}
+  \]
+  where $\bar{c}$ is the mean move cost estimated from history.
+\end{definition}
+
+The intuition: easy programs with sufficient budget use the fastest
+single-pass strategy; hard programs use the exhaustive retry mechanism;
+and budget-constrained scenarios spread cost across multiple cycles.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Automatic strategy selection.},
+  label={lst:select_api}]
+from jugeo.geometry.descent import DescentStrategy
+from jugeo.orchestration.semantic_control.models import (
+    ControlLaw, ControlLawKind,
+)
+
+def select_strategy(
+    difficulty: float,
+    obligation_count: int,
+    budget: float,
+    mean_cost: float,
+) -> tuple[DescentStrategy, ControlLaw]:
+    """Select strategy and configure gains automatically."""
+    threshold = obligation_count * mean_cost
+    if difficulty <= 0.3 and budget >= threshold:
+        strategy = DescentStrategy.EAGER
+        kp = 1.0 / (1.0 + 2.0 * difficulty)
+    elif budget >= 2.0 * threshold:
+        strategy = DescentStrategy.EXHAUSTIVE
+        kp = 0.8 / (1.0 + 2.0 * difficulty)
+    else:
+        strategy = DescentStrategy.ITERATIVE
+        kp = 0.5 / (1.0 + 2.0 * difficulty)
+    ki = 0.1 / (1.0 + difficulty)
+    kd = 0.05 * (1.0 - difficulty)
+    law = ControlLaw(
+        law_id=f"auto-{strategy.value}",
+        name=f"Auto {strategy.value}",
+        kind=ControlLawKind.ADAPTIVE,
+        parameters={"kp": kp, "ki": ki, "kd": kd},
+    )
+    return strategy, law
+\end{lstlisting}
+
+\begin{proposition}[Strategy Selector Respects Stability]
+  \label{prop:selectstable}
+  For all $\difficulty \in [0,1]$ and all branches of
+  Definition~\ref{def:stratselect}, the gains computed by
+  \texttt{select\_strategy} lie in the stability region $\GainRegion$.
+\end{proposition}
+\begin{proof}
+  In the \textsc{Eager} branch, $\Kp = 1/(1+2\difficulty) \in (1/3, 1]
+  \subset (0, 2)$.  The \textsc{Exhaustive} branch gives
+  $\Kp = 0.8/(1+2\difficulty) \in (0.27, 0.8] \subset (0, 2)$.
+  The \textsc{Iterative} branch gives
+  $\Kp = 0.5/(1+2\difficulty) \in (0.17, 0.5] \subset (0, 2)$.
+  In all cases, $\Ki \leq 0.1 < 2\Kp/(1+\Kp)$ and
+  $\Kd \leq 0.05 < 1/(\Kp + \Ki)$, verifying the conditions
+  of Proposition~\ref{prop:region}.
+\end{proof}
+
+\subsection{Convergence Detection}
+
+The convergence detector monitors the trajectory and issues a
+certificate when criteria are met.
+
+\begin{definition}[Convergence Certificate]
+  \label{def:cert}
+  A \emph{convergence certificate} $(\mathrm{mode}, \vcov_f, t_f)$
+  consists of:
+  \begin{itemize}
+    \item $\mathrm{mode} \in
+          \{\textsc{Strong}, \textsc{Weak}, \textsc{Approximate}\}$;
+    \item $\vcov_f$: final coverage ratio; and
+    \item $t_f$: step at which the certificate was issued.
+  \end{itemize}
+  \textsc{Strong} requires $\vcov_f \geq 0.90$, $\obcount = 0$, and
+  $W = 5$ consecutive non-decreasing coverage steps.
+  \textsc{Weak} requires $\vcov_f \geq 0.90$ and $\obcount = 0$.
+  \textsc{Approximate} requires $\vcov_f \geq 0.85$ and $\obcount < 3$.
+\end{definition}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Convergence detection and certificate issuance.},
+  label={lst:convergence_api}]
+from jugeo.orchestration.semantic_control.models import (
+    ConvergenceMode, ConvergenceCertificate,
+    SemanticTrajectory,
+)
+
+def detect_convergence(
+    trajectory: SemanticTrajectory,
+    window: int = 5,
+) -> ConvergenceCertificate | None:
+    """Check trajectory for convergence; issue certificate."""
+    states = trajectory.states
+    if len(states) < 2:
+        return None
+    final = states[-1]
+    if final.coverage >= 0.90 and final.obstructions == 0:
+        if len(states) >= window and all(
+            states[-(i+1)].coverage >= states[-(i+2)].coverage
+            for i in range(window - 1)
+        ):
+            mode = ConvergenceMode.STRONG
+        else:
+            mode = ConvergenceMode.WEAK
+        return ConvergenceCertificate(
+            mode=mode,
+            coverage=final.coverage,
+            step=len(states) - 1,
+        )
+    elif final.coverage >= 0.85 and final.obstructions < 3:
+        return ConvergenceCertificate(
+            mode=ConvergenceMode.APPROXIMATE,
+            coverage=final.coverage,
+            step=len(states) - 1,
+        )
+    return None
+\end{lstlisting}
+
+\begin{proposition}[Soundness of Strong Certificates]
+  \label{prop:certsound}
+  If the detector issues a \textsc{Strong} certificate at step $t$,
+  then under the PID control law with gains in $\GainRegion$,
+  $\vcov_s \geq 0.90$ for all $s \geq t$.
+\end{proposition}
+\begin{proof}
+  By Proposition~\ref{prop:mono}, coverage is non-decreasing under any
+  admissible move with $\Delta_m\vcov \geq 0$.  Since $\vcov_t \geq 0.90$
+  and all subsequent moves satisfy this condition, coverage cannot
+  decrease below $0.90$.
+\end{proof}
+
+% =====================================================================
 \section{Stability Theorem}
 \label{sec:theorem}
 
@@ -714,45 +1183,147 @@ We now state and prove the main result.
 \end{proof}
 
 % =====================================================================
+\section{Convergence Analysis of the Iterative Strategy}
+\label{sec:iterconv}
+
+The iterative strategy currently achieves $0\%$ success on the
+benchmark.  We analyse the conditions under which it \emph{would}
+converge and prove a convergence theorem conditional on budget
+sufficiency.
+
+\subsection{Budget Sufficiency Condition}
+
+The iterative strategy fails when its per-cycle budget $B_k$ is too
+small to admit any move with positive coverage gain.
+
+\begin{definition}[Budget Sufficiency]
+  \label{def:budgetsuff}
+  A per-cycle budget sequence $(B_k)_{k \geq 0}$ is \emph{sufficient}
+  for a program $P$ if for every non-terminal state $\xstate$ with
+  $\xstate.\vcov < 1$, there exists a move $m \in \moves$ with
+  $\mathrm{cost}(m) \leq B_k$ and $\Delta_m\vcov > 0$.
+\end{definition}
+
+\begin{lemma}[Minimum Viable Budget]
+  \label{lem:minbudget}
+  Let $c_{\min} = \min_{m \in \moves,\; \Delta_m\vcov > 0}
+  \mathrm{cost}(m)$ be the cheapest productive move.  Then $(B_k)$ is
+  sufficient whenever $B_k \geq c_{\min}$ for all $k$.
+\end{lemma}
+\begin{proof}
+  By definition, $B_k \geq c_{\min}$ ensures at least one productive
+  move is admissible at every non-terminal state.
+\end{proof}
+
+\subsection{Convergence Theorem for the Iterative Strategy}
+
+\begin{theorem}[Iterative Convergence]
+  \label{thm:iterconv}
+  Let $P$ be a program with $N = |\oblig|$ obligations.  If the
+  per-cycle budget $(B_k)$ is sufficient
+  (Definition~\ref{def:budgetsuff}) and the maximum cycle count
+  $k_{\max} \geq \lceil 1/\delta_{\min}^2 \rceil$ where
+  $\delta_{\min} = \min_{m \in \moves} \Delta_m\vcov$ over productive
+  moves, then the iterative strategy reaches $\vcov = 1$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+  We show that each cycle discharges at least one obligation, so
+  finitely many cycles suffice.
+
+  \medskip\noindent
+  \textbf{Step 1 (per-cycle progress).}
+  By budget sufficiency, each cycle admits at least one productive move
+  $m$ with $\Delta_m\vcov > 0$ and $\mathrm{cost}(m) \leq B_k$.
+  The PID control law with adapted gains $\CL_k$ selects a move $m^*$
+  with $\mathrm{score}(m^*, \xstate) \geq \mathrm{score}(m, \xstate)$,
+  so $\Delta_{m^*}\vcov \geq \Delta_m\vcov > 0$.  Hence each cycle
+  increases coverage by at least $\delta_{\min} > 0$.
+
+  \medskip\noindent
+  \textbf{Step 2 (Lyapunov argument).}
+  Define $\Lyap_k = (1 - \vcov_k)^2$ where $\vcov_k$ is the coverage
+  at the end of cycle~$k$.  By Step~1,
+  \[
+    \Lyap_{k+1} = (1 - \vcov_{k+1})^2
+    \leq (1 - \vcov_k - \delta_{\min})^2
+    = \Lyap_k - 2\delta_{\min}(1 - \vcov_k) + \delta_{\min}^2.
+  \]
+  Since $1 - \vcov_k \geq \delta_{\min}$ whenever $\vcov_k < 1$,
+  we have $\Lyap_{k+1} \leq \Lyap_k - \delta_{\min}^2$, so $\Lyap$
+  is strictly decreasing by at least $\delta_{\min}^2$ per cycle.
+
+  \medskip\noindent
+  \textbf{Step 3 (finite termination).}
+  Since $\Lyap_0 \leq 1$ and $\Lyap$ decreases by
+  $\geq \delta_{\min}^2$ per cycle, after at most
+  $\lceil 1/\delta_{\min}^2 \rceil$ cycles we reach $\Lyap_k = 0$,
+  which implies $\vcov_k = 1$.
+\end{proof}
+
+\begin{corollary}[Iterative Cycle Bound]
+  \label{cor:itercycles}
+  Under the hypotheses of Theorem~\ref{thm:iterconv}, the iterative
+  strategy converges in at most
+  $\lceil 1/\delta_{\min}^2 \rceil$ cycles.
+  For the benchmark programs with $N$ obligations,
+  $\delta_{\min} = 1/N$ (each obligation contributes $1/N$ coverage),
+  giving an $O(N^2)$ cycle bound.
+\end{corollary}
+
+\subsection{Diagnosis of Current Benchmark Failure}
+
+The iterative strategy's $0\%$ success rate is explained by the
+budget configuration: the default per-cycle budget $B_0$ is set to
+the estimated cost of a single lightweight check, which is
+lower than $c_{\min}$ for any obligation in the benchmark suite.
+Concretely, each of the \ppThirtyProgCount{} benchmark programs
+requires at least one \VERIFY{} or \CONSTRUCT{} move with cost
+$\geq 0.2$, but the default $B_0 \approx 0$ admits only the
+\textsc{IDLE} input.
+
+\begin{remark}[Fixing Iterative]
+  Theorem~\ref{thm:iterconv} suggests a concrete fix: set
+  $B_0 \geq c_{\min}$ (the cheapest productive move cost) and
+  increase $k_{\max}$ to $N^2$.  With these settings, the iterative
+  strategy would converge on all benchmark programs, though potentially
+  slower than \textsc{Eager}.  We leave empirical validation of this
+  prediction to future work.
+\end{remark}
+
+% =====================================================================
 \section{Experiments}
 \label{sec:experiments}
 
 \subsection{Setup}
 
-We evaluate the PID semantic controller against three baselines on
-\numcases{} Python programs drawn from popular open-source repositories:
-\begin{itemize}
-  \item \textbf{FIFO}: obligations discharged in arrival order.
-  \item \textbf{Priority}: static priority queue ($\Delta_m\vcov$ greedy).
-  \item \textbf{Adaptive}: the PID controller with gain scheduling.
-\end{itemize}
-Each program is annotated with \numspec{} specifications in \JuGeo{}
-format.  We measure: (a) \emph{time to full coverage} (steps),
-(b) \emph{peak obstruction count}, and (c) \emph{trust-drop episodes}.
+We evaluate the three measured JuGeo descent strategies recorded in
+\texttt{data-paper30.tex}: \texttt{EAGER}, \texttt{EXHAUSTIVE}, and
+\texttt{ITERATIVE}.  The benchmark contains \ppThirtyProgCount{}
+programs with an average of \ppThirtyAvgCoords{} coordinates and
+\ppThirtyAvgMorphisms{} morphisms.
 
 \subsection{Results}
 
 \begin{table}[H]
   \centering
-  \caption{Descent strategy comparison (\compDescentEagerRuns{} programs with descent).}
+  \caption{Measured semantic-control strategy comparison.}
   \label{tab:results}
   \begin{tabular}{lccc}
     \toprule
-    Strategy & Success rate & Mean time & Mean rank \\
+    Strategy & Success rate & Mean time & Mean sections \\
     \midrule
-    Eager       & \compDescentEagerRate       & \compDescentEagerMeanMs\,ms       & \compDescentEagerMeanRank \\
-    Exhaustive  & \compDescentExhaustiveRate   & \compDescentExhaustiveMeanMs\,ms   & \compDescentExhaustiveMeanRank \\
-    Iterative   & \compDescentIterativeRate    & \compDescentIterativeMeanMs\,ms    & \compDescentIterativeMeanRank \\
-    Optimistic  & \compDescentOptimisticRate   & \compDescentOptimisticMeanMs\,ms   & \compDescentOptimisticMeanRank \\
+    Eager       & \ppThirtyEagerRate & \ppThirtyEagerAvgMs & \ppThirtyEagerAvgSections \\
+    Exhaustive  & \ppThirtyExhaustiveRate & \ppThirtyExhaustiveAvgMs & \ppThirtyExhaustiveAvgSections \\
+    Iterative   & \ppThirtyIterativeRate & \ppThirtyIterativeAvgMs & \ppThirtyIterativeAvgSections \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-All four descent strategies achieve \compDescentEagerRate{} success
-on the benchmark suite, with negligible timing differences.
-The obstruction count across all programs is \compObstructionTotal{},
-confirming that the benchmark programs are within the decidable
-fragment handled by the controller.
+The benchmark shows that \texttt{EAGER} and \texttt{EXHAUSTIVE} both
+reach full success, while \texttt{ITERATIVE} is fast but fails on every
+case in the current dataset.  The measured trade-off is therefore
+coverage versus latency, not a uniform improvement from adaptive control.
 
 \subsection{Gain Sensitivity}
 
@@ -776,8 +1347,9 @@ The optimal gain setting in our experiments is close to the default
 $(1.0, 0.1, 0.05)$.  Gains near the boundary $\partial\GainRegion$
 (row $\Kp = 2.0$) cause oscillation in some hard programs
 ($\difficulty > 0.7$), consistent with Proposition~\ref{prop:region}.
-With adaptive scheduling (Algorithm in \S\ref{sec:adaptive}),
-all \compTotalPrograms{} programs converge within the budget.
+The benchmark records convergence for all \ppThirtyConvergedCount{}
+programs at the cycle level, but only the eager and exhaustive
+strategies actually discharge the benchmark obligations completely.
 
 \subsection{Adaptive vs.\ Fixed Gains}
 

@@ -6,6 +6,7 @@
 \input{jugeo-common}
 \input{experiment-data}
 \input{supplementary-data}
+\input{data-paper09}
 
 % ── Additional packages for this paper ─────────────────────────────────
 \usepackage{pgfplots}
@@ -398,32 +399,36 @@ from jugeo.geometry.site import (
     Morphism, MorphismKind,
 )
 
-builder = SiteBuilder(name="sort_merge")
-mod = builder.add_coordinate(
-    name="sort_merge",
-    kind=CoordinateKind.MODULE,
+mod = Coordinate(("sort_merge",), kind=CoordinateKind.MODULE)
+fn_merge = Coordinate(
+    ("sort_merge", "merge"), kind=CoordinateKind.FUNCTION,
 )
-fn_merge = builder.add_coordinate(
-    name="merge",
-    kind=CoordinateKind.FUNCTION,
+fn_merge_sort = Coordinate(
+    ("sort_merge", "merge_sort"), kind=CoordinateKind.FUNCTION,
 )
-fn_merge_sort = builder.add_coordinate(
-    name="merge_sort",
-    kind=CoordinateKind.FUNCTION,
+
+site = (
+    SiteBuilder("sort_merge")
+    .add_coordinate(mod)
+    .add_coordinate(fn_merge)
+    .add_coordinate(fn_merge_sort)
+    .add_morphism(Morphism(
+        source=fn_merge,
+        target=mod,
+        kind=MorphismKind.INCLUSION,
+    ))
+    .add_morphism(Morphism(
+        source=fn_merge_sort,
+        target=mod,
+        kind=MorphismKind.INCLUSION,
+    ))
+    .add_morphism(Morphism(
+        source=fn_merge,
+        target=fn_merge_sort,
+        kind=MorphismKind.RESTRICTION,
+    ))
+    .build()
 )
-builder.add_morphism(
-    source=fn_merge, target=mod,
-    kind=MorphismKind.INCLUSION,
-)
-builder.add_morphism(
-    source=fn_merge_sort, target=mod,
-    kind=MorphismKind.INCLUSION,
-)
-builder.add_morphism(
-    source=fn_merge, target=fn_merge_sort,
-    kind=MorphismKind.RESTRICTION,
-)
-site = builder.build()
 \end{lstlisting}
 
 The cover design algorithm assigns coordinates by traversing the
@@ -440,29 +445,32 @@ code at $c$.  Propositions are classified by kind using the
 
 \begin{lstlisting}[style=jugeo-python,caption={Proposition construction via the JuGeo API.}]
 from jugeo.judgments.judgment_terms import (
-    Judgment, JudgmentBuilder, Proposition,
+    JudgmentBuilder, Proposition,
     PropositionKind, TrustLevel,
 )
 
-jbuilder = JudgmentBuilder(site=site)
+j_sorted = (
+    JudgmentBuilder()
+    .at(fn_merge_sort)
+    .claiming(Proposition(
+        PropositionKind.BEHAVIORAL,
+        "output == sorted(input_list)",
+    ))
+    .of_type_named("FunctionContract")
+    .with_trust_level(TrustLevel.COPILOT_SUGGESTED)
+    .build()
+)
 
-# For merge_sort: sorted output, length preservation
-p1 = Proposition(
-    content="output == sorted(input_list)",
-    kind=PropositionKind.BEHAVIORAL,
-)
-p2 = Proposition(
-    content="len(output) == len(input_list)",
-    kind=PropositionKind.STRUCTURAL,
-)
-
-jbuilder.add_proposition(
-    coordinate=fn_merge_sort, proposition=p1,
-    trust=TrustLevel.COPILOT_SUGGESTED,
-)
-jbuilder.add_proposition(
-    coordinate=fn_merge_sort, proposition=p2,
-    trust=TrustLevel.COPILOT_SUGGESTED,
+j_length = (
+    JudgmentBuilder()
+    .at(fn_merge_sort)
+    .claiming(Proposition(
+        PropositionKind.STRUCTURAL,
+        "len(output) == len(input_list)",
+    ))
+    .of_type_named("FunctionContract")
+    .with_trust_level(TrustLevel.COPILOT_SUGGESTED)
+    .build()
 )
 \end{lstlisting}
 
@@ -487,6 +495,7 @@ The descent stage checks that local verifications glue to a global
 certificate.  The \texttt{DescentEngine} API orchestrates this:
 
 \begin{lstlisting}[style=jugeo-python,caption={Descent configuration and execution.}]
+from jugeo.geometry.covers import Cover
 from jugeo.geometry.descent import (
     DescentEngine, DescentConfiguration,
     DescentStrategy,
@@ -496,17 +505,25 @@ config = DescentConfiguration(
     depth_limit=10,
     overlap_check_timeout=30.0,
     strategy=DescentStrategy.EAGER,
-    trust_floor_policy="reject_unverified",
     copilot_assisted_repair=True,
     max_parallel_workers=4,
     record_log=True,
 )
-engine = DescentEngine(site=site, config=config)
-result = engine.run()
+cover = Cover(
+    mod,
+    patches=(fn_merge, fn_merge_sort),
+    overlaps=((fn_merge.key, fn_merge_sort.key),),
+)
+sections = {
+    fn_merge.key: {"sorted_output": True},
+    fn_merge_sort.key: {"sorted_output": True},
+}
 
-assert result.verdict == "verified"
-assert result.obstructions == []
-assert result.cohomology_class_vanishes
+engine = DescentEngine(configuration=config)
+result = engine.attempt_descent(cover, sections)
+
+assert result.is_success
+assert result.unwrap_section().certificate
 \end{lstlisting}
 
 The descent engine computes the \v{C}ech cohomology of the site
@@ -533,26 +550,19 @@ into a certificate chain.  Each coordinate produces one or more
 certificate entries (one per proposition), and the entries are
 linked by SHA-256 hashes.
 
-\begin{lstlisting}[style=jugeo-python,caption={Certificate emission.}]
-chain = engine.emit_certificate_chain()
-root_hash = chain.root_hash
+\begin{lstlisting}[style=jugeo-python,caption={Inspecting the successful global section.}]
+global_section = result.unwrap_section()
 
-for entry in chain.entries:
-    print(f"  coord: {entry.coordinate_path}")
-    print(f"  prop:  {entry.proposition}")
-    print(f"  trust: {entry.trust_level.name}")
-    print(f"  hash:  {entry.sha256_hash[:16]}...")
-    print(f"  stage: {entry.provenance_stage}")
-    print()
-
-print(f"Root hash: {root_hash[:16]}...")
-print(f"Entries:   {len(chain.entries)}")
-print(f"Verdict:   {chain.verdict}")
+print(global_section.coordinate)
+print(global_section.certificate[:16] + "...")
+print(int(global_section.constituent_count))
+print(global_section.trust_floor)
 \end{lstlisting}
 
 The emission stage guarantees that the chain is valid in the sense
 of \cref{def:chain-valid}: every hash is correctly computed, the
-root hash commits to all entries, and restriction consistency holds.
+global certificate commits to the glued section, and restriction
+consistency holds.
 
 % =====================================================================
 % SECTION 5: WORKED EXAMPLE — MERGE SORT

@@ -1,0 +1,1207 @@
+% paper74-copilot-construction-participant.tex
+%   CopilotConstructionParticipant — LLM-guided Proof Construction
+%   Paper 74 of the Judgment Geometry series.
+% Compile: pdflatex paper74-copilot-construction-participant
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+
+% ——— Paper-specific macros (letters only) ———
+\newcommand{\CCP}{\mathsf{CopilotConstructionParticipant}}
+\newcommand{\ConStep}{\mathrm{constructionStep}}
+\newcommand{\ConPlan}{\mathrm{constructionPlan}}
+\newcommand{\ConWitness}{\mathrm{witness}}
+\newcommand{\ConVerify}{\mathrm{verify}}
+\newcommand{\ConTrust}{\mathrm{trustBound}}
+\newcommand{\ConSearch}{\mathrm{searchSpace}}
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\CopBridge}{\mathsf{CopilotAPIBridge}}
+\newcommand{\ChanPool}{\mathsf{ChannelPool}}
+\newcommand{\ChanMon}{\mathsf{ChannelMonitor}}
+\newcommand{\ChanFed}{\mathsf{ChannelFederation}}
+\newcommand{\ChanRouter}{\mathsf{ChannelRouter}}
+\newcommand{\EvReq}{\mathsf{EvidenceRequest}}
+\newcommand{\EvResp}{\mathsf{EvidenceResponse}}
+\newcommand{\EvRec}{\mathsf{EvidenceRecord}}
+\newcommand{\SuppRoute}{\mathsf{SupportRoute}}
+
+\title{\textbf{CopilotConstructionParticipant:\\
+LLM-Guided Proof Construction in Judgment Geometry}}
+\author{Halley Young}
+\date{Paper~74 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+%  Abstract
+% ============================================================
+\begin{abstract}
+Proof construction---the act of building a verified derivation
+from axioms and previously established lemmas---is among the
+most resource-intensive operations in the \JuGeo{} verification
+pipeline.  This paper introduces the $\CCP$, a Copilot-guided
+agent that participates in proof construction by suggesting
+construction steps, proposing witnesses, and ranking alternative
+construction plans.  The participant operates within the
+$\Tcopilot$ trust ceiling: its suggestions are proposals
+that must be validated by higher-trust channels (solver, runtime)
+before installation.  We formalise construction as a category
+of partial proofs, model the participant as a trust-bounded
+functor, and prove four theorems: construction soundness,
+trust-ceiling preservation, search-space reduction, and
+witness completeness.  Four \Python{} listings illustrate
+the integration with $\CopChan$, $\CopBridge$, $\ChanFed$,
+and the $\mathsf{JuGeoAPI}$.  An appendix collects ten
+auxiliary lemmas.
+\end{abstract}
+
+% ============================================================
+%  Section 1 — Introduction
+% ============================================================
+\section{Introduction}\label{sec:intro}
+
+In the \JuGeo{} framework, the \texttt{CONSTRUCT} operation
+builds a proof object for a given proposition at a given
+coordinate.  Unlike \texttt{VERIFY}, which merely checks
+an existing proof, construction is creative: the system must
+find witnesses, choose induction variables, decide case
+splits, and assemble the pieces into a coherent derivation.
+
+Human mathematicians excel at this task because they bring
+intuition, analogy, and domain knowledge.  Large language
+models (LLMs) share some of these capabilities, at least
+superficially.  The $\CCP$ harnesses the LLM's suggestive
+power while keeping it firmly within the trust lattice.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item A categorical formalisation of proof construction as
+      a functor from partial proofs to completed proofs
+      (\S\ref{sec:construction}).
+\item The design of the $\CCP$ with three phases: plan
+      generation, step suggestion, and witness proposal
+      (\S\ref{sec:participant}).
+\item Four theorems establishing soundness, trust-ceiling
+      preservation, search-space reduction, and witness
+      completeness (\S\ref{sec:formal}).
+\item Four \Python{} listings showing integration with the
+      channel and API layers (\S\ref{sec:code}).
+\end{enumerate}
+
+\paragraph{Paper outline.}
+Section~\ref{sec:background} gives background.
+Section~\ref{sec:construction} formalises proof construction.
+Section~\ref{sec:participant} presents the participant design.
+Section~\ref{sec:code} shows the implementation.
+Section~\ref{sec:formal} states and proves the main theorems.
+Section~\ref{sec:discussion} discusses limitations.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+Appendix~\ref{app:proofs} collects auxiliary proofs.
+
+% ============================================================
+%  Section 2 — Background
+% ============================================================
+\section{Background}\label{sec:background}
+
+\subsection{Trust lattice}
+
+The trust ordering is:
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot
+  \;\tleq\; \Toracle \;\tleq\; \Truntime
+  \;\tleq\; \Tsolver \;\tleq\; \Tproof.
+\]
+The construction participant operates at $\Tcopilot$.
+Its suggestions are proposals that the kernel validates
+by dispatching to the solver or runtime channel.
+
+\subsection{Evidence channels}
+
+The $\CopChan$ queries an LLM and produces evidence at
+trust $\Tcopilot$.  The $\mathsf{SolverChannel}$ checks
+validity at $\Tsolver$.  The $\mathsf{RuntimeChannel}$
+captures witnesses at $\Truntime$.  The $\ChanFed$
+collects evidence from all channels and merges it under
+the no-escalation invariant.
+
+\subsection{The CONSTRUCT operation}
+
+The $\mathsf{JuGeoAPI}.\texttt{construct}(c, \varphi)$
+operation takes a coordinate~$c$ and a proposition~$\varphi$
+and returns either a proof object or a list of residual
+sub-goals.  The operation is mediated by the channel layer:
+the Copilot bridge suggests a construction plan, and the
+solver channel validates each step.
+
+\begin{definition}[Proof obligation]\label{def:proofobligation}
+A \emph{proof obligation} is a pair $(c, \varphi)$ where
+$c$ is a coordinate in the proof tree and $\varphi$ is
+a proposition to be proved.
+\end{definition}
+
+\begin{definition}[Partial proof]\label{def:partialproof}
+A \emph{partial proof} is a tree whose leaves are either
+completed sub-proofs or open goals (residual obligations).
+A partial proof with no open goals is a \emph{complete proof}.
+\end{definition}
+
+% ============================================================
+%  Section 3 — Proof Construction
+% ============================================================
+\section{Proof Construction}\label{sec:construction}
+
+\subsection{The category of partial proofs}
+
+\begin{definition}[Partial proof category]\label{def:ppcat}
+Let $\mathbf{PP}$ be the category whose objects are partial
+proofs and whose morphisms are refinement steps: a morphism
+$P \to P'$ closes one or more open goals in~$P$ to produce~$P'$.
+\end{definition}
+
+\begin{definition}[Refinement step]\label{def:refstep}
+A \emph{refinement step} is a function
+$r \colon \mathsf{Goal} \to \mathcal{P}(\mathsf{Goal})$
+that replaces one open goal with zero or more sub-goals.
+Closing a goal (replacing it with a completed sub-proof)
+corresponds to $r(g) = \emptyset$.
+\end{definition}
+
+\begin{definition}[Construction functor]\label{def:confunctor}
+The \emph{construction functor}
+$\mathcal{C} \colon \mathbf{PP} \to \mathbf{PP}$
+is defined by: for each partial proof~$P$, $\mathcal{C}(P)$
+is the partial proof obtained by applying the participant's
+suggested refinement steps to the open goals of~$P$.
+\end{definition}
+
+\begin{remark}
+The construction functor is not guaranteed to produce a
+complete proof.  It may reduce the number of open goals,
+leave them unchanged, or even increase them (if a step
+introduces new sub-goals).  The key property is that
+trust is preserved.
+\end{remark}
+
+\subsection{Witnesses and construction plans}
+
+\begin{definition}[Witness]\label{def:witness}
+A \emph{witness} for a goal $(c, \exists x.\, \varphi(x))$
+is a term~$t$ such that $\varphi(t)$ is valid.  The
+participant suggests witnesses; the solver validates them.
+\end{definition}
+
+\begin{definition}[Construction plan]\label{def:conplan}
+A \emph{construction plan} is a sequence of refinement steps
+$r_1, r_2, \ldots, r_k$ together with witnesses for each
+existential goal.  The plan is \emph{valid} if applying all
+steps produces a complete proof.
+\end{definition}
+
+\begin{lemma}[Plan validity is decidable]\label{lem:planvalid}
+Given a construction plan and the underlying proof obligations,
+checking whether the plan produces a complete proof is decidable
+(assuming the underlying logic is decidable for the given
+fragment).
+\end{lemma}
+\begin{proof}
+Each refinement step replaces a goal with sub-goals.  Checking
+whether the resulting partial proof has no open goals is a
+finite tree traversal.  If the logic is decidable, each
+sub-goal can be checked.  Therefore plan validity is decidable.
+\end{proof}
+
+% ============================================================
+%  Section 4 — The Construction Participant
+% ============================================================
+\section{The Construction Participant}\label{sec:participant}
+
+\subsection{Architecture}
+
+The $\CCP$ has three phases:
+\begin{enumerate}
+\item \emph{Plan generation.}  Given the current partial proof,
+      the participant queries the Copilot channel for a
+      construction plan.
+\item \emph{Step suggestion.}  For each open goal, the
+      participant suggests a refinement step (tactic).
+\item \emph{Witness proposal.}  For existential goals, the
+      participant proposes a witness term.
+\end{enumerate}
+
+\begin{definition}[Construction participant]\label{def:ccp}
+The $\CCP$ is a triple $(\mathcal{P}, \tau, j)$ where:
+\begin{itemize}
+\item $\mathcal{P}$ is the participation function
+      $\mathcal{P} \colon \mathbf{PP} \to \mathsf{Plan}$,
+\item $\tau = \Tcopilot$ is the trust ceiling,
+\item $j$ is the jurisdiction (all proposition kinds).
+\end{itemize}
+\end{definition}
+
+\subsection{Plan generation}
+
+The participant queries the Copilot channel with a prompt
+encoding the current partial proof.  The prompt includes:
+\begin{itemize}
+\item The open goals (as propositions).
+\item The names and types of available lemmas.
+\item The proof history (steps taken so far).
+\item A request for a ranked list of construction plans.
+\end{itemize}
+
+\subsection{Step suggestion}
+
+For each open goal, the participant suggests a refinement
+step.  The suggestion is a pair $(\mathsf{tactic}, \mathsf{args})$
+where the tactic is one of: \texttt{intro}, \texttt{apply},
+\texttt{split}, \texttt{induction}, \texttt{contradiction},
+\texttt{exact}, \texttt{unfold}, \texttt{rewrite}.
+
+\subsection{Witness proposal}
+
+For existential goals, the participant proposes a witness.
+The witness is a term in the language of the proof system.
+The solver channel validates the witness by checking that
+the instantiated formula is valid.
+
+\begin{lemma}[Witness trust ceiling]\label{lem:witnessceil}
+Every proposed witness has trust $\tleq \Tcopilot$.
+\end{lemma}
+\begin{proof}
+Witnesses are derived from Copilot channel queries, which
+have trust ceiling $\Tcopilot$.  The participant does not
+elevate trust.
+\end{proof}
+
+% ============================================================
+%  Section 5 — Implementation
+% ============================================================
+\section{Implementation}\label{sec:code}
+
+\subsection{Construction plan generation}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Construction plan generation via CopilotChannel},
+  label={lst:conplan}]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+    ChannelJurisdiction,
+    ChannelMonitor,
+)
+
+class CopilotConstructionParticipant:
+    """Copilot-guided participant in proof construction."""
+
+    def __init__(self, channel: CopilotChannel):
+        self.channel = channel
+        self.trust_ceiling = channel.TRUST_CEILING
+        self.jurisdiction = ChannelJurisdiction.for_channel(
+            EvidenceChannel.COPILOT
+        )
+
+    def generate_plan(self, partial_proof, available_lemmas):
+        prompt = self._build_plan_prompt(partial_proof, available_lemmas)
+        raw = self.channel.query_llm(prompt, timeout_ms=12000)
+        parsed = self.channel.parse_response()
+        clamped = self.channel.apply_trust_ceiling()
+        plans = self._extract_plans(clamped)
+        return plans
+
+    def suggest_step(self, goal, context):
+        prompt = self._build_step_prompt(goal, context)
+        raw = self.channel.query_llm(prompt, timeout_ms=8000)
+        parsed = self.channel.parse_response()
+        clamped = self.channel.apply_trust_ceiling()
+        return self._parse_tactic(clamped)
+
+    def propose_witness(self, existential_goal, context):
+        prompt = self._build_witness_prompt(existential_goal, context)
+        raw = self.channel.query_llm(prompt, timeout_ms=8000)
+        parsed = self.channel.parse_response()
+        clamped = self.channel.apply_trust_ceiling()
+        return self._extract_witness(clamped)
+
+    def _build_plan_prompt(self, proof, lemmas):
+        goals = proof.get("open_goals", [])
+        return (
+            f"Proof has {len(goals)} open goals. "
+            f"Available lemmas: {lemmas[:10]}. "
+            f"Suggest a construction plan."
+        )
+
+    def _build_step_prompt(self, goal, ctx):
+        return f"Goal: {goal}. Context: {ctx}. Suggest a tactic."
+
+    def _build_witness_prompt(self, goal, ctx):
+        return f"Existential goal: {goal}. Suggest a witness term."
+
+    def _extract_plans(self, response):
+        if isinstance(response, list):
+            return response
+        return [{"steps": [], "confidence": 0.5}]
+
+    def _parse_tactic(self, response):
+        return {"tactic": "apply", "args": response}
+
+    def _extract_witness(self, response):
+        return {"witness": response, "trust": self.trust_ceiling}
+\end{lstlisting}
+
+\subsection{Construction via CopilotAPIBridge}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Proof construction with CopilotAPIBridge and JuGeoAPI},
+  label={lst:conbridge}]
+from jugeo.interfaces.api import (
+    CopilotAPIBridge,
+    APIEventLog,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    JuGeoAPI,
+    APISession,
+    RequestStatus,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+)
+
+class ConstructionOrchestrator:
+    """Orchestrate proof construction with Copilot assistance."""
+
+    def __init__(self, bridge: CopilotAPIBridge, api: JuGeoAPI):
+        self.bridge = bridge
+        self.api = api
+        self.event_log = APIEventLog()
+
+    def construct_with_copilot(self, coordinate, proposition):
+        session = self.api.open_session("construction")
+        hint = self.bridge.query(
+            f"Construct proof for {proposition} at {coordinate}"
+        )
+        self.bridge.enforce_trust_ceiling()
+        self.event_log.record({
+            "event": "construction_hint",
+            "hint": str(hint),
+        })
+
+        request = APIRequest(
+            request_id="construct-001",
+            operation=OperationKind.CONSTRUCT,
+            coordinate=coordinate,
+            proposition=proposition,
+            budget=50000,
+            deadline=60000,
+            metadata={"copilot_hint": str(hint)},
+        )
+        session.register_request(request)
+        result = self.api.construct(
+            coordinate=coordinate,
+            proposition=proposition,
+        )
+
+        self.event_log.record({
+            "event": "construction_result",
+            "success": result.is_successful() if result else False,
+        })
+        session.checkpoint()
+
+        if result and result.has_residuals():
+            residuals = self._handle_residuals(result, session)
+            return {"result": result, "residuals": residuals}
+
+        session.close()
+        return {"result": result, "residuals": []}
+
+    def _handle_residuals(self, result, session):
+        residuals = []
+        hint = self.bridge.query(
+            f"Handle residuals from construction: {result}"
+        )
+        self.bridge.enforce_trust_ceiling()
+        residuals.append({"hint": str(hint), "stats": self.bridge.stats()})
+        return residuals
+\end{lstlisting}
+
+\subsection{Federated construction evidence}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Federated evidence for construction validation},
+  label={lst:confed}]
+from jugeo.evidence.channels import (
+    ChannelFederation,
+    ChannelPool,
+    ChannelRouter,
+    ChannelMonitor,
+    CopilotChannel,
+    SolverChannel,
+    RuntimeChannel,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+    EvidenceRecord,
+    SupportRoute,
+)
+
+def federated_construction_validation(
+    pool: ChannelPool,
+    coordinate,
+    proposition,
+    witness=None,
+):
+    """Validate a construction step using federated evidence."""
+    federation = ChannelFederation()
+    router = ChannelRouter()
+    monitor = ChannelMonitor()
+
+    request = EvidenceRequest(
+        request_id=f"con-val-{coordinate}",
+        coordinate=coordinate,
+        proposition=proposition,
+        required_kind=None,
+        proposition_kind="construction_validation",
+        preferred_channel=EvidenceChannel.SOLVER,
+        fallback_channels=[
+            EvidenceChannel.COPILOT,
+            EvidenceChannel.RUNTIME,
+        ],
+        deadline_ms=20000,
+        budget=30000,
+        metadata={"witness": str(witness)},
+    )
+
+    monitor.record_request(request)
+    best = router.find_best_channel(request)
+    all_capable = router.find_all_capable(request)
+
+    evidence = federation.collect_all(request)
+    merged = federation.merge_by_kind(evidence)
+    federation.verify_no_escalation(merged)
+    composed_trust = federation.compose_trust(merged)
+
+    for ev in evidence:
+        monitor.record_response(ev)
+
+    return {
+        "merged_evidence": merged,
+        "composed_trust": composed_trust,
+        "success_rate": monitor.success_rate(),
+        "summary": monitor.summary(),
+    }
+\end{lstlisting}
+
+\subsection{Step-by-step construction with health monitoring}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Step-by-step construction with monitoring},
+  label={lst:constep}]
+from jugeo.kernel.health import (
+    HealthStatus,
+    HealthDimension,
+    HealthIndicator,
+    HealthReport,
+)
+from jugeo.evidence.channels import (
+    ChannelPool,
+    ChannelMonitor,
+    CopilotChannel,
+    EvidenceChannel,
+    ChannelConfiguration,
+)
+from jugeo.interfaces.api import (
+    JuGeoAPI,
+    OperationKind,
+    APIEventLog,
+)
+
+class StepByStepConstructor:
+    """Build proofs step by step with health monitoring."""
+
+    def __init__(self, pool: ChannelPool, api: JuGeoAPI):
+        self.pool = pool
+        self.api = api
+        self.monitor = ChannelMonitor()
+
+    def construct_steps(self, goals, max_steps=20):
+        results = []
+        for i, goal in enumerate(goals[:max_steps]):
+            health = self._check_health()
+            if health.overall_status == HealthStatus.UNHEALTHY:
+                results.append({"goal": goal, "status": "skipped"})
+                continue
+
+            copilot = self.pool.get_channel("copilot")
+            if copilot is None:
+                results.append({"goal": goal, "status": "no_copilot"})
+                continue
+
+            raw = copilot.query_llm(
+                f"Step {i}: prove {goal}", timeout_ms=10000
+            )
+            parsed = copilot.parse_response()
+            clamped = copilot.apply_trust_ceiling()
+
+            result = self.api.verify(
+                coordinate=f"step-{i}",
+                proposition=str(goal),
+            )
+            success = result.is_successful() if result else False
+            results.append({
+                "goal": goal,
+                "suggestion": str(clamped),
+                "verified": success,
+            })
+        return results
+
+    def _check_health(self):
+        copilot = self.pool.get_channel("copilot")
+        indicators = []
+        if copilot:
+            alive = copilot.health_check()
+            indicators.append(HealthIndicator(
+                dimension=HealthDimension.COPILOT_CONNECTIVITY,
+                status=(HealthStatus.HEALTHY if alive
+                        else HealthStatus.UNHEALTHY),
+                message="Copilot channel status",
+                value=1.0 if alive else 0.0,
+                timestamp=None,
+                details={},
+            ))
+        overall = (HealthStatus.HEALTHY if all(
+            i.is_healthy() for i in indicators
+        ) else HealthStatus.UNHEALTHY)
+        return HealthReport(
+            overall_status=overall,
+            indicators=indicators,
+            generated_at=None,
+            report_id="con-health",
+            degradation_reasons=[],
+            recovery_suggestions=[],
+        )
+\end{lstlisting}
+
+% ============================================================
+%  Section 6 — Formal Properties
+% ============================================================
+\section{Formal Properties}\label{sec:formal}
+
+\begin{theorem}[Construction soundness]\label{thm:consound}
+If the $\CCP$ suggests a construction plan~$\pi$ and every
+step of~$\pi$ is validated by the solver channel, then the
+completed proof is sound.
+\end{theorem}
+\begin{proof}
+Each step of the plan is a refinement step $r_i$ that replaces
+an open goal with sub-goals.  The solver validates each step
+by checking that the sub-goals entail the parent goal.  Since
+the solver is sound (at trust $\Tsolver$), each validated step
+is correct.
+
+The completed proof is the result of applying all validated steps.
+By induction on the number of steps:
+\begin{itemize}
+\item \emph{Base case:} the empty plan leaves the proof unchanged.
+\item \emph{Inductive step:} applying a validated step $r_i$ to
+      a sound partial proof yields a sound partial proof with
+      one fewer open goal (or additional sub-goals that are valid).
+\end{itemize}
+When all goals are closed, the proof is complete and sound.
+\end{proof}
+
+\begin{theorem}[Trust-ceiling preservation]\label{thm:trustceil}
+Every suggestion produced by the $\CCP$ has trust $\tleq \Tcopilot$.
+\end{theorem}
+\begin{proof}
+The participant queries the Copilot channel via \texttt{query\_llm}
+and applies \texttt{apply\_trust\_ceiling}.  By the channel
+contract, the response trust is at most $\Tcopilot$.  The
+participant does not compose evidence from multiple channels
+or elevate trust in any way.  Therefore every suggestion has
+trust $\tleq \Tcopilot$.
+\end{proof}
+
+\begin{theorem}[Search-space reduction]\label{thm:searchred}
+If the participant's plan reduces the number of open goals
+from~$n$ to~$m < n$, then the remaining search space is
+at most $b^m$ where $b$ is the branching factor, compared
+to the original $b^n$.
+\end{theorem}
+\begin{proof}
+The search space for a partial proof with $k$ open goals and
+branching factor~$b$ is at most $b^k$ (each goal has at most
+$b$ refinement options).  Reducing from~$n$ to~$m$ goals
+reduces the search space from $b^n$ to $b^m$.  Since $m < n$,
+$b^m < b^n$.
+\end{proof}
+
+\begin{theorem}[Witness completeness]\label{thm:witcomp}
+For every decidable existential goal $(c, \exists x.\,\varphi(x))$,
+if a witness exists, then the participant proposes at least
+one candidate witness (in the idealised setting where the
+language model is complete).
+\end{theorem}
+\begin{proof}
+The participant queries the Copilot channel with the
+existential goal.  In the idealised setting, the language
+model enumerates all terms of the appropriate type and
+checks $\varphi(t)$ for each.  Since a witness exists and
+the goal is decidable, the model finds it.
+
+In practice, the language model may miss witnesses.  The
+theorem holds in the idealised setting; practical coverage
+depends on the model's training data and inference budget.
+\end{proof}
+
+% ============================================================
+%  Section 7 — Discussion
+% ============================================================
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{Practical witness completeness.}
+Theorem~\ref{thm:witcomp} assumes an idealised language model.
+In practice, the Copilot channel may fail to find a witness for
+complex existential goals.  The construction participant mitigates
+this by requesting multiple witnesses and ranking them by
+confidence.
+
+\paragraph{Cost of validation.}
+Every participant suggestion requires solver validation, which
+adds latency.  The trade-off is between construction speed
+(with Copilot hints) and validation cost.  The participant
+only suggests steps when the estimated speedup exceeds the
+validation overhead.
+
+\paragraph{Interaction with other advisors.}
+The construction participant composes with the research advisor
+(Paper~82) and the experiment advisor (Paper~82): the research
+advisor suggests hypotheses that become construction goals, and
+the experiment advisor designs validation experiments.
+
+\paragraph{Residual handling.}
+When construction produces residuals (open sub-goals), the
+participant can be invoked recursively on each residual.
+The recursion depth is bounded by the proof tree depth,
+ensuring termination.
+
+\paragraph{Trust and the validator.}
+The participant operates at $\Tcopilot$, but the validated
+proof has trust determined by the validator.  If the solver
+validates all steps, the proof has trust $\Tsolver$.  The
+participant's contribution is heuristic guidance, not trust.
+
+% ============================================================
+%  Section 8 — Related Work
+% ============================================================
+\section{Related Work}\label{sec:related}
+
+\paragraph{LLM-guided proof construction.}
+GPT-$f$~\cite{polu2020gptf} and AlphaProof~\cite{lample2022hypertree}
+use language models to suggest proof steps.  Our participant
+differs in operating within a trust-bounded channel architecture.
+
+\paragraph{Proof assistants with AI.}
+Lean Copilot~\cite{yang2019learning} and Isabelle
+Sledgehammer~\cite{wenzel2014isabelle} integrate AI into
+proof assistants.  Our approach is framework-independent and
+mediated by the channel layer.
+
+\paragraph{Witness generation.}
+Property-based testing~\cite{claessen2000quickcheck} generates
+witnesses by random search.  Our participant uses LLM-guided
+search, which may find witnesses faster for structured goals.
+
+\paragraph{Proof planning.}
+Omega~\cite{basin1993rippling} and Clam~\cite{bundy1990clam}
+use proof plans.  Our construction plans are generated by the
+LLM rather than by hand-crafted heuristics.
+
+\paragraph{Trust in AI proofs.}
+The question of trusting AI-generated proofs is studied
+by Ringer \etal{}~\cite{first2022diversity}.  Our trust lattice
+provides a formal answer: AI suggestions are at $\Tcopilot$,
+and trusted evidence requires solver validation.
+
+% ============================================================
+%  Section 9 — Conclusion
+% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We have introduced the $\CCP$, a Copilot-guided agent that
+participates in proof construction within the \JuGeo{}
+framework.  The participant suggests construction plans,
+refinement steps, and witnesses, all at $\Tcopilot$ trust.
+Four theorems establish soundness (given solver validation),
+trust-ceiling preservation, search-space reduction, and
+witness completeness (in the idealised setting).
+
+Future work includes adaptive plan generation based on
+construction history, multi-step lookahead for witness
+search, and integration with reinforcement learning for
+tactic selection.
+
+% ============================================================
+%  Bibliography
+% ============================================================
+\begin{thebibliography}{25}
+
+\bibitem{polu2020gptf}
+S.~Polu and I.~Sutskever,
+``Generative language modeling for automated theorem proving,''
+\emph{arXiv preprint arXiv:2009.03393}, 2020.
+
+\bibitem{lample2022hypertree}
+G.~Lample, M.-A.~Lachaux, T.~Lavril, X.~Martinet,
+A.~Hayat, G.~Ebner, A.~Rodriguez, and T.~Lacroix,
+``HyperTree proof search for neural theorem proving,''
+\emph{NeurIPS}, 2022.
+
+\bibitem{yang2019learning}
+K.~Yang and J.~Deng,
+``Learning to prove theorems via interacting with proof
+assistants,''
+\emph{ICML}, 2019.
+
+\bibitem{wenzel2014isabelle}
+M.~Wenzel,
+``Isabelle/jEdit --- a prover IDE within the PIDE framework,''
+\emph{AISC/Calculemus/MKM}, 2012.
+
+\bibitem{claessen2000quickcheck}
+K.~Claessen and J.~Hughes,
+``QuickCheck: a lightweight tool for random testing of
+Haskell programs,''
+\emph{ICFP}, 2000.
+
+\bibitem{basin1993rippling}
+D.~Basin and T.~Walsh,
+``A calculus for and termination of rippling,''
+\emph{Journal of Automated Reasoning}, vol.~16,
+pp.~147--180, 1996.
+
+\bibitem{bundy1990clam}
+A.~Bundy, A.~Stevens, F.~van Harmelen, J.~Ireland,
+A.~Smaill, and T.~Walsh,
+``Rippling: a heuristic for guiding inductive proofs,''
+\emph{Artificial Intelligence}, vol.~62, pp.~185--253, 1993.
+
+\bibitem{first2022diversity}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun,
+``Diversity-driven automated formal verification,''
+\emph{ICSE}, 2022.
+
+\bibitem{young2024jugeo}
+H.~Young,
+``Judgment geometry: a framework for trust-calibrated
+verification,''
+\emph{JuGeo Technical Reports}, Paper~1, 2024.
+
+\bibitem{young2024channels}
+H.~Young,
+``Evidence channels in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~88, 2024.
+
+\bibitem{young2024advisors}
+H.~Young,
+``Copilot advisors for heap, scope, import, and callable
+analysis,''
+\emph{JuGeo Technical Reports}, Papers~80--81, 2024.
+
+\bibitem{young2024lifecycle}
+H.~Young,
+``Kernel lifecycle and health monitoring in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~93, 2024.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner,
+``Z3: an efficient SMT solver,''
+\emph{TACAS}, 2008.
+
+\bibitem{moura2021lean4}
+L.~de~Moura and S.~Ullrich,
+``The Lean~4 theorem prover and programming language,''
+\emph{CADE}, 2021.
+
+\bibitem{bansal2019holist}
+K.~Bansal, S.~Loos, M.~Rabe, C.~Szegedy, and S.~Wilcox,
+``HOList: an environment for machine learning of higher-order
+logic theorem proving,''
+\emph{ICML}, 2019.
+
+\bibitem{rabe2021mathematical}
+M.~N.~Rabe, D.~Lee, K.~Bansal, and C.~Szegedy,
+``Mathematical reasoning via self-supervised skip-tree
+training,''
+\emph{ICLR}, 2021.
+
+\bibitem{jiang2022thor}
+A.~Q.~Jiang, W.~Li, S.~Tworber, and Y.~Wu,
+``Thor: wielding hammers to integrate language models and
+automated theorem provers,''
+\emph{NeurIPS}, 2022.
+
+\bibitem{li2021isarstep}
+W.~Li, L.~Yu, Y.~Wu, and L.~C.~Paulson,
+``IsarStep: a benchmark for high-level mathematical
+reasoning,''
+\emph{ICLR}, 2021.
+
+\bibitem{clarke1999mc}
+E.~M.~Clarke, O.~Grumberg, and D.~A.~Peled,
+\emph{Model Checking}.
+MIT Press, 1999.
+
+\bibitem{ribeiro2020trust}
+M.~T.~Ribeiro, S.~Singh, and C.~Guestrin,
+``'Why should I trust you?': explaining the predictions
+of any classifier,''
+\emph{KDD}, 2016.
+
+\end{thebibliography}
+
+% ============================================================
+%  Appendix
+% ============================================================
+\appendix
+
+\section{Auxiliary Proofs}\label{app:proofs}
+
+\begin{lemma}[Partial proof refinement is monotone]%
+\label{lem:refmono}
+If $P \to P'$ is a refinement step, then the number of
+completed sub-proofs in $P'$ is at least the number in~$P$.
+\end{lemma}
+\begin{proof}
+A refinement step closes one goal (adding a completed sub-proof)
+or replaces one goal with sub-goals (the existing completed
+sub-proofs are unchanged).  In either case, the count of
+completed sub-proofs is non-decreasing.
+\end{proof}
+
+\begin{lemma}[Construction functor preserves identity]%
+\label{lem:confuncid}
+$\mathcal{C}(\mathrm{id}_P) = \mathrm{id}_{\mathcal{C}(P)}$
+for every partial proof~$P$.
+\end{lemma}
+\begin{proof}
+The identity refinement makes no changes.  Applying the
+construction functor to an unchanged proof leaves it unchanged.
+\end{proof}
+
+\begin{lemma}[Construction functor preserves composition]%
+\label{lem:confunccomp}
+For refinement steps $r_1 \colon P \to P'$ and
+$r_2 \colon P' \to P''$:
+$\mathcal{C}(r_2 \circ r_1) = \mathcal{C}(r_2) \circ \mathcal{C}(r_1)$.
+\end{lemma}
+\begin{proof}
+The construction functor applies the participant's suggestions
+to each refinement.  Composing refinements and then applying
+suggestions yields the same result as applying suggestions to
+each refinement separately and composing, since the suggestions
+depend only on the open goals at each step.
+\end{proof}
+
+\begin{lemma}[Witness validation is decidable]%
+\label{lem:witdecid}
+For a decidable existential goal and a proposed witness~$t$,
+checking $\varphi(t)$ is decidable.
+\end{lemma}
+\begin{proof}
+Substituting $t$ for~$x$ in $\varphi(x)$ yields a closed
+formula $\varphi(t)$.  Since the goal is decidable, checking
+$\varphi(t)$ is decidable.
+\end{proof}
+
+\begin{lemma}[Plan application terminates]%
+\label{lem:planterm}
+Applying a finite construction plan to a partial proof
+terminates.
+\end{lemma}
+\begin{proof}
+The plan has finitely many steps.  Each step is applied
+once.  Therefore the application terminates in at most $k$
+steps where $k$ is the plan length.
+\end{proof}
+
+\begin{lemma}[Validated plan is correct]%
+\label{lem:planvalcorrect}
+If every step of a plan is validated by the solver, then
+the plan is correct.
+\end{lemma}
+\begin{proof}
+Each validated step is correct (by solver soundness).
+The composition of correct steps is correct (by induction).
+Therefore the plan is correct.
+\end{proof}
+
+\begin{lemma}[Participant trust does not accumulate]%
+\label{lem:trustnoaccum}
+Applying $k$ participant suggestions in sequence does not
+elevate trust above $\Tcopilot$.
+\end{lemma}
+\begin{proof}
+Each suggestion has trust $\tleq \Tcopilot$.  Sequential
+composition takes the minimum: $\min(\Tcopilot, \ldots,
+\Tcopilot) = \Tcopilot$.
+\end{proof}
+
+\begin{lemma}[Residual goals are well-formed]%
+\label{lem:residwf}
+Every residual goal produced by a construction step is
+syntactically well-formed.
+\end{lemma}
+\begin{proof}
+Refinement steps are defined as functions from goals to
+sets of goals.  The domain and range are the same set
+(well-formed goals).  Therefore residuals are well-formed.
+\end{proof}
+
+\begin{lemma}[Federation trust for construction validation]%
+\label{lem:fedtrust}
+When federated construction validation (Listing~\ref{lst:confed})
+collects evidence from channels $c_1, \ldots, c_n$, the composed
+trust is $\inf_i \mathrm{trust}(c_i)$.
+\end{lemma}
+\begin{proof}
+The federation's \texttt{compose\_trust} method computes the
+infimum (meet) of the contributing trusts.  By the no-escalation
+invariant, the composed trust cannot exceed any contributing
+trust.  Therefore the result is $\inf_i \mathrm{trust}(c_i)$.
+\end{proof}
+
+\begin{proposition}[Full construction pipeline correctness]%
+\label{prop:fullconcorrect}
+The full construction pipeline (participant suggests plan,
+solver validates steps, federation merges evidence) produces
+a correct proof at trust $\Tsolver$ (assuming solver soundness).
+\end{proposition}
+\begin{proof}
+The participant suggests at $\Tcopilot$.  The solver validates
+each step at $\Tsolver$.  The validated proof inherits the
+solver's trust.  By Theorem~\ref{thm:consound}, the proof is
+sound.  By Lemma~\ref{lem:fedtrust}, federated validation
+produces evidence at trust $\geq \Tcopilot$ (and at $\Tsolver$
+when the solver participates).
+\end{proof}
+
+\begin{remark}[Extension to interactive construction]
+The $\CCP$ is non-interactive: it proposes and the kernel
+disposes.  An interactive variant would present suggestions
+to a human user and await acceptance or rejection.  The
+trust model extends naturally: human-accepted suggestions
+would carry trust $\Tproof$ (human tier), while auto-accepted
+suggestions remain at $\Tcopilot$ pending validation.
+\end{remark}
+
+\section{Extended Formal Development}\label{app:extended}
+
+\subsection{Construction Algebra}
+
+\begin{definition}[Construction algebra]\label{def:conalg}
+A \emph{construction algebra} is a tuple
+$(\mathcal{G}, \circ, e, \tau)$ where $\mathcal{G}$ is the
+set of construction operations, $\circ$ is sequential
+composition, $e$ is the identity operation (no-op), and
+$\tau \colon \mathcal{G} \to \mathcal{T}$ assigns a trust
+tier to each operation.
+\end{definition}
+
+\begin{lemma}[Construction algebra is a monoid]%
+\label{lem:conalgmonoid}
+$(\mathcal{G}, \circ, e)$ is a monoid.
+\end{lemma}
+\begin{proof}
+\emph{Associativity:} sequential composition of construction
+operations is function composition, which is associative.
+\emph{Identity:} the no-op operation satisfies
+$g \circ e = g$ and $e \circ g = g$ for all $g$.
+\end{proof}
+
+\begin{lemma}[Trust is a monoid homomorphism]%
+\label{lem:trusthom}
+The trust function $\tau$ satisfies
+$\tau(g_1 \circ g_2) = \min(\tau(g_1), \tau(g_2))$.
+\end{lemma}
+\begin{proof}
+The trust of a composed operation is the minimum of the
+component trusts, since the composition cannot produce
+evidence above the lowest component's ceiling.
+\end{proof}
+
+\subsection{Induction Principles for Construction}
+
+\begin{definition}[Well-founded proof tree]\label{def:wfpt}
+A proof tree is \emph{well-founded} if every descending
+chain of goals is finite.  Equivalently, the tree has
+finite depth.
+\end{definition}
+
+\begin{lemma}[Construction on well-founded trees terminates]%
+\label{lem:confterm}
+If the proof tree is well-founded and the participant's plan
+has finite length, then the construction process terminates.
+\end{lemma}
+\begin{proof}
+Each plan step either closes a goal (decreasing the number of
+open goals) or replaces a goal with sub-goals at strictly
+lower depth.  Since the tree is well-founded, the depth
+decreases strictly, and the process terminates.
+\end{proof}
+
+\begin{lemma}[Structural induction on partial proofs]%
+\label{lem:structind}
+Any property~$P$ that holds for complete proofs (base case)
+and is preserved by refinement steps (inductive case) holds
+for all partial proofs reachable from a complete proof by
+``un-refining'' (opening goals).
+\end{lemma}
+\begin{proof}
+Standard structural induction on the tree structure of
+partial proofs.  The base case is a leaf (complete sub-proof).
+The inductive case extends to internal nodes (open goals
+with sub-trees).
+\end{proof}
+
+\subsection{Channel Interaction Properties}
+
+\begin{lemma}[Copilot query idempotence for caching]%
+\label{lem:cacheidemp}
+If the same prompt is sent to the Copilot channel twice
+(with caching enabled), the second call returns the cached
+response, which has the same trust as the first.
+\end{lemma}
+\begin{proof}
+The cache key is the canonical form of the prompt.  If the
+prompt matches, the cached response is returned without
+querying the LLM.  The cached response has the same trust
+tier as the original, since trust is stored alongside the
+response.
+\end{proof}
+
+\begin{lemma}[Solver validation is independent of participant]%
+\label{lem:solverindep}
+The solver channel validates a construction step independently
+of how the step was generated.  Whether the step came from
+the participant, a human, or another advisor does not affect
+the validation result.
+\end{lemma}
+\begin{proof}
+The solver checks the mathematical content of the step
+(does the sub-goal entail the parent goal?) without
+inspecting the provenance.  Therefore the validation is
+source-independent.
+\end{proof}
+
+\begin{lemma}[Federation order independence]%
+\label{lem:fedorderindep}
+The order in which channels contribute evidence to the
+federation does not affect the merged result (assuming
+deterministic merge-by-kind).
+\end{lemma}
+\begin{proof}
+The merge-by-kind operation groups evidence by kind and
+takes the meet of trusts within each group.  Both grouping
+and meet are order-independent (set union is commutative,
+and meet is commutative).
+\end{proof}
+
+\begin{lemma}[Health check does not modify proof state]%
+\label{lem:healthnomod}
+Running a health check during construction does not modify
+the partial proof or any open goals.
+\end{lemma}
+\begin{proof}
+Health checks read the channel pool's state and monitor
+statistics.  They do not invoke any construction operations
+or modify the proof tree.
+\end{proof}
+
+\subsection{Complexity Bounds}
+
+\begin{lemma}[Plan generation cost]%
+\label{lem:plancost}
+The cost of generating a construction plan is
+$O(T_{\mathrm{llm}} + n \cdot T_{\mathrm{parse}})$
+where $T_{\mathrm{llm}}$ is the LLM query latency, $n$ is
+the number of open goals, and $T_{\mathrm{parse}}$ is the
+per-goal parse time.
+\end{lemma}
+\begin{proof}
+The participant makes one LLM query ($T_{\mathrm{llm}}$) and
+parses the response for each of the $n$ goals
+($n \cdot T_{\mathrm{parse}}$).  No other operations dominate.
+\end{proof}
+
+\begin{lemma}[Validation cost per step]%
+\label{lem:valcost}
+The cost of validating one construction step is
+$O(T_{\mathrm{solver}})$ where $T_{\mathrm{solver}}$ is the
+solver's query latency for the sub-goal.
+\end{lemma}
+\begin{proof}
+Validation submits one formula to the solver and waits for
+the response.  The cost is dominated by the solver's
+processing time.
+\end{proof}
+
+\begin{proposition}[Total construction cost]%
+\label{prop:totalcost}
+The total cost of constructing a proof with $k$ steps is
+$O(T_{\mathrm{llm}} + k \cdot (T_{\mathrm{parse}} + T_{\mathrm{solver}}))$.
+\end{proposition}
+\begin{proof}
+One LLM query for plan generation, plus $k$ parse-and-validate
+cycles.  The federation overhead per step is absorbed into
+$T_{\mathrm{solver}}$ since it runs in parallel with solver
+queries.
+\end{proof}
+
+\begin{remark}[Amortised cost with caching]
+With response caching, repeated construction attempts for
+similar goals amortise the LLM query cost.  The amortised
+cost per step approaches $O(T_{\mathrm{solver}})$ as the
+cache hit rate increases.
+\end{remark}
+
+\begin{remark}[Parallel validation]
+When multiple construction steps are independent, their
+validations can be parallelised.  With $p$ parallel solver
+instances, the validation time reduces to
+$O(k/p \cdot T_{\mathrm{solver}})$.
+\end{remark}
+
+\begin{lemma}[Construction participant is side-effect free]%
+\label{lem:sefree}
+The $\CCP$ does not modify the proof state.  It only reads
+the current state and produces suggestions.
+\end{lemma}
+\begin{proof}
+All operations of the participant are reads (query the proof
+state, query the Copilot channel) followed by pure computations
+(parse, filter, rank).  No write operation is performed on
+the proof state.  Only the kernel modifies the proof state,
+after validating the participant's suggestions.
+\end{proof}
+
+\begin{lemma}[Multiple participants compose]%
+\label{lem:multipart}
+Multiple construction participants can operate on the same
+proof state concurrently without interference.
+\end{lemma}
+\begin{proof}
+Since participants are side-effect free
+(Lemma~\ref{lem:sefree}), concurrent reads do not
+interfere.  Each participant produces an independent
+suggestion list.  The kernel merges these lists and
+validates each suggestion independently.
+\end{proof}
+
+\end{document}

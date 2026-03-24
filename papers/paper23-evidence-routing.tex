@@ -8,6 +8,7 @@
 \input{experiment-data}
 \input{subsystem-data}
 \input{comprehensive-data}
+\input{data-paper23}
 
 % ── Additional packages ────────────────────────────────────────────
 \usepackage{array}
@@ -55,11 +56,11 @@
 \newcommand{\FragSet}[1]{\mathcal{F}(#1)} % fragment set of VC
 
 % Timing / experiment
-\newcommand{\numroute}{100}
-\newcommand{\routeacc}{\subSiteSuccessRate}
-\newcommand{\numfrag}{\compMorphTotal}
-\newcommand{\avgsplit}{—}
-\newcommand{\medroute}{\subSiteMeanTime}
+\providecommand{\numroute}{100}
+\providecommand{\routeacc}{\ppTwentythreeJugeoRouteAcc}
+\providecommand{\numfrag}{\ppTwentythreeMorphTotal}
+\providecommand{\avgsplit}{---}
+\providecommand{\medroute}{\ppTwentythreeJugeoLatency}
 
 % Title ─────────────────────────────────────────────────────────────
 \title{\textbf{Mixed Evidence Routing:\\Theory-Aware Dispatch of Verification
@@ -81,32 +82,17 @@ Conditions}}
 Real verification campaigns routinely produce \emph{mixed-theory}
 verification conditions (\textsc{VC}s) that combine linear arithmetic,
 string constraints, bitvector arithmetic, and uninterpreted functions
-in a single formula.  Monolithic dispatch — sending the entire \textsc{VC}
-to a single SMT backend — suffers from exponential blow-up in Nelson-Oppen
-combination, from mismatched solver capabilities, and from opaque failures
-when any one sub-theory is unsupported.  We introduce \emph{Mixed Evidence
-Routing}, a theory-aware dispatch framework implemented in the
-\JuGeo{} orchestration layer.  The \texttt{EvidenceRouter} classifies the
-theory content of a \textsc{VC}, splits it into pure-theory
-\emph{logical fragments} (\QFLIA, \QFLRA, \QFBV, \QFUF), dispatches each
-fragment to its specialised solver backend via a
-\texttt{SolverAdapter}, and reassembles the per-fragment results into
-a single \texttt{EvidenceBundle}.  Evidence channels
-(\texttt{EvidenceChannel}: \textsc{Z3}, \textsc{LLM}, \textsc{RT},
-\textsc{Human}, \textsc{Comp}) are classified by jurisdiction and trust
-ceiling; routing strategies (\texttt{RoutingStrategy}: strict-jurisdiction,
-cost-optimal, latency-optimal, trust-optimal, load-balanced) choose among
-available backends.
-
-Our central result (\S\ref{sec:soundness}) is a
-\emph{Routing Soundness Theorem}: if each pure-theory fragment is
-independently valid under its assigned backend, the reassembled bundle
-witnesses validity of the original mixed condition.  We prove the theorem
-formally in \LEAN{} (Paper23\_EvidenceRouting.lean) without appeals to
-\texttt{sorry}.  An evaluation on \numroute{} real-world programs from the
-\JuGeo{} test suite reports routing accuracy of \routeacc{}, a mean of
-\avgsplit{} fragments per \textsc{VC}, and median dispatch latency of
-\medroute{}.
+in a single formula.  Monolithic dispatch sends the entire \textsc{VC}
+to one backend, while JuGeo's router classifies fragments and routes
+them to matching solver capabilities and trust ceilings.  This paper
+describes that routing model and evaluates the current implementation on
+12 JuGeo benchmark programs.  The measured router reaches
+\routeacc{} routing accuracy on that benchmark, preserves a 100.0\%
+verification rate across the compared configurations, and reduces median
+dispatch latency to \medroute{} versus 7980.93\,ms for monolithic Z3.
+The empirical claim is therefore about routing overhead and fragment
+selection, not about human annotation studies or external proof
+assistant validation.
 \end{abstract}
 
 \newpage
@@ -803,41 +789,34 @@ Table~\ref{tab:main} summarises the main results.
 \toprule
 Method & Routing accuracy & Verif.\ rate & Mean frags & Median latency \\
 \midrule
-Monolithic (Z3) & N/A & — & — & — \\
-Manual tagging  & — & — & — & — \\
-\JuGeo{} router & \routeacc{} & \expAccuracy & — & \medroute{} \\
+Monolithic (Z3) & N/A & \ppTwentythreeMonoVerif & \ppTwentythreeMonoFrags & \ppTwentythreeMonoLatency \\
+Manual tagging  & \ppTwentythreeManualRouteAcc & \ppTwentythreeManualVerif & \ppTwentythreeManualFrags & \ppTwentythreeManualLatency \\
+\JuGeo{} router & \ppTwentythreeJugeoRouteAcc & \ppTwentythreeJugeoVerif & \ppTwentythreeJugeoFrags & \ppTwentythreeJugeoLatency \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \paragraph{Routing accuracy.}
-The \JuGeo{} router achieved \routeacc{} routing accuracy against the
-manual gold standard.  The seven misclassified VCs involved
-higher-order string pattern matching whose theory signature was
-ambiguous between the \texttt{STRINGS} and \texttt{QF\_UF} fragments;
-we attribute this to a gap in the signature hash cache for nested
-\texttt{str.replace} calls.
+On the measured benchmark, the \JuGeo{} router achieved
+\routeacc{} routing accuracy against the benchmark routing labels.
+No misclassified cases were recorded in the current dataset.
 
 \paragraph{Verification rate.}
-The router achieves \expAccuracy{} verification rate on the universal benchmark — comparable to the
-expert manual baseline — while requiring no human
-intervention.  The monolithic baseline is limited because some
-programs generate VCs containing theories unsupported by Z3's default
-\texttt{smt} tactic.
+All three measured configurations verify every benchmark program, so the
+current comparison is about routing latency rather than end-to-end
+success rate differences.
 
 \paragraph{Fragment statistics.}
-Across \numroute{} programs, \numfrag{} total fragments were produced.
-The average of \avgsplit{} fragments per VC confirms that real-world
-VCs are highly mixed: only 23 programs yielded a single pure-theory VC.
-The most common fragment type was \QFLIA{}, followed by
-\texttt{STRINGS}, \QFUF{}, and \QFBV{}.
+Across \numroute{} programs, \numfrag{} routed morphism records were
+produced, with a measured mean of \ppTwentythreeJugeoFrags{} fragments
+per workload.  The benchmark therefore exercises genuinely mixed
+conditions rather than single-fragment obligations.
 
 \paragraph{Dispatch latency.}
-Median dispatch latency of \medroute{} is $8\times$ faster than
-monolithic Z3 dispatch.  The speedup arises from two
-sources: parallel fragment dispatch eliminates sequential theory
-combination, and each backend operates on a smaller, pure-theory
-problem that it handles efficiently.
+Median dispatch latency of \medroute{} is about $2\times$ faster than
+the monolithic Z3 baseline (7980.93\,ms) and also below the manual
+routing configuration (8135.42\,ms).  The measured advantage comes from
+fragment-specific routing, not from any external human-in-the-loop step.
 
 \subsection{Fragment type breakdown}\label{sec:fragment-breakdown}
 
@@ -850,14 +829,14 @@ and their associated backends across the benchmark.
 \toprule
 Morphism type & Count & Share & Analogous fragment \\
 \midrule
-Restriction  & \compMorphRestriction & \compMorphRestrictionPct & \QFLIA{} / arithmetic \\
-Transport    & \compMorphTransport   & \compMorphTransportPct   & Cross-theory dispatch \\
-Inclusion    & \compMorphInclusion   & \compMorphInclusionPct   & Subsort embedding \\
+Restriction  & \ppTwentythreeMorphRestrictionCount & \ppTwentythreeMorphRestrictionPct & \QFLIA{} / arithmetic \\
+Analogue     & \ppTwentythreeMorphAnalogueCount   & \ppTwentythreeMorphAnaloguePct   & Cross-theory dispatch \\
+Structural   & \ppTwentythreeMorphStructuralCount  & \ppTwentythreeMorphStructuralPct  & Subsort embedding \\
 \midrule
-\textbf{Total} & \compMorphTotal & 100\% & — \\
+\textbf{Total} & \ppTwentythreeMorphTotal & 100\% & --- \\
 \bottomrule
 \end{tabular}
-\caption{Morphism-type distribution used for evidence routing (\compMorphTotal{} total morphisms).}
+\caption{Morphism-type distribution used for evidence routing (\ppTwentythreeMorphTotal{} total morphisms).}
 \label{fig:fragments}
 \end{figure}
 

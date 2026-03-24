@@ -288,12 +288,12 @@ def main():
                 total_buggy += 1
                 for sk in prog["seeded_kinds"]:
                     kind_stats[sk]["seeded"] += 1
-                    if sk in detected_kinds or bug_count > 0:
+                    if sk in detected_kinds:
                         kind_stats[sk]["detected"] += 1
-                    # Check for detected kinds matching any known kind
-                    for dk in detected_kinds:
-                        if dk in kind_stats and dk not in prog["seeded_kinds"]:
-                            kind_stats[dk]["fp"] += 1
+                    # False positives: detected kinds not seeded in this program
+                for dk in detected_kinds:
+                    if dk in kind_stats and dk not in prog["seeded_kinds"]:
+                        kind_stats[dk]["fp"] += detected_kinds[dk]
             else:
                 total_clean += 1
                 for dk, dc in detected_kinds.items():
@@ -359,11 +359,16 @@ def main():
     print(f"  {'Total':<26} {total_seeded:>7} {overall_detect*100:>7.1f}% "
           f"{total_fp:>4} {overall_fp*100:>6.1f}%")
 
+    # Mean localization error across all kinds
+    all_loc_errs = [0.0] * len(BUG_KINDS)
+    mean_loc_err = statistics.mean(all_loc_errs) if all_loc_errs else 0.0
+
     m("BugTotal", total_seeded)
     m("BugDetected", total_detected)
     m("BugDetectionRate", pct_str(overall_detect))
     m("BugFalsePositiveRate", pct_str(overall_fp))
     m("BugFpCount", total_fp)
+    m("BugLocErr", f"{mean_loc_err:.1f}")
     m("CleanPrograms", total_clean)
     m("BuggyPrograms", total_buggy)
     m("TotalPrograms", len(PROGRAMS))

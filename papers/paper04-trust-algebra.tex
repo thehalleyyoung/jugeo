@@ -1,6 +1,7 @@
 \documentclass[11pt]{article}
 \input{jugeo-common}
 \input{comprehensive-data}
+\input{data-paper04}
 
 \title{\textbf{Accounting for Trust When Machines Write Proofs}}
 
@@ -653,25 +654,18 @@ as two primary classes in \texttt{jugeo.evidence.trust}.
 \subsection{The \texttt{TrustLevel} enum}
 
 The \texttt{TrustLevel} enum defines the eight levels of the
-trust lattice as an \texttt{IntEnum}:
+trust lattice as an ordered enum:
 
 \begin{lstlisting}[caption={The TrustLevel enum.},label=lst:trustlevel]
 from jugeo.evidence.trust import TrustLevel
 
-# Eight levels in total order
-# TrustLevel.CONTRADICTED          = 0  (bottom)
-# TrustLevel.UNVERIFIED            = 1
-# TrustLevel.COPILOT_SUGGESTED     = 2
-# TrustLevel.ORACLE_PROPOSED       = 3
-# TrustLevel.HUMAN_ATTESTED        = 4
-# TrustLevel.RUNTIME_WITNESSED     = 5
-# TrustLevel.SOLVER_DISCHARGED     = 6
-# TrustLevel.MECHANICALLY_VERIFIED = 7  (top)
-
-# Useful methods:
-level = TrustLevel.from_label("SOLVER_DISCHARGED")
-all_levels = TrustLevel.ordered()
+# Ordered from weakest to strongest
+levels = TrustLevel.ordered()
+level = TrustLevel.from_label("solver_discharged")
 comparable = level.is_comparable(TrustLevel.COPILOT_SUGGESTED)
+
+print([item.name for item in levels])
+print(level.name, comparable)
 \end{lstlisting}
 
 The enum also provides sheaf-theoretic methods:
@@ -713,13 +707,6 @@ r = algebra.promote(TrustLevel.COPILOT_SUGGESTED,
 r = algebra.demote(TrustLevel.MECHANICALLY_VERIFIED,
                    ceiling=TrustLevel.RUNTIME_WITNESSED)
 # => TrustLevel.RUNTIME_WITNESSED
-
-# Challenge: adversarially lower trust
-r = algebra.challenge(
-    TrustLevel.SOLVER_DISCHARGED,
-    reason="solver timeout on variant",
-    residual_scope=("sortedness",),
-    demote_to=TrustLevel.RUNTIME_WITNESSED)
 \end{lstlisting}
 
 \subsection{Sheaf-theoretic integration}
@@ -728,10 +715,10 @@ The \texttt{TrustAlgebra} class provides methods connecting
 to the geometric framework:
 
 \begin{itemize}[nosep]
-  \item \texttt{algebra.is\_admissible(level)} ---
-        check admissibility given the evidence configuration.
-  \item \texttt{algebra.sheaf\_condition\_check(sections)} ---
-        verify trust compatibility on overlapping sections.
+  \item \texttt{algebra.is\_admissible(evidence\_config)} ---
+        check admissibility of an evidence configuration.
+  \item \texttt{algebra.sheaf\_condition\_check(site, trust\_assignment)} ---
+        verify trust compatibility over a site's covering families.
   \item \texttt{algebra.judgment\_trust\_profile(judgment)} ---
         aggregate trust profile across all evidence items.
 \end{itemize}
@@ -764,40 +751,40 @@ trust = algebra.compose(trust,
 assert trust == TrustLevel.COPILOT_SUGGESTED
 \end{lstlisting}
 
-\subsection{Challenge sequences}\label{sec:api-challenge}
+\subsection{Explicit demotion sequences}\label{sec:api-challenge}
 
-A \emph{challenge sequence} models adversarial probing of
-evidence.  Each challenge demotes the trust by one step,
-simulating the discovery of a weakness or the failure of a
-re-check.
+The public trust algebra exposes demotion directly.  In the full
+judgment layer, these same demotions can be justified by concrete
+counterevidence or review outcomes.
 
-\begin{lstlisting}[caption={Challenge sequence.},
+\begin{lstlisting}[caption={Explicit demotion sequence.},
                    label=lst:challenge-seq]
 from jugeo.evidence.trust import TrustAlgebra, TrustLevel
 
 algebra = TrustAlgebra()
 level = TrustLevel.SOLVER_DISCHARGED       # 6
 
-# Round 1: solver timeout on a variant
-level = algebra.challenge(level,
-    reason="timeout on permutation variant")
+# Round 1: cap the trust at runtime evidence
+level = algebra.demote(level,
+    ceiling=TrustLevel.RUNTIME_WITNESSED)
 # => RUNTIME_WITNESSED (5)
 
-# Round 2: flaky test discovered
-level = algebra.challenge(level,
-    reason="flaky test for edge case")
+# Round 2: human review becomes the strongest surviving evidence
+level = algebra.demote(level,
+    ceiling=TrustLevel.HUMAN_ATTESTED)
 # => HUMAN_ATTESTED (4)
 
-# Round 3: human review inconclusive
-level = algebra.challenge(level,
-    reason="reviewer uncertain about loop bound")
+# Round 3: only an oracle-level proposal remains
+level = algebra.demote(level,
+    ceiling=TrustLevel.ORACLE_PROPOSED)
 # => ORACLE_PROPOSED (3)
 \end{lstlisting}
 
-\subsection{Promotion with justification logging}\label{sec:api-promo-log}
+\subsection{Promotion with explicit justification}\label{sec:api-promo-log}
 
-Every promotion records its justification in the audit log,
-enabling post-hoc review of trust escalations.
+The lattice API requires a non-empty justification for every promotion.
+Richer audit trails are attached at the judgment layer rather than in the
+bare trust-level algebra.
 
 \begin{lstlisting}[caption={Promotion with audit trail.},
                    label=lst:promo-audit]
@@ -811,11 +798,10 @@ level = algebra.promote(level,
     justification="1000 property tests pass")
 # => ORACLE_PROPOSED (3)
 
-# Attempt further promotion (blocked by ceiling)
-level_attempt = algebra.promote(level,
-    justification="secondary LLM confirms")
-# => ORACLE_PROPOSED (3)  -- copilot ceiling blocks
-assert level_attempt == TrustLevel.ORACLE_PROPOSED
+# Promote again after an explicit human review
+level = algebra.promote(level,
+    justification="human review completed")
+# => HUMAN_ATTESTED (4)
 \end{lstlisting}
 
 
@@ -1091,17 +1077,17 @@ engine\_2 & VERIFIED & semantic & --- \\
 Trust levels
   & 1 & 2 & 1 & 0 & \textbf{8} \\
 Trust lattice
-  & --- & --- & --- & --- & \checkmark \\
+  & \ppFOURleanAlgebra & \ppFOURfstarAlgebra & \ppFOURdafnyAlgebra & $\times$ & \checkmark \\
 Audit log
-  & --- & --- & --- & --- & \checkmark \\
+  & \ppFOURleanAudit & \ppFOURfstarAudit & \ppFOURdafnyAudit & $\times$ & \checkmark \\
 Copilot ceiling
   & N/A & N/A & N/A & N/A & $\Tcopilot$ \\
 Silent promo.
   & Yes & Yes & Yes & Yes & \textbf{No} \\
 Programs tested
-  & --- & --- & --- & --- & \textbf{\compTotalPrograms} \\
+  & $\times$ & $\times$ & $\times$ & $\times$ & \textbf{\compTotalPrograms} \\
 $\Hcoh{1}$ detection
-  & --- & --- & --- & --- & Acc.=\compOverallAccuracy \\
+  & $\times$ & $\times$ & $\times$ & $\times$ & Acc.=\compOverallAccuracy \\
 \bottomrule
 \end{tabular}
 \end{table}

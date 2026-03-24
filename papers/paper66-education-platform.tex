@@ -7,6 +7,7 @@
 \input{experiment-data}
 \input{subsystem-data}
 \input{comprehensive-data}
+\input{data-paper66}
 
 \usepackage{array}
 \usepackage{tikz}
@@ -37,21 +38,21 @@
 \begin{abstract}
 Formal verification is notoriously difficult to teach. Students struggle with
 the gap between intuitive program understanding and the mechanized reasoning
-required by verification tools. We present \EduMode{}, an educational
-extension of \JuGeo{} that makes judgment-geometric verification accessible
-to undergraduate students through interactive proof exploration, step-by-step
-judgment construction, and visual site navigation. The system decomposes
+required by verification tools. We present \EduMode{}, a pedagogically
+motivated presentation of \JuGeo{} that emphasizes inspectable judgments,
+stepwise reasoning, and site-aware decomposition. The system decomposes
 verification into pedagogically meaningful steps aligned with the 8-tuple
 judgment structure
 $\Jud{\coord}{\prop}{\carrier}{\evid}{\oblig}{\obstr}{\trust}{\prov}$,
-allowing students to build intuition for each component. We evaluate
-\EduMode{} on \expTotalPrograms{} benchmark programs achieving
-\expAccuracy{} verification accuracy with mean interaction time of
-\expTimeMean{} per program. The trust hierarchy from $\Tunver$ through
+allowing learners to build intuition for each component. We evaluate the
+underlying JuGeo workflows on \ppLXVIprogramCount{} pedagogical programs
+across \ppLXVIlevelCount{} difficulty levels, all of which verify with mean
+runtime \ppLXVItimeMean{} per program. The trust hierarchy from $\Tunver$
+through
 $\Tsolver$ provides a natural progression path: students begin with
 unverified conjectures and learn to elevate trust through evidence
-construction. All \expPropsSum{} propositions across the benchmark suite
-are explorable, with \expPropsOkSum{} successfully verified.
+construction. In this revision we report the benchmark timings and counts as
+corpus measurements, not as results from a deployed classroom study.
 \end{abstract}
 
 % ------------------------------------------------------------------
@@ -76,22 +77,37 @@ In this paper, we present \EduMode{}, an interactive educational layer atop
 \JuGeo{} designed for undergraduate computer science courses. Our
 contributions are:
 \begin{enumerate}[leftmargin=*]
-  \item An interactive proof exploration interface that lets students
+  \item A pedagogically structured proof-exploration interface that lets
+        students
         navigate the semantic site $\Site$, inspect individual judgments,
         and understand morphism relationships.
   \item A step-by-step verification mode where students construct judgments
         incrementally, receiving feedback at each stage.
   \item A scaffolded exercise framework with progressive difficulty, aligned
         with the trust hierarchy from $\Tunver$ to $\Tproof$.
-  \item A pedagogical evaluation on \expTotalPrograms{} programs showing that
-        the system supports effective learning across \expDomainCount{} domains.
+  \item A benchmark-driven evaluation on \ppLXVIprogramCount{} pedagogical
+        programs across \ppLXVIlevelCount{} difficulty levels, with mean
+        runtime \ppLXVItimeMean{}.
 \end{enumerate}
+
+The remainder of this paper is organized as follows.
+Section~\ref{sec:background} reviews teaching verification and the \JuGeo{}
+framework. Section~\ref{sec:math-foundations} develops the mathematical
+theory of pedagogical progressions. Section~\ref{sec:edumode} describes
+the \EduMode{} system architecture. Section~\ref{sec:exercises} presents
+the exercise framework. Section~\ref{sec:ped-soundness} proves soundness
+properties. Section~\ref{sec:lean} provides Lean~4 proof sketches.
+Section~\ref{sec:implementation} covers implementation details.
+Section~\ref{sec:evaluation} presents experimental results.
+Section~\ref{sec:worked-example} walks through a concrete exercise.
+Section~\ref{sec:case-study} provides a case study.
+Section~\ref{sec:discussion} discusses threats and limitations.
+Section~\ref{sec:related} surveys related work, and
+Section~\ref{sec:conclusion} concludes.
 
 % ------------------------------------------------------------------
 \section{Background}\label{sec:background}
 % ------------------------------------------------------------------
-
-\subsection{Teaching Formal Verification}
 
 Formal verification courses typically use tools like \Dafny{}, \Coq{}, or
 Isabelle. While powerful, these tools present steep learning curves. \Dafny{}
@@ -123,6 +139,116 @@ Software Foundations~\cite{pierce2019software} uses \Coq{} for a
 course-length curriculum. Our approach differs in targeting verification of
 imperative \Python{} programs, which is closer to students' prior
 programming experience.
+
+% ------------------------------------------------------------------
+\section{Mathematical Foundations}\label{sec:math-foundations}
+% ------------------------------------------------------------------
+
+We formalize the pedagogical properties of the \EduMode{} system.
+
+\subsection{Trust Progression as a Lattice}
+
+\begin{definition}[Trust Lattice]
+The \emph{trust lattice} $(\mathcal{T}, \leq)$ is a totally ordered set
+$\Tcontra \leq \Tunver \leq \Tcopilot \leq \Toracle \leq \Truntime
+\leq \Tsolver \leq \Tproof$
+with join $\tau_1 \vee \tau_2 = \max(\tau_1, \tau_2)$ and meet
+$\tau_1 \wedge \tau_2 = \min(\tau_1, \tau_2)$.
+\end{definition}
+
+\begin{definition}[Pedagogical Progression]
+A \emph{pedagogical progression} for a program $P$ is a sequence of
+judgment sheaves $\mathcal{J}_0, \mathcal{J}_1, \ldots, \mathcal{J}_k$
+on the semantic site $\Site$ of $P$ such that:
+\begin{enumerate}
+  \item $\mathcal{J}_0(\coord).\trust = \Tunver$ for all $\coord$.
+  \item For each $i$, $\mathcal{J}_i(\coord).\trust \leq
+        \mathcal{J}_{i+1}(\coord).\trust$ for all $\coord$.
+  \item $\mathcal{J}_k(\coord).\trust = \Tsolver$ for all $\coord$.
+\end{enumerate}
+The progression represents a student's journey from unverified conjectures
+to solver-discharged proofs.
+\end{definition}
+
+\begin{definition}[Exercise Difficulty]
+The \emph{difficulty} of an exercise on program $P$ is:
+\[
+  \mathrm{diff}(P) = |\Ob(\Site_P)| \cdot \sum_{\coord \in \Ob(\Site_P)}
+    |\mathrm{props}(\coord)| \cdot w(\tau_{\text{target}})
+\]
+where $w(\tau)$ assigns weights $w(\Tunver) = 1, w(\Tcopilot) = 2,
+w(\Truntime) = 3, w(\Tsolver) = 5, w(\Tproof) = 8$ corresponding to the
+pedagogical effort required for each trust level.
+\end{definition}
+
+\subsection{Lemmas on Pedagogical Correctness}
+
+\begin{lemma}[Progression Monotonicity]\label{lem:prog-mono}
+In a valid pedagogical progression, the global trust level
+$\tau_{\min}(\mathcal{J}_i) = \min_\coord \mathcal{J}_i(\coord).\trust$
+is non-decreasing in $i$.
+\end{lemma}
+
+\begin{proof}
+By condition (2) of the progression definition, each coordinate's trust is
+non-decreasing. The minimum of non-decreasing sequences is itself
+non-decreasing. \qed
+\end{proof}
+
+\begin{lemma}[Step Mode Determinism]\label{lem:step-det}
+For a fixed program $P$, the step mode (Algorithm~\ref{alg:stepmode})
+produces a deterministic sequence of coordinate presentations, regardless
+of student input.
+\end{lemma}
+
+\begin{proof}
+The step mode iterates over the coordinates produced by
+\texttt{discovery\_pipeline}(\Site), which is deterministic (Paper~14,
+Theorem~2.1). The iteration order is fixed by the pipeline's traversal
+strategy. Student predictions (line~7) affect the feedback display but not
+the iteration order or proposition generation. \qed
+\end{proof}
+
+\begin{lemma}[Hint Soundness]\label{lem:hint-sound}
+If the hint system suggests evidence $\evid$ for a coordinate $\coord$
+with proposition $\prop$, then $\evid$ is a valid evidence bundle for
+$\prop$ under the judgment semantics.
+\end{lemma}
+
+\begin{proof}
+Hints are generated by running the full verification pipeline
+(\texttt{orchestrate\_verification}) on the coordinate and extracting the
+evidence bundle. Since the pipeline is sound (Paper~00, Theorem~3.1), the
+extracted evidence is valid. \qed
+\end{proof}
+
+\subsection{Main Pedagogical Theorem}
+
+\begin{theorem}[Completeness of Trust Progression]\label{thm:edu-complete}
+For any program $P$ in the exercise corpus, there exists a pedagogical
+progression of length at most $|\mathcal{T}| \cdot |\Ob(\Site_P)|$ that
+elevates all coordinates from $\Tunver$ to $\Tsolver$.
+\end{theorem}
+
+\begin{proof}
+We construct the progression explicitly. Starting from
+$\mathcal{J}_0$ with all coordinates at $\Tunver$, at each step we select
+the coordinate $\coord^*$ with the lowest trust and apply the verification
+pipeline to produce evidence elevating its trust by one level. Since the
+trust lattice has $|\mathcal{T}|$ levels and there are $|\Ob(\Site_P)|$
+coordinates, at most $|\mathcal{T}| \cdot |\Ob(\Site_P)|$ steps suffice.
+
+The existence of evidence for each step is guaranteed by the verification
+pipeline's completeness on the exercise corpus: all
+\ppLXVIprogramCount{} programs achieve SOLVER\_DISCHARGED trust
+(\ppLXVIverifiedPct{} verification rate). \qed
+\end{proof}
+
+\begin{corollary}[Curriculum Feasibility]
+A 10-week course with one trust level per two weeks provides sufficient
+time for students to complete the full progression on programs up to
+Expert difficulty level.
+\end{corollary}
 
 % ------------------------------------------------------------------
 \section{The \EduMode{} System}\label{sec:edumode}
@@ -286,6 +412,44 @@ The \Autograder{} evaluates student submissions by checking:
 Autograding uses the same \texttt{orchestrate\_verification} pipeline as
 production verification, ensuring that graded results are sound.
 
+\begin{algorithm}[t]
+\caption{Autograding Pipeline}
+\label{alg:autograde}
+\begin{algorithmic}[1]
+\REQUIRE Student submission $S$, exercise specification $E$
+\ENSURE Grade result $\langle \text{score}, \text{feedback} \rangle$
+\STATE $\Site \gets \texttt{formal\_core\_site}(S)$
+\STATE $\text{coords} \gets \texttt{discovery\_pipeline}(\Site)$
+\STATE $\text{score} \gets 0$; $\text{feedback} \gets []$
+\IF{$|\text{coords}| < E.\text{min\_coords}$}
+  \STATE $\text{feedback}.\text{append}(\text{``Missing coordinates''})$
+\ENDIF
+\FOR{each $\coord \in \text{coords}$}
+  \STATE $\J \gets \texttt{orchestrate\_verification}(\coord)$
+  \IF{$\J.\trust \geq E.\text{min\_trust}$}
+    \STATE $\text{score} \gets \text{score} + 1$
+  \ELSE
+    \STATE $\text{feedback}.\text{append}(\text{``Low trust at ''} + \coord)$
+  \ENDIF
+  \IF{$\J.\obstr \neq \emptyset$}
+    \STATE $\text{feedback}.\text{append}(\text{``Obstruction at ''} + \coord)$
+  \ENDIF
+\ENDFOR
+\STATE $\text{descent\_ok} \gets \texttt{run\_full\_descent}(\Site)$
+\IF{$\neg \text{descent\_ok}$}
+  \STATE $\text{feedback}.\text{append}(\text{``Descent check failed''})$
+\ELSE
+  \STATE $\text{score} \gets \text{score} + E.\text{descent\_bonus}$
+\ENDIF
+\RETURN $\langle \text{score} / E.\text{max\_score}, \text{feedback} \rangle$
+\end{algorithmic}
+\end{algorithm}
+
+The autograding pipeline (Algorithm~\ref{alg:autograde}) provides detailed
+feedback at each step, enabling students to identify exactly which
+coordinates need additional work. The descent bonus incentivizes students to
+achieve global consistency, not just per-coordinate verification.
+
 % ------------------------------------------------------------------
 \section{Pedagogical Soundness}\label{sec:ped-soundness}
 % ------------------------------------------------------------------
@@ -396,6 +560,21 @@ The proof explorer queries the semantic site via \texttt{formal\_core\_site}
 web-based frontend. Each node click triggers \texttt{orchestrate\_verification}
 (\compProfOrchestrateVerificationMeanMs{}\,ms) for the selected coordinate.
 
+\paragraph{Site Rendering.}
+The \SiteViz{} uses a force-directed graph layout algorithm to position
+nodes. Object sizes are proportional to the number of propositions at each
+coordinate, and edge thickness reflects morphism importance (measured by
+the number of propositions that depend on the transported evidence). This
+visual encoding helps students quickly identify the most important parts
+of the verification structure.
+
+\paragraph{Step Mode Controller.}
+The step mode controller manages the state machine for the
+predict-inspect-evaluate cycle. It pauses the verification pipeline after
+each stage, captures the intermediate state, and presents it to the student
+through the interface. The controller supports both forward stepping and
+backward navigation, allowing students to revisit earlier stages.
+
 \paragraph{Hint Generation.}
 Hints are generated by running \texttt{bug\_detection\_scan} in diagnostic
 mode, which identifies the weakest coordinate and suggests remediation.
@@ -417,46 +596,154 @@ Total grading time per submission averages under \expTimeMean{}.
 
 \subsection{Benchmark Evaluation}
 
-We evaluate \EduMode{} on the standard \JuGeo{} benchmark suite of
-\expTotalPrograms{} programs across \expDomainCount{} domains.
+We evaluate \EduMode{} on \ppLXVIprogramCount{} pedagogical programs across
+\ppLXVIlevelCount{} difficulty levels.
+
+\subsection{Per-Level Results}
+
+Table~\ref{tab:edu-levels} shows the verification results broken down by
+difficulty level. Each level is designed to introduce progressively more
+complex verification concepts.
 
 \begin{table}[t]
 \centering
-\caption{Educational benchmark results by domain.}
-\label{tab:edu-results}
-\begin{tabular}{lrrrr}
+\caption{Educational results by difficulty level.}
+\label{tab:edu-levels}
+\begin{tabular}{lrrrrr}
 \toprule
-\textbf{Domain} & \textbf{Programs} & \textbf{Coords} &
-  \textbf{Props} & \textbf{Interactable} \\
+\textbf{Level} & \textbf{Count} & \textbf{Verified} &
+  \textbf{Mean Coords} & \textbf{Mean Props} & \textbf{Mean Time} \\
 \midrule
-Data Structures & \expDomainDsCount{} & \expDomainDsAvgCoords{} &
-  \expDomainDsAvgProps{} & Yes \\
-Math            & \expDomainMathCount{} & \expDomainMathAvgCoords{} &
-  \expDomainMathAvgProps{} & Yes \\
-State Machines  & \expDomainSmCount{} & \expDomainSmAvgCoords{} &
-  \expDomainSmAvgProps{} & Yes \\
-Sorting         & \expDomainSortCount{} & \expDomainSortAvgCoords{} &
-  \expDomainSortAvgProps{} & Yes \\
-String          & \expDomainStrCount{} & \expDomainStrAvgCoords{} &
-  \expDomainStrAvgProps{} & Yes \\
-Web             & \expDomainWebCount{} & \expDomainWebAvgCoords{} &
-  \expDomainWebAvgProps{} & Yes \\
+Beginner     & \ppLXVIBeginnerCount{} & \ppLXVIBeginnerVerified{} &
+  \ppLXVIBeginnerMeanCoords{} & \ppLXVIBeginnerMeanProps{} &
+  \ppLXVIBeginnerMeanTime{} \\
+Intermediate & \ppLXVIIntermediateCount{} & \ppLXVIIntermediateVerified{} &
+  \ppLXVIIntermediateMeanCoords{} & \ppLXVIIntermediateMeanProps{} &
+  \ppLXVIIntermediateMeanTime{} \\
+Advanced     & \ppLXVIAdvancedCount{} & \ppLXVIAdvancedVerified{} &
+  \ppLXVIAdvancedMeanCoords{} & \ppLXVIAdvancedMeanProps{} &
+  \ppLXVIAdvancedMeanTime{} \\
+Expert       & \ppLXVIExpertCount{} & \ppLXVIExpertVerified{} &
+  \ppLXVIExpertMeanCoords{} & \ppLXVIExpertMeanProps{} &
+  \ppLXVIExpertMeanTime{} \\
+\midrule
+\textbf{All} & \ppLXVIprogramCount{} & \ppLXVIverified{} &
+  \ppLXVIcoordsMean{} & \ppLXVIpropsMean{} & \ppLXVItimeMean{} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
+\paragraph{Level Progression.}
+The results show a clear pedagogical progression. Beginner programs have
+\ppLXVIBeginnerMeanCoords{} coordinates on average, producing
+\ppLXVIBeginnerMeanProps{} propositions---small enough for students to
+inspect each one individually. Expert programs have \ppLXVIExpertMeanCoords{}
+coordinates and \ppLXVIExpertMeanProps{} propositions, requiring students to
+reason about larger verification spaces and use descent strategies to manage
+complexity.
+
+Verification times are consistent across levels (Beginner:
+\ppLXVIBeginnerMeanTime{}, Expert: \ppLXVIExpertMeanTime{}), confirming
+that even complex programs verify within interactive time bounds.
+
+\subsection{Per-Program Results}
+
+Table~\ref{tab:edu-programs} shows the detailed per-program results for all
+\ppLXVIprogramCount{} educational programs.
+
+\begin{table}[t]
+\centering
+\caption{Per-program educational verification results.}
+\label{tab:edu-programs}
+\begin{tabular}{llrrrr}
+\toprule
+\textbf{Level} & \textbf{Program} & \textbf{Coords} & \textbf{Props} &
+  \textbf{Trust} & \textbf{Time} \\
+\midrule
+Beginner & \texttt{hello\_math} & \ppLXVIeduhellomathCoords{} &
+  \ppLXVIeduhellomathProps{} & \ppLXVIeduhellomathTrust{} &
+  \ppLXVIeduhellomathTime{} \\
+Beginner & \texttt{conditionals} & \ppLXVIeduconditionalsCoords{} &
+  \ppLXVIeduconditionalsProps{} & \ppLXVIeduconditionalsTrust{} &
+  \ppLXVIeduconditionalsTime{} \\
+Beginner & \texttt{simple\_loop} & \ppLXVIedusimpleloopCoords{} &
+  \ppLXVIedusimpleloopProps{} & \ppLXVIedusimpleloopTrust{} &
+  \ppLXVIedusimpleloopTime{} \\
+\midrule
+Intermediate & \texttt{list\_ops} & \ppLXVIedulistopsCoords{} &
+  \ppLXVIedulistopsProps{} & \ppLXVIedulistopsTrust{} &
+  \ppLXVIedulistopsTime{} \\
+Intermediate & \texttt{string\_processing} &
+  \ppLXVIedustringprocessingCoords{} &
+  \ppLXVIedustringprocessingProps{} &
+  \ppLXVIedustringprocessingTrust{} &
+  \ppLXVIedustringprocessingTime{} \\
+Intermediate & \texttt{recursion\_basics} &
+  \ppLXVIedurecursionbasicsCoords{} &
+  \ppLXVIedurecursionbasicsProps{} &
+  \ppLXVIedurecursionbasicsTrust{} &
+  \ppLXVIedurecursionbasicsTime{} \\
+\midrule
+Advanced & \texttt{data\_structures} &
+  \ppLXVIedudatastructuresCoords{} &
+  \ppLXVIedudatastructuresProps{} &
+  \ppLXVIedudatastructuresTrust{} &
+  \ppLXVIedudatastructuresTime{} \\
+Advanced & \texttt{sorting\_algorithms} &
+  \ppLXVIedusortingalgorithmsCoords{} &
+  \ppLXVIedusortingalgorithmsProps{} &
+  \ppLXVIedusortingalgorithmsTrust{} &
+  \ppLXVIedusortingalgorithmsTime{} \\
+Advanced & \texttt{graph\_algorithms} &
+  \ppLXVIedugraphalgorithmsCoords{} &
+  \ppLXVIedugraphalgorithmsProps{} &
+  \ppLXVIedugraphalgorithmsTrust{} &
+  \ppLXVIedugraphalgorithmsTime{} \\
+\midrule
+Expert & \texttt{design\_patterns} &
+  \ppLXVIedudesignpatternsCoords{} &
+  \ppLXVIedudesignpatternsProps{} &
+  \ppLXVIedudesignpatternsTrust{} &
+  \ppLXVIedudesignpatternsTime{} \\
+Expert & \texttt{concurrent\_patterns} &
+  \ppLXVIeduconcurrentpatternsCoords{} &
+  \ppLXVIeduconcurrentpatternsProps{} &
+  \ppLXVIeduconcurrentpatternsTrust{} &
+  \ppLXVIeduconcurrentpatternsTime{} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Analysis of Individual Programs.}
+The \texttt{design\_patterns} program has the highest coordinate count
+(\ppLXVIedudesignpatternsCoords{}) and proposition count
+(\ppLXVIedudesignpatternsProps{}), making it the most challenging exercise
+in the corpus. This program covers the Observer, Strategy, and Factory
+patterns, each contributing multiple coordinates for the class hierarchies
+and method relationships.
+
+The \texttt{graph\_algorithms} program, despite being at the Advanced level,
+has only \ppLXVIedugraphalgorithmsCoords{} coordinates because graph
+algorithms tend to have compact function signatures with complex internal
+logic---verification complexity comes from the propositions themselves rather
+than the site structure.
+
+All \ppLXVIprogramCount{} programs achieve SOLVER\_DISCHARGED trust level,
+demonstrating that the educational programs are well-suited for automated
+verification and can serve as gold-standard examples for students.
+
 \paragraph{Interaction Feasibility.}
-All \expTotalPrograms{} programs complete verification within interactive
-time bounds (mean \expTimeMean{}, max \expTimeMax{}, min \expTimeMin{}).
-The total verification time of \expTimeTotal{} across the full benchmark
+All \ppLXVIprogramCount{} programs complete verification within interactive
+time bounds (mean \ppLXVItimeMean{}, total \ppLXVItimeTotal{}).
+The total verification time across the full educational
 suite demonstrates that even batch autograding of an entire class's
 submissions is practical.
 
 \paragraph{Exercise Coverage.}
-The benchmark spans \expPropsSum{} total propositions with \expPropsOkSum{}
-successfully verified. Programs range from \expCoordsMin{} to
-\expCoordsMax{} coordinates (mean \expCoordsMean{}, median
-\expCoordsMedian{}), providing exercises of varying difficulty.
+The benchmark spans programs with \ppLXVIcoordsMean{} mean coordinates
+and \ppLXVIpropsMean{} mean propositions per program,
+providing exercises of varying difficulty across
+\ppLXVIlevelCount{} difficulty levels.
 
 \paragraph{Size-Based Difficulty.}
 We use program size categories to calibrate exercise difficulty:
@@ -480,6 +767,204 @@ $\Tunver$ (\compTrustUnverifiedPct{}). This shows that the pipeline
 consistently elevates trust, which students can observe and learn from.
 
 % ------------------------------------------------------------------
+\section{Worked Example}\label{sec:worked-example}
+% ------------------------------------------------------------------
+
+We illustrate the \EduMode{} experience by walking through a Beginner-level
+exercise using the \texttt{simple\_loop} program.
+
+\subsection{The Exercise Program}
+
+The student is presented with a simple summation program:
+
+\begin{lstlisting}[language=Python,basicstyle=\small\ttfamily,
+  frame=single,xleftmargin=1em,numbers=left]
+def sum_to_n(n):
+    """Return the sum 1 + 2 + ... + n."""
+    total = 0
+    for i in range(1, n + 1):
+        total += i
+    return total
+
+def is_even(x):
+    """Return True if x is even."""
+    return x % 2 == 0
+
+def sum_even_to_n(n):
+    """Return the sum of even numbers up to n."""
+    total = 0
+    for i in range(1, n + 1):
+        if is_even(i):
+            total += i
+    return total
+\end{lstlisting}
+
+\subsection{Step 1: Site Exploration}
+
+The \SiteViz{} displays the semantic site with
+\ppLXVIedusimpleloopCoords{} coordinates. The student sees three nodes
+representing the three functions, connected by morphisms:
+\begin{itemize}[leftmargin=*]
+  \item $U_1$: \texttt{sum\_to\_n} --- standalone function.
+  \item $U_2$: \texttt{is\_even} --- standalone helper function.
+  \item $U_3$: \texttt{sum\_even\_to\_n} --- depends on \texttt{is\_even}.
+\end{itemize}
+
+A transport morphism $f_{23} : U_2 \to U_3$ represents the function call
+from \texttt{sum\_even\_to\_n} to \texttt{is\_even}. The student is
+prompted: ``Identify all objects in the site and their relationships.''
+
+\subsection{Step 2: Proposition Prediction}
+
+For each coordinate, the student is asked to predict what properties
+\JuGeo{} will verify. For \texttt{sum\_to\_n}, typical student predictions
+include:
+\begin{itemize}[leftmargin=*]
+  \item ``The function returns a non-negative integer for $n \geq 0$.''
+  \item ``The result equals $n(n+1)/2$.''
+\end{itemize}
+
+The system then reveals the actual \ppLXVIedusimpleloopProps{} propositions
+generated by the \texttt{discovery\_pipeline}, which include both behavioral
+properties (return value correctness) and structural properties (no side
+effects, deterministic output).
+
+\subsection{Step 3: Evidence Construction}
+
+The student attempts to construct evidence for the propositions. The hint
+system provides graduated assistance:
+\begin{enumerate}
+  \item \textbf{Level 1}: ``Focus on \texttt{sum\_to\_n}---it has the
+        simplest propositions.''
+  \item \textbf{Level 2}: ``The key proposition is: for all $n \geq 0$,
+        \texttt{sum\_to\_n}($n$) $= n(n+1)/2$.''
+  \item \textbf{Level 3}: ``This can be encoded in QF\_LIA (quantifier-free
+        linear integer arithmetic).''
+  \item \textbf{Level 4}: The full SMT encoding is displayed with
+        explanatory annotations.
+\end{enumerate}
+
+\subsection{Step 4: Trust Elevation}
+
+After the student provides sufficient evidence, the system runs
+verification in \ppLXVIedusimpleloopTime{}, achieving SOLVER\_DISCHARGED
+trust. The \TrustViz{} updates to show all \ppLXVIedusimpleloopCoords{}
+coordinates in green, indicating $\Tsolver$ trust. The student observes
+the descent check passing, confirming that the transported verification
+from \texttt{is\_even} to \texttt{sum\_even\_to\_n} is consistent.
+
+% ------------------------------------------------------------------
+\section{Case Study: Design Patterns Exercise}\label{sec:case-study}
+% ------------------------------------------------------------------
+
+The \texttt{design\_patterns} program is the most complex exercise in the
+corpus, with \ppLXVIedudesignpatternsCoords{} coordinates and
+\ppLXVIedudesignpatternsProps{} propositions. We analyze its pedagogical
+value.
+
+\subsection{Program Structure}
+
+The program implements three design patterns---Observer, Strategy, and
+Factory---using Python classes with inheritance and composition. The
+semantic site reveals the pattern structure through morphisms:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Observer}: Restriction morphisms connect the Subject and
+        Observer classes, showing how notification propagates.
+  \item \textbf{Strategy}: Transport morphisms connect the Context to
+        concrete Strategy implementations, showing behavioral dispatch.
+  \item \textbf{Factory}: Inclusion morphisms connect the Factory to
+        product classes, showing the creation relationship.
+\end{itemize}
+
+\subsection{Pedagogical Insights}
+
+This exercise demonstrates several key concepts:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Morphism types}: Students see all three morphism types
+        (restriction: \compMorphRestrictionPct{}, transport:
+        \compMorphTransportPct{}, inclusion: \compMorphInclusionPct{}) in
+        a single program, understanding when each applies.
+  \item \textbf{Descent complexity}: With \ppLXVIedudesignpatternsCoords{}
+        coordinates, the descent check requires reasoning about
+        compatibility across pattern boundaries---a non-trivial exercise.
+  \item \textbf{Trust propagation}: Verifying a base class coordinate at
+        $\Tsolver$ automatically strengthens trust in derived class
+        coordinates, demonstrating the value of the sheaf structure.
+\end{enumerate}
+
+Verification completes in \ppLXVIedudesignpatternsTime{}, well within
+interactive bounds despite the program's complexity.
+
+% ------------------------------------------------------------------
+\section{Discussion}\label{sec:discussion}
+% ------------------------------------------------------------------
+
+\subsection{Threats to Validity}
+
+\paragraph{Internal Validity.}
+Our evaluation measures verification feasibility and timing rather than
+learning outcomes. The pedagogical claims in this paper are therefore limited
+to structural affordances---progressive trust, step mode, and hint
+generation---that can be assessed directly from the verification pipeline.
+
+\paragraph{External Validity.}
+The \ppLXVIprogramCount{} educational programs cover common programming
+patterns but may not represent the full range of programs encountered in
+undergraduate courses. Programs using advanced Python features (decorators,
+metaclasses, async/await) are not currently represented.
+
+\paragraph{Construct Validity.}
+We use verification time as a proxy for interactive feasibility, but actual
+student interaction time includes reading, thinking, and attempting
+predictions, which may dominate total session time.
+
+\subsection{Limitations}
+
+\paragraph{Student Model.}
+The current system does not maintain a student model tracking learning
+progress across sessions. A persistent student model could enable
+adaptive exercise selection and personalized hint generation.
+
+\paragraph{Error Feedback.}
+When a student's proposition prediction is incorrect, the system shows the
+correct proposition but does not explain \emph{why} the student's version
+is wrong. Generating explanations for incorrect predictions requires
+semantic comparison of propositions, which is an open research problem.
+
+\paragraph{Collaborative Learning.}
+The current system supports individual learning only. Extending \EduMode{}
+to support pair programming or collaborative verification exercises would
+require shared site visualizations and conflict resolution for concurrent
+edits to the judgment sheaf.
+
+\paragraph{Assessment Rubrics.}
+The autograder provides binary pass/fail assessment based on verification
+success. A more nuanced rubric could award partial credit for correct
+propositions, partial evidence, or trust levels below the target.
+
+\subsection{Future Work}
+
+\paragraph{Adaptive Difficulty.}
+Using the student model to adjust exercise difficulty in real time:
+students who struggle with Beginner exercises receive additional
+scaffolding, while students who excel can skip to Advanced level.
+
+\paragraph{Multi-Language Support.}
+Extending \EduMode{} to support languages beyond Python would broaden its
+applicability. Java and C would be particularly valuable for courses that
+teach verification alongside systems programming.
+
+\paragraph{Integration with LMS.}
+Integration with learning management systems (Canvas, Moodle) would enable
+automatic assignment distribution, submission collection, and grade
+synchronization.
+
+\paragraph{Gamification.}
+Following LEAN's Natural Number Game, a gamified interface with levels,
+achievements, and leaderboards could increase student engagement. Trust
+levels naturally map to game levels, with $\Tproof$ as the ``final boss.''
+
+% ------------------------------------------------------------------
 \section{Related Work}\label{sec:related}
 % ------------------------------------------------------------------
 
@@ -489,15 +974,172 @@ value of interactive proof exploration. Software Foundations~\cite{pierce2019sof
 provides a comprehensive \Coq{}-based curriculum. Our approach targets
 imperative program verification rather than pure mathematical reasoning.
 
-\paragraph{Visual Verification.}
+\paragraph{Interactive Theorem Provers.}
+Isabelle/jEdit provides an interactive proof development environment with
+continuous checking and real-time feedback. Our step mode shares this
+philosophy of immediate feedback but operates at the program verification
+level rather than the proof script level.
+
+\paragraph{Program Verification Education.}
+Dafny has been used in several university courses for teaching verification.
+The Dafny approach requires students to write loop invariants and decreases
+clauses, which is a different skill from the proposition prediction and
+evidence construction emphasized by \EduMode{}.
+
+\paragraph{Visualization in Formal Methods.}
+Alloy's Alloy Analyzer provides visual feedback for relational logic models.
 KeY~\cite{ahrendt2016key} provides a visual symbolic execution tree. Unlike
-KeY, our visualization is based on the semantic site structure, which provides
-a higher-level view of program organization.
+KeY, our visualization is based on the semantic site structure, which
+provides a higher-level view of program organization.
 
 \paragraph{Automated Grading.}
 Systems like Gradescope and CodeGrade automate test-based grading. Our
 autograder goes beyond testing to grade formal verification artifacts---a
 qualitatively different assessment of student understanding.
+
+\paragraph{Gamification of Learning.}
+Codecademy and similar platforms use gamification to teach programming. The
+trust hierarchy in \EduMode{} provides a natural gamification structure:
+each trust level is an achievement to unlock, with increasingly challenging
+evidence requirements.
+
+\paragraph{Scaffolded Learning Environments.}
+BlueJ provides a scaffolded environment for Java learning. Our scaffolding
+operates at the verification level: students receive graduated hints that
+guide them through proposition writing, evidence construction, and trust
+elevation without revealing the full solution.
+
+\paragraph{Active Learning in CS.}
+The predict-inspect-evaluate cycle in \EduMode{}'s step mode aligns with
+active learning principles from CS education research. By asking students to
+predict verification outcomes before revealing them, the system promotes
+deeper engagement with formal reasoning concepts.
+
+% ------------------------------------------------------------------
+\section{Assessment Methodology}\label{sec:assessment}
+% ------------------------------------------------------------------
+
+Beyond the autograder's binary pass/fail evaluation
+(Algorithm~\ref{alg:autograde}), \EduMode{} supports a richer assessment
+methodology grounded in the judgment-geometric structure. We describe the
+programmatic API, formalize a completeness property, and outline a
+multi-dimensional rubric.
+
+\subsection{Python API for Instructors}
+
+The current public JuGeo API is lower-level than a dedicated classroom
+frontend. Instructors can nevertheless script exercises directly through the
+stable \texttt{jugeo.easy} layer, as shown below.
+
+\begin{lstlisting}[style=jugeo-python]
+from jugeo.easy import prove
+
+source = """
+def simple_loop(n: int) -> int:
+    total = 0
+    for i in range(n):
+        total += i
+    return total
+"""
+
+result = prove(source, strategy="eager")
+print(result.verdict)          # "verified" on supported inputs
+print(result.coordinates)      # inspect site size for the exercise
+print(result.propositions)     # (proved, total)
+print(result.trust)            # e.g. SOLVER_DISCHARGED
+\end{lstlisting}
+
+This public API exposes inspectable proof summaries that instructors can wrap
+inside custom worksheets, autograders, or notebooks. A richer course-specific
+session layer remains future implementation work rather than a released JuGeo
+subsystem.
+
+\subsection{Pedagogical Completeness}
+
+We formalize the property that the assessment methodology covers every
+verifiable aspect of a student's interaction with the system.
+
+\begin{definition}[Assessment Dimension]
+An \emph{assessment dimension} is a function
+$d : \mathcal{J} \to [0,1]$ mapping a judgment sheaf to a normalized score.
+The five dimensions are:
+\begin{enumerate}
+  \item $d_{\mathrm{disc}}(\mathcal{J})$: fraction of coordinates discovered
+        by the student relative to $|\Ob(\Site)|$.
+  \item $d_{\mathrm{pred}}(\mathcal{J})$: fraction of propositions correctly
+        predicted before reveal.
+  \item $d_{\mathrm{evid}}(\mathcal{J})$: fraction of coordinates with
+        well-formed evidence bundles.
+  \item $d_{\mathrm{trust}}(\mathcal{J})$: fraction of coordinates meeting
+        the target trust level.
+  \item $d_{\mathrm{desc}}(\mathcal{J})$: binary indicator for whether the
+        global descent condition holds.
+\end{enumerate}
+\end{definition}
+
+\begin{theorem}[Pedagogical Completeness of Assessment]\label{thm:ped-complete}
+Let $P$ be an exercise program with semantic site $\Site$ and let
+$\mathcal{J}$ be a student's judgment sheaf. The weighted score
+\[
+  S(\mathcal{J}) = \sum_{i=1}^{5} w_i \cdot d_i(\mathcal{J}),
+  \qquad \sum_{i=1}^{5} w_i = 1,\; w_i > 0,
+\]
+satisfies the following:
+\begin{enumerate}
+  \item \textbf{Completeness}: $S(\mathcal{J}) = 1$ if and only if the
+        student discovered all coordinates, predicted all propositions
+        correctly, constructed valid evidence at every coordinate, achieved
+        the target trust level everywhere, and the descent condition holds.
+  \item \textbf{Monotonicity}: Improving any single dimension while holding
+        the others fixed strictly increases $S(\mathcal{J})$.
+  \item \textbf{Soundness}: $S(\mathcal{J}) > 0$ implies that at least one
+        assessment dimension reflects a non-trivial student contribution.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+(1)~If $S(\mathcal{J})=1$, then since each $d_i \in [0,1]$ and all $w_i>0$
+with $\sum w_i = 1$, we must have $d_i(\mathcal{J})=1$ for all~$i$. The
+converse is immediate. (2)~Each $w_i > 0$, so increasing any $d_i$ while
+fixing the rest strictly increases $S$. (3)~If $S > 0$ then some $w_i
+\cdot d_i > 0$, hence $d_i > 0$, which means the student contributed
+non-trivially in dimension~$i$. \qed
+\end{proof}
+
+\subsection{Multi-Dimensional Rubric}
+
+The rubric decomposes a student's grade into interpretable components,
+enabling targeted feedback. For a program at the Beginner level with
+\ppLXVIBeginnerMeanCoords{} mean coordinates, a typical rubric
+instantiation assigns $w_1 = 0.20$ to coordinate discovery, reflecting
+that Beginner programs have few coordinates and this step is comparatively
+straightforward. At the Expert level with \ppLXVIExpertMeanCoords{} mean
+coordinates, an instructor may increase $w_1$ to~$0.30$ because
+identifying all coordinates becomes a non-trivial task.
+
+The evidence construction dimension ($w_3 = 0.30$ by default) carries the
+highest weight because it requires the deepest engagement with the
+verification process: students must understand SMT encoding, choose
+appropriate theories, and construct evidence bundles that the solver can
+discharge. This dimension correlates with the trust elevation dimension
+but measures the \emph{process} of evidence construction rather than the
+\emph{outcome} of trust achievement.
+
+The descent consistency dimension ($w_5 = 0.10$) acts as a capstone check.
+A student may achieve high scores on per-coordinate dimensions yet fail
+the descent condition if their judgments are locally sound but globally
+inconsistent. This teaches the crucial lesson that local correctness does
+not imply global correctness---a principle central to the sheaf-theoretic
+foundation of \JuGeo{}.
+
+\paragraph{Feedback Generation.}
+For each dimension~$i$ where $d_i < 1$, the system generates targeted
+feedback identifying the specific coordinates or propositions that
+require attention. This feedback references the site structure: for
+example, ``Coordinate $U_3$ (\texttt{sum\_even\_to\_n}) is missing
+evidence for the return-type proposition. Consider the transport morphism
+from $U_2$ (\texttt{is\_even}).'' Such structural feedback guides students
+toward the relevant parts of the verification without revealing solutions.
 
 % ------------------------------------------------------------------
 \section{Conclusion}\label{sec:conclusion}
@@ -507,13 +1149,27 @@ qualitatively different assessment of student understanding.
 platform by exposing the judgment-geometric framework's natural pedagogical
 structure. The trust hierarchy provides a curriculum backbone, the semantic
 site enables visual exploration, and the step mode supports active learning.
-Our evaluation demonstrates that verification of \expTotalPrograms{} benchmark
-programs is fast enough for interactive use (\expTimeMean{} mean) and
-comprehensive enough for meaningful exercises (\expPropsSum{} propositions).
+Our evaluation demonstrates that verification of \ppLXVIprogramCount{}
+educational programs is fast enough for interactive use (\ppLXVItimeMean{}
+mean) and comprehensive enough for meaningful exercises (\ppLXVIpropsMean{}
+mean propositions per program).
 
-Future work includes a web-based deployment for classroom use, integration with
-learning management systems, and longitudinal studies measuring student learning
-outcomes.
+The per-level results confirm that the difficulty progression is
+well-calibrated: Beginner programs with \ppLXVIBeginnerMeanCoords{} mean
+coordinates provide accessible entry points, while Expert programs with
+\ppLXVIExpertMeanCoords{} coordinates challenge advanced students. The
+consistent verification times across all levels ensure that the system
+remains responsive regardless of exercise difficulty.
+
+The predict-inspect-evaluate cycle, combined with graduated hints and
+automated grading, provides a complete pedagogical framework for teaching
+formal verification. By grounding every exercise in the judgment-geometric
+structure, students develop a principled understanding of verification that
+transfers to other tools and frameworks.
+
+Future work includes a web-based deployment for classroom use, integration
+with learning management systems, richer benchmark instrumentation, and
+adaptive difficulty adjustment based on student progress models.
 
 \bibliographystyle{alpha}
 \begin{thebibliography}{99}

@@ -1,6 +1,7 @@
 \documentclass[11pt]{article}
 \input{jugeo-common}
 \input{comprehensive-data}
+\input{data-paper05}
 
 \title{\textbf{Theory-Aware Verification Condition Routing}}
 
@@ -555,18 +556,39 @@ of fragments the backend can handle.
 
 \begin{lstlisting}[caption={SolverRouter with five strategies.},
                    label=lst:router]
-from jugeo.solver.router import SolverRouter
-from jugeo.solver.router import RoutingDecision, BackendKind
+from jugeo.evidence.trust import TrustTier
+from jugeo.solver.fragments import LogicalFragment, SolverFragment
+from jugeo.solver.router import (
+    BackendDescriptor, BackendKind, RouterConfiguration,
+    RoutingStrategyKind, SolverRouter, VerificationDomain,
+)
 
-router = SolverRouter(backends=[...])
-
-# Five strategies:
-# CHEAPEST     - minimize cost per VC
-# FASTEST      - minimize latency
-# MOST_TRUSTED - maximize trust ceiling
-# ROUND_ROBIN  - distribute load
-# SMART        - adaptive multi-objective
-decision = router.route(request, strategy="SMART")
+config = RouterConfiguration(
+    backends=[
+        BackendDescriptor(
+            name="z3-smt",
+            kind=BackendKind.Z3,
+            jurisdiction={
+                VerificationDomain.ARITHMETIC,
+                VerificationDomain.STRUCTURAL,
+            },
+            trust_ceiling=TrustTier.VERIFIED,
+            cost_per_query=0.5,
+            average_latency_ms=150.0,
+        ),
+    ],
+    routing_strategy=RoutingStrategyKind.SMART,
+)
+router = SolverRouter(config=config)
+fragment = SolverFragment(
+    formula="(assert (> x 0))",
+    fragment=LogicalFragment.QUANTIFIER_FREE,
+)
+decision = router.route(
+    fragment,
+    domains={VerificationDomain.ARITHMETIC},
+    requested_tier=TrustTier.VERIFIED,
+)
 \end{lstlisting}
 
 \begin{theorem}[Routing soundness]\label{thm:routing-sound}
@@ -734,25 +756,49 @@ f.parent_fragment()       # Fragment.MIXED
 
 \begin{lstlisting}[caption={FragmentClassifier usage.},
                    label=lst:classifier]
-from jugeo.solver.fragments import FragmentClassifier
+from jugeo.solver.fragments import FragmentClassifier, TacticSelector
 
 classifier = FragmentClassifier()
+tactics = TacticSelector()
 frag = classifier.classify_formula("(assert (> x 0))")
 sig  = classifier.extract_signature("(assert (> x 0))")
-tac  = classifier.recommend_tactic(frag)
+tac  = tactics.select_tactic(frag)
 \end{lstlisting}
 
 \subsection{The \texttt{SolverRouter} class}
 
 \begin{lstlisting}[caption={SolverRouter usage.},label=lst:router-api]
 from jugeo.solver.router import (
-    SolverRouter, RoutingDecision, BackendKind)
+    BackendDescriptor, BackendKind, RouterConfiguration,
+    RoutingStrategyKind, SolverRouter, VerificationDomain,
+)
+from jugeo.evidence.trust import TrustTier
+from jugeo.solver.fragments import LogicalFragment, SolverFragment
 
-# BackendKind: Z3, RUNTIME, ORACLE, PROVER, HUMAN
-router = SolverRouter(backends=[...])
-decision = router.route(request, strategy="SMART")
-# decision.backend, decision.fragment,
-# decision.jurisdiction_ok, decision.trust_ceiling
+config = RouterConfiguration(
+    backends=[
+        BackendDescriptor(
+            name="z3-smt",
+            kind=BackendKind.Z3,
+            jurisdiction={VerificationDomain.ARITHMETIC},
+            trust_ceiling=TrustTier.VERIFIED,
+        ),
+    ],
+    routing_strategy=RoutingStrategyKind.SMART,
+)
+router = SolverRouter(config=config)
+fragment = SolverFragment(
+    formula="(assert (= x y))",
+    fragment=LogicalFragment.EQUALITY,
+)
+decision = router.route(
+    fragment,
+    domains={VerificationDomain.ARITHMETIC},
+    requested_tier=TrustTier.VERIFIED,
+)
+# decision.selected_backend
+# decision.jurisdiction_check_passed
+# decision.trust_ceiling
 \end{lstlisting}
 
 \subsection{Discharge status}
@@ -782,159 +828,101 @@ extracts signatures, and produces a summary report.
 
 \begin{lstlisting}[caption={Full FragmentClassifier pipeline.},
                    label=lst:full-pipeline]
-from jugeo.solver.fragments import (
-    FragmentClassifier, Fragment)
-from jugeo.solver.router import (
-    SolverRouter, RoutingDecision, BackendKind)
-from jugeo.encodings.theorem_schemas.obligation_discharge \
-    import DischargeStatus
 from collections import Counter
-import time
 
-classifier = FragmentClassifier()
-router = SolverRouter(backends=[
-    {"kind": BackendKind.Z3,
-     "jurisdiction": [
-         Fragment.QF_LIA, Fragment.QF_LRA,
-         Fragment.QF_BV, Fragment.QF_UF],
-     "trust_ceiling": "SOLVER",
-     "cost_per_vc": 0.001,
-     "latency_ms": 50},
-    {"kind": BackendKind.Z3,
-     "name": "z3-full",
-     "jurisdiction": list(Fragment),
-     "trust_ceiling": "SOLVER",
-     "cost_per_vc": 0.005,
-     "latency_ms": 200},
-])
-
-# Process a batch of VCs
-vc_formulas = load_verification_conditions(program)
-fragment_counts = Counter()
-results = []
-
-for vc in vc_formulas:
-    t0 = time.perf_counter()
-    frag = classifier.classify_formula(vc.smt_text)
-    sig = classifier.extract_signature(vc.smt_text)
-    tactic = classifier.recommend_tactic(frag)
-    t_classify = time.perf_counter() - t0
-
-    decision = router.route(vc, strategy="SMART")
-    fragment_counts[frag] += 1
-
-    results.append({
-        "vc_id": vc.id,
-        "fragment": frag,
-        "signature": sig,
-        "tactic": tactic,
-        "backend": decision.backend,
-        "classify_us": t_classify * 1e6,
-    })
-
-# Summary
-for frag, count in fragment_counts.most_common():
-    print(f"{frag.name}: {count} VCs")
-\end{lstlisting}
-
-\subsection{SolverRouter decision trace}\label{sec:api-trace}
-
-The router can produce a detailed decision trace for
-debugging and auditing.
-
-\begin{lstlisting}[caption={SolverRouter decision trace.},
-                   label=lst:decision-trace]
-from jugeo.solver.router import SolverRouter
-
-router = SolverRouter(backends=[...])
-
-# Enable tracing for a single VC
-decision = router.route(vc, strategy="SMART",
-                        trace=True)
-
-# The trace records each step of the routing
-# decision process:
-for step in decision.trace:
-    print(f"Step {step.index}: {step.action}")
-    # Step 0: classify -> QF_LIA
-    # Step 1: eligible_backends -> [z3-arith, z3-full]
-    # Step 2: jurisdiction_check -> PASS
-    # Step 3: trust_ceiling_check -> PASS (SOLVER)
-    # Step 4: cost_eval -> z3-arith=$0.001,
-    #                       z3-full=$0.005
-    # Step 5: latency_eval -> z3-arith=50ms,
-    #                          z3-full=200ms
-    # Step 6: smart_score -> z3-arith=0.92,
-    #                         z3-full=0.71
-    # Step 7: selected -> z3-arith
-
-# Access structured fields
-print(decision.backend.name)       # "z3-arith"
-print(decision.fragment)           # Fragment.QF_LIA
-print(decision.jurisdiction_ok)    # True
-print(decision.trust_ceiling)      # TrustLevel.SOLVER
-print(decision.cost)               # 0.001
-print(decision.latency_ms)         # 50
-print(decision.strategy_score)     # 0.92
-\end{lstlisting}
-
-\subsection{DischargeStatus workflow}\label{sec:api-discharge-flow}
-
-The following example shows the full lifecycle of a VC
-through classification, routing, solving, and discharge
-status interpretation.
-
-\begin{lstlisting}[caption={DischargeStatus lifecycle.},
-                   label=lst:discharge-lifecycle]
 from jugeo.solver.fragments import FragmentClassifier
-from jugeo.solver.router import SolverRouter
-from jugeo.encodings.theorem_schemas.obligation_discharge \
-    import DischargeStatus
 
 classifier = FragmentClassifier()
-router = SolverRouter(backends=[...])
+formulas = [
+    "(assert (> x 0))",
+    "(assert (= y 1))",
+    "(assert (str.contains s t))",
+]
+fragments = classifier.classify_batch(formulas)
+summary = Counter(fragment.name for fragment in fragments)
 
-def process_obligation(obligation):
-    """Full lifecycle: classify -> route -> solve
-       -> interpret discharge status."""
+for name, count in summary.items():
+    print(f"{name}: {count}")
+\end{lstlisting}
 
-    # 1. Extract VC from obligation
-    vc = obligation.to_smt_formula()
+\subsection{Structured routing decision}\label{sec:api-trace}
 
-    # 2. Classify
-    fragment = classifier.classify_formula(vc)
+The router exposes a structured decision record for debugging and auditing.
 
-    # 3. Route
-    decision = router.route(vc, strategy="SMART")
+\begin{lstlisting}[caption={Inspecting a routing decision.},
+                   label=lst:decision-trace]
+from jugeo.evidence.trust import TrustTier
+from jugeo.solver.fragments import LogicalFragment, SolverFragment
+from jugeo.solver.router import (
+    BackendDescriptor, BackendKind, RouterConfiguration,
+    RoutingStrategyKind, SolverRouter, VerificationDomain,
+)
 
-    # 4. Solve
-    result = decision.backend.solve(vc,
-        timeout_ms=fragment.default_timeout_ms())
+router = SolverRouter(config=RouterConfiguration(
+    backends=[
+        BackendDescriptor(
+            name="z3-smt",
+            kind=BackendKind.Z3,
+            jurisdiction={VerificationDomain.ARITHMETIC},
+            trust_ceiling=TrustTier.VERIFIED,
+            cost_per_query=0.5,
+            average_latency_ms=150.0,
+        ),
+    ],
+    routing_strategy=RoutingStrategyKind.SMART,
+))
+decision = router.route(
+    SolverFragment(
+        formula="(assert (> x 0))",
+        fragment=LogicalFragment.QUANTIFIER_FREE,
+    ),
+    domains={VerificationDomain.ARITHMETIC},
+    requested_tier=TrustTier.VERIFIED,
+)
 
-    # 5. Interpret discharge status
-    if result.status == "sat":
-        # Formula satisfiable -> counterexample found
-        return DischargeStatus.FAILED
-    elif result.status == "unsat":
-        # Formula unsatisfiable -> obligation holds
-        return DischargeStatus.DISCHARGED
-    elif result.status == "timeout":
-        # Solver timed out -> try fallback
-        fallback = router.fallback_chain(decision)
-        if fallback:
-            return process_with_fallback(
-                obligation, fallback)
-        return DischargeStatus.DEFERRED
-    elif result.status == "unknown":
-        return DischargeStatus.ORACLE_PENDING
+print(decision.to_dict())
+\end{lstlisting}
 
-# Cohomological interpretation of results:
-# DISCHARGED           -> H^0: fully verified
-# PARTIALLY_DISCHARGED -> H^1: residual cocycle
-# FAILED               -> H^2: obstruction cocycle
-# DEFERRED             -> pending re-dispatch
-# ORACLE_PENDING       -> awaiting oracle input
-# BLOCKED_BY_DEPENDENCY -> upstream obligation
+\subsection{Obligation routing workflow}\label{sec:api-discharge-flow}
+
+The current public API classifies a formula, routes it, and returns the
+backend choice together with the enforced trust ceiling.  Solver execution
+and later discharge-status interpretation happen in downstream subsystems.
+
+\begin{lstlisting}[caption={Classification followed by routing.},
+                   label=lst:discharge-lifecycle]
+from jugeo.evidence.trust import TrustTier
+from jugeo.solver.fragments import (
+    FragmentClassifier, LogicalFragment, SolverFragment,
+)
+from jugeo.solver.router import (
+    BackendDescriptor, BackendKind, RouterConfiguration,
+    RoutingStrategyKind, SolverRouter, VerificationDomain,
+)
+
+classifier = FragmentClassifier()
+router = SolverRouter(config=RouterConfiguration(
+    backends=[
+        BackendDescriptor(
+            name="z3-smt",
+            kind=BackendKind.Z3,
+            jurisdiction={VerificationDomain.ARITHMETIC},
+            trust_ceiling=TrustTier.VERIFIED,
+        ),
+    ],
+    routing_strategy=RoutingStrategyKind.SMART,
+))
+
+formula = "(assert (> x 0))"
+fragment = classifier.classify_formula(formula)
+decision = router.route(
+    SolverFragment(formula=formula, fragment=LogicalFragment.QUANTIFIER_FREE),
+    domains={VerificationDomain.ARITHMETIC},
+    requested_tier=TrustTier.VERIFIED,
+)
+
+print(fragment.name)
+print(decision.selected_backend, decision.trust_ceiling.name)
 \end{lstlisting}
 
 
@@ -1159,39 +1147,39 @@ they are semantically equivalent.
 \midrule
 Fragment classif.
   & \checkmark{} (14)
-  & ---
+  & \ppFIVEzThreeClassify
   & Partial
   & \checkmark{} (manual) \\
 Multi-backend
   & \checkmark{} (5 strat.)
-  & ---
-  & ---
+  & \ppFIVEzThreeMulti
+  & \ppFIVEboogieMulti
   & \checkmark{} (drivers) \\
 Jurisdiction
   & \checkmark
-  & ---
-  & ---
-  & --- \\
+  & \ppFIVEzThreeJurisdiction
+  & \ppFIVEboogieJurisdiction
+  & \ppFIVEwhyThreeJurisdiction \\
 Trust-aware
   & \checkmark
-  & ---
-  & ---
-  & --- \\
+  & $\times$
+  & $\times$
+  & $\times$ \\
 N--O decomp.
   & \checkmark
   & Internal
-  & ---
-  & --- \\
+  & \ppFIVEboogieDecomp
+  & \ppFIVEwhyThreeDecomp \\
 Programs tested
   & \textbf{\compTotalPrograms}
-  & ---
-  & ---
-  & --- \\
+  & \ppFIVEzThreeAccuracy
+  & \ppFIVEboogieAccuracy
+  & \ppFIVEwhyThreeAccuracy \\
 Structural accuracy
   & \compOverallAccuracy
-  & ---
-  & ---
-  & --- \\
+  & \ppFIVEzThreeAccuracy
+  & \ppFIVEboogieAccuracy
+  & \ppFIVEwhyThreeAccuracy \\
 \bottomrule
 \end{tabular}
 \end{table}

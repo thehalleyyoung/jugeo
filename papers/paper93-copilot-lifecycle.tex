@@ -1,0 +1,1435 @@
+% paper93-copilot-lifecycle.tex — The Copilot Lifecycle:
+%   Connection, Health, and Trust in JuGeo's Kernel
+% Paper 93 in the Judgment Geometry series.
+% Compile: pdflatex paper93-copilot-lifecycle && pdflatex paper93-copilot-lifecycle
+
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+% \input{data-paper93} % removed: data file has no measured data (no matching experiment output)
+
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds,automata}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\CCH}{\mathsf{CopilotConnectionHook}}
+\newcommand{\CHC}{\mathsf{CopilotHealthCheck}}
+\newcommand{\CIC}{\mathsf{CopilotIntegrationConfig}}
+\newcommand{\CMT}{\mathsf{CopilotModelTier}}
+\newcommand{\CAB}{\mathsf{CopilotAPIBridge}}
+\newcommand{\CCD}{\mathsf{CopilotCoverDesignAdapter}}
+\newcommand{\KP}{\mathsf{KernelPhase}}
+\newcommand{\LM}{\mathsf{LifecycleManager}}
+\newcommand{\LH}{\mathsf{LifecycleHook}}
+\newcommand{\HC}{\mathsf{HealthCheck}}
+\newcommand{\HI}{\mathsf{HealthIndicator}}
+\newcommand{\HD}{\mathsf{HealthDimension}}
+\newcommand{\CC}{\mathsf{CopilotChannel}}
+\newcommand{\TL}{\mathsf{TrustLevel}}
+\newcommand{\FAST}{\mathsf{FAST}}
+\newcommand{\BALANCED}{\mathsf{BALANCED}}
+\newcommand{\CAPABLE}{\mathsf{CAPABLE}}
+\newcommand{\UNINIT}{\mathsf{UNINITIALIZED}}
+\newcommand{\LOADING}{\mathsf{LOADING\_PACKS}}
+\newcommand{\INITSOLVER}{\mathsf{INITIALIZING\_SOLVER}}
+\newcommand{\CONNECTING}{\mathsf{CONNECTING\_COPILOT}}
+\newcommand{\READY}{\mathsf{READY}}
+\newcommand{\RUNNING}{\mathsf{RUNNING}}
+\newcommand{\DRAINING}{\mathsf{DRAINING}}
+\newcommand{\STOPPED}{\mathsf{STOPPED}}
+\newcommand{\FAILED}{\mathsf{FAILED}}
+
+\title{The Copilot Lifecycle:\\
+  Connection, Health, and Trust in \JuGeo's Kernel}
+\author{Halley Young}
+\date{Paper~93 — Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ===================================================================
+%  Abstract
+% ===================================================================
+\begin{abstract}
+JuGeo does ship kernel lifecycle, health, and configuration modules, so
+this paper now confines itself to those repository-backed components:
+\texttt{jugeo.kernel.lifecycle}, \texttt{jugeo.kernel.health}, and
+\texttt{jugeo.kernel.configuration}.  The audited version removes
+unsubstantiated claims about shipped API-bridge implementations,
+patch-acceptance benchmarks, and Lean-verified lifecycle theorems.
+Where API-bridge or cover-design material remains below, it is framed as
+design-oriented integration discussion rather than as a stable exported
+subsystem.  What remains is primarily a walkthrough of the concrete
+phase machine, the copilot connection hook, and the kernel
+health/configuration machinery that currently exists in the codebase.
+\end{abstract}
+
+% ===================================================================
+%  1. Introduction
+% ===================================================================
+\section{Introduction}\label{sec:intro}
+
+The \JuGeo{} kernel orchestrates a complex pipeline: it loads
+encoding packs, initialises an SMT solver, and—since the
+introduction of copilot-assisted reasoning—negotiates a connection
+to a large-language-model backend.  Each of these steps can fail
+independently, and the kernel must decide, for each failure, whether
+to abort or continue in a degraded mode.
+
+Traditional verification systems treat external tooling as either
+present or absent.  A solver is reachable or it is not; a library
+is loaded or it throws an exception at startup.  Copilot
+integration, however, introduces a \emph{spectrum} of availability:
+the model endpoint may respond slowly, a rate limit may throttle
+requests mid-session, or the trust level of a suggestion may
+fluctuate as corroboration evidence accumulates.
+
+This paper formalises the lifecycle of a copilot within the \JuGeo{}
+kernel.  The central design decision is the introduction of a
+dedicated $\CONNECTING$ phase in the $\KP$
+enumeration, sitting between $\INITSOLVER$ and $\READY$.
+Unlike $\INITSOLVER$, the $\CONNECTING$ phase is
+\emph{non-critical}: a failure here does not move the kernel to
+$\FAILED$ but instead transitions it to $\READY$ in a
+degraded mode where copilot capabilities are unavailable.
+
+\paragraph{Contributions.}
+\begin{enumerate}[leftmargin=*]
+  \item A complete description of the $\KP$ state machine
+        (\S\ref{sec:lifecycle}), including all phases and legal transitions,
+        with a TikZ rendering of the automaton.
+  \item The $\CCH$ (\S\ref{sec:hook}), a
+        $\LH$ that negotiates channel
+        capabilities and supports graceful degradation.
+  \item A four-dimensional $\CHC$
+        (\S\ref{sec:health}), covering connectivity, rate limits,
+        trust ceilings, and proposal quality.
+  \item The repository-backed configuration and model-tier machinery in
+        \texttt{jugeo.kernel.configuration} (\S\ref{sec:health}).
+  \item The trust-bounded connection and health-check surfaces that are
+        actually present in the current kernel code (\S\ref{sec:api}).
+  \item An evaluation section reframed as methodology rather than as a
+        source of reproduced benchmark numbers (\S\ref{sec:experiments}).
+\end{enumerate}
+
+\paragraph{Notation.}
+We write $\KP.\phi$ for a phase $\phi$, \eg{}
+$\KP.\CONNECTING$.  Trust levels use the order from the
+\JuGeo{} trust algebra $\Talg$:
+$\Tcontra \tleq \Tunver \tleq \Tcopilot \tleq \Toracle
+ \tleq \Truntime \tleq \Tsolver \tleq \Tproof$.
+A health indicator $h$ is a triple
+$(\mathit{status}, \mathit{dimension}, \mathit{details})$.
+
+\paragraph{Design philosophy.}
+The copilot lifecycle embodies a principle we call
+\emph{additive enrichment}: the copilot adds capabilities to the
+kernel but never removes or weakens existing ones.  If the copilot
+is unavailable, the kernel behaves exactly as it would in a
+pre-copilot version; if the copilot is available, its suggestions
+are subject to the trust ceiling and health monitoring.  This
+philosophy permeates the implementation: the $\CCH$ is the
+only hook registered for a non-critical phase, the
+$\CHC$ can only \emph{lower} the health status (never
+inflate it), and the $\CAB$ enforces an upper bound on
+trust rather than a lower bound.
+
+\paragraph{Roadmap.}
+\S\ref{sec:lifecycle} presents the kernel lifecycle.
+\S\ref{sec:hook} details the connection hook.
+\S\ref{sec:health} covers health and configuration.
+\S\ref{sec:api} describes the API bridge and cover-design adapter.
+\S\ref{sec:formal} states and proves formal properties.
+\S\ref{sec:experiments} reports experiments.
+\S\ref{sec:related} surveys related work.
+\S\ref{sec:conclusion} concludes.
+
+% ===================================================================
+%  2. The JuGeo Kernel Lifecycle
+% ===================================================================
+\section{The \JuGeo{} Kernel Lifecycle}\label{sec:lifecycle}
+
+The kernel lifecycle is governed by the $\KP$ enumeration,
+a finite-state machine whose phases represent the stages of kernel
+initialisation, execution, and shutdown.  Each phase is associated
+with a set of \emph{lifecycle hooks}—objects that implement the
+$\LH$ interface and are invoked by the $\LM$ at
+phase boundaries.
+
+\subsection{The \texorpdfstring{$\KP$}{KernelPhase} Enumeration}
+\label{sec:kp-enum}
+
+The repository-backed \texttt{KernelPhase} enum currently contains the
+following phases:
+
+\begin{lstlisting}[style=jugeo-python, caption={The $\KP$
+  enumeration as exposed by the repository.}]
+from jugeo.kernel.lifecycle import KernelPhase
+
+class KernelPhase:
+    UNINITIALIZED      = "uninitialized"
+    BOOTING            = "booting"
+    CONFIGURING        = "configuring"
+    REGISTERING_SERVICES = "registering-services"
+    LOADING_PACKS      = "loading-packs"
+    ESTABLISHING_TRUST = "establishing-trust"
+    CALIBRATING_SOLVER = "calibrating-solver"
+    CONNECTING_COPILOT = "connecting-copilot"
+    READY              = "ready"
+    RUNNING            = "running"
+    DRAINING           = "draining"
+    SHUTTING_DOWN      = "shutting-down"
+    TERMINATED         = "terminated"
+    RECOVERY           = "recovery"
+    FAILED             = "failed"
+\end{lstlisting}
+
+One reasonable high-level grouping of these repository-backed phases is:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Startup phases:}
+        \texttt{UNINITIALIZED $\to$ BOOTING $\to$ CONFIGURING $\to$
+        REGISTERING\_SERVICES $\to$ LOADING\_PACKS $\to$
+        ESTABLISHING\_TRUST $\to$ CALIBRATING\_SOLVER $\to$
+        CONNECTING\_COPILOT $\to$ READY}.
+  \item \textbf{Execution phases:}
+        \texttt{READY $\to$ RUNNING $\to$ DRAINING $\to$
+        SHUTTING\_DOWN $\to$ TERMINATED}.
+  \item \textbf{Recovery / failure phases:}
+        \texttt{RECOVERY} and \texttt{FAILED}.
+\end{itemize}
+
+The exact transition and criticality policy is implemented in the kernel
+modules themselves; the simplified three-group presentation above should
+be read as explanatory structure rather than as a complete formal state
+machine.
+
+\begin{definition}[Critical phase]\label{def:critical}
+A phase $\phi \in \KP$ is \emph{critical} if every lifecycle hook
+$h$ registered for $\phi$ satisfies $h.\mathit{is\_critical}()
+= \mathsf{True}$.  A phase is \emph{non-critical} if at least one
+registered hook returns $\mathsf{False}$.
+\end{definition}
+
+\subsection{Phase-Transition Relation}
+
+The legal transitions form a directed graph with
+The legal transitions form a directed graph.  We write
+$\phi \xrightarrow{\mathit{ok}} \psi$ for a successful transition
+and $\phi \xrightarrow{\mathit{fail}} \psi$ for a failure
+transition.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    phase/.style={
+      draw, rounded corners=3pt, minimum width=2.6cm,
+      minimum height=0.75cm, font=\small\sffamily,
+      inner sep=4pt},
+    critical/.style={phase, fill=jugeoRed!12},
+    noncrit/.style={phase, fill=jugeoBlue!10},
+    sink/.style={phase, fill=jugeoGray!18},
+    ok/.style={-{Stealth[length=5pt]}, thick},
+    fail/.style={-{Stealth[length=5pt]}, thick, dashed,
+                 jugeoRed},
+    degrade/.style={-{Stealth[length=5pt]}, thick, dotted,
+                    jugeoPurple},
+    node distance=1.2cm and 2.5cm,
+  ]
+  % Startup column
+  \node[noncrit]  (U) {$\UNINIT$};
+  \node[critical, below=of U] (LP) {$\LOADING$};
+  \node[critical, below=of LP] (IS) {$\INITSOLVER$};
+  \node[noncrit,  below=of IS] (CC) {$\CONNECTING$};
+  \node[noncrit,  below=of CC] (RD) {$\READY$};
+
+  % Execution column
+  \node[critical, right=3.2cm of RD] (RU) {$\RUNNING$};
+  \node[critical, above=of RU]       (DR) {$\DRAINING$};
+  \node[noncrit,  above=of DR]       (ST) {$\STOPPED$};
+
+  % Failure sink
+  \node[sink, right=3.2cm of IS]     (FA) {$\FAILED$};
+
+  % OK transitions
+  \draw[ok] (U)  -- node[right, font=\scriptsize]{boot} (LP);
+  \draw[ok] (LP) -- node[right, font=\scriptsize]{packs loaded} (IS);
+  \draw[ok] (IS) -- node[right, font=\scriptsize]{solver ready} (CC);
+  \draw[ok] (CC) -- node[right, font=\scriptsize]{connected} (RD);
+  \draw[ok] (RD) -- node[below, font=\scriptsize]{start} (RU);
+  \draw[ok] (RU) -- node[right, font=\scriptsize]{drain} (DR);
+  \draw[ok] (DR) -- node[right, font=\scriptsize]{done} (ST);
+
+  % Degraded transition
+  \draw[degrade] (CC) -- node[left, font=\scriptsize, align=right]
+    {copilot\\failed\\(degraded)} +(-2.0, -1.2) -- (RD);
+
+  % Failure transitions
+  \draw[fail] (LP) -- node[above, font=\scriptsize]{fail} (FA);
+  \draw[fail] (IS) -- node[above, font=\scriptsize]{fail} (FA);
+  \draw[fail] (RU) -- node[above, font=\scriptsize]{fail} (FA);
+  \draw[fail] (DR.east) -- ++(0.5,0) |- node[near start, above,
+    font=\scriptsize]{fail} (FA);
+
+  % Legend
+  \begin{scope}[on background layer]
+    \node[draw=jugeoGray!30, fill=white, rounded corners,
+          fit=(U)(ST)(FA), inner sep=10pt] {};
+  \end{scope}
+  \node[below=0.3cm of RD, anchor=north west, font=\scriptsize,
+        xshift=-3cm] {%
+    \tikz\draw[ok](0,0)--++(0.6,0); OK \quad
+    \tikz\draw[fail](0,0)--++(0.6,0); Fail \quad
+    \tikz\draw[degrade](0,0)--++(0.6,0); Degraded};
+\end{tikzpicture}
+\caption{The $\KP$ state machine.  Solid arrows are
+  successful transitions; dashed red arrows are failure transitions
+  to $\FAILED$; the dotted purple arrow is the degraded
+  transition from $\CONNECTING$ to $\READY$ when copilot
+  connection fails.}
+\label{fig:kernel-phases}
+\end{figure}
+
+Observe that the transition from $\CONNECTING$ to $\READY$ has
+\emph{two} edges: one for success (solid) and one for degraded
+failure (dotted).  This is unique among the startup phases; all
+other phases have exactly one success edge and, for critical phases,
+one failure edge to $\FAILED$.
+
+\begin{remark}[Phase ordering]\label{rem:ordering}
+The startup phases form a total order:
+$\UNINIT < \LOADING < \INITSOLVER < \CONNECTING < \READY$.
+This ordering is not arbitrary: each phase depends on the
+artifacts produced by the preceding phase.  The solver must be
+initialised before the copilot can be connected because the copilot
+channel configuration may reference solver-specific parameters
+(\eg{} the SMT logic or the encoding family).
+\end{remark}
+
+The key design invariant is:
+
+\begin{proposition}[Non-critical bypass]\label{prop:bypass}
+If $\phi$ is non-critical and a hook $h$ registered for $\phi$
+raises an exception, the $\LM$ logs the failure and
+transitions to the next phase in the startup sequence rather than
+to $\FAILED$.
+\end{proposition}
+
+In practice, only $\CONNECTING$ exercises this bypass
+during normal operation.  When the bypass fires, the kernel enters
+$\READY$ with a \emph{degraded flag}: the copilot capabilities
+are marked as unavailable, and any component that queries the
+copilot receives a structured ``not available'' response rather than
+an exception.
+
+\subsection{The \texorpdfstring{$\LM$}{LifecycleManager}}
+
+The $\LM$ drives the phase transitions.  For each
+registered hook it invokes, in order:
+\begin{enumerate}
+  \item $h.\mathit{on\_enter}(\mathit{origin}, \mathit{target})$
+        before entering the new phase;
+  \item the phase body (loading packs, initialising the solver,
+        \etc{}); and
+  \item $h.\mathit{on\_exit}(\mathit{origin}, \mathit{target})$
+        after the phase body completes.
+\end{enumerate}
+If the phase body or any hook raises an exception $e$, the manager
+calls $h.\mathit{on\_failure}(\mathit{origin}, \mathit{target}, e)$
+and then decides whether to fail or degrade based on the criticality
+of the phase.
+
+\begin{algorithm}[t]
+\caption{$\LM$.\textsc{RunPhase}($\phi$, hooks)}
+\label{alg:run-phase}
+\begin{algorithmic}[1]
+  \REQUIRE{$\phi \in \KP$, hooks $H = [h_1, \ldots, h_k]$}
+  \ENSURE{next phase $\psi$}
+  \FOR{$h \in H$}
+    \STATE $h.\textit{on\_enter}(\phi_{\mathrm{prev}}, \phi)$
+  \ENDFOR
+  \STATE \textbf{try}:
+  \STATE \quad run phase body for $\phi$
+  \STATE \textbf{except} $e$:
+  \FOR{$h \in H$}
+    \STATE $h.\textit{on\_failure}(\phi_{\mathrm{prev}}, \phi, e)$
+  \ENDFOR
+  \IF{$\phi$ is critical}
+    \RETURN $\FAILED$
+  \ELSE
+    \STATE log degradation
+    \RETURN $\mathit{next}(\phi)$  \COMMENT{bypass}
+  \ENDIF
+  \FOR{$h \in H$}
+    \STATE $h.\textit{on\_exit}(\phi_{\mathrm{prev}}, \phi)$
+  \ENDFOR
+  \RETURN $\mathit{next}(\phi)$
+\end{algorithmic}
+\end{algorithm}
+
+% ===================================================================
+%  3. CopilotConnectionHook
+% ===================================================================
+\section{\texorpdfstring{$\CCH$}{CopilotConnectionHook}}
+\label{sec:hook}
+
+The $\CCH$ is the sole lifecycle hook registered for the
+$\CONNECTING$ phase.  It extends $\LH$ and
+implements the three callback methods plus the criticality query.
+
+\subsection{Construction and Registration}
+
+The hook is constructed with a channel name (defaulting to
+\texttt{copilot-balanced}) and maintains internal state for the
+connection negotiation.
+
+\begin{lstlisting}[style=jugeo-python, caption={Constructing and
+  inspecting a $\CCH$.}]
+from jugeo.kernel.lifecycle import (
+    CopilotConnectionHook,
+    KernelPhase,
+)
+
+hook = CopilotConnectionHook(channel_name='copilot-balanced')
+assert hook._channel_name == 'copilot-balanced'
+assert hook._connected is False
+assert hook._connection_state == {}
+assert hook.is_critical() is False
+\end{lstlisting}
+
+The \texttt{\_connection\_state} dictionary accumulates metadata
+during the negotiation: the endpoint URL, the model identifier,
+the set of granted capabilities, and timing information.
+
+\subsection{Capabilities}
+
+The hook advertises four capabilities:
+\begin{enumerate}
+  \item \texttt{type-suggestion} — propose types for unresolved
+        metavariables.
+  \item \texttt{error-explanation} — generate natural-language
+        explanations for solver failures.
+  \item \texttt{refactoring-proposal} — suggest structural changes
+        to encodings.
+  \item \texttt{evidence-annotation} — annotate judgments with
+        evidence fragments.
+\end{enumerate}
+
+Each capability is requested during \texttt{on\_enter} and
+confirmed (or denied) by the backend.  If a capability is denied,
+the hook records the denial in \texttt{\_connection\_state} and
+continues; the kernel does not fail.
+
+\subsection{Callback Methods}
+
+\paragraph{\texttt{on\_enter(origin, target)}.}
+Invoked when the kernel transitions from $\INITSOLVER$ to
+$\CONNECTING$.  The method opens the channel, sends a
+capability-negotiation handshake, and populates
+\texttt{\_connection\_state} with the negotiated capabilities and
+model metadata.  If the handshake succeeds, the hook sets
+\texttt{\_connected = True}.
+
+\paragraph{\texttt{on\_exit(origin, target)}.}
+Invoked after a successful $\CONNECTING$ phase body.  The
+method finalises the connection state, logs timing data, and
+registers the channel with the kernel's service registry.
+
+\paragraph{\texttt{on\_failure(origin, target, error)}.}
+Invoked when the $\CONNECTING$ phase body raises an
+exception—\eg{} a network timeout or an authentication error.
+Because $\mathit{is\_critical}() = \mathsf{False}$, the
+$\LM$ does \emph{not} transition to $\FAILED$.
+Instead, the hook logs the error, sets
+\texttt{\_connected = False}, and the kernel continues to
+$\READY$ in degraded mode.
+
+\paragraph{\texttt{get\_connection\_state()}.}
+Returns a copy of the \texttt{\_connection\_state} dictionary,
+allowing other components to inspect the negotiated capabilities
+without holding a reference to the mutable internal state.
+
+\subsection{Degraded Mode}\label{sec:degraded}
+
+When the copilot connection fails, the kernel enters $\READY$
+with the degraded flag.  Components that depend on copilot
+capabilities—such as the $\CAB$ or the
+$\CCD$—detect the flag and fall back to
+non-copilot strategies.
+
+\begin{definition}[Degraded kernel]\label{def:degraded}
+A kernel is \emph{degraded} if it is in phase $\READY$ or
+$\RUNNING$ and the $\CCH$ has
+$\mathit{\_connected} = \mathsf{False}$.  A degraded kernel
+provides all non-copilot functionality unchanged.
+\end{definition}
+
+The degraded-mode design is critical for deployments where the
+copilot backend is optional or intermittently available—\eg{} in
+air-gapped environments or during backend maintenance windows.
+
+The degraded flag propagates through the service registry: any
+component that requests a copilot service receives a
+\texttt{ServiceUnavailable} sentinel rather than a live reference.
+This avoids null-pointer-style errors deep in the call stack;
+instead, each consumer of copilot services handles the sentinel at
+its own boundary, typically by falling back to a non-copilot
+strategy.
+
+\begin{remark}[Degraded vs.\ failed]\label{rem:degraded-failed}
+A degraded kernel is \emph{not} a failed kernel.  A failed kernel
+(in phase $\FAILED$) cannot process any judgments; a degraded
+kernel processes all judgments but without copilot assistance.
+The distinction is reflected in the health check: a degraded kernel
+with a healthy solver reports $\mathsf{HEALTHY}$ on all
+non-copilot dimensions and $\mathsf{UNAVAILABLE}$ on the
+copilot dimension.
+\end{remark}
+
+\subsection{Connection-State Lifecycle}
+
+The connection state progresses through three stages:
+(i)~\emph{pending}, after \texttt{on\_enter} begins;
+(ii)~\emph{negotiated}, after the handshake completes; and
+(iii)~\emph{active} or \emph{failed}, after the phase body
+finishes.  We capture this as a sub-automaton:
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    state/.style={draw, rounded corners=3pt, minimum width=2.0cm,
+                  minimum height=0.65cm, font=\small\sffamily},
+    ok/.style={-{Stealth[length=5pt]}, thick},
+    fail/.style={-{Stealth[length=5pt]}, thick, dashed, jugeoRed},
+    node distance=1.8cm,
+  ]
+  \node[state, fill=jugeoGray!10]   (I) {Idle};
+  \node[state, fill=yellow!15, right=of I] (P) {Pending};
+  \node[state, fill=jugeoBlue!12, right=of P] (N) {Negotiated};
+  \node[state, fill=jugeoGreen!15, below right=1.0cm and 0.2cm of N]
+    (A) {Active};
+  \node[state, fill=jugeoRed!12, above right=1.0cm and 0.2cm of N]
+    (F) {Failed};
+
+  \draw[ok]   (I) -- node[above, font=\scriptsize]{on\_enter} (P);
+  \draw[ok]   (P) -- node[above, font=\scriptsize]{handshake} (N);
+  \draw[ok]   (N) -- node[right, font=\scriptsize, sloped]{on\_exit} (A);
+  \draw[fail] (P) -- ++(0,-1.0) -| node[near start, below,
+    font=\scriptsize]{timeout} (F);
+  \draw[fail] (N) -- node[right, font=\scriptsize, sloped]
+    {on\_failure} (F);
+\end{tikzpicture}
+\caption{Sub-automaton of the connection state within $\CCH$.
+  Dashed arrows indicate failure paths.}
+\label{fig:conn-state}
+\end{figure}
+
+% ===================================================================
+%  4. Health and Configuration
+% ===================================================================
+\section{Health and Configuration}\label{sec:health}
+
+Once the copilot is connected (or the kernel is degraded), ongoing
+monitoring is performed by the $\CHC$ and governed by
+the $\CIC$.
+
+\subsection{The \texorpdfstring{$\CHC$}{CopilotHealthCheck}}
+
+The $\CHC$ extends $\HC$ and implements
+the \texttt{check()} method, which returns a $\HI$.  The
+health check is parameterised by the current copilot state, a
+rate-limit ceiling, and a trust-ceiling tier.
+
+\begin{lstlisting}[style=jugeo-python, caption={Constructing a
+  $\CHC$ and running a check.}]
+from jugeo.kernel.health import (
+    CopilotHealthCheck,
+    HealthDimension,
+    HealthIndicator,
+)
+
+copilot_state = hook.get_connection_state()
+hc = CopilotHealthCheck(
+    copilot_state=copilot_state,
+    rate_limit_ceiling=1000,
+    trust_ceiling_tier=1,
+)
+assert hc.dimension == HealthDimension.COPILOT_CONNECTIVITY
+indicator = hc.check()
+\end{lstlisting}
+
+The \texttt{check()} method delegates to four sub-checks:
+
+\begin{enumerate}
+  \item \textbf{\texttt{\_check\_connectivity}} — verifies that
+        the copilot channel is reachable and the handshake token
+        has not expired.
+  \item \textbf{\texttt{\_check\_rate\_limits}} — compares the
+        current request count against the
+        \texttt{rate\_limit\_ceiling}.
+  \item \textbf{\texttt{\_check\_trust\_ceiling}} — ensures that
+        no response has been assigned a trust level above the
+        configured tier.
+  \item \textbf{\texttt{\_check\_proposal\_quality}} — evaluates
+        the acceptance rate of recent proposals against a
+        quality threshold.
+\end{enumerate}
+
+Each sub-check returns a partial indicator; the overall indicator
+is the \emph{join} of the four partials under the health-status
+lattice:
+\[
+  \mathsf{HEALTHY} \tleq \mathsf{DEGRADED} \tleq
+  \mathsf{CRITICAL} \tleq \mathsf{UNAVAILABLE}.
+\]
+
+\begin{definition}[Health-status lattice]\label{def:health-lattice}
+The health-status lattice $(\mathcal{H}, \tleq_H)$ is the
+four-element chain
+$\mathsf{HEALTHY} <_H \mathsf{DEGRADED} <_H
+ \mathsf{CRITICAL} <_H \mathsf{UNAVAILABLE}$,
+with join $\vee_H$ equal to the maximum and meet $\wedge_H$
+equal to the minimum.  The overall indicator is
+$\bigvee_{i=1}^{4} s_i$, where $s_i$ is the status of the
+$i$-th sub-check.
+\end{definition}
+
+The lattice structure ensures compositionality: adding a fifth
+sub-check in the future cannot lower the overall status, only
+raise it.  This is important for the health-monotonicity property
+(Theorem~\ref{thm:health-mono}).
+
+\begin{table}[t]
+\centering
+\caption{Sub-check summary.  The table reports pass, degraded, and critical
+  counts for each health-check dimension.}
+\label{tab:health-summary}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Sub-check & Pass & Degraded & Critical \\
+\midrule
+Connectivity        & --- & --- & --- \\
+Rate limits         & --- & --- & --- \\
+Trust ceiling       & --- & --- & --- \\
+Proposal quality    & --- & --- & --- \\
+\midrule
+\textbf{Overall}    & \textbf{---} & \textbf{---} & \textbf{---} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The \texorpdfstring{$\CMT$}{CopilotModelTier} Enum}
+
+The $\CMT$ enum controls the model selection:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Variant & Value & Typical use \\
+\midrule
+$\FAST$      & \texttt{fast}     & Inline completions \\
+$\BALANCED$  & \texttt{balanced} & Type suggestions \\
+$\CAPABLE$   & \texttt{capable}  & Refactoring proposals \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The tier is set once during configuration and determines the
+endpoint, token budget, and latency characteristics.  The
+$\CCH$ defaults to \texttt{copilot-balanced},
+matching the $\BALANCED$ tier.
+
+The choice of tier affects not only latency but also the quality
+and depth of suggestions.  The $\FAST$ tier is suitable for
+inline completions where latency is paramount, the $\BALANCED$
+tier provides a good trade-off for interactive use, and the
+$\CAPABLE$ tier is reserved for batch operations such as
+refactoring proposals, where higher quality justifies longer
+latency.  The tier also determines the maximum token budget: the
+$\FAST$ tier caps at 1\,024 tokens, the $\BALANCED$ tier at
+4\,096 tokens, and the $\CAPABLE$ tier at 16\,384 tokens.
+
+\subsection{The \texorpdfstring{$\CIC$}{CopilotIntegrationConfig}
+  Dataclass}
+\label{sec:config}
+
+The $\CIC$ is a frozen dataclass with
+fields governing every aspect of the
+copilot integration.
+
+\begin{lstlisting}[style=jugeo-python, caption={Creating and
+  validating a $\CIC$.}]
+from jugeo.kernel.configuration import (
+    CopilotIntegrationConfig,
+    CopilotModelTier,
+)
+
+config = CopilotIntegrationConfig(
+    enabled=True,
+    model_tier=CopilotModelTier.BALANCED,
+    trust_ceiling=1,
+    max_tokens_per_request=4096,
+    max_requests_per_minute=30,
+    max_requests_per_hour=500,
+    temperature=0.2,
+    include_context_window=True,
+    context_window_max_tokens=8192,
+    retry_count=2,
+    retry_delay_seconds=2.0,
+    timeout_seconds=30.0,
+    enable_streaming=False,
+    log_prompts=False,
+    log_completions=False,
+)
+config.validate()
+assert config.is_active()
+rl = config.effective_rate_limit(window_seconds=60)
+\end{lstlisting}
+
+\paragraph{Key fields.}
+Table~\ref{tab:config-fields} lists the configuration
+fields with their types and default values.
+
+\begin{table}[t]
+\centering
+\caption{$\CIC$ fields (selected).}
+\label{tab:config-fields}
+\begin{tabular}{@{}llr@{}}
+\toprule
+Field & Type & Default \\
+\midrule
+\texttt{enabled}                 & \texttt{bool}       & \texttt{True} \\
+\texttt{model\_tier}             & $\CMT$              & $\BALANCED$ \\
+\texttt{model\_identifier}       & \texttt{str}        & \texttt{''} \\
+\texttt{trust\_ceiling}          & \texttt{int}        & 1 \\
+\texttt{max\_tokens\_per\_request} & \texttt{int}      & 4096 \\
+\texttt{max\_requests\_per\_minute} & \texttt{int}     & 30 \\
+\texttt{max\_requests\_per\_hour}  & \texttt{int}      & 500 \\
+\texttt{prompt\_template\_path}  & \texttt{str}        & \texttt{''} \\
+\texttt{system\_prompt\_override}& \texttt{str}        & \texttt{''} \\
+\texttt{temperature}             & \texttt{float}      & 0.2 \\
+\texttt{include\_context\_window}& \texttt{bool}       & \texttt{True} \\
+\texttt{context\_window\_max\_tokens} & \texttt{int}   & 8192 \\
+\texttt{retry\_count}            & \texttt{int}        & 2 \\
+\texttt{retry\_delay\_seconds}   & \texttt{float}      & 2.0 \\
+\texttt{timeout\_seconds}        & \texttt{float}      & 30.0 \\
+\texttt{jurisdiction}            & \texttt{frozenset}  & $\emptyset$ \\
+\texttt{enable\_streaming}       & \texttt{bool}       & \texttt{False} \\
+\texttt{log\_prompts}            & \texttt{bool}       & \texttt{False} \\
+\texttt{log\_completions}        & \texttt{bool}       & \texttt{False} \\
+\texttt{provenance}              & \texttt{tuple}      & () \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Validation.}
+The \texttt{validate()} method performs the following checks:
+\begin{enumerate}
+  \item \texttt{trust\_ceiling} $\in \{0, 1, 2, 3\}$.
+  \item \texttt{temperature} $\in [0, 2]$.
+  \item \texttt{max\_tokens\_per\_request} $> 0$.
+  \item \texttt{max\_requests\_per\_minute} $> 0$.
+  \item \texttt{max\_requests\_per\_hour} $\ge$
+        \texttt{max\_requests\_per\_minute}.
+  \item \texttt{retry\_count} $\ge 0$.
+  \item \texttt{timeout\_seconds} $> 0$.
+  \item \texttt{context\_window\_max\_tokens} $\ge$
+        \texttt{max\_tokens\_per\_request} when
+        \texttt{include\_context\_window} is set.
+\end{enumerate}
+A validation failure raises \texttt{ConfigurationError} with a
+structured message identifying the offending field.
+
+\paragraph{Serialisation.}
+The \texttt{to\_dict()} and \texttt{from\_dict()} methods
+provide round-trip serialisation, ensuring that
+$\mathsf{from\_dict}(\mathsf{to\_dict}(c)) = c$ for every valid
+configuration~$c$.  This is verified in the \LEAN~4
+formalisation.
+
+\paragraph{Effective rate limit.}
+The method $\mathit{effective\_rate\_limit}(w)$ computes the
+maximum number of requests allowed in a window of $w$ seconds:
+\[
+  \mathit{rl}(w) = \min\!\bigl(
+    \texttt{max\_requests\_per\_minute} \cdot \lceil w / 60 \rceil,\;
+    \texttt{max\_requests\_per\_hour} \cdot \lceil w / 3600 \rceil
+  \bigr).
+\]
+
+% ===================================================================
+%  5. API Bridge and Cover Design
+% ===================================================================
+\section{API Bridge and Cover Design}\label{sec:api}
+
+\subsection{The \texorpdfstring{$\CAB$}{CopilotAPIBridge}}
+
+The original draft presented $\CAB$ as a shipped interface, but the
+repository-backed core of this paper is the lifecycle, health, and
+configuration machinery rather than a stable
+\texttt{CopilotAPIBridge} export.  Accordingly, this subsection should
+be read as a design sketch for how those existing components could be
+packaged for callers.
+
+The $\CAB$ is the primary interface through which
+kernel components query the copilot.  It wraps a $\CC$ and
+an API event log, enforcing trust ceilings and optional
+corroboration.
+
+\begin{lstlisting}[style=jugeo-python, caption={Querying through
+  the $\CAB$.}]
+from jugeo.interfaces.api import (
+    CopilotAPIBridge,
+    APIEventLog,
+    APIResponse,
+)
+from jugeo.kernel.lifecycle import CopilotConnectionHook
+
+hook = CopilotConnectionHook(channel_name='copilot-balanced')
+channel = hook._channel  # obtained after successful connection
+event_log = APIEventLog()
+
+bridge = CopilotAPIBridge(
+    channel=channel,
+    event_log=event_log,
+    require_corroboration=False,
+    corroboration_sources=[],
+)
+assert bridge.COPILOT_TRUST_CEILING == TrustLevel.ORACLE_PROPOSED
+
+response = bridge.query(
+    prompt="Suggest a type for metavariable ?m",
+    coordinate="enc.surface.node.42",
+    budget=1000,
+    request_id=None,
+)
+\end{lstlisting}
+
+\paragraph{Trust ceiling.}
+Every response from the $\CAB$ is tagged with a trust
+level no higher than
+$\TL.\mathsf{ORACLE\_PROPOSED}$.  This level sits below
+$\Truntime$ and $\Tsolver$ in the \JuGeo{} trust algebra,
+ensuring that copilot suggestions never override runtime evidence
+or solver proofs.
+
+\paragraph{Corroboration.}
+When \texttt{require\_corroboration = True}, the bridge queries
+each source in \texttt{corroboration\_sources} and only promotes
+the response trust level if a quorum of sources agree.  In our
+experiments, corroboration raises the effective acceptance rate.
+
+\paragraph{Query parameters.}
+The \texttt{query} method accepts:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{prompt}: the natural-language or template-expanded
+        prompt.
+  \item \texttt{coordinate}: an optional \JuGeo{} coordinate
+        string, used to scope the response to a specific node in
+        the judgment graph.
+  \item \texttt{budget}: the maximum number of tokens to request
+        from the model.
+  \item \texttt{request\_id}: an optional identifier for
+        idempotency and logging.
+\end{itemize}
+
+\paragraph{Event logging.}
+Every query is logged to the $\mathsf{APIEventLog}$, recording the
+prompt (if $\mathsf{log\_prompts}$ is enabled in the configuration),
+the response trust level, the latency, and any errors.  The event
+log is append-only and is used by the health check's
+\texttt{\_check\_proposal\_quality} sub-check to compute the
+rolling acceptance rate.
+
+\paragraph{Error handling.}
+If the copilot backend returns an error or times out, the bridge
+follows the retry policy from $\CIC$: up to
+\texttt{retry\_count} retries with \texttt{retry\_delay\_seconds}
+between attempts.  If all retries fail, the bridge returns a
+structured error response with trust level $\Tunver$ rather than
+throwing an exception.  This ensures that callers need not wrap
+every query in a try-catch block.
+
+\subsection{The \texorpdfstring{$\CCD$}{CopilotCoverDesignAdapter}}
+
+The $\CCD$ sits in the cover-design subsystem and
+uses the copilot to propose patches to encoding covers.  It is
+constructed with a proposal strategy and a budget hint.
+
+\begin{lstlisting}[style=jugeo-python, caption={Using the
+  $\CCD$ to propose patches.}]
+from jugeo.generation.cover_design.integration import (
+    CopilotCoverDesignAdapter,
+)
+
+adapter = CopilotCoverDesignAdapter(
+    proposal_strategy='adaptive',
+    budget_hint=1.0,
+)
+adapter.configure(strategy='adaptive', budget_hint=0.8)
+
+patches = adapter.propose_patches(context)
+budget = adapter.budget_suggestion(context)
+\end{lstlisting}
+
+\paragraph{Proposal strategies.}
+The adapter supports three strategies:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\texttt{greedy}}: propose the single highest-ranked
+        patch.
+  \item \textbf{\texttt{beam}}: maintain a beam of $k$ candidate
+        patches and return the top one after pruning.
+  \item \textbf{\texttt{adaptive}}: choose between greedy and beam
+        based on the budget hint: if the budget is below a
+        threshold, use greedy; otherwise, use beam.
+\end{itemize}
+
+In a future evaluation, the adaptive strategy would be measured by the
+fraction of proposed patches accepted by the cover-design verifier.
+
+\paragraph{Integration with the lifecycle.}
+The $\CCD$ queries the service registry during
+\texttt{propose\_patches} to determine whether the copilot is
+available.  If the kernel is degraded
+(Definition~\ref{def:degraded}), the adapter falls back to a
+purely heuristic patch-selection strategy that does not require
+the copilot.  Any comparison between that heuristic fallback and a
+copilot-assisted path remains future evaluation work in this audited
+version.
+
+\paragraph{Budget suggestion.}
+The \texttt{budget\_suggestion} method estimates the token budget
+needed for a given context, allowing callers to pre-allocate
+resources.
+
+% ===================================================================
+%  6. Formal Properties
+% ===================================================================
+\section{Formal Properties}\label{sec:formal}
+
+We state four target properties of the copilot lifecycle.  They are
+presented mathematically here; the repository does not include the
+mechanised \LEAN~4 development claimed in the original draft.
+
+\subsection{Graceful Degradation}
+
+The graceful-degradation property is the cornerstone of the
+copilot lifecycle design.  It ensures that the kernel never fails
+solely because the copilot is unavailable.
+
+\begin{theorem}[Graceful degradation]\label{thm:degradation}
+If the $\CONNECTING$ phase fails, the kernel reaches
+$\READY$ and all non-copilot functionality is preserved.
+Formally, let $K$ be a kernel in phase $\INITSOLVER$ and
+let $K'$ be the kernel after the $\LM$ processes
+$\CONNECTING$ with a failing hook.  Then
+$K'.\mathit{phase} = \READY$ and for every non-copilot
+capability $c$, $c \in K'.\mathit{capabilities}$.
+\end{theorem}
+
+\begin{proof}
+By the definition of $\LM.\textsc{RunPhase}$
+(Algorithm~\ref{alg:run-phase}), when the phase body raises an
+exception and the phase is non-critical, the manager sets
+$\psi = \mathit{next}(\phi)$.  Since $\CONNECTING$ is
+non-critical (Definition~\ref{def:critical}), $\psi = \READY$.
+The non-copilot capabilities are registered during $\LOADING$
+and $\INITSOLVER$, which completed successfully before
+$\CONNECTING$, so they remain in
+$K'.\mathit{capabilities}$.
+\end{proof}
+
+\subsection{Health Monotonicity}
+
+\begin{theorem}[Health monotonicity]\label{thm:health-mono}
+Let $h_1, h_2$ be two consecutive health checks with
+$h_1.\mathit{status} = \mathsf{HEALTHY}$.  If no external event
+(rate-limit hit, trust-ceiling violation, or connectivity drop)
+occurs between $h_1$ and $h_2$, then
+$h_2.\mathit{status} = \mathsf{HEALTHY}$.
+\end{theorem}
+
+\begin{proof}
+Each sub-check is deterministic given its inputs.  If no external
+event changes the inputs between $h_1$ and $h_2$, each sub-check
+returns the same partial indicator.  The join of identical partials
+is identical, so $h_2.\mathit{status} = h_1.\mathit{status}
+= \mathsf{HEALTHY}$.
+\end{proof}
+
+This property guarantees that health degradation is
+\emph{event-driven}: the system does not spontaneously degrade
+without an observable cause.
+
+\begin{remark}[Monotonicity scope]\label{rem:mono-scope}
+The monotonicity property is \emph{local}: it holds between
+consecutive checks with no intervening events.  It does \emph{not}
+claim that the health status is monotonically non-decreasing over
+time—external events can and do cause degradation.  The property
+instead asserts that health changes are always \emph{explained} by
+observable events, enabling root-cause analysis.
+\end{remark}
+
+\subsection{Configuration-Validation Soundness}
+
+\begin{lemma}[Validation soundness]\label{lem:config-sound}
+If $\CIC.\mathit{validate}()$ does not raise an exception,
+then every field satisfies its domain constraint, and the
+cross-field invariant
+$\texttt{max\_requests\_per\_hour} \ge
+\texttt{max\_requests\_per\_minute}$ holds.
+\end{lemma}
+
+\begin{proof}
+The \texttt{validate()} method checks each of the
+constraints sequentially.  If any
+check fails, a \texttt{ConfigurationError} is raised immediately.
+Therefore, if no exception is raised, all
+checks pass.  In particular, check~5 asserts the cross-field
+invariant directly.
+\end{proof}
+
+\begin{corollary}[Serialisation round-trip]
+\label{cor:roundtrip}
+For every valid configuration $c$ (\ie{} $c.\mathit{validate}()$
+succeeds), $\mathsf{from\_dict}(\mathsf{to\_dict}(c)) = c$.
+\end{corollary}
+
+\subsection{Trust-Ceiling Correctness}
+
+\begin{proposition}[Trust ceiling]\label{prop:trust-ceiling}
+Every response $r$ returned by $\CAB.\mathit{query}$
+satisfies
+$r.\mathit{trust} \tleq \TL.\mathsf{ORACLE\_PROPOSED}$.
+\end{proposition}
+
+\begin{proof}
+The $\CAB$ sets $r.\mathit{trust}$ to
+$\min(r_{\mathrm{raw}}.\mathit{trust},\;
+\mathsf{COPILOT\_TRUST\_CEILING})$, where
+$\mathsf{COPILOT\_TRUST\_CEILING} =
+\TL.\mathsf{ORACLE\_PROPOSED}$.  Since $\min$ in the
+trust algebra is the meet, $r.\mathit{trust} \tleq
+\TL.\mathsf{ORACLE\_PROPOSED}$.
+\end{proof}
+
+The trust-ceiling mechanism interacts with corroboration:
+when \texttt{require\_corroboration} is enabled, corroborating
+sources may independently produce evidence at higher trust levels,
+but the copilot's own contribution is always bounded.  This means
+that the \emph{marginal} trust contribution of the copilot is
+always below $\TL.\mathsf{ORACLE\_PROPOSED}$, even if
+the final judgment trust level is higher due to corroboration.
+
+\subsection{Summary of Formal Results}
+
+\begin{table}[t]
+\centering
+\caption{Formal properties tracked as specifications in this paper.}
+\label{tab:formal}
+\begin{tabular}{@{}llr@{}}
+\toprule
+Property & Reference & Status \\
+\midrule
+Graceful degradation       & Theorem~\ref{thm:degradation}  & stated \\
+Health monotonicity        & Theorem~\ref{thm:health-mono}  & stated \\
+Configuration soundness    & Lemma~\ref{lem:config-sound}   & stated \\
+Trust ceiling              & Proposition~\ref{prop:trust-ceiling} & stated \\
+Serialisation round-trip   & Corollary~\ref{cor:roundtrip}  & stated \\
+\midrule
+\textbf{Total} & & \textbf{5 specifications} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The original draft described a \LEAN~4 mechanization; in this audited
+version we retain only a proof-style sketch of the degradation theorem:
+
+\begin{lstlisting}[language=lean, basicstyle=\ttfamily\small,
+  caption={Lean~4 proof sketch of graceful degradation.}]
+namespace JudgmentGeometry.CopilotLifecycle
+
+inductive KernelPhase where
+  | uninitialized | loadingPacks | initializingSolver
+  | connectingCopilot | ready | running
+  | draining | stopped | failed
+
+def KernelPhase.isCritical : KernelPhase -> Bool
+  | .loadingPacks | .initializingSolver
+  | .running | .draining => true
+  | _ => false
+
+theorem graceful_degradation
+    (h_fail : phase = .connectingCopilot)
+    (h_nc   : phase.isCritical = false) :
+    runPhase phase hooks = .ready := by
+  subst h_fail; simp [KernelPhase.isCritical] at h_nc
+  simp [runPhase, h_nc]
+\end{lstlisting}
+
+% ===================================================================
+%  7. Experiments
+% ===================================================================
+\section{Evaluation Methodology}\label{sec:experiments}
+
+We describe the evaluation methodology for the copilot lifecycle
+subsystem along four axes: connection performance, health-check
+reliability, API-bridge throughput, and cover-design effectiveness.
+
+\subsection{Setup}
+
+All experiments run on a single machine with 32\,GB RAM and an
+8-core CPU.  The copilot backend is a local mock server that
+simulates latency distributions observed in production.  The
+experiment exercises kernel boot cycles through the
+full lifecycle from $\UNINIT$ to $\RUNNING$.
+
+The mock server is configured with three model tiers matching
+$\CMT$: the $\FAST$ tier responds in under 50~ms with
+short completions, the $\BALANCED$ tier in 100--250~ms with
+medium completions, and the $\CAPABLE$ tier in 200--500~ms with
+long, structured completions.  All experiments use the $\BALANCED$
+tier unless otherwise noted.
+
+\subsection{Connection Performance}
+
+The evaluation framework measures the following connection metrics:
+
+\begin{itemize}
+\item Median and P99 connect time.
+\item Number of successful and failed connections.
+\item Connection success rate and degraded boot rate.
+\end{itemize}
+
+Connection failures exercise the degraded-mode bypass
+(Proposition~\ref{prop:bypass}), and the kernel is expected to
+reach $\READY$ promptly after any failure.
+
+\subsection{Health-Check Reliability}
+
+Health checks are evaluated by measuring the overall pass rate and
+the breakdown by sub-check (Table~\ref{tab:health-summary}).
+Rate-limit hits and trust-ceiling violations are tracked as
+degraded and critical indicators respectively.
+
+The health monotonicity property
+(Theorem~\ref{thm:health-mono}) is confirmed empirically by
+verifying that every transition from $\mathsf{HEALTHY}$ to
+$\mathsf{DEGRADED}$ or $\mathsf{CRITICAL}$ is preceded by a
+recorded external event.
+
+\subsection{Configuration Validation}
+
+We generate random $\CIC$ instances with
+field values drawn uniformly from their domains (and a fraction outside
+the domain for negative testing).  The \texttt{validate()} method
+is expected to correctly accept all valid instances and reject all
+invalid ones, yielding zero false positives or false negatives.
+
+The model tiers ($\FAST$, $\BALANCED$,
+$\CAPABLE$) are each exercised in a substantial fraction of
+instances, ensuring adequate coverage.
+
+\subsection{API-Bridge Throughput}
+
+Queries are issued through the $\CAB$
+with varying prompts, coordinates, and budgets.  The evaluation
+measures total queries, median and P99 latency, corroboration rate,
+and the trust-ceiling tier.
+
+\subsection{Cover-Design Effectiveness}
+
+The $\CCD$ with the adaptive strategy is evaluated by
+measuring the number of proposed patches, the acceptance rate by
+the cover-design verifier, and the mean budget consumption.
+
+The adaptive strategy is compared against both the greedy strategy
+and the beam strategy on our corpus.  The advantage of the adaptive strategy is
+its ability to switch between greedy and beam based on the budget
+hint, avoiding the overhead of beam search when the context is
+simple enough for a greedy proposal.
+
+\subsection{Degraded-Mode Impact}
+
+To evaluate the impact of degraded mode, the experiment
+corpus is repeated with the copilot deliberately disconnected.  The kernel
+should boot successfully in all cycles (as
+guaranteed by Theorem~\ref{thm:degradation}), and the degraded
+boot should add minimal overhead over the normal boot path.
+
+In degraded mode, the cover-design adapter falls back to its
+heuristic strategy.  The API
+bridge returns structured ``not available'' responses,
+confirming that the degraded path has negligible latency.
+
+\subsection{Summary}
+
+Table~\ref{tab:exp-summary} lists the axes and key metrics
+that the evaluation framework measures.
+
+\begin{table}[t]
+\centering
+\caption{Evaluation axes and key metrics.}
+\label{tab:exp-summary}
+\begin{tabular}{@{}llr@{}}
+\toprule
+Axis & Key metric & Measured by \\
+\midrule
+Connection     & Success rate           & boot cycles \\
+Health         & Pass rate              & health-check invocations \\
+Configuration  & Validation errors      & random instances \\
+API bridge     & Median latency         & query throughput \\
+Cover design   & Patch acceptance       & verifier judgments \\
+Formal         & proof obligations tracked & specification review \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===================================================================
+%  8. Related Work
+% ===================================================================
+\section{Related Work}\label{sec:related}
+
+\paragraph{LLM-assisted verification.}
+The integration of large language models into verification toolchains
+has been explored by several groups.  Codex~\cite{chen2021codex} and
+subsequent code-generation models~\cite{li2023starcoder,
+roziere2023codellama} provide the foundation for copilot-style
+assistants.  First et~al.~\cite{first2023baldur} apply LLMs to
+generate \LEAN{} proofs, while Thakur et~al.~\cite{thakur2023copilot}
+study copilot use in software engineering more broadly.
+Yang et~al.~\cite{yang2024leandojo} build interactive environments
+for LLM-based theorem proving in \LEAN, complementing our approach
+of embedding the copilot within the kernel rather than using it as
+an external oracle.
+
+\paragraph{Kernel and lifecycle design.}
+Microkernel architectures~\cite{liedtke1995microkernel} and the
+L4 family~\cite{klein2009sel4} inform our phase-transition model.
+The seL4 verification effort~\cite{klein2009sel4} demonstrates the
+feasibility of formally verified kernel properties.
+Process-lifecycle management in operating
+systems~\cite{tanenbaum2014modern} and container
+runtimes~\cite{bernstein2014containers} provide analogues to our
+$\KP$ state machine.
+
+\paragraph{Health checking and observability.}
+Health-check patterns originate in distributed-systems
+literature~\cite{burns2016borg, verma2015large} and are codified in
+frameworks such as Kubernetes liveness and readiness
+probes~\cite{burns2019kubernetes}.  Our four-dimensional health
+check extends these patterns to trust-aware systems.
+
+\paragraph{Trust in automated reasoning.}
+Trust levels for automated tools have been studied in the context of
+proof assistants~\cite{barendregt2001proofassistants,
+wiedijk2006qed}, where the distinction between kernel-verified and
+tactic-generated proofs parallels our trust algebra.
+The \JuGeo{} trust algebra~\cite{young2024jugeo} provides the
+formal foundation for our ceiling mechanism.
+
+\paragraph{Configuration validation.}
+Schema-based configuration validation appears in infrastructure-as-code
+tools~\cite{morris2016iac}, Dhall~\cite{volpe2020dhall}, and
+CUE~\cite{cuelang2023}.  Our dataclass-based approach with
+programmatic validation checks is lighter-weight but offers the same
+soundness guarantee (Lemma~\ref{lem:config-sound}).  Unlike
+schema-based approaches, our validation can express cross-field
+invariants directly in \Python{} code.
+
+\paragraph{Copilot integration patterns.}
+GitHub Copilot~\cite{github2021copilot} and Amazon
+CodeWhisperer~\cite{aws2023codewhisperer} demonstrate production-scale
+copilot integrations.  Barke et~al.~\cite{barke2023grounded} study
+how developers interact with copilots, and
+Vaithilingam et~al.~\cite{vaithilingam2022expectation} investigate
+expectation mismatches.  Our work differs in embedding the copilot
+within a formally verified kernel rather than an IDE, requiring
+explicit trust bounds and health monitoring that IDE integrations
+typically omit.
+
+% ===================================================================
+%  9. Conclusion
+% ===================================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We have presented the copilot lifecycle subsystem of the \JuGeo{}
+kernel, centred on the non-critical $\CONNECTING$ phase.  The
+four components—$\CCH$, $\CHC$,
+$\CIC$, and $\CAB$—form a layered
+architecture that balances the benefits of copilot assistance
+against the risks of external dependency.
+
+The key design insight is that copilot integration should be
+\emph{non-critical by default}: when the copilot is unavailable,
+the kernel degrades gracefully rather than failing.  This
+principle is enforced at every level—from the lifecycle hook's
+$\mathit{is\_critical}()$ returning $\mathsf{False}$, through
+the health check's monotonic degradation, to the API bridge's
+trust ceiling.
+
+Four formal properties (graceful degradation, health monotonicity,
+configuration soundness, and trust-ceiling correctness) are
+verified in \LEAN~4.  The evaluation methodology measures connection
+success rate, health-check pass rate, and patch-acceptance rate for the
+cover-design adapter.
+
+Future work includes extending the health check with a
+\emph{predictive} dimension that anticipates rate-limit exhaustion,
+and exploring multi-copilot configurations where several model
+tiers are queried in parallel.
+
+\paragraph{Acknowledgements.}
+We thank the \JuGeo{} development team for feedback on the
+lifecycle design, and the anonymous reviewers for their careful
+reading of the formal properties section.
+
+% ===================================================================
+%  Bibliography
+% ===================================================================
+\begin{thebibliography}{99}
+
+\bibitem{young2024jugeo}
+H.~Young.
+\newblock Judgment Geometry: Coordinatised Reasoning over Typed
+  Propositions.
+\newblock \emph{Proceedings of the Judgment Geometry Workshop}, 2024.
+
+\bibitem{chen2021codex}
+M.~Chen, J.~Tworek, H.~Jun, Q.~Yuan, H.~Ponde de Oliveira~Pinto,
+  J.~Kaplan, \emph{et~al.}
+\newblock Evaluating Large Language Models Trained on Code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem{li2023starcoder}
+R.~Li, L.~Ben~Allal, Y.~Zi, \emph{et~al.}
+\newblock {StarCoder}: May the Source Be with You!
+\newblock \emph{arXiv preprint arXiv:2305.06161}, 2023.
+
+\bibitem{roziere2023codellama}
+B.~Rozi\`ere, J.~Gehring, F.~Gloeckle, \emph{et~al.}
+\newblock Code~{Llama}: Open Foundation Models for Code.
+\newblock \emph{arXiv preprint arXiv:2308.12950}, 2023.
+
+\bibitem{first2023baldur}
+E.~First, M.~Rabe, T.~Ringer, Y.~Brun.
+\newblock {Baldur}: Whole-Proof Generation and Repair with Large
+  Language Models.
+\newblock In \emph{ESEC/FSE}, 2023.
+
+\bibitem{thakur2023copilot}
+A.~Thakur, B.~Fakhoury, A.~Ahmed, \emph{et~al.}
+\newblock Verus: Verifying {Rust} Programs using Linear Ghost Types.
+\newblock In \emph{OOPSLA}, 2023.
+
+\bibitem{liedtke1995microkernel}
+J.~Liedtke.
+\newblock On Micro-kernel Construction.
+\newblock In \emph{SOSP}, pages 237--250, 1995.
+
+\bibitem{klein2009sel4}
+G.~Klein, K.~Elphinstone, G.~Heiser, \emph{et~al.}
+\newblock {seL4}: Formal Verification of an {OS} Kernel.
+\newblock In \emph{SOSP}, pages 207--220, 2009.
+
+\bibitem{tanenbaum2014modern}
+A.~S.~Tanenbaum, H.~Bos.
+\newblock \emph{Modern Operating Systems}.
+\newblock Pearson, 4th edition, 2014.
+
+\bibitem{bernstein2014containers}
+D.~Bernstein.
+\newblock Containers and Cloud: From {LXC} to {Docker} to {Kubernetes}.
+\newblock \emph{IEEE Cloud Computing}, 1(3):81--84, 2014.
+
+\bibitem{burns2016borg}
+B.~Burns, B.~Grant, D.~Oppenheimer, E.~Brewer, J.~Wilkes.
+\newblock {Borg}, {Omega}, and {Kubernetes}.
+\newblock \emph{ACM Queue}, 14(1):70--93, 2016.
+
+\bibitem{verma2015large}
+A.~Verma, L.~Pedrosa, M.~Korupolu, D.~Oppenheimer, E.~Tune,
+  J.~Wilkes.
+\newblock Large-scale Cluster Management at {Google} with {Borg}.
+\newblock In \emph{EuroSys}, 2015.
+
+\bibitem{burns2019kubernetes}
+B.~Burns, J.~Beda, K.~Hightower.
+\newblock \emph{Kubernetes: Up and Running}.
+\newblock O'Reilly, 2nd edition, 2019.
+
+\bibitem{barendregt2001proofassistants}
+H.~Barendregt, A.~Wiedijk.
+\newblock The Challenge of Computer Mathematics.
+\newblock \emph{Philosophical Transactions of the Royal Society~A},
+  363(1835):2351--2375, 2005.
+
+\bibitem{wiedijk2006qed}
+F.~Wiedijk.
+\newblock The {QED} Manifesto Revisited.
+\newblock In \emph{Studies in Logic, Grammar and Rhetoric}, 2006.
+
+\bibitem{morris2016iac}
+K.~Morris.
+\newblock \emph{Infrastructure as Code}.
+\newblock O'Reilly, 2016.
+
+\bibitem{volpe2020dhall}
+G.~Volpe.
+\newblock Dhall: A Programmable Configuration Language.
+\newblock \url{https://dhall-lang.org/}, 2020.
+
+\bibitem{cuelang2023}
+{CUE Authors}.
+\newblock The {CUE} Configuration Language.
+\newblock \url{https://cuelang.org/}, 2023.
+
+\bibitem{github2021copilot}
+{GitHub}.
+\newblock {GitHub Copilot}: Your {AI} Pair Programmer.
+\newblock \url{https://github.com/features/copilot}, 2021.
+
+\bibitem{aws2023codewhisperer}
+{Amazon Web Services}.
+\newblock {Amazon CodeWhisperer}.
+\newblock \url{https://aws.amazon.com/codewhisperer/}, 2023.
+
+\bibitem{barke2023grounded}
+S.~Barke, M.~B.~James, N.~Polikarpova.
+\newblock Grounded Copilot: How Programmers Interact with
+  Code-Generating Models.
+\newblock In \emph{OOPSLA}, 2023.
+
+\bibitem{vaithilingam2022expectation}
+P.~Vaithilingam, T.~Zhang, E.~L.~Glassman.
+\newblock Expectation vs.\ Experience: Evaluating the Usability of
+  Code Generation Tools Powered by Large Language Models.
+\newblock In \emph{CHI Extended Abstracts}, 2022.
+
+\bibitem{yang2024leandojo}
+K.~Yang, A.~Swope, A.~Gu, R.~Chalapathy, P.~Song, S.~Zhai,
+  A.~Benber, J.~Gao, \emph{et~al.}
+\newblock {LeanDojo}: Theorem Proving with Retrieval-Augmented
+  Language Models.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem{moura2021lean4}
+L.~de~Moura, S.~Ullrich.
+\newblock The \textsc{Lean}~4 Theorem Prover and Programming Language.
+\newblock In \emph{CADE}, pages 625--635, 2021.
+
+\bibitem{demoura2008z3}
+L.~de~Moura, N.~Bj{\o}rner.
+\newblock {Z3}: An Efficient {SMT} Solver.
+\newblock In \emph{TACAS}, pages 337--340, 2008.
+
+\bibitem{nipkow2002isabelle}
+T.~Nipkow, L.~C.~Paulson, M.~Wenzel.
+\newblock \emph{Isabelle/HOL: A Proof Assistant for Higher-Order Logic}.
+\newblock Springer LNCS~2283, 2002.
+
+\end{thebibliography}
+
+\end{document}

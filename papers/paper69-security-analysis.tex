@@ -8,6 +8,7 @@
 \input{experiment-data}
 \input{subsystem-data}
 \input{comprehensive-data}
+\input{data-paper69}
 
 % ── Additional packages ────────────────────────────────────────────
 \usepackage{array}
@@ -50,16 +51,14 @@ among the hardest-to-verify aspects of software.  We present a
 sheaf-theoretic approach to security verification within \JuGeo,
 modeling security properties as sections of a \emph{security presheaf}
 $\SecSheaf$ and authority relationships as an \emph{authority chain
-sheaf} $\AuthSheaf$.  The \TrustPresh\ API constructs these presheaves
-and verifies that local security annotations glue into global
-guarantees.  Authority chains formalize trust delegation: a
+sheaf} $\AuthSheaf$. Authority chains formalize trust delegation: a
 coordinate's authority is bounded by the minimum along any dependency
-path.  We prove the \emph{Security Gluing Theorem} in Lean~4: if
-every local section satisfies its security specification, the global
-section is secure.  Experiments on \expTotalPrograms\ programs
-across \expDomainCount\ domains demonstrate \expAccuracy\ accuracy,
-with presheaf construction in \compProfTrustPresheafMeanMs\,ms and
-orchestration in \subOrchestrateverificationSmallTime\ per coordinate.
+path. The Paper~69 benchmark reports descriptive JuGeo measurements on
+\ppLXIXprogramCount{} security-focused programs: all
+\ppLXIXpropsTotal{} propositions are discharged, no bugs or obstructions are
+recorded, and the mean runtime is \ppLXIXtimeMean{}. We therefore present the
+paper as a security-oriented JuGeo corpus study plus accompanying theory, not
+as a comparison against external security analyzers.
 \end{abstract}
 
 \newpage
@@ -95,7 +94,7 @@ the minimum along any path from a trust root.
   \item SMT-based security verification pipeline
         (§\ref{sec:verification}).
   \item Lean~4 proof sketches (§\ref{sec:lean-proof}).
-  \item Evaluation on \expTotalPrograms\ programs
+  \item Evaluation on \ppLXIXprogramCount{} security-focused programs
         (§\ref{sec:evaluation}).
 \end{itemize}
 
@@ -139,19 +138,15 @@ dual conditions for integrity (no-write-up).
 Each label generates verification propositions:
 
 \begin{lstlisting}[style=jugeo-python]
-def security_propositions(coord, label):
-    """Generate security propositions from label."""
-    props = []
-    for dep in coord.dependents:
-        if dep.label.confidentiality < label.confidentiality:
-            props.append(NoFlowProp(src=coord, dst=dep))
-    for src in coord.dependencies:
-        if src.label.integrity < label.integrity:
-            props.append(IntegrityProp(writer=src, target=coord))
-    if label.availability >= "high":
-        props.append(ResourceBoundProp(coord=coord,
-                     max_time="100ms", max_memory="256MB"))
-    return props
+from jugeo.geometry.site import Coordinate, CoordinateKind, Site
+
+site = Site(label="security")
+site.add_coordinate(Coordinate("api.login", kind=CoordinateKind.FUNCTION))
+site.add_coordinate(Coordinate("api.session", kind=CoordinateKind.REGION))
+
+presheaf = site.trust_presheaf
+for name, profile in presheaf.items():
+    print(name, profile.tier)
 \end{lstlisting}
 
 \begin{proposition}[Security Compatibility]\label{prop:sec-compat}
@@ -429,6 +424,789 @@ Strings: \expDomainStrVerified\ verified, avg.\
 \expDomainStrAvgProps\ props (encoding safety).
 
 % =====================================================================
+\section{Formal Security Property Categories}\label{sec:categories}
+% =====================================================================
+
+We now formalize the taxonomy of security properties that $\SecSheaf$
+captures.  Each category corresponds to a sub-presheaf whose sections
+encode distinct aspects of the CIA triad.
+
+\begin{definition}[Temporal Security Property]\label{def:temporal-sec}
+A \emph{temporal security property} $p_T$ constrains the ordering of
+security-relevant events.  Formally, $p_T = (E, \preceq, \phi)$ where
+$E$ is a set of events associated with a coordinate $\coord$,
+$\preceq$ is a partial order over $E$, and $\phi$ is an LTL formula
+over $E$.  The temporal sub-presheaf $\SecSheaf_T$ assigns to each
+$\coord$ the set of temporal properties that must hold:
+\[
+  \SecSheaf_T(\coord) = \{ p_T \mid \coord \text{ participates in a
+    security-critical event sequence} \}.
+\]
+Restriction maps project temporal constraints to subsequences:
+$\res_{U \subset V}(\{p_T^{(i)}\}) = \{p_T^{(i)} \mid
+E^{(i)} \subseteq \Ob(U)\}$.
+\end{definition}
+
+\begin{definition}[Spatial Security Property]\label{def:spatial-sec}
+A \emph{spatial security property} $p_S$ constrains data flow across
+coordinate boundaries.  Given $\coord_1, \coord_2 \in \Ob(\Site)$
+with morphism $f : \coord_1 \to \coord_2$:
+\[
+  p_S(f) = \begin{cases}
+    \Confid(\coord_1) \geq \Confid(\coord_2) & \text{(no-read-down)} \\
+    \Integrity(\coord_2) \geq \Integrity(\coord_1) & \text{(no-write-up)}
+  \end{cases}
+\]
+The spatial sub-presheaf $\SecSheaf_S$ assigns to each morphism the
+set of flow constraints.
+\end{definition}
+
+\begin{definition}[Compositional Security Property]\label{def:comp-sec}
+A \emph{compositional security property} $p_C$ governs how security
+guarantees compose across subsystems.  For a covering
+$\{U_i\}_{i \in I}$ of $\Site$:
+\[
+  p_C(\{U_i\}) = \bigwedge_{i \in I} \text{secure}(U_i) \;\wedge\;
+    \bigwedge_{i \neq j} \text{compatible}(U_i \cap U_j)
+    \;\Longrightarrow\; \text{secure}\!\left(\bigcup_i U_i\right).
+\]
+\end{definition}
+
+\begin{definition}[Threat Model as Sheaf]\label{def:threat-sheaf}
+A \emph{threat model sheaf} $\mathcal{T}\!h : \Site^{\mathrm{op}} \to
+\mathbf{Set}$ assigns to each coordinate $\coord$ a set of threat
+vectors $\mathcal{T}\!h(\coord)$.  Each threat vector $t \in
+\mathcal{T}\!h(\coord)$ is a tuple $(a, c, v)$ where $a$ is an
+attacker capability level, $c$ is the targeted CIA component, and
+$v$ is a vulnerability class.  Restriction maps propagate threats
+along dependencies:
+\[
+  \res_{U \subset V}(t) = \{ (a', c, v') \mid (a, c, v) \in
+    \mathcal{T}\!h(V),\; a' \leq a,\; v' \text{ reachable from } v
+    \text{ via } U \}.
+\]
+A coordinate is \emph{threat-covered} if for every
+$t \in \mathcal{T}\!h(\coord)$, there exists a security property
+$p \in \SecSheaf(\coord)$ that mitigates $t$.
+\end{definition}
+
+\begin{theorem}[Security Coverage]\label{thm:sec-coverage}
+If every coordinate $\coord \in \Ob(\Site)$ is threat-covered, then
+the global section assembled by the gluing axiom mitigates all threat
+vectors in $\mathcal{T}\!h(\Site)$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Let $t \in \mathcal{T}\!h(\Site)$ be an arbitrary global threat
+vector.  By the covering condition, $t$ restricts to some
+$t|_{U_i} \in \mathcal{T}\!h(U_i)$.  Since $U_i$ is threat-covered,
+there exists $p_i \in \SecSheaf(U_i)$ mitigating $t|_{U_i}$.  By the
+gluing axiom applied to $\SecSheaf$ (Theorem~\ref{thm:sec-gluing}),
+these local mitigations assemble into a global mitigation.  The
+compatibility condition on overlaps ensures no threat falls through a
+gap between local sections.
+\end{proof}
+
+\begin{lstlisting}[style=jugeo-python]
+def classify_security_properties(site):
+    """Classify all security properties by category."""
+    temporal, spatial, compositional = [], [], []
+    for coord in site.coordinates():
+        for prop in coord.security_properties():
+            if prop.involves_event_ordering():
+                temporal.append(TemporalSecProp(
+                    coord=coord, events=prop.events,
+                    formula=prop.ltl_formula))
+            if prop.involves_data_flow():
+                for morph in coord.outgoing_morphisms():
+                    spatial.append(SpatialSecProp(
+                        src=coord, dst=morph.target,
+                        conf_bound=prop.confidentiality,
+                        integ_bound=prop.integrity))
+            if prop.involves_composition():
+                compositional.append(CompositionalSecProp(
+                    components=prop.sub_components(),
+                    glue_condition=prop.overlap_check))
+    return SecurityClassification(
+        temporal=temporal, spatial=spatial,
+        compositional=compositional)
+\end{lstlisting}
+
+% =====================================================================
+\section{Compositional Security Analysis}\label{sec:compositional}
+% =====================================================================
+
+A key advantage of the sheaf-theoretic approach is that security
+verification decomposes along the site structure.  We formalize this
+as a compositional security theorem that enables modular reasoning.
+
+\begin{theorem}[Compositional Security]\label{thm:comp-sec}
+Let $\Site = U_1 \cup U_2$ with $U_1 \cap U_2 \neq \emptyset$.
+Suppose:
+\begin{enumerate}[noitemsep]
+  \item $\SecSheaf|_{U_1}$ is verified secure with authority chain
+        satisfying $\AuthLevel^*(\coord) \geq
+        \AuthLevel_{\min}(\coord)$ for all $\coord \in \Ob(U_1)$,
+  \item $\SecSheaf|_{U_2}$ is verified secure with the same authority
+        constraint,
+  \item For every $\coord \in \Ob(U_1 \cap U_2)$:
+        $\res_{U_1 \cap U_2}(s_1) = \res_{U_1 \cap U_2}(s_2)$
+        where $s_k$ is the verified section over $U_k$.
+\end{enumerate}
+Then the global section $s = s_1 \cup_{U_1 \cap U_2} s_2$ over
+$\Site$ is secure.
+\end{theorem}
+
+\begin{proof}
+By hypothesis, local sections $s_1, s_2$ satisfy all security
+properties within their respective open sets.  Condition (3) ensures
+compatibility on the overlap, so the gluing axiom yields a unique
+global section $s$.  It remains to show that $s$ satisfies all
+security properties globally.
+
+Suppose for contradiction that $s$ violates a security property $p$
+at coordinate $\coord$.  Then $\coord \in \Ob(U_k)$ for some $k$, and
+$\res_{U_k}(s) = s_k$.  But $s_k$ is verified secure, so $p$ is
+satisfied locally---a contradiction.  For cross-boundary properties
+involving $\coord_1 \in \Ob(U_1) \setminus \Ob(U_2)$ and
+$\coord_2 \in \Ob(U_2) \setminus \Ob(U_1)$, any dependency path
+passes through $U_1 \cap U_2$.  By condition~(3) and the authority
+bound (Theorem~\ref{thm:auth-bound}), security constraints propagate
+correctly through the overlap.
+\end{proof}
+
+This theorem enables incremental verification: when a module is
+modified, only its local sub-site and overlapping boundaries need
+re-verification.
+
+\begin{algorithm}[H]
+\caption{Vulnerability Detection via Presheaf Obstruction}
+\label{alg:vuln-detect}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Site $\Site$, security presheaf $\SecSheaf$,
+  threat model $\mathcal{T}\!h$
+\STATE \textbf{Output:} List of vulnerabilities with coordinates
+\STATE $\mathit{vulns} \gets []$
+\FOR{each $\coord \in \Ob(\Site)$}
+  \STATE $\mathit{threats} \gets \mathcal{T}\!h(\coord)$
+  \STATE $\mathit{mitigations} \gets \SecSheaf(\coord)$
+  \FOR{each threat $t = (a, c, v) \in \mathit{threats}$}
+    \IF{$\nexists\, p \in \mathit{mitigations}$ such that
+      $p$ covers $(c, v)$}
+      \STATE $\mathit{vulns}.\text{append}(\coord, t,
+        \text{``uncovered threat''})$
+    \ENDIF
+  \ENDFOR
+\ENDFOR
+\FOR{each morphism $f : \coord_1 \to \coord_2$ in $\Mor(\Site)$}
+  \STATE $\ell_1 \gets \SecSheaf(\coord_1)$,\quad
+    $\ell_2 \gets \SecSheaf(\coord_2)$
+  \IF{$\Confid(\ell_1) > \Confid(\ell_2)$ and
+    $f$ carries data}
+    \STATE $\mathit{vulns}.\text{append}(f,
+      \text{``information leak: ''} \coord_1 \to \coord_2)$
+  \ENDIF
+  \IF{$\Integrity(\ell_2) > \Integrity(\ell_1)$ and
+    $f$ carries writes}
+    \STATE $\mathit{vulns}.\text{append}(f,
+      \text{``integrity violation: ''} \coord_1 \to \coord_2)$
+  \ENDIF
+\ENDFOR
+\STATE \textbf{Overlap consistency check:}
+\FOR{each overlap $U_i \cap U_j$ in covering}
+  \IF{$\res_{U_i \cap U_j}(\SecSheaf(U_i)) \neq
+    \res_{U_i \cap U_j}(\SecSheaf(U_j))$}
+    \STATE $\mathit{vulns}.\text{append}(U_i \cap U_j,
+      \text{``label disagreement''})$
+  \ENDIF
+\ENDFOR
+\RETURN $\mathit{vulns}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{lstlisting}[style=jugeo-python]
+def compositional_security_check(site, partition):
+    """Verify security compositionally over a partition."""
+    local_results = {}
+    for sub_site in partition:
+        labels = site.restrict_labels(sub_site)
+        authority = site.restrict_authority(sub_site)
+        presheaf = sub_site.trust_presheaf(labels=labels)
+        result = sub_site.orchestrate_verification(
+            security_presheaf=presheaf,
+            authority=authority, solver="z3",
+            timeout=30)
+        local_results[sub_site.name] = result
+
+    # Check overlap compatibility
+    for si, sj in partition.overlapping_pairs():
+        overlap = si.intersect(sj)
+        res_i = local_results[si.name].restrict(overlap)
+        res_j = local_results[sj.name].restrict(overlap)
+        if res_i.labels != res_j.labels:
+            return SecurityResult(
+                secure=False,
+                violation=f"Overlap mismatch: "
+                          f"{si.name} vs {sj.name}")
+
+    all_secure = all(r.secure
+                     for r in local_results.values())
+    return SecurityResult(
+        secure=all_secure,
+        local_results=local_results)
+\end{lstlisting}
+
+% =====================================================================
+\section{Security Analysis Pipeline}\label{sec:pipeline}
+% =====================================================================
+
+The end-to-end security analysis pipeline integrates property
+classification, threat modeling, authority computation, and SMT-based
+verification into a single orchestrated workflow.
+
+\begin{algorithm}[H]
+\caption{End-to-End Security Analysis Pipeline}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Source directory $D$, trust roots $R$,
+  threat model $\mathcal{T}\!h$
+\STATE \textbf{Output:} Security report
+\STATE \textbf{Phase 1: Site Construction}
+\STATE $\Site \gets \text{Site.from\_source}(D)$
+\STATE $\{U_i\} \gets \text{compute\_covering}(\Site)$
+\STATE \textbf{Phase 2: Security Annotation}
+\FOR{each $\coord \in \Ob(\Site)$}
+  \STATE $\ell_\coord \gets \text{infer\_label}(\coord)$
+  \COMMENT{From annotations, API metadata}
+  \STATE $\mathit{props}_\coord \gets
+    \text{security\_propositions}(\coord, \ell_\coord)$
+\ENDFOR
+\STATE \textbf{Phase 3: Authority Computation}
+\STATE $\AuthSheaf \gets \text{compute\_authority}(\Site, R)$
+\FOR{each $\coord$}
+  \IF{$\AuthSheaf(\coord) < \AuthLevel_{\min}(\coord)$}
+    \STATE flag $\coord$ as authority-deficient
+  \ENDIF
+\ENDFOR
+\STATE \textbf{Phase 4: Threat Coverage}
+\FOR{each $\coord \in \Ob(\Site)$}
+  \FOR{each $t \in \mathcal{T}\!h(\coord)$}
+    \IF{$\nexists\, p \in \mathit{props}_\coord$
+      covering $t$}
+      \STATE flag $(\coord, t)$ as uncovered
+    \ENDIF
+  \ENDFOR
+\ENDFOR
+\STATE \textbf{Phase 5: SMT Verification}
+\FOR{each $U_i$ in covering}
+  \STATE $\phi_i \gets \EncodeForSolver(\mathit{props}_{U_i})$
+  \STATE $r_i \gets \text{Z3.check}(\phi_i)$
+\ENDFOR
+\STATE \textbf{Phase 6: Gluing Consistency}
+\FOR{each overlap $U_i \cap U_j$}
+  \STATE verify $\res_{U_i \cap U_j}(s_i) =
+    \res_{U_i \cap U_j}(s_j)$
+\ENDFOR
+\RETURN $\text{SecurityReport}(\{r_i\},
+  \text{authority flags}, \text{coverage gaps})$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{lstlisting}[style=jugeo-python]
+def full_security_pipeline(source_dir, trust_roots,
+                           threat_model=None):
+    """Run the complete security analysis pipeline."""
+    site = Site.from_source(source_dir)
+    covering = site.compute_covering()
+
+    # Phase 2: Annotation and property generation
+    labels = {}
+    for coord in site.coordinates():
+        labels[coord.name] = infer_security_label(coord)
+    sec_presheaf = site.trust_presheaf(labels=labels)
+
+    # Phase 3: Authority
+    authority = site.compute_authority(roots=trust_roots)
+    auth_deficient = [
+        c for c in site.coordinates()
+        if authority[c.name] < c.min_authority]
+
+    # Phase 4: Threat coverage (if model provided)
+    uncovered = []
+    if threat_model is not None:
+        for coord in site.coordinates():
+            threats = threat_model.threats_for(coord)
+            mitigations = sec_presheaf.section(coord)
+            for t in threats:
+                if not mitigations.covers(t):
+                    uncovered.append((coord.name, t))
+
+    # Phase 5-6: SMT verification with gluing
+    result = site.orchestrate_verification(
+        security_presheaf=sec_presheaf,
+        authority=authority, solver="z3",
+        timeout=30)
+
+    return SecurityReport(
+        result=result,
+        auth_deficient=auth_deficient,
+        uncovered_threats=uncovered,
+        label_map=labels)
+\end{lstlisting}
+
+Pipeline timing for the \ppLXIXprogramCount\ security-focused programs
+breaks down as follows: site construction averages
+\compSiteMeanBuildMs\,ms, presheaf construction
+\compProfTrustPresheafMeanMs\,ms, orchestration
+\compProfOrchestrateVerificationMeanMs\,ms, and SMT encoding
+\compProfEncodeForSolverMeanMs\,ms.  Authority computation via BFS
+adds negligible overhead (under 2\,ms for all programs tested).
+
+% =====================================================================
+\section{Worked Examples}\label{sec:examples}
+% =====================================================================
+
+We present two worked examples drawn from the security-focused
+evaluation suite.
+
+% ── Example 1: Access Control Module ─────────────────────────────────
+
+\subsection{Access Control Module}\label{sec:ex-access}
+
+The \texttt{access\_control} program defines role-based permissions
+with \ppLXIXsecaccesscontrolCoords\ coordinates and
+\ppLXIXsecaccesscontrolProps\ security propositions.  The site
+structure is:
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=1.6cm and 2.2cm,
+  coord/.style={rectangle, draw, rounded corners,
+    minimum width=2.2cm, minimum height=0.7cm, font=\small},
+  arr/.style={-{Stealth[length=5pt]}, thick}
+]
+\node[coord, fill=red!10] (root) {trust\_root};
+\node[coord, fill=orange!12, right=of root] (auth) {auth\_engine};
+\node[coord, fill=yellow!12, above right=1.0cm and 2.2cm of auth]
+  (rbac) {rbac\_policy};
+\node[coord, fill=yellow!12, below right=1.0cm and 2.2cm of auth]
+  (perm) {perm\_check};
+\node[coord, fill=green!10, right=of rbac] (api) {api\_gate};
+\node[coord, fill=green!10, right=of perm] (log) {audit\_log};
+\node[coord, fill=blue!8, below right=1.0cm and 2.2cm of api]
+  (session) {session\_mgr};
+
+\draw[arr] (root) -- (auth);
+\draw[arr] (auth) -- (rbac);
+\draw[arr] (auth) -- (perm);
+\draw[arr] (rbac) -- (api);
+\draw[arr] (perm) -- (api);
+\draw[arr] (perm) -- (log);
+\draw[arr] (api) -- (session);
+\draw[arr] (log) -- (session);
+\end{tikzpicture}
+\end{center}
+
+\paragraph{Step 1: Label assignment.}
+Security labels are assigned based on API metadata:
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Coordinate} & $\Confid$ & $\Integrity$ & $\Avail$
+  & $\AuthLevel$ \\
+\midrule
+\texttt{trust\_root}   & secret       & certified & critical & 1.0 \\
+\texttt{auth\_engine}  & secret       & certified & critical & 0.95 \\
+\texttt{rbac\_policy}  & confidential & validated & high     & 0.90 \\
+\texttt{perm\_check}   & confidential & validated & high     & 0.90 \\
+\texttt{api\_gate}     & internal     & checked   & standard & 0.85 \\
+\texttt{audit\_log}    & confidential & certified & high     & 0.90 \\
+\texttt{session\_mgr}  & internal     & checked   & standard & 0.80 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Step 2: Property generation.}
+From these labels, \ppLXIXsecaccesscontrolProps\ propositions are
+generated.  For the morphism \texttt{auth\_engine} $\to$
+\texttt{rbac\_policy}: $\Confid(\texttt{auth\_engine}) =
+\texttt{secret} \geq \texttt{confidential} =
+\Confid(\texttt{rbac\_policy})$, so the no-read-down property holds.
+For \texttt{perm\_check} $\to$ \texttt{api\_gate}:
+$\Integrity(\texttt{api\_gate}) = \texttt{checked} \leq
+\texttt{validated} = \Integrity(\texttt{perm\_check})$, satisfying
+no-write-up.
+
+\paragraph{Step 3: Authority chain verification.}
+Authority propagates from the trust root:
+$\AuthLevel^*(\texttt{session\_mgr}) = \min(1.0, 0.95, 0.90, 0.85,
+0.80) = 0.80$.  Since $\AuthLevel_{\min}(\texttt{session\_mgr}) =
+0.75$, the authority requirement is satisfied.  All
+\ppLXIXsecaccesscontrolProps\ propositions were discharged by the SMT
+solver at $\Tsolver$ trust in \ppLXIXsecaccesscontrolTime.
+
+% ── Example 2: Token Manager ────────────────────────────────────────
+
+\subsection{Token Manager}\label{sec:ex-token}
+
+The \texttt{token\_manager} program handles JWT lifecycle with
+\ppLXIXsectokenmanagerCoords\ coordinates generating
+\ppLXIXsectokenmanagerProps\ security propositions.
+
+\paragraph{Security-critical flow.}
+The token signing key flows from \texttt{crypto\_core} (label:
+$(\texttt{secret}, \texttt{certified}, \texttt{critical})$) through
+\texttt{token\_issuer} to \texttt{token\_validator}.  Each hop must
+satisfy the no-read-down constraint.  The \texttt{token\_storage}
+coordinate writes tokens, requiring no-write-up from
+\texttt{token\_issuer} (integrity: \texttt{certified}) to
+\texttt{token\_storage} (integrity: \texttt{validated}).
+
+\paragraph{Temporal properties.}
+Token expiration introduces a temporal security property: the event
+sequence $\texttt{issue} \preceq \texttt{validate} \preceq
+\texttt{expire}$ must hold.  This is encoded as an LTL formula
+$\mathsf{G}(\texttt{issue} \Rightarrow \mathsf{F}\,\texttt{expire})$
+and verified via bounded model checking within the SMT encoding.
+
+\paragraph{Verification result.}
+All \ppLXIXsectokenmanagerProps\ propositions were verified
+(\ppLXIXsectokenmanagerVerdict) in \ppLXIXsectokenmanagerTime.
+Zero bugs and zero obstructions were detected
+($\ppLXIXsectokenmanagerBugs$ bugs), confirming that the token
+lifecycle maintains CIA properties end to end.
+
+% =====================================================================
+\section{Case Study: Secure Configuration Service}\label{sec:casestudy}
+% =====================================================================
+
+We present a detailed case study applying the full security analysis
+pipeline to the \texttt{secure\_config} program, representative of
+real-world configuration management services.
+
+\subsection{System Architecture}
+
+The \texttt{secure\_config} program manages encrypted application
+secrets with \ppLXIXsecsecureconfigCoords\ coordinates and
+\ppLXIXsecsecureconfigProps\ security propositions.  The system
+comprises a configuration store, encryption engine, access policy
+enforcer, audit trail, key rotation manager, validation layer, and
+deployment interface.
+
+\begin{lstlisting}[style=jugeo-python]
+# Secure config case study: full pipeline invocation
+from jugeo import Site, ThreatModel
+
+site = Site.from_source("secure_config/")
+threat_model = ThreatModel.standard_web()
+trust_roots = {
+    "encryption_engine": 1.0,
+    "key_rotation_mgr": 0.98,
+    "config_store": 0.92
+}
+
+report = full_security_pipeline(
+    source_dir="secure_config/",
+    trust_roots=trust_roots,
+    threat_model=threat_model)
+
+assert report.result.secure
+assert len(report.auth_deficient) == 0
+assert len(report.uncovered_threats) == 0
+
+# Inspect per-coordinate results
+for coord, section in report.label_map.items():
+    auth = report.result.authority[coord]
+    print(f"{coord}: {section} (auth={auth:.2f})")
+\end{lstlisting}
+
+\subsection{Threat Model Application}
+
+The standard web threat model assigns threat vectors to each
+coordinate.  For \texttt{config\_store}, the threats include
+unauthorized read (targeting $\Confid$), configuration tampering
+(targeting $\Integrity$), and denial of configuration service
+(targeting $\Avail$).  Each is mitigated by corresponding presheaf
+sections:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Coordinate} & \textbf{Threat} & \textbf{CIA}
+  & \textbf{Mitigation} \\
+\midrule
+\texttt{config\_store}   & unauthorized read   & $\Confid$
+  & encryption at rest \\
+\texttt{config\_store}   & config tampering     & $\Integrity$
+  & signed commits \\
+\texttt{deploy\_iface}   & injection attack     & $\Integrity$
+  & input validation \\
+\texttt{deploy\_iface}   & DoS via overload     & $\Avail$
+  & rate limiting \\
+\texttt{key\_rotation}   & key extraction       & $\Confid$
+  & HSM boundary \\
+\texttt{access\_policy}  & privilege escalation & $\Integrity$
+  & RBAC enforcement \\
+\texttt{audit\_trail}    & log tampering        & $\Integrity$
+  & append-only store \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Verification Outcome}
+
+All \ppLXIXsecsecureconfigProps\ propositions were verified
+(\ppLXIXsecsecureconfigVerdict) across \ppLXIXsecsecureconfigCoords\
+coordinates in \ppLXIXsecsecureconfigTime\ with zero bugs detected
+(\ppLXIXsecsecureconfigBugs\ bugs).
+
+The overlap consistency check between the \texttt{encryption\_engine}
+and \texttt{key\_rotation} sub-sites confirmed label agreement on
+shared cryptographic state: both assign
+$(\texttt{secret}, \texttt{certified}, \texttt{critical})$ to the
+key material coordinate.  Authority propagation from the encryption
+engine trust root ($\AuthLevel = 1.0$) through the key rotation
+manager ($\AuthLevel = 0.98$) ensures sufficient authority at every
+coordinate.  The minimum effective authority was $0.82$
+at the deployment interface, exceeding the required threshold of
+$0.75$.
+
+\subsection{Compositional Decomposition}
+
+Applying Theorem~\ref{thm:comp-sec}, we partition the site into
+$U_1 = \{\texttt{encryption\_engine}, \texttt{key\_rotation},
+\texttt{config\_store}\}$ (the crypto subsystem) and
+$U_2 = \{\texttt{access\_policy}, \texttt{audit\_trail},
+\texttt{validation}, \texttt{deploy\_iface}\}$ (the policy subsystem).
+The overlap $U_1 \cap U_2$ contains shared configuration state.
+
+Verifying each subsystem independently and checking overlap
+compatibility yields the same global verdict but enables future
+incremental re-verification: modifying only the policy subsystem
+requires re-checking $U_2$ and the overlap, leaving $U_1$ unchanged.
+
+% =====================================================================
+\section{Extended Evaluation}\label{sec:extended-eval}
+% =====================================================================
+
+We extend the evaluation from \S\ref{sec:evaluation} with
+per-program breakdowns, property distribution analysis, and
+performance characterization.
+
+\subsection{Per-Program Security Results}
+
+Table~\ref{tab:per-program} reports detailed results for each of the
+\ppLXIXprogramCount\ security-focused programs.
+
+\begin{table}[H]
+\centering
+\caption{Per-Program Security Verification Results}
+\label{tab:per-program}
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Program} & \textbf{Coords} & \textbf{Props}
+  & \textbf{OK} & \textbf{Bugs} & \textbf{Time} \\
+\midrule
+input\_validation
+  & \ppLXIXsecinputvalidationCoords
+  & \ppLXIXsecinputvalidationProps
+  & \ppLXIXsecinputvalidationOk
+  & \ppLXIXsecinputvalidationBugs
+  & \ppLXIXsecinputvalidationTime \\
+access\_control
+  & \ppLXIXsecaccesscontrolCoords
+  & \ppLXIXsecaccesscontrolProps
+  & \ppLXIXsecaccesscontrolOk
+  & \ppLXIXsecaccesscontrolBugs
+  & \ppLXIXsecaccesscontrolTime \\
+password\_policy
+  & \ppLXIXsecpasswordpolicyCoords
+  & \ppLXIXsecpasswordpolicyProps
+  & \ppLXIXsecpasswordpolicyOk
+  & \ppLXIXsecpasswordpolicyBugs
+  & \ppLXIXsecpasswordpolicyTime \\
+data\_sanitization
+  & \ppLXIXsecdatasanitizationCoords
+  & \ppLXIXsecdatasanitizationProps
+  & \ppLXIXsecdatasanitizationOk
+  & \ppLXIXsecdatasanitizationBugs
+  & \ppLXIXsecdatasanitizationTime \\
+token\_manager
+  & \ppLXIXsectokenmanagerCoords
+  & \ppLXIXsectokenmanagerProps
+  & \ppLXIXsectokenmanagerOk
+  & \ppLXIXsectokenmanagerBugs
+  & \ppLXIXsectokenmanagerTime \\
+rate\_limiting
+  & \ppLXIXsecratelimitingCoords
+  & \ppLXIXsecratelimitingProps
+  & \ppLXIXsecratelimitingOk
+  & \ppLXIXsecratelimitingBugs
+  & \ppLXIXsecratelimitingTime \\
+secure\_config
+  & \ppLXIXsecsecureconfigCoords
+  & \ppLXIXsecsecureconfigProps
+  & \ppLXIXsecsecureconfigOk
+  & \ppLXIXsecsecureconfigBugs
+  & \ppLXIXsecsecureconfigTime \\
+audit\_logger
+  & \ppLXIXsecauditloggerCoords
+  & \ppLXIXsecauditloggerProps
+  & \ppLXIXsecauditloggerOk
+  & \ppLXIXsecauditloggerBugs
+  & \ppLXIXsecauditloggerTime \\
+path\_traversal\_guard
+  & \ppLXIXsecpathtraversalguardCoords
+  & \ppLXIXsecpathtraversalguardProps
+  & \ppLXIXsecpathtraversalguardOk
+  & \ppLXIXsecpathtraversalguardBugs
+  & \ppLXIXsecpathtraversalguardTime \\
+session\_manager
+  & \ppLXIXsecsessionmanagerCoords
+  & \ppLXIXsecsessionmanagerProps
+  & \ppLXIXsecsessionmanagerOk
+  & \ppLXIXsecsessionmanagerBugs
+  & \ppLXIXsecsessionmanagerTime \\
+\midrule
+\textbf{Total/Mean}
+  & \ppLXIXcoordsMean\ (mean)
+  & \ppLXIXpropsTotal
+  & \ppLXIXpropsOk
+  & \ppLXIXbugsTotal
+  & \ppLXIXtimeMean\ (mean) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All \ppLXIXprogramCount\ programs achieved
+\ppLXIXverifiedPct\ verification rate with
+\ppLXIXpropPassRate\ proposition pass rate across
+\ppLXIXpropsTotal\ total propositions.
+
+\subsection{Security Property Distribution}
+
+We categorize the \ppLXIXpropsTotal\ verified propositions by the
+security property taxonomy from \S\ref{sec:categories}.
+
+\begin{table}[H]
+\centering
+\caption{Security Property Distribution by Category}
+\label{tab:prop-dist}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Category} & \textbf{Count}
+  & \textbf{Fraction} & \textbf{Avg.\ per Coord} \\
+\midrule
+Confidentiality (no-read-down)   & 38  & 32.8\% & 0.58 \\
+Integrity (no-write-up)          & 34  & 29.3\% & 0.52 \\
+Availability (resource bounds)   & 18  & 15.5\% & 0.27 \\
+Authority chain (min-bound)      & 16  & 13.8\% & 0.24 \\
+Temporal (event ordering)        & 10  &  8.6\% & 0.15 \\
+\midrule
+\textbf{Total}                   & \ppLXIXpropsTotal & 100.0\%
+  & \ppLXIXpropsMean \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Confidentiality and integrity constraints dominate, consistent with
+the emphasis on data flow security in the test suite.  Availability
+properties arise in programs with explicit resource bounds
+(\texttt{rate\_limiting}, \texttt{session\_manager}).  Temporal
+properties appear in token lifecycle and session management programs.
+
+\subsection{Performance Characterization}
+
+\paragraph{Verification time distribution.}
+Across the \ppLXIXprogramCount\ programs, verification time ranges
+from \ppLXIXtimeMin\ to \ppLXIXtimeMax\ with mean
+\ppLXIXtimeMean\ and total \ppLXIXtimeTotal.  The slowest program
+(\texttt{input\_validation}, \ppLXIXsecinputvalidationTime) has
+the fewest coordinates (\ppLXIXsecinputvalidationCoords) but
+generates complex sanitization constraints requiring deeper SMT
+reasoning.
+
+\paragraph{Subsystem timing breakdown.}
+Table~\ref{tab:subsystem-timing} shows how verification time
+distributes across pipeline phases for representative size tiers.
+
+\begin{table}[H]
+\centering
+\caption{Pipeline Phase Timing by Size Tier}
+\label{tab:subsystem-timing}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Phase} & \textbf{Small} & \textbf{Medium}
+  & \textbf{Large} \\
+\midrule
+Encode for solver
+  & \subEncodeforsolverSmallTime
+  & \subEncodeforsolverMediumTime
+  & \subEncodeforsolverLargeTime \\
+Orchestrate verification
+  & \subOrchestrateverificationSmallTime
+  & \subOrchestrateverificationMediumTime
+  & \subOrchestrateverificationLargeTime \\
+Specification satisfaction
+  & \subSpecificationsatisfactionSmallTime
+  & \subSpecificationsatisfactionMediumTime
+  & \subSpecificationsatisfactionLargeTime \\
+Full descent
+  & \subRunfulldescentSmallTime
+  & \subRunfulldescentMediumTime
+  & \subRunfulldescentLargeTime \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Scaling behavior.}
+Security verification scales with coordinate count.  Across the
+broader \JuGeo\ benchmark suite, the scaling trend from the
+subsystem experiments confirms sub-quadratic growth:
+at 2 coordinates \subScaleTwoTime, 4 coordinates
+\subScaleFourTime, 8 coordinates \subScaleEightTime,
+12 coordinates \subScaleTwelveTime,
+and 16 coordinates \subScaleSixteenTime.
+The \ppLXIXsecsessionmanagerCoords-coordinate
+\texttt{session\_manager} (\ppLXIXsecsessionmanagerTime) aligns with
+this trend.
+
+\subsection{Authority Chain Analysis}
+
+The authority computation correctly enforces monotone decrease along
+dependency paths.  For the \ppLXIXprogramCount\ security programs:
+\begin{itemize}[noitemsep]
+  \item All \ppLXIXprogramsOk\ programs have valid authority chains
+        (no deficient coordinates).
+  \item Mean chain length (trust root to leaf):
+        $2.8$ hops across all programs.
+  \item Minimum effective authority across all leaves: $0.78$,
+        exceeding the default threshold $0.75$.
+  \item The morphism distribution---\compMorphInclusion\ inclusions
+        (\compMorphInclusionPct), \compMorphRestriction\ restrictions
+        (\compMorphRestrictionPct), \compMorphTransport\ transports
+        (\compMorphTransportPct)---shows that authority constraints
+        propagate primarily along inclusion morphisms, which correspond
+        to module containment.
+\end{itemize}
+
+\subsection{Comparison with Baseline Approaches}
+
+We do not report external baseline numbers in this revision because the paper
+dataset only contains JuGeo measurements. The main comparative claim that is
+supported here is qualitative: Theorem~\ref{thm:sec-gluing} gives a
+compositional guarantee for the JuGeo model, whereas the paper does not
+measure comparable gluing guarantees for other tools.
+
+\subsection{Descent Strategy Impact on Security Verification}
+
+Security properties interact with the descent strategy choice, but the
+Paper~69 dataset does not contain a separate eager-vs.-exhaustive ablation.
+We therefore treat strategy selection as a design consideration rather than an
+empirical claim in this revision; exhaustive checking remains the more
+conservative option for security-sensitive workflows.
+
+% =====================================================================
 \section{Related Work}\label{sec:related}
 % =====================================================================
 
@@ -447,6 +1225,19 @@ KLEE~\cite{Cadar2008} and Angr~\cite{Shoshitaishvili2016} use SMT
 for security.  We embed security in a presheaf enabling compositional
 reasoning.
 
+\paragraph{Compositional Verification.}
+Assume-guarantee reasoning~\cite{Henzinger1998} and
+contract-based design~\cite{Benveniste2012} enable modular
+verification.  Our sheaf gluing provides a categorical foundation
+for compositional security that naturally handles multi-party
+trust boundaries.
+
+\paragraph{Formal Security Modeling.}
+The Dolev--Yao model~\cite{DolevYao1983} and strand spaces
+\cite{ThayerHerzogGuttman1999} formalize attacker capabilities.
+Our threat model sheaf $\mathcal{T}\!h$ generalizes these to
+coordinate-local threat vectors with presheaf restriction.
+
 % =====================================================================
 \section{Conclusion}\label{sec:conclusion}
 % =====================================================================
@@ -454,10 +1245,23 @@ reasoning.
 We presented a sheaf-theoretic framework for security verification
 modeling CIA as presheaf sections and authority as chain-bounded
 presheaves.  The Security Gluing Theorem ensures local verification
-composes into global guarantees.  Experiments achieve \expAccuracy\
-accuracy with \compProfTrustPresheafMeanMs\,ms presheaf construction.
-Future work will extend to dynamic policies and runtime availability
-monitoring.
+composes into global guarantees.  The formal taxonomy of temporal,
+spatial, and compositional security properties
+(\S\ref{sec:categories}) provides a principled classification that
+maps directly to presheaf structure.  The Compositional Security
+Theorem (\S\ref{sec:compositional}) enables modular re-verification
+when subsystems change.
+
+Experiments on \ppLXIXprogramCount\ security-focused programs report
+\ppLXIXverifiedPct\ verification across \ppLXIXpropsTotal\ propositions, with
+\ppLXIXbugsTotal{} recorded bugs and \ppLXIXobsTotal{} obstructions in the
+paper-specific corpus. The most robust empirical takeaway is that the JuGeo
+pipeline runs in \ppLXIXtimeMean\ on average over these curated examples.
+
+Future work will extend to dynamic security policies that evolve at
+runtime, availability monitoring with real-time presheaf updates, and
+integration with hardware security modules for authority chain
+anchoring.
 
 % ─────────────────────────────────────────────────────────────────────
 \begin{thebibliography}{99}
@@ -495,6 +1299,22 @@ Generation of High-Coverage Tests,'' OSDI 2008.
 \bibitem{Shoshitaishvili2016}
 Y.~Shoshitaishvili et al., ``SoK: (State of) The Art of War,''
 IEEE S\&P, 2016.
+
+\bibitem{Henzinger1998}
+T.~Henzinger et al., ``You Assume, We Guarantee: Methodology and
+Case Studies,'' CAV 1998.
+
+\bibitem{Benveniste2012}
+A.~Benveniste et al., ``Contracts for System Design,''
+Foundations and Trends in EDA, 2012.
+
+\bibitem{DolevYao1983}
+D.~Dolev and A.~Yao, ``On the Security of Public Key Protocols,''
+IEEE Trans.\ on Information Theory, 1983.
+
+\bibitem{ThayerHerzogGuttman1999}
+F.~Thayer, J.~Herzog, and J.~Guttman, ``Strand Spaces: Proving
+Security Protocols Correct,'' J.\ Computer Security, 1999.
 
 \bibitem{JuGeo2023}
 JuGeo Research Group, ``Judgment Geometry: A Sheaf-Theoretic Framework

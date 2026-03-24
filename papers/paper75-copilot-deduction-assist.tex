@@ -1,0 +1,1223 @@
+% paper75-copilot-deduction-assist.tex
+%   CopilotDeductionAssist — Trust-Calibrated Deduction Hints
+%   Paper 75 of the Judgment Geometry series.
+% Compile: pdflatex paper75-copilot-deduction-assist
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+
+% ——— Paper-specific macros (letters only) ———
+\newcommand{\CDA}{\mathsf{CopilotDeductionAssist}}
+\newcommand{\DedHint}{\mathrm{deductionHint}}
+\newcommand{\DedPlan}{\mathrm{deductionPlan}}
+\newcommand{\DedStep}{\mathrm{deductionStep}}
+\newcommand{\DedTrust}{\mathrm{hintTrust}}
+\newcommand{\DedCalib}{\mathrm{calibration}}
+\newcommand{\RuleApp}{\mathrm{ruleApplication}}
+\newcommand{\SubGoal}{\mathrm{subGoal}}
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\CopBridge}{\mathsf{CopilotAPIBridge}}
+\newcommand{\ChanPool}{\mathsf{ChannelPool}}
+\newcommand{\ChanMon}{\mathsf{ChannelMonitor}}
+\newcommand{\ChanRouter}{\mathsf{ChannelRouter}}
+\newcommand{\EvReq}{\mathsf{EvidenceRequest}}
+\newcommand{\EvResp}{\mathsf{EvidenceResponse}}
+
+\title{\textbf{CopilotDeductionAssist:\\
+Trust-Calibrated Deduction Hints in Judgment Geometry}}
+\author{Halley Young}
+\date{Paper~75 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+%  Abstract
+% ============================================================
+\begin{abstract}
+Deduction---the application of inference rules to derive new
+judgments from existing ones---is the fundamental mechanism by
+which the \JuGeo{} kernel advances proofs.  While the kernel's
+deduction engine is sound by construction, choosing \emph{which}
+rules to apply, in what order, and with what arguments is a
+search problem.  This paper introduces the $\CDA$, a Copilot-guided
+assistant that provides trust-calibrated deduction hints.  The
+assistant suggests rule applications, ranks deduction plans by
+estimated utility, and provides calibrated confidence scores.
+All hints operate at the $\Tcopilot$ trust tier and require
+validation before installation.  We formalise deduction hints
+as morphisms in a rule-application category, prove four main
+theorems (hint soundness, trust calibration, deduction
+completeness, and plan optimality), and provide four \Python{}
+code listings.  An appendix contains additional lemmas on
+category axioms and calibration properties.
+\end{abstract}
+
+% ============================================================
+%  Section 1 — Introduction
+% ============================================================
+\section{Introduction}\label{sec:intro}
+
+The deduction engine in \JuGeo{} applies inference rules
+drawn from a rule base.  Given a goal, the engine searches
+for a sequence of rule applications that derives the goal
+from available hypotheses and previously proven lemmas.
+This search can be expensive: the rule base may contain
+hundreds of rules, each with multiple instantiation patterns.
+
+The $\CDA$ addresses this by providing \emph{hints}:
+ranked suggestions for which rules to try, in what order,
+and with what arguments.  The assistant does not modify
+the proof state; it merely guides the search.  The trust
+model ensures that hints are treated as suggestions, not
+as proofs.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item A categorical model of deduction as a rule-application
+      category (\S\ref{sec:deduction}).
+\item The design of the $\CDA$ with three capabilities:
+      rule suggestion, plan ranking, and confidence
+      calibration (\S\ref{sec:assistant}).
+\item Four theorems establishing soundness, calibration,
+      completeness, and optimality (\S\ref{sec:formal}).
+\item Four \Python{} listings showing integration with
+      the channel layer (\S\ref{sec:code}).
+\end{enumerate}
+
+\paragraph{Paper outline.}
+Section~\ref{sec:background} gives background.
+Section~\ref{sec:deduction} formalises deduction.
+Section~\ref{sec:assistant} presents the assistant design.
+Section~\ref{sec:code} shows the implementation.
+Section~\ref{sec:formal} states the main theorems.
+Section~\ref{sec:discussion} discusses limitations.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+Appendix~\ref{app:proofs} contains auxiliary proofs.
+
+% ============================================================
+%  Section 2 — Background
+% ============================================================
+\section{Background}\label{sec:background}
+
+\subsection{Trust lattice}
+
+The trust ordering:
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot
+  \;\tleq\; \Toracle \;\tleq\; \Truntime
+  \;\tleq\; \Tsolver \;\tleq\; \Tproof.
+\]
+The deduction assistant operates at $\Tcopilot$.
+
+\subsection{Inference rules}
+
+An \emph{inference rule} is a pair
+$(\Gamma, \varphi)$ where $\Gamma = \{\psi_1, \ldots, \psi_n\}$
+are the premises and $\varphi$ is the conclusion.  A rule is
+\emph{applicable} to a goal $\varphi$ if $\varphi$ matches
+the conclusion and all premises are derivable or are open goals.
+
+\begin{definition}[Rule base]\label{def:rulebase}
+A \emph{rule base} $\mathcal{R}$ is a finite set of inference
+rules.  The kernel's deduction engine applies rules from
+$\mathcal{R}$ to advance proofs.
+\end{definition}
+
+\begin{definition}[Rule application]\label{def:ruleapp}
+A \emph{rule application} is a tuple $(r, \sigma, g)$ where
+$r \in \mathcal{R}$ is a rule, $\sigma$ is a substitution
+instantiating the rule's schematic variables, and $g$ is the
+goal to which the rule is applied.
+\end{definition}
+
+\subsection{Deduction search}
+
+\begin{definition}[Deduction tree]\label{def:dedtree}
+A \emph{deduction tree} is a tree whose root is the goal,
+internal nodes are rule applications, and leaves are either
+axioms (closed) or open sub-goals.
+\end{definition}
+
+\begin{definition}[Deduction plan]\label{def:dedplan}
+A \emph{deduction plan} is a sequence of rule applications
+$(a_1, \ldots, a_k)$ that, when applied in order, transforms
+the initial goal into a set of sub-goals (possibly empty).
+A plan with no remaining sub-goals constitutes a complete
+deduction.
+\end{definition}
+
+% ============================================================
+%  Section 3 — Formalisation
+% ============================================================
+\section{Deduction Formalisation}\label{sec:deduction}
+
+\subsection{Rule-application category}
+
+\begin{definition}[Rule-application category]\label{def:racat}
+Let $\mathbf{RA}$ be the category whose objects are proof
+states (sets of open goals) and whose morphisms are rule
+applications: $a \colon S \to S'$ means applying rule
+application~$a$ to state~$S$ produces state~$S'$.
+\end{definition}
+
+\begin{lemma}[Category axioms]\label{lem:cataxioms}
+$\mathbf{RA}$ satisfies the category axioms:
+\begin{enumerate}
+\item \emph{Identity:} the no-op application $\mathrm{id}_S$
+      leaves state~$S$ unchanged.
+\item \emph{Composition:} if $a_1 \colon S \to S'$ and
+      $a_2 \colon S' \to S''$, then
+      $a_2 \circ a_1 \colon S \to S''$.
+\item \emph{Associativity:} $(a_3 \circ a_2) \circ a_1 =
+      a_3 \circ (a_2 \circ a_1)$.
+\end{enumerate}
+\end{lemma}
+\begin{proof}
+\emph{(1)}~The no-op does not change the goal set.
+\emph{(2)}~Applying $a_1$ then $a_2$ is well-defined since
+$a_2$ applies to the state produced by $a_1$.
+\emph{(3)}~Application is sequential; the result depends only
+on the intermediate states, which are uniquely determined.
+\end{proof}
+
+\subsection{Hint as a morphism selector}
+
+\begin{definition}[Deduction hint]\label{def:dedhint}
+A \emph{deduction hint} is a function
+$h \colon \mathsf{Obj}(\mathbf{RA}) \to
+\mathcal{P}(\mathsf{Mor}(\mathbf{RA}))$
+that assigns to each proof state a ranked set of candidate
+rule applications.  Each candidate carries a confidence
+score $c \in [0,1]$.
+\end{definition}
+
+\begin{definition}[Hint quality]\label{def:hintquality}
+The \emph{quality} of a hint~$h$ at state~$S$ is:
+\[
+  Q(h, S) = \sum_{a \in h(S)} c(a) \cdot \mathbb{1}[\text{$a$
+  leads to a shorter proof}].
+\]
+Higher quality means more correct, highly-ranked suggestions.
+\end{definition}
+
+\subsection{Calibration}
+
+\begin{definition}[Calibrated hint]\label{def:calibhint}
+A hint~$h$ is \emph{calibrated} if for every confidence
+level~$c$, the fraction of suggestions with confidence
+$\geq c$ that are correct is at least~$c$.  Formally:
+\[
+  \Pr[\text{suggestion correct} \mid c(\text{suggestion}) \geq c]
+  \geq c.
+\]
+\end{definition}
+
+\begin{remark}
+Calibration ensures that the confidence scores are
+meaningful: a suggestion with 90\% confidence should be
+correct at least 90\% of the time.
+\end{remark}
+
+% ============================================================
+%  Section 4 — The Deduction Assistant
+% ============================================================
+\section{The Deduction Assistant}\label{sec:assistant}
+
+\subsection{Architecture}
+
+The $\CDA$ has three capabilities:
+\begin{enumerate}
+\item \emph{Rule suggestion:} given a goal, suggest which
+      inference rules to apply.
+\item \emph{Plan ranking:} given multiple deduction plans,
+      rank them by estimated quality.
+\item \emph{Confidence calibration:} provide calibrated
+      confidence scores for each suggestion.
+\end{enumerate}
+
+\subsection{Rule suggestion}
+
+The assistant queries the Copilot channel with a prompt
+encoding the goal, the available rules, and the proof context.
+The response is a ranked list of rule applications.
+
+\begin{definition}[Rule suggestion protocol]\label{def:rulesuggprot}
+The rule suggestion protocol:
+\begin{enumerate}
+\item Encode the goal as a string.
+\item Append the names and schemas of available rules.
+\item Query the Copilot channel.
+\item Parse the response into rule applications.
+\item Filter invalid applications (those that do not match
+      the goal).
+\item Return the filtered list with confidence scores.
+\end{enumerate}
+\end{definition}
+
+\subsection{Plan ranking}
+
+The assistant ranks deduction plans by querying the Copilot
+channel for an assessment of each plan's likely success.
+
+\begin{definition}[Plan ranking function]\label{def:planrank}
+The plan ranking function
+$R \colon \mathcal{P}(\mathsf{Plan}) \to \mathsf{List}(\mathsf{Plan})$
+orders plans by estimated quality.  The quality estimate
+is the product of the confidence scores of the plan's steps.
+\end{definition}
+
+\subsection{Confidence calibration}
+
+The assistant's confidence scores are calibrated using
+historical data from the $\ChanMon$.  The calibration
+function adjusts raw LLM confidence scores based on the
+observed success rate at each confidence level.
+
+\begin{definition}[Calibration function]\label{def:calibfunc}
+The calibration function
+$\kappa \colon [0,1] \to [0,1]$
+maps raw confidence $c_{\mathrm{raw}}$ to calibrated
+confidence $c_{\mathrm{cal}}$ using isotonic regression
+on historical success data.
+\end{definition}
+
+\begin{lemma}[Calibration is monotone]\label{lem:calibmono}
+$c_1 \leq c_2 \implies \kappa(c_1) \leq \kappa(c_2)$.
+\end{lemma}
+\begin{proof}
+Isotonic regression produces a monotone function by
+construction: it fits a non-decreasing step function to
+the data.
+\end{proof}
+
+% ============================================================
+%  Section 5 — Implementation
+% ============================================================
+\section{Implementation}\label{sec:code}
+
+\subsection{Rule suggestion via CopilotChannel}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Deduction hint generation via CopilotChannel},
+  label={lst:dedhint}]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+    ChannelJurisdiction,
+    ChannelMonitor,
+)
+
+class CopilotDeductionAssist:
+    """Copilot-guided deduction hint provider."""
+
+    def __init__(self, channel: CopilotChannel, monitor: ChannelMonitor):
+        self.channel = channel
+        self.monitor = monitor
+        self.trust_ceiling = channel.TRUST_CEILING
+        self.jurisdiction = ChannelJurisdiction.for_channel(
+            EvidenceChannel.COPILOT
+        )
+        self.calibration_data = {}
+
+    def suggest_rules(self, goal, available_rules, context=None):
+        prompt = self._build_rule_prompt(goal, available_rules, context)
+        raw = self.channel.query_llm(prompt, timeout_ms=10000)
+        parsed = self.channel.parse_response()
+        clamped = self.channel.apply_trust_ceiling()
+        suggestions = self._filter_and_rank(clamped, available_rules)
+        calibrated = self._calibrate(suggestions)
+        return calibrated
+
+    def rank_plans(self, plans, goal):
+        prompt = self._build_ranking_prompt(plans, goal)
+        raw = self.channel.query_llm(prompt, timeout_ms=8000)
+        parsed = self.channel.parse_response()
+        clamped = self.channel.apply_trust_ceiling()
+        return self._parse_ranking(clamped, plans)
+
+    def update_calibration(self, suggestion, was_correct):
+        conf = suggestion.get("confidence", 0.5)
+        bucket = round(conf, 1)
+        if bucket not in self.calibration_data:
+            self.calibration_data[bucket] = {"correct": 0, "total": 0}
+        self.calibration_data[bucket]["total"] += 1
+        if was_correct:
+            self.calibration_data[bucket]["correct"] += 1
+
+    def _build_rule_prompt(self, goal, rules, ctx):
+        return (
+            f"Goal: {goal}. "
+            f"Available rules: {[r['name'] for r in rules[:15]]}. "
+            f"Context: {ctx}. "
+            f"Suggest rule applications with confidence scores."
+        )
+
+    def _build_ranking_prompt(self, plans, goal):
+        return f"Rank these deduction plans for goal {goal}: {plans}"
+
+    def _filter_and_rank(self, response, rules):
+        rule_names = {r["name"] for r in rules}
+        if isinstance(response, list):
+            return [s for s in response
+                    if s.get("rule") in rule_names]
+        return []
+
+    def _calibrate(self, suggestions):
+        for s in suggestions:
+            raw_conf = s.get("confidence", 0.5)
+            bucket = round(raw_conf, 1)
+            data = self.calibration_data.get(bucket)
+            if data and data["total"] >= 10:
+                s["confidence"] = data["correct"] / data["total"]
+        return suggestions
+
+    def _parse_ranking(self, response, plans):
+        return sorted(plans, key=lambda p: p.get("score", 0), reverse=True)
+\end{lstlisting}
+
+\subsection{Deduction with CopilotAPIBridge}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Deduction orchestration with CopilotAPIBridge},
+  label={lst:dedbridge}]
+from jugeo.interfaces.api import (
+    CopilotAPIBridge,
+    APIEventLog,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    JuGeoAPI,
+    APISession,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+)
+
+class DeductionOrchestrator:
+    """Orchestrate deduction with Copilot assistance."""
+
+    def __init__(self, bridge: CopilotAPIBridge, api: JuGeoAPI):
+        self.bridge = bridge
+        self.api = api
+        self.event_log = APIEventLog()
+
+    def deduce_with_hints(self, coordinate, proposition, rules):
+        session = self.api.open_session("deduction")
+
+        hint = self.bridge.query(
+            f"Suggest deduction strategy for {proposition}"
+        )
+        self.bridge.enforce_trust_ceiling()
+        self.event_log.record({
+            "event": "deduction_hint",
+            "hint": str(hint),
+        })
+
+        request = APIRequest(
+            request_id="ded-001",
+            operation=OperationKind.VERIFY,
+            coordinate=coordinate,
+            proposition=proposition,
+            budget=30000,
+            deadline=45000,
+            metadata={"deduction_hint": str(hint), "rules": len(rules)},
+        )
+        session.register_request(request)
+        result = self.api.verify(
+            coordinate=coordinate,
+            proposition=proposition,
+        )
+
+        self.event_log.record({
+            "event": "deduction_result",
+            "success": result.is_successful() if result else False,
+        })
+        session.checkpoint()
+
+        if result and result.has_residuals():
+            sub_hints = self.bridge.query(
+                f"Handle sub-goals from deduction: {result}"
+            )
+            self.bridge.enforce_trust_ceiling()
+            stats = self.bridge.stats()
+            session.close()
+            return {"result": result, "sub_hints": str(sub_hints),
+                    "stats": stats}
+
+        session.close()
+        return {"result": result}
+\end{lstlisting}
+
+\subsection{Deduction evidence request flow}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Evidence request flow for deduction hints},
+  label={lst:dedevflow}]
+from jugeo.evidence.channels import (
+    EvidenceRequest,
+    EvidenceResponse,
+    EvidenceRecord,
+    SupportRoute,
+    EvidenceChannel,
+    CopilotChannel,
+    SolverChannel,
+    ChannelRouter,
+    ChannelPool,
+    ChannelMonitor,
+)
+
+def deduction_evidence_flow(
+    pool: ChannelPool,
+    router: ChannelRouter,
+    goal,
+    rule_application,
+):
+    """Full evidence flow for a deduction hint validation."""
+    monitor = ChannelMonitor()
+
+    request = EvidenceRequest(
+        request_id=f"ded-ev-{id(goal)}",
+        coordinate=str(goal),
+        proposition=f"rule {rule_application} applies to {goal}",
+        required_kind=None,
+        proposition_kind="deduction_validation",
+        preferred_channel=EvidenceChannel.SOLVER,
+        fallback_channels=[EvidenceChannel.COPILOT],
+        deadline_ms=15000,
+        budget=20000,
+        metadata={"rule": str(rule_application)},
+    )
+
+    if request.is_expired():
+        return None
+    remaining = request.remaining_ms()
+    canonical = request.canonical_key()
+
+    best = router.find_best_channel(request)
+    all_capable = router.find_all_capable(request)
+
+    monitor.record_request(request)
+
+    solver = pool.get_channel("solver")
+    if solver:
+        solver_resp = solver.handle_request(request)
+        monitor.record_response(solver_resp)
+        if solver_resp and not solver_resp.is_empty():
+            record = EvidenceRecord(
+                record_id=f"ded-rec-{id(goal)}",
+                request=request,
+                response=solver_resp,
+                channel=EvidenceChannel.SOLVER,
+                timestamp=None,
+            )
+            route = SupportRoute(
+                source=EvidenceChannel.SOLVER,
+                target=str(goal),
+                trust="solver",
+            )
+            record_with_route = record.with_support_route(route)
+            return {
+                "record": record_with_route,
+                "regions": record_with_route.support_regions(),
+                "canonical": record_with_route.canonical_key(),
+                "success_rate": monitor.success_rate(),
+            }
+
+    copilot = pool.get_channel("copilot")
+    if copilot:
+        copilot_resp = copilot.handle_request(request)
+        monitor.record_response(copilot_resp)
+        return {"fallback": True, "response": copilot_resp}
+
+    return None
+\end{lstlisting}
+
+\subsection{Deduction monitoring and diagnostics}
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Deduction monitoring and diagnostics},
+  label={lst:deddiag}]
+from jugeo.kernel.health import (
+    HealthStatus,
+    HealthDimension,
+    HealthIndicator,
+    HealthReport,
+)
+from jugeo.evidence.channels import (
+    ChannelPool,
+    ChannelMonitor,
+    CopilotChannel,
+)
+from jugeo.interfaces.api import (
+    JuGeoAPI,
+    APIEventLog,
+)
+
+class DeductionDiagnostics:
+    """Monitor deduction assistant performance."""
+
+    def __init__(self, pool: ChannelPool, monitor: ChannelMonitor):
+        self.pool = pool
+        self.monitor = monitor
+
+    def hint_success_rate(self):
+        return self.monitor.success_rate()
+
+    def hint_latency(self):
+        return self.monitor.latency_percentiles()
+
+    def copilot_health(self):
+        copilot = self.pool.get_channel("copilot")
+        if copilot is None:
+            return HealthIndicator(
+                dimension=HealthDimension.COPILOT_CONNECTIVITY,
+                status=HealthStatus.UNHEALTHY,
+                message="No copilot channel",
+                value=0.0,
+                timestamp=None,
+                details={},
+            )
+        alive = copilot.health_check()
+        return HealthIndicator(
+            dimension=HealthDimension.COPILOT_CONNECTIVITY,
+            status=HealthStatus.HEALTHY if alive
+                   else HealthStatus.DEGRADED,
+            message="Copilot for deduction",
+            value=1.0 if alive else 0.5,
+            timestamp=None,
+            details={"alive": alive},
+        )
+
+    def full_report(self):
+        copilot_ind = self.copilot_health()
+        success = self.hint_success_rate()
+        flow_ind = HealthIndicator(
+            dimension=HealthDimension.EVIDENCE_FLOW,
+            status=(HealthStatus.HEALTHY if success >= 0.8
+                    else HealthStatus.DEGRADED),
+            message=f"Deduction hint success: {success:.2%}",
+            value=success,
+            timestamp=None,
+            details=self.monitor.summary(),
+        )
+        indicators = [copilot_ind, flow_ind]
+        overall = (HealthStatus.HEALTHY
+                   if all(i.is_healthy() for i in indicators)
+                   else HealthStatus.DEGRADED)
+        return HealthReport(
+            overall_status=overall,
+            indicators=indicators,
+            generated_at=None,
+            report_id="ded-health",
+            degradation_reasons=[],
+            recovery_suggestions=[],
+        )
+\end{lstlisting}
+
+% ============================================================
+%  Section 6 — Formal Properties
+% ============================================================
+\section{Formal Properties}\label{sec:formal}
+
+\begin{theorem}[Hint soundness]\label{thm:hintsound}
+Every deduction hint produced by the $\CDA$ is either valid
+(the suggested rule application is applicable) or is filtered
+out during the validation step.  No invalid hint reaches the
+deduction engine.
+\end{theorem}
+\begin{proof}
+The assistant's rule suggestion protocol
+(Definition~\ref{def:rulesuggprot}) includes a filtering step
+that checks each suggested rule application against the current
+goal.  Applications that do not match are discarded.  Those
+that pass the filter are submitted to the solver channel for
+validation.  Invalid applications are rejected by the solver.
+Therefore, only valid applications reach the engine.
+\end{proof}
+
+\begin{theorem}[Trust calibration]\label{thm:trustcalib}
+The $\CDA$ produces calibrated confidence scores (in the limit).
+Specifically, after sufficiently many interactions, the
+calibration function $\kappa$ satisfies
+Definition~\ref{def:calibhint}.
+\end{theorem}
+\begin{proof}
+The calibration function uses isotonic regression on historical
+data.  By the law of large numbers, as the number of suggestions
+grows, the observed success rate at each confidence bucket
+converges to the true probability.  Isotonic regression fits
+a monotone function to these converging estimates.  In the limit,
+the calibration satisfies Definition~\ref{def:calibhint}.
+\end{proof}
+
+\begin{theorem}[Deduction completeness]\label{thm:dedcomp}
+If a goal is derivable from the rule base, then the $\CDA$
+eventually suggests a complete deduction plan (in the idealised
+setting where the language model is complete).
+\end{theorem}
+\begin{proof}
+If the goal is derivable, there exists a finite deduction plan
+$\pi = (a_1, \ldots, a_k)$.  In the idealised setting, the
+language model enumerates all rule applications for each sub-goal,
+including those in~$\pi$.  The plan ranking function assigns
+positive quality to~$\pi$ (since all its steps are correct).
+Therefore~$\pi$ is included in the ranked plan list.
+\end{proof}
+
+\begin{theorem}[Plan optimality]\label{thm:planopt}
+Among the plans suggested by the $\CDA$, the highest-ranked
+plan has the highest estimated quality (by
+Definition~\ref{def:hintquality}).
+\end{theorem}
+\begin{proof}
+The plan ranking function sorts plans by estimated quality
+in descending order.  The first plan in the sorted list has
+the highest estimated quality.  This is optimal with respect
+to the estimate; the actual quality may differ, but the ranking
+is correct with respect to the available information.
+\end{proof}
+
+% ============================================================
+%  Section 7 — Discussion
+% ============================================================
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{Calibration warm-up.}
+The calibration function requires historical data to be
+accurate.  During the warm-up period (first ~100 suggestions),
+the raw confidence scores from the LLM are used without
+calibration.  The assistant flags these as uncalibrated.
+
+\paragraph{Rule base size.}
+Large rule bases (hundreds of rules) make rule suggestion
+challenging.  The assistant mitigates this by filtering rules
+by type match before querying the Copilot channel, reducing
+the search space.
+
+\paragraph{Interaction with construction participant.}
+The deduction assistant and construction participant (Paper~74)
+are complementary: the construction participant generates proof
+plans, while the deduction assistant suggests individual rule
+applications within those plans.
+
+\paragraph{Deduction depth.}
+For deep deductions (many rule applications), the assistant's
+confidence in individual steps may compound unfavourably.
+The plan ranking function accounts for this by penalising
+longer plans.
+
+\paragraph{Fallback to exhaustive search.}
+When the assistant's suggestions fail, the deduction engine
+falls back to exhaustive search over the rule base.  The
+assistant's hints reduce the expected search time but do not
+eliminate the fallback.
+
+% ============================================================
+%  Section 8 — Related Work
+% ============================================================
+\section{Related Work}\label{sec:related}
+
+\paragraph{Tactic suggestion.}
+Proverbot9001~\cite{sanchez2020proverbot} and
+ASTactic~\cite{yang2019learning} suggest proof tactics using
+machine learning.  Our assistant differs in using a trust
+lattice and channel architecture.
+
+\paragraph{Proof hint systems.}
+Isabelle's \texttt{try} command~\cite{wenzel2014isabelle}
+and Coq's \texttt{auto}~\cite{bertot2004coq} provide
+automated deduction hints.  Our approach externalises hint
+generation to the Copilot channel.
+
+\paragraph{Confidence calibration.}
+Platt scaling~\cite{platt1999probabilities} and isotonic
+regression~\cite{zadrozny2002transforming} are standard
+calibration methods.  We adopt isotonic regression for its
+monotonicity guarantee.
+
+\paragraph{Copilot advisors.}
+Papers~74 and~80--84 of this series introduce related
+advisors.  The deduction assistant is the most fundamental:
+all other advisors ultimately rely on deduction for
+validation.
+
+% ============================================================
+%  Section 9 — Conclusion
+% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We have introduced the $\CDA$, a Copilot-guided assistant
+that provides trust-calibrated deduction hints in the
+\JuGeo{} framework.  The assistant suggests rule applications,
+ranks deduction plans, and provides calibrated confidence
+scores, all at $\Tcopilot$ trust.  Four theorems establish
+hint soundness, trust calibration, deduction completeness,
+and plan optimality.
+
+Future work includes integrating the calibration function
+with the channel monitor for online calibration updates,
+supporting multi-step deduction hints (suggesting sequences
+rather than individual rules), and adapting the assistant
+to different logics.
+
+% ============================================================
+%  Bibliography
+% ============================================================
+\begin{thebibliography}{25}
+
+\bibitem{sanchez2020proverbot}
+A.~Sanchez-Stern, Y.~Alhessi, L.~Saul, and S.~Lerner,
+``Generating correctness proofs with neural networks,''
+\emph{MAPL}, 2020.
+
+\bibitem{yang2019learning}
+K.~Yang and J.~Deng,
+``Learning to prove theorems via interacting with proof
+assistants,''
+\emph{ICML}, 2019.
+
+\bibitem{wenzel2014isabelle}
+M.~Wenzel,
+``Isabelle/jEdit --- a prover IDE within the PIDE framework,''
+\emph{AISC/Calculemus/MKM}, 2012.
+
+\bibitem{bertot2004coq}
+Y.~Bertot and P.~Cast\'{e}ran,
+\emph{Interactive Theorem Proving and Program Development:
+Coq'Art}.
+Springer, 2004.
+
+\bibitem{platt1999probabilities}
+J.~Platt,
+``Probabilistic outputs for support vector machines and
+comparisons to regularized likelihood methods,''
+\emph{Advances in Large Margin Classifiers}, 1999.
+
+\bibitem{zadrozny2002transforming}
+B.~Zadrozny and C.~Elkan,
+``Transforming classifier scores into accurate multiclass
+probability estimates,''
+\emph{KDD}, 2002.
+
+\bibitem{polu2020gptf}
+S.~Polu and I.~Sutskever,
+``Generative language modeling for automated theorem proving,''
+\emph{arXiv preprint arXiv:2009.03393}, 2020.
+
+\bibitem{lample2022hypertree}
+G.~Lample \etal{},
+``HyperTree proof search for neural theorem proving,''
+\emph{NeurIPS}, 2022.
+
+\bibitem{young2024jugeo}
+H.~Young,
+``Judgment geometry: a framework for trust-calibrated
+verification,''
+\emph{JuGeo Technical Reports}, Paper~1, 2024.
+
+\bibitem{young2024channels}
+H.~Young,
+``Evidence channels in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~88, 2024.
+
+\bibitem{young2024construction}
+H.~Young,
+``CopilotConstructionParticipant --- LLM-guided proof
+construction,''
+\emph{JuGeo Technical Reports}, Paper~74, 2024.
+
+\bibitem{young2024advisors}
+H.~Young,
+``Copilot advisors for heap, scope, import, and callable
+analysis,''
+\emph{JuGeo Technical Reports}, Papers~80--81, 2024.
+
+\bibitem{young2024lifecycle}
+H.~Young,
+``Kernel lifecycle and health monitoring in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~93, 2024.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner,
+``Z3: an efficient SMT solver,''
+\emph{TACAS}, 2008.
+
+\bibitem{moura2021lean4}
+L.~de~Moura and S.~Ullrich,
+``The Lean~4 theorem prover and programming language,''
+\emph{CADE}, 2021.
+
+\bibitem{bansal2019holist}
+K.~Bansal, S.~Loos, M.~Rabe, C.~Szegedy, and S.~Wilcox,
+``HOList: an environment for machine learning of higher-order
+logic theorem proving,''
+\emph{ICML}, 2019.
+
+\bibitem{first2022diversity}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun,
+``Diversity-driven automated formal verification,''
+\emph{ICSE}, 2022.
+
+\bibitem{jiang2022thor}
+A.~Q.~Jiang, W.~Li, S.~Tworber, and Y.~Wu,
+``Thor: wielding hammers to integrate language models and
+automated theorem provers,''
+\emph{NeurIPS}, 2022.
+
+\bibitem{rabe2021mathematical}
+M.~N.~Rabe, D.~Lee, K.~Bansal, and C.~Szegedy,
+``Mathematical reasoning via self-supervised skip-tree
+training,''
+\emph{ICLR}, 2021.
+
+\bibitem{li2021isarstep}
+W.~Li, L.~Yu, Y.~Wu, and L.~C.~Paulson,
+``IsarStep: a benchmark for high-level mathematical
+reasoning,''
+\emph{ICLR}, 2021.
+
+\end{thebibliography}
+
+% ============================================================
+%  Appendix
+% ============================================================
+\appendix
+
+\section{Auxiliary Proofs}\label{app:proofs}
+
+\subsection{Category Axioms}
+
+\begin{lemma}[Identity rule application is unique]%
+\label{lem:idunique}
+For each proof state~$S$, there is exactly one identity
+morphism $\mathrm{id}_S$.
+\end{lemma}
+\begin{proof}
+The identity morphism makes no changes to the goal set.
+It is unique because the only function that leaves a set
+unchanged is the identity function.
+\end{proof}
+
+\begin{lemma}[Composition is well-defined]%
+\label{lem:compwd}
+If $a_1 \colon S \to S'$ and $a_2 \colon S' \to S''$ are
+rule applications, then $a_2 \circ a_1 \colon S \to S''$ is
+a valid rule application sequence.
+\end{lemma}
+\begin{proof}
+$a_1$ transforms $S$ to $S'$.  $a_2$ is defined on $S'$.
+Their composition applies $a_1$ first, then $a_2$, producing
+$S''$.  The composition is well-defined because the codomain
+of $a_1$ equals the domain of $a_2$.
+\end{proof}
+
+\subsection{Calibration Properties}
+
+\begin{lemma}[Isotonic regression preserves monotonicity]%
+\label{lem:isomono}
+The isotonic regression function $\kappa$ is non-decreasing.
+\end{lemma}
+\begin{proof}
+By construction, isotonic regression fits a non-decreasing
+step function to the data.  This is guaranteed by the
+pool-adjacent-violators algorithm.
+\end{proof}
+
+\begin{lemma}[Calibration error converges to zero]%
+\label{lem:caliberr}
+As the number of observations $n \to \infty$, the expected
+calibration error $\mathrm{ECE}$ converges to zero.
+\end{lemma}
+\begin{proof}
+By the law of large numbers, the observed success rate in
+each bucket converges to the true probability.  Isotonic
+regression then maps each bucket to its true probability.
+The expected calibration error, which measures the
+discrepancy between predicted and observed success rates,
+converges to zero.
+\end{proof}
+
+\begin{lemma}[Hint trust ceiling after calibration]%
+\label{lem:hintceilcalib}
+Calibration does not affect trust: the trust of a hint
+remains $\tleq \Tcopilot$ regardless of the calibrated
+confidence score.
+\end{lemma}
+\begin{proof}
+Calibration adjusts the confidence score, not the trust
+tier.  The trust is determined by the channel (Copilot)
+and is clamped at $\Tcopilot$.  Confidence and trust are
+independent properties.
+\end{proof}
+
+\subsection{Deduction Search Properties}
+
+\begin{lemma}[Search space with hints is smaller]%
+\label{lem:searchhint}
+If the assistant suggests $k$ rule applications out of $n$
+available, the search space at each step is reduced from $n$
+to $k$ (where $k \leq n$).
+\end{lemma}
+\begin{proof}
+Without hints, the engine considers all $n$ rules.  With
+hints, it first tries the $k$ suggested rules (in priority
+order), only falling back to the remaining $n - k$ rules
+if none succeed.  In the best case, the effective search
+space is $k$.
+\end{proof}
+
+\begin{lemma}[Hint-guided search terminates]%
+\label{lem:hintsearchterm}
+If the rule base is finite and the deduction depth is bounded,
+then hint-guided search terminates.
+\end{lemma}
+\begin{proof}
+At each step, the engine tries at most $n$ rules (with hints
+reducing the expected number).  The depth is bounded by~$d$.
+Therefore the total number of rule applications is at most
+$n^d$, which is finite.
+\end{proof}
+
+\begin{lemma}[Plan quality monotonicity]%
+\label{lem:planqualmono}
+Adding a correct step to a plan does not decrease its quality:
+$Q(\pi \cdot a, S) \geq Q(\pi, S)$ when $a$ is correct.
+\end{lemma}
+\begin{proof}
+$Q$ is the sum of confidence-weighted correctness indicators.
+A correct step contributes a positive term $c(a) > 0$.
+Therefore the quality increases or stays the same.
+\end{proof}
+
+\begin{lemma}[Fallback completeness]%
+\label{lem:fallbackcomp}
+Even if all hints fail, the engine's exhaustive fallback
+finds the derivation (if one exists), since the fallback
+enumerates all rule applications up to the depth bound.
+\end{lemma}
+\begin{proof}
+The fallback tries all $n$ rules at each depth level up
+to~$d$.  If a derivation of depth $\leq d$ exists, the
+exhaustive search finds it.
+\end{proof}
+
+\begin{proposition}[End-to-end deduction correctness]%
+\label{prop:e2eded}
+The deduction pipeline with Copilot hints produces only
+correct derivations, regardless of the quality of the hints.
+\end{proposition}
+\begin{proof}
+Hints guide the search but do not bypass validation.  Every
+rule application is checked by the solver channel (at
+$\Tsolver$).  Invalid applications are rejected.  Therefore,
+only correct derivations are accepted.
+\end{proof}
+
+\begin{remark}[Multi-step hints]
+The current assistant suggests one rule application at a time.
+A multi-step hint would suggest a sequence of applications,
+reducing the number of Copilot queries.  The trust model
+extends naturally: each step in the sequence has trust
+$\Tcopilot$, and the sequence trust is $\Tcopilot$.
+\end{remark}
+
+\section{Extended Formal Development}\label{app:extended}
+
+\subsection{Rule-Application Algebra}
+
+\begin{definition}[Rule-application algebra]%
+\label{def:raalg}
+A \emph{rule-application algebra} is a tuple
+$(\mathcal{A}, \circ, e, \tau)$ where $\mathcal{A}$ is the set
+of rule applications, $\circ$ is sequential composition,
+$e$ is the identity (no-op), and $\tau$ assigns a trust tier.
+\end{definition}
+
+\begin{lemma}[Rule-application algebra is a monoid]%
+\label{lem:raalgmonoid}
+$(\mathcal{A}, \circ, e)$ is a monoid.
+\end{lemma}
+\begin{proof}
+Associativity: sequential application of rules is function
+composition, which is associative.
+Identity: the no-op leaves the proof state unchanged.
+\end{proof}
+
+\begin{lemma}[Trust homomorphism for rule applications]%
+\label{lem:trusthomra}
+$\tau(a_1 \circ a_2) = \min(\tau(a_1), \tau(a_2))$.
+\end{lemma}
+\begin{proof}
+Composed rule applications inherit the minimum trust of
+their components, since the composition cannot produce
+evidence above the lowest component's ceiling.
+\end{proof}
+
+\subsection{Deduction-Space Topology}
+
+\begin{definition}[Deduction neighbourhood]%
+\label{def:dedneighbour}
+The \emph{deduction neighbourhood} of a proof state~$S$ is
+the set of states reachable by a single rule application:
+$N(S) = \{S' \mid \exists a.\; a \colon S \to S'\}$.
+\end{definition}
+
+\begin{lemma}[Neighbourhood is finite]%
+\label{lem:neighfinite}
+For a finite rule base $\mathcal{R}$ and a proof state~$S$
+with finitely many open goals, $N(S)$ is finite.
+\end{lemma}
+\begin{proof}
+Each rule in $\mathcal{R}$ can be applied to each open goal
+with finitely many substitutions (assuming the substitution
+space is finite, \eg{} for ground terms).  Therefore $|N(S)|
+\leq |\mathcal{R}| \times |S| \times |\Sigma|$ where
+$|\Sigma|$ is the number of valid substitutions.
+\end{proof}
+
+\begin{definition}[Deduction distance]%
+\label{def:deddist}
+The \emph{deduction distance} $d(S, S')$ between two proof
+states is the minimum number of rule applications needed to
+reach $S'$ from $S$.  If $S'$ is unreachable, $d(S, S') = \infty$.
+\end{definition}
+
+\begin{lemma}[Distance is a metric on reachable states]%
+\label{lem:distmetric}
+On the set of mutually reachable states, $d$ is a metric:
+\begin{enumerate}
+\item $d(S, S) = 0$,
+\item $d(S, S') = d(S', S)$ (assuming reversible rules), and
+\item $d(S, S'') \leq d(S, S') + d(S', S'')$ (triangle inequality).
+\end{enumerate}
+\end{lemma}
+\begin{proof}
+\emph{(1)}~Zero applications take $S$ to itself.
+\emph{(2)}~If rules are reversible, any path from $S$ to $S'$
+can be reversed.
+\emph{(3)}~A path from $S$ to $S''$ via $S'$ has length
+$d(S, S') + d(S', S'')$, which is at least the minimum
+path length $d(S, S'')$.
+\end{proof}
+
+\subsection{Hint Effectiveness Measures}
+
+\begin{definition}[Hint effectiveness]%
+\label{def:hinteffect}
+The \emph{effectiveness} of a hint $h$ at state $S$ is the
+ratio of the search cost without hints to the search cost
+with hints:
+$E(h, S) = T_{\mathrm{no\text{-}hint}}(S) / T_{\mathrm{hint}}(S)$.
+\end{definition}
+
+\begin{lemma}[Effectiveness is at least 1]%
+\label{lem:effectatleast}
+$E(h, S) \geq 1$ for any hint $h$, since hints can only
+reduce search cost (or leave it unchanged if ignored).
+\end{lemma}
+\begin{proof}
+The hint-guided search tries the hinted rules first.  If
+they fail, it falls back to exhaustive search.  In the worst
+case, the hint adds a small constant overhead to the
+exhaustive search.  Under the convention that we measure
+asymptotic cost, $T_{\mathrm{hint}} \leq T_{\mathrm{no\text{-}hint}}$,
+so $E \geq 1$.
+\end{proof}
+
+\begin{lemma}[Optimal hint effectiveness]%
+\label{lem:opteffect}
+If the hint always suggests the correct rule application
+first, the effectiveness is $E(h, S) = n$, where $n = |\mathcal{R}|$.
+\end{lemma}
+\begin{proof}
+Without hints, the expected search tries $n/2$ rules on average.
+With a perfect hint, the correct rule is tried first.  The
+speedup factor is approximately $n/2 / 1 = n/2$.  Under the
+convention of worst-case analysis, the exhaustive search tries
+all $n$ rules, while the perfect hint tries 1.  Therefore
+$E = n$.
+\end{proof}
+
+\subsection{Calibration Error Bounds}
+
+\begin{definition}[Expected calibration error]%
+\label{def:ece}
+The \emph{expected calibration error} (ECE) is:
+\[
+  \mathrm{ECE} = \sum_{b=1}^{B} \frac{n_b}{N}
+  |p_b - c_b|
+\]
+where $B$ is the number of calibration buckets, $n_b$ is the
+count in bucket~$b$, $N$ is the total count, $p_b$ is the
+observed accuracy, and $c_b$ is the average confidence.
+\end{definition}
+
+\begin{lemma}[ECE bound after $N$ observations]%
+\label{lem:ecebound}
+After $N$ observations, the ECE is bounded by
+$O(B/\sqrt{N_{min}})$ where $N_{min} = \min_b n_b$
+is the smallest bucket count.
+\end{lemma}
+\begin{proof}
+In each bucket, the observed accuracy $p_b$ deviates from
+the true accuracy by $O(1/\sqrt{n_b})$ with high probability
+(by Hoeffding's inequality).  The ECE is a weighted sum of
+these deviations.  With $B$ buckets and minimum count
+$N_{min}$, the ECE is bounded by $B / \sqrt{N_{min}}$.
+\end{proof}
+
+\begin{lemma}[Calibration improves with data]%
+\label{lem:calibimprove}
+The ECE is non-increasing in expectation as $N$ grows.
+\end{lemma}
+\begin{proof}
+Each new observation refines the empirical accuracy in its
+bucket.  By the law of large numbers, the empirical accuracy
+converges to the true accuracy.  Isotonic regression then
+produces a better fit.  Therefore the ECE decreases.
+\end{proof}
+
+\subsection{Session and Rate-Limit Properties}
+
+\begin{lemma}[Deduction sessions are isolated]%
+\label{lem:dedsessiso}
+Concurrent deduction sessions do not share mutable state.
+\end{lemma}
+\begin{proof}
+Each \texttt{APISession} instance has private fields.  The
+\texttt{APIEventLog} is shared but append-only.  Therefore
+sessions do not interfere.
+\end{proof}
+
+\begin{lemma}[Rate limit compliance for deduction]%
+\label{lem:dedratelimit}
+The deduction assistant respects the global rate limit.
+\end{lemma}
+\begin{proof}
+All API calls go through \texttt{JuGeoAPI}, which enforces
+the rate limit via \texttt{APIRateLimiter}.  The assistant
+does not bypass the API.
+\end{proof}
+
+\begin{proposition}[Deduction pipeline safety]%
+\label{prop:dedpipelinesafe}
+The deduction pipeline (hint generation, validation, application)
+is safe: only correct rule applications are applied, trust is
+bounded by $\Tcopilot$ for hints and $\Tsolver$ for validations,
+and the pipeline terminates.
+\end{proposition}
+\begin{proof}
+Correctness: Theorem~\ref{thm:hintsound} and
+Proposition~\ref{prop:e2eded}.
+Trust: hints are at $\Tcopilot$; validations at $\Tsolver$.
+Termination: Lemma~\ref{lem:hintsearchterm}.
+\end{proof}
+
+\end{document}

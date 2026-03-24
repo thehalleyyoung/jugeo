@@ -380,12 +380,26 @@ def main():
         "hot_reload": "Reload",
     }
 
+    total_tracked = 0
+    total_elevated = 0
+
     for kind, prefix in kind_macro_map.items():
         d = kind_data[kind]
+        rate = d["elevated"] / d["tracked"] if d["tracked"] > 0 else 0.0
+        med = safe_median(d["overhead_times"])
+        p95 = percentile_95(d["overhead_times"])
         m(f"{prefix}Tracked", d["tracked"])
         m(f"{prefix}Elevated", d["elevated"])
-        p95 = percentile_95(d["overhead_times"])
+        m(f"{prefix}Rate", fmt_pct(rate))
+        m(f"{prefix}Median", fmt_time(med))
         m(f"{prefix}Pctile", fmt_time(p95))
+        total_tracked += d["tracked"]
+        total_elevated += d["elevated"]
+
+    total_rate = total_elevated / total_tracked if total_tracked > 0 else 0.0
+    m("TotalTracked", total_tracked)
+    m("TotalElevated", total_elevated)
+    m("TotalRate", fmt_pct(total_rate))
 
     tex_path = os.path.join(ROOT, "papers", "data-paper48.tex")
     with open(tex_path, "w") as f:

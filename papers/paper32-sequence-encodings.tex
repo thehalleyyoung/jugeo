@@ -3,6 +3,7 @@
 \documentclass[11pt]{article}
 \input{jugeo-common}
 \input{experiment-data}
+\input{data-paper32}
 
 \title{\textbf{Sequence and Mutation Encodings:\\
 Verifying Python Lists, Dicts, and Mutable State}}
@@ -67,17 +68,15 @@ Verifying Python Lists, Dicts, and Mutable State}}
 \maketitle
 
 \begin{abstract}
-Mutable collections---Python lists, dicts, and sets---are the dominant source
-of verification difficulty in imperative Python programs.  Unlike integers or
-booleans, their semantics couple together \emph{structural} changes (length,
-keyspace) with \emph{value} changes (element reassignment), and their
-\emph{aliasing} behaviour means a single mutation may silently update multiple
-program variables.  We present the \JuGeo{} sequence and mutation encoding
-framework, implemented in
-\texttt{sequence\_mutation\_encodings} and \texttt{collection\_heap\_encodings},
-which translates Python mutable-collection operations into the quantifier-free
-theory of arrays (\QFARRAY{}) augmented with the theory of uninterpreted
-functions (\QFUF{}).  The encoding consists of four layers:
+Mutable collections---Python lists, dicts, and sets---are a major source
+of verification difficulty in imperative Python programs.  We present a
+JuGeo sequence/mutation encoding framework that translates benchmarked
+collection operations into solver-friendly constraints.  The audited
+empirical claim is limited to the repository benchmark: across 10
+programs, the measured encode/solve agreement is 100.0\% for the listed
+operations, with overall mean encode and solve times of
+\ppXXXIIOverallEnc{} and \ppXXXIIOverallSolve{} respectively.  The
+encoding consists of four layers:
 (i) a \emph{sequence model} mapping each Python list to a Z3 array with an
 associated integer-valued length variable;
 (ii) a \emph{mutation semantics} expressing \texttt{append}, \texttt{insert},
@@ -89,8 +88,8 @@ footprint calculus.  We prove the \emph{Mutation Soundness Theorem}: every
 admissible Python list operation corresponds to a satisfiable SMT formula
 under our encoding, and unsatisfiability witnesses precisely rule out
 impossible Python states.  Evaluation on \numcases{} benchmark programs
-shows a median encoding time of \medtime{} per file and \expAccuracy{} verification accuracy
-rate with a reference CPython interpreter on reachability queries.
+shows 100.0\% encode/solve agreement with the reference interpreter on
+the audited benchmark operations.
 \end{abstract}
 
 \section*{Keywords}
@@ -261,6 +260,25 @@ We define a grammar of admissible Python sequence operations:
 \]
 where $v : S$ is a value, $i,j,k : \mathbb{Z}$ are index expressions.
 
+\begin{lstlisting}[language=Python, caption={Encoding sequence mutations into Z3 SMT formulas using the \JuGeo{} API.}]
+from jugeo.geometry import SiteBuilder
+
+# A module containing list-mutation-heavy functions
+code = open("list_algorithms.py").read()
+site = SiteBuilder(code).build()
+
+print(f"Coordinates: {site.coordinate_count()}")
+print(f"Morphisms:   {site.morphism_count()}")
+
+# Encode the site into a solver-ready representation
+solver_data = site.encode_for_solver()
+print(f"SMT fragment:        {solver_data['smt_fragment']}")
+print(f"Array variables:     {solver_data['array_var_count']}")
+print(f"Length constraints:  {solver_data['length_constraint_count']}")
+print(f"Mutation assertions: {solver_data['mutation_assertion_count']}")
+print(f"Frame conditions:    {solver_data['frame_condition_count']}")
+\end{lstlisting}
+
 \subsection{Pre/post-state encoding}
 
 Each operation $o$ transforms a sequence encoding
@@ -329,6 +347,170 @@ the universal is unrolled over a finite \emph{window} $[lo, hi)$ extracted
 from the program context.  For arrays of statically-known length $\leq
 \texttt{MAX\_UNROLL}$ (default: 64), this produces a ground formula in
 \QFLIA{}.
+
+\subsection{Worked example: append--pop sequence}\label{sec:workedexample}
+
+We illustrate the full encoding on a concrete Python program that performs
+an \MutApp{} followed by a \MutPop{}.
+
+\paragraph{Source program.}
+\begin{lstlisting}[language=Python, caption={Source program for the worked example: append followed by pop.}]
+xs = [10, 20, 30]
+xs.append(42)
+result = xs.pop(1)
+# Post-state: xs = [10, 30, 42], result = 20
+\end{lstlisting}
+
+\paragraph{Step 1: Initial encoding.}
+The list literal \lstinline[style=jugeo-python]{[10, 20, 30]} is encoded as
+the initial state $E_0 = (\arrvar{0}, \lenvar{0}, \defval)$ with the
+following ground constraints:
+\begin{align}
+  \lenvar{0} &= 3 \tag{Init-Len}\\
+  \arrvar{0}[0] &= 10 \tag{Init-Elem-A}\\
+  \arrvar{0}[1] &= 20 \tag{Init-Elem-B}\\
+  \arrvar{0}[2] &= 30 \tag{Init-Elem-C}\\
+  \forall \idx.\; (\idx < 0 \vee \idx \geq 3)
+    &\Rightarrow \arrvar{0}[\idx] = \defval \tag{Init-OOB}
+\end{align}
+
+\paragraph{Step 2: Encoding \MutApp(42).}
+Applying Definition~\ref{def:append} with $v = 42$, we obtain the post-state
+$E_1 = (\arrvar{1}, \lenvar{1}, \defval)$:
+\begin{align}
+  \lenvar{1} &= \lenvar{0} + 1 = 4 \tag{WE-App-Len}\\
+  \arrvar{1}[\lenvar{0}] &= \arrvar{1}[3] = 42 \tag{WE-App-New}\\
+  \forall \idx.\; 0 \leq \idx < 3
+    &\Rightarrow \arrvar{1}[\idx] = \arrvar{0}[\idx] \tag{WE-App-Frame}
+\end{align}
+Since $\lenvar{0} = 3$ is concrete, the frame condition~(WE-App-Frame) is
+unrolled into three ground equalities:
+\[
+  \arrvar{1}[0] = 10 \;\wedge\;
+  \arrvar{1}[1] = 20 \;\wedge\;
+  \arrvar{1}[2] = 30
+\]
+The intermediate state is thus
+$\arrvar{1} = \{0 \mapsto 10,\; 1 \mapsto 20,\; 2 \mapsto 30,\;
+3 \mapsto 42\}$ with $\lenvar{1} = 4$.
+
+\paragraph{Step 3: Encoding \MutPop(1).}
+Applying Definition~\ref{def:pop} with $k = 1$ to $E_1$, we obtain the
+post-state $E_2 = (\arrvar{2}, \lenvar{2}, \defval)$ and the return value
+$r = \arrvar{1}[1]$:
+\begin{align}
+  r &= \arrvar{1}[1] = 20 \tag{WE-Pop-Ret}\\
+  \lenvar{2} &= \lenvar{1} - 1 = 3 \tag{WE-Pop-Len}\\
+  \forall \idx.\; 1 \leq \idx < 3
+    &\Rightarrow \arrvar{2}[\idx] = \arrvar{1}[\idx + 1] \tag{WE-Pop-Shift}\\
+  \forall \idx.\; 0 \leq \idx < 1
+    &\Rightarrow \arrvar{2}[\idx] = \arrvar{1}[\idx] \tag{WE-Pop-Frame}
+\end{align}
+With concrete indices, (WE-Pop-Shift) becomes:
+\[
+  \arrvar{2}[1] = \arrvar{1}[2] = 30 \quad\wedge\quad
+  \arrvar{2}[2] = \arrvar{1}[3] = 42
+\]
+and (WE-Pop-Frame) yields $\arrvar{2}[0] = \arrvar{1}[0] = 10$.  The final
+state is $\arrvar{2} = \{0 \mapsto 10,\; 1 \mapsto 30,\; 2 \mapsto 42\}$
+with $\lenvar{2} = 3$ and return value $r = 20$.
+
+\paragraph{Step 4: Verification.}
+We ask Z3 to check the conjunction
+$\Phi = \Phi_{\MutApp} \wedge \Phi_{\MutPop} \wedge \phi_{\mathrm{post}}$,
+where $\phi_{\mathrm{post}}$ asserts the expected post-condition:
+\[
+  \phi_{\mathrm{post}} \;\equiv\;
+  \lenvar{2} = 3 \;\wedge\;
+  \arrvar{2}[0] = 10 \;\wedge\;
+  \arrvar{2}[1] = 30 \;\wedge\;
+  \arrvar{2}[2] = 42 \;\wedge\;
+  r = 20
+\]
+Z3 returns \texttt{sat} with a model that agrees on all variables.  To verify
+that no \emph{other} post-state is possible, we negate $\phi_{\mathrm{post}}$
+and check unsatisfiability:
+\[
+  \Phi \;\wedge\; \neg\phi_{\mathrm{post}} \quad\text{is \texttt{unsat}}
+\]
+This confirms that the encoding deterministically maps the input program to
+its unique post-state.
+
+\paragraph{Observations.}
+The worked example demonstrates three key aspects of the encoding:
+\begin{enumerate}[label=(\alph*),nosep]
+  \item \emph{Compositionality}: each operation adds constraints
+        independently, and the conjunction yields the composite semantics.
+  \item \emph{Frame precision}: the frame conditions for \MutApp{} and
+        \MutPop{} together preserve exactly the elements outside both
+        supports.
+  \item \emph{Return-value extraction}: the pop return value is captured
+        as an auxiliary variable $r$ constrained by the pre-state array.
+\end{enumerate}
+
+\subsection{Unified encoding function}\label{sec:encfunc}
+
+The definitions in \S\ref{sec:mutsemantics} can be unified into a single
+\emph{encoding function} $\mathcal{E}$ that maps each operation and its
+arguments to a Z3 formula relating pre- and post-states.
+
+\begin{definition}[Encoding Function]\label{def:encfunc}
+The \emph{encoding function}
+$\mathcal{E} : \MutOp \times \SeqEnc{S} \to
+(\mathrm{Formula} \times \SeqEnc{S})$
+is defined by case analysis on the operation:
+\begin{align*}
+  \mathcal{E}(\MutApp(v),\; E) &= \bigl(\,
+    \poststate{\lenvar{}} = \prestate{\lenvar{}} + 1 \;\wedge\;
+    \poststate{\arrvar{}}[\prestate{\lenvar{}}] = v \;\wedge\;
+    \Frame{\MutApp}{E},\; \poststate{E}\,\bigr)
+  \\[4pt]
+  \mathcal{E}(\MutIns(k,v),\; E) &= \bigl(\,
+    \poststate{\lenvar{}} = \prestate{\lenvar{}} + 1 \;\wedge\;
+    \poststate{\arrvar{}}[k] = v \;\wedge\;
+    \mathsf{shift}^{+}(k) \;\wedge\;
+    \Frame{\MutIns}{E},\; \poststate{E}\,\bigr)
+  \\[4pt]
+  \mathcal{E}(\MutPop(k),\; E) &= \bigl(\,
+    \poststate{\lenvar{}} = \prestate{\lenvar{}} - 1 \;\wedge\;
+    \mathsf{shift}^{-}(k) \;\wedge\;
+    \Frame{\MutPop}{E},\; \poststate{E}\,\bigr)
+  \\[4pt]
+  \mathcal{E}(\MutAssign(k,v),\; E) &= \bigl(\,
+    \poststate{\lenvar{}} = \prestate{\lenvar{}} \;\wedge\;
+    \poststate{\arrvar{}} = \mathsf{store}(\prestate{\arrvar{}},k,v),\;
+    \poststate{E}\,\bigr)
+  \\[4pt]
+  \mathcal{E}(\MutSlice(lo,hi,1),\; E) &= \bigl(\,
+    \lenvar{}' = hi - lo \;\wedge\;
+    \mathsf{copy}(lo,\lenvar{}'),\; E'\,\bigr)
+\end{align*}
+where $\mathsf{shift}^{+}(k)$ denotes the right-shift universal from
+Definition~\ref{def:insert}, $\mathsf{shift}^{-}(k)$ the left-shift from
+Definition~\ref{def:pop}, and $\mathsf{copy}(lo,n)$ the element-copy from
+Definition~\ref{def:slice}.
+\end{definition}
+
+The encoding function satisfies a \emph{compositionality property}: for a
+sequence of operations $o_1; o_2$,
+\[
+  \mathcal{E}(o_1; o_2,\; E)
+  \;=\;
+  \text{let } (\Phi_1, E_1) = \mathcal{E}(o_1, E) \text{ in }
+  \text{let } (\Phi_2, E_2) = \mathcal{E}(o_2, E_1) \text{ in }
+  (\Phi_1 \wedge \Phi_2,\; E_2)
+\]
+This sequential composition is realized in the implementation by the
+\texttt{encode\_mutation\_chain} method, which threads the post-state
+encoding through a list of operations.
+
+\begin{proposition}[Guard Preservation]\label{prop:guardpres}
+If operation $o_1$ has guard $G_1$ and $o_2$ has guard $G_2$, then the
+composed encoding $\mathcal{E}(o_1; o_2, E)$ includes the assertion
+$G_1(\prestate{E}) \wedge G_2(E_1)$.  If $G_2$ depends on the length
+(e.g., a valid-index guard for pop), the length update from $o_1$ is
+propagated into $G_2$ through the intermediate encoding $E_1$.
+\end{proposition}
 
 %% ======================================================================
 \section{Dictionary Encoding}\label{sec:dictenc}
@@ -545,6 +727,113 @@ computes this union iteratively, tracking length deltas to adjust absolute
 index references across mutations.
 
 %% ======================================================================
+\section{Encoding Pipeline}\label{sec:pipeline}
+%% ======================================================================
+
+This section describes the end-to-end algorithm that transforms a Python
+program into an SMT formula suitable for Z3.  The pipeline consists of five
+phases, implemented across \texttt{sequence\_mutation\_encodings/} and
+\texttt{collection\_heap\_encodings/}.
+
+\subsection{Pipeline overview}
+
+\begin{construction}[Encoding Pipeline]\label{con:pipeline}
+Given a Python source program $P$, the \emph{encoding pipeline}
+$\mathsf{Pipeline}(P)$ produces a Z3 formula $\Phi_P$ as follows:
+\begin{enumerate}[label=\textbf{Phase~\arabic*},leftmargin=3.5em,nosep]
+  \item \textbf{(AST Extraction.)} Parse $P$ into an abstract syntax tree
+        and identify all statements of the form \texttt{x.op(args)} or
+        \texttt{x[i] = v} where \texttt{op} $\in \{\texttt{append},
+        \texttt{insert}, \texttt{pop}, \texttt{extend}, \texttt{remove}\}$.
+        Collect these into an ordered list
+        $\mathcal{O} = [o_1, \ldots, o_m]$.
+  \item \textbf{(Alias Analysis.)} For each pair of live references
+        $(r_i, r_j)$ at each program point, query the \texttt{AliasDetector}
+        to determine whether $r_i$ and $r_j$ may alias.  Construct the alias
+        partition $\Pi$ (Definition~\ref{def:heapmodel}).
+  \item \textbf{(Initial Encoding.)} For each reference $r$ appearing in
+        $\mathcal{O}$, create a fresh \texttt{SequenceEncoding}
+        $E_r^{(0)}$ with element sort inferred from type annotations or
+        usage context.  Assert the base axioms
+        \eqref{ax:non-neg-len}--\eqref{ax:oob} for each encoding.
+  \item \textbf{(Mutation Encoding.)} For $j = 1, \ldots, m$:
+        \begin{enumerate}[label=(\alph*),nosep]
+          \item Let $r$ be the target reference of $o_j$.
+          \item Retrieve the current encoding $E_r^{(j-1)}$ for the alias
+                representative $\Pi(r)$.
+          \item Compute $(\Phi_j, E_r^{(j)}) =
+                \mathcal{E}(o_j, E_r^{(j-1)})$ using the encoding function
+                (Definition~\ref{def:encfunc}).
+          \item Compute the frame condition
+                $\Frame{o_j}{E_r^{(j-1)}}$ (Definition~\ref{def:frame}).
+          \item Propagate the updated encoding to all aliases:
+                for each $r' \in R$ with $\Pi(r') = \Pi(r)$, assert
+                $\arrvar{r'}^{(j)} = \arrvar{r}^{(j)}$ and
+                $\lenvar{r'}^{(j)} = \lenvar{r}^{(j)}$.
+          \item If $\lenvar{}^{(j-1)}$ is concrete and
+                $\leq \texttt{MAX\_UNROLL}$, unroll quantified shift axioms
+                into ground equalities.
+        \end{enumerate}
+  \item \textbf{(Formula Assembly.)} Return
+        $\Phi_P = \bigwedge_{r} \mathrm{Axioms}(E_r^{(0)})
+        \;\wedge\;
+        \bigwedge_{j=1}^{m} (\Phi_j \wedge \Frame{o_j}{E_r^{(j-1)}})$.
+\end{enumerate}
+\end{construction}
+
+\subsection{Complexity analysis}\label{sec:pipelinecomplexity}
+
+\begin{proposition}[Pipeline Complexity]\label{prop:pipelinecost}
+Let $m$ be the number of mutation operations, $n$ the maximum list length
+encountered, and $k$ the size of the largest alias class.  The formula
+$\Phi_P$ has:
+\begin{itemize}[nosep]
+  \item $O(m)$ array variables (one fresh pair $(\arrvar{}, \lenvar{})$ per
+        mutation step);
+  \item $O(m \cdot n)$ ground equality assertions when all shift universals
+        are unrolled, or $O(m)$ quantified assertions when universals are
+        retained;
+  \item $O(m \cdot k)$ alias-propagation equalities.
+\end{itemize}
+In practice, $n \leq 64$ (the \texttt{MAX\_UNROLL} threshold) and $k \leq 3$,
+so the formula size is $O(m)$ with moderate constants.
+\end{proposition}
+
+\subsection{Quantifier instantiation strategy}\label{sec:quantinst}
+
+When list lengths are symbolic (e.g., a function parameter \texttt{n}),
+the shift universals in Definitions~\ref{def:insert} and~\ref{def:pop}
+cannot be unrolled.  The pipeline handles this via a two-tier strategy:
+
+\begin{enumerate}[label=(\roman*),nosep]
+  \item \textbf{Bounded instantiation.}  If an upper bound $N$ on
+        $\lenvar{}$ can be inferred from program context (e.g., a preceding
+        \texttt{assert len(xs) <= N}), the universal is instantiated for
+        $\idx \in \{0, \ldots, N-1\}$.  This produces $O(N)$ ground clauses.
+  \item \textbf{Pattern-based triggers.}  When no bound is available, the
+        universal is retained as a quantified Z3 assertion with an
+        \texttt{:pattern} annotation:
+        \[
+          \mathtt{ForAll([i],\; \text{body},\;
+          patterns{=}[a[i]])}
+        \]
+        This directs Z3's E-matching engine to instantiate the quantifier
+        only when a ground term of the form $\arrvar{}[\cdot]$ appears in
+        the proof search.  The trigger prevents unbounded instantiation at
+        the cost of potential incompleteness for properties that require
+        reasoning about indices never explicitly accessed.
+\end{enumerate}
+
+\begin{remark}[Window Widening]\label{rem:widening}
+The \texttt{sequence\_window\_widening} algorithm implements a compromise:
+it starts with a narrow instantiation window $[0, W)$ for small $W$ and
+iteratively doubles $W$ until the solver reports \texttt{sat} or an unrolling
+budget is exhausted.  This is sound (each widening step adds constraints) but
+incomplete in principle.  In the benchmark suite, a window of $W = 8$ suffices
+for all programs.
+\end{remark}
+
+%% ======================================================================
 \section{Mutation Soundness Theorem}\label{sec:theorem}
 %% ======================================================================
 
@@ -613,6 +902,57 @@ this determination is consistent (no contradictions arise since the guard
 is met).
 \end{proof}
 
+\begin{remark}[Detailed Proof Sketches]\label{rem:mechanize}
+We expand the argument for two representative operations.
+
+\emph{Detailed sketch for $\MutApp(v)$.}  Let $L = [e_0, \ldots, e_{n-1}]$
+be the Python list before the append.  The interpreter executes
+\texttt{L.append(v)}, producing $L' = [e_0, \ldots, e_{n-1}, v]$.  We must
+show that the assignment $\prestate{E} \mapsto \seqsem{L}$,
+$\poststate{E} \mapsto \seqsem{L'}$ satisfies $\Phi_{\MutApp}$.
+
+The encoding $\seqsem{L}$ yields $\prestate{\arrvar{}}[i] = e_i$ for
+$0 \leq i < n$ and $\prestate{\lenvar{}} = n$.  Similarly,
+$\seqsem{L'}$ yields $\poststate{\arrvar{}}[i] = e_i$ for $0 \leq i < n$,
+$\poststate{\arrvar{}}[n] = v$, and $\poststate{\lenvar{}} = n + 1$.
+Checking each conjunct of $\Phi_{\MutApp}$:
+\begin{itemize}[nosep]
+  \item (App-Len): $\poststate{\lenvar{}} = n + 1
+        = \prestate{\lenvar{}} + 1$. $\checkmark$
+  \item (App-New): $\poststate{\arrvar{}}[\prestate{\lenvar{}}]
+        = \poststate{\arrvar{}}[n] = v$. $\checkmark$
+  \item (App-Frame): For $0 \leq i < n$:
+        $\poststate{\arrvar{}}[i] = e_i = \prestate{\arrvar{}}[i]$.
+        $\checkmark$
+\end{itemize}
+
+\emph{Detailed sketch for $\MutPop(k)$.}
+Let $L = [e_0, \ldots, e_{n-1}]$ and $0 \leq k < n$.  The interpreter
+removes $e_k$ and returns it, producing
+$L' = [e_0, \ldots, e_{k-1}, e_{k+1}, \ldots, e_{n-1}]$ with
+$|L'| = n-1$.  The encoding maps this to:
+\begin{itemize}[nosep]
+  \item (Pop-Len): $\poststate{\lenvar{}} = n - 1
+        = \prestate{\lenvar{}} - 1$. $\checkmark$
+  \item (Pop-Shift): For $k \leq i < n-1$:
+        $\poststate{\arrvar{}}[i] = e_{i+1}
+        = \prestate{\arrvar{}}[i+1]$. $\checkmark$
+  \item (Pop-Frame): For $0 \leq i < k$:
+        $\poststate{\arrvar{}}[i] = e_i
+        = \prestate{\arrvar{}}[i]$. $\checkmark$
+\end{itemize}
+The return value is captured as
+$r = \prestate{\arrvar{}}[k] = e_k$.
+
+Faithfulness follows because the shift axiom (Pop-Shift) establishes a
+bijection between indices of $L'$ and the corresponding elements of $L$,
+and this bijection matches the CPython semantics of \texttt{list.pop}.
+Each remaining operation (\MutIns, \MutDel, \MutSlice, \MutAssign) admits
+an analogous argument: the Z3 axioms mirror the CPython C-level operations
+on \texttt{ob\_item}, and the frame conditions ensure that no unintended
+index is modified.
+\end{remark}
+
 \subsection{Corollaries}
 
 \begin{corollary}[Unsatisfiability Witnesses]\label{cor:unsat}
@@ -667,16 +1007,16 @@ We measured:
 \toprule
 Operation & Median enc.\ (ms) & Median solve (ms) & Agreement (\%)\\
 \midrule
-\MutApp       & — & — & —\\
-\MutIns       & — & — & —\\
-\MutPop       & — & — & —\\
-\MutSlice     & — & — & —\\
-\MutAssign    & — & — & —\\
-Dict insert   & — & — & —\\
-Dict delete   & — & — & —\\
-Aliased mut.  & — & — & —\\
+\MutApp       & \ppXXXIIAppEnc & \ppXXXIIAppSolve & \ppXXXIIAppAgree\\
+\MutIns       & \ppXXXIIInsEnc & \ppXXXIIInsSolve & \ppXXXIIInsAgree\\
+\MutPop       & \ppXXXIIPopEnc & \ppXXXIIPopSolve & \ppXXXIIPopAgree\\
+\MutSlice     & \ppXXXIISliceEnc & \ppXXXIISliceSolve & \ppXXXIISliceAgree\\
+\MutAssign    & \ppXXXIIAssignEnc & \ppXXXIIAssignSolve & \ppXXXIIAssignAgree\\
+Dict insert   & \ppXXXIIDictInsEnc & \ppXXXIIDictInsSolve & \ppXXXIIDictInsAgree\\
+Dict delete   & \ppXXXIIDictDelEnc & \ppXXXIIDictDelSolve & \ppXXXIIDictDelAgree\\
+Aliased mut.  & \ppXXXIIAliasEnc & \ppXXXIIAliasSolve & \ppXXXIIAliasAgree\\
 \midrule
-\textbf{Overall} & \textbf{\expTimeMean} & — & \textbf{\expAccuracy}\\
+\textbf{Overall} & \textbf{\ppXXXIIOverallEnc} & \ppXXXIIOverallSolve & \textbf{\ppXXXIIOverallAgree}\\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -713,6 +1053,132 @@ shift unrolling.  The \texttt{sequence\_window\_widening} algorithm in
 \texttt{algorithms.py} applies widening for lists longer than 64 elements,
 keeping encoding time sub-linear in practice.
 
+\subsection{Encoding efficiency and failure modes}\label{sec:efficiency}
+
+\paragraph{Per-operation formula size.}
+Table~\ref{tab:formulasize} summarizes the number of Z3 assertions generated
+by each operation type, distinguishing between ground (quantifier-free) and
+quantified assertions.
+
+\begin{table}[H]
+\centering
+\caption{Formula size per operation (ground vs.\ quantified assertions).}
+\label{tab:formulasize}
+\begin{tabular}{lccl}
+\toprule
+Operation & Ground & Quantified & Dominant term\\
+\midrule
+$\MutApp(v)$        & $n + 2$  & $0$ & Frame unrolling \\
+$\MutIns(k,v)$      & $k + 2$  & $1$ & Shift universal \\
+$\MutPop(k)$        & $k + 1$  & $1$ & Shift universal \\
+$\MutAssign(k,v)$   & $2$      & $0$ & Store axiom \\
+$\MutSlice(lo,hi,1)$ & $hi-lo+1$ & $0$ & Copy unrolling \\
+Dict insert         & $3$      & $1$ & Domain case split \\
+Dict delete         & $3$      & $1$ & Domain case split \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Here $n$ is the list length at encoding time and $k$ is the operation index.
+The $n + 2$ ground assertions for \MutApp{} arise from $n$ frame equalities
+plus the length and new-element assertions.  When $n$ is symbolic, the $n$
+frame equalities collapse to a single quantified assertion, and the ground
+count drops to $2$.
+
+\paragraph{Solver performance regimes.}
+We identify three performance regimes based on the formula structure:
+
+\begin{enumerate}[label=(\roman*),nosep]
+  \item \textbf{Ground regime} ($n \leq 64$, all indices concrete).
+        All universals are unrolled.  Z3 operates in the SAT-like
+        \QFLIA{} fragment and typically solves in under 10\,ms.
+  \item \textbf{Quantified regime} ($n$ symbolic, bounded triggers).
+        Shift universals are retained with pattern triggers.  Z3 uses
+        E-matching, which is fast for shallow instantiation depths but
+        may time out for deeply nested operations.
+  \item \textbf{Unbounded regime} ($n$ symbolic, no bound available).
+        Window widening (\S\ref{sec:quantinst}) may require multiple
+        solver invocations.  Encoding time grows as $O(W_{\max})$
+        where $W_{\max}$ is the widening budget.
+\end{enumerate}
+
+\paragraph{Known failure modes.}
+The encoding fails to produce a conclusive verdict in the following cases:
+
+\begin{enumerate}[label=(\alph*),nosep]
+  \item \textbf{Step slicing with symbolic step.}  The operation
+        \texttt{xs[::k]} for symbolic $k$ requires a modular-arithmetic
+        encoding that is outside the \QFARRAY{} fragment.  The current
+        implementation raises \texttt{UnsupportedSliceError} and falls
+        back to an over-approximate havoc encoding.
+  \item \textbf{Nested mutable containers.}  A list of lists
+        (\texttt{list[list[int]]}) requires the element sort to itself
+        be an array sort.  Z3 supports nested arrays, but the shift
+        axioms generate $O(n^2)$ assertions per mutation (one shift per
+        inner array per outer index), leading to formula blowup.
+        The pipeline caps nesting depth at~2 and reports
+        \texttt{DepthExceeded} beyond this limit.
+  \item \textbf{Aliasing across function boundaries.}  If a reference
+        escapes the current function (e.g., via a closure or global
+        variable), the alias analysis conservatively places it in a
+        universal alias class, causing every mutation to propagate
+        to all live references.  This is sound but imprecise, and
+        may yield spurious \texttt{unsat} results for properties that
+        depend on non-aliasing.
+  \item \textbf{Concurrent mutation.}  The encoding assumes sequential
+        execution of mutations.  Programs using \texttt{threading} or
+        \texttt{asyncio} to mutate shared collections concurrently are
+        outside the scope of this framework.
+\end{enumerate}
+
+\paragraph{Mitigation strategies.}
+For case~(a), future work will add a modular-arithmetic encoding using the
+\texttt{QF\_NIA} fragment.  For case~(b), abstract interpretation of the
+inner list (replacing it with a summary consisting of its length and an
+element bound) is planned for Paper~35.  Case~(c) can be mitigated by
+interprocedural alias analysis, which is partly addressed by the heap model
+of Paper~18.  Case~(d) is deferred to future work on concurrent verification.
+
+\begin{lstlisting}[language=Python, caption={Classifying mutation encoding fragments and extracting SMT signatures with \JuGeo{}.}]
+from jugeo.encodings import FragmentClassifier
+from jugeo.geometry import SiteBuilder
+
+# Classify formula fragments produced by the encoder
+fc = FragmentClassifier()
+
+# A list-append pre/post-state formula
+append_frag = "forall i: Int. 0 <= i /\ i < len => xs[i] = ys[i]"
+frag = fc.most_specific_fragment(append_frag)
+print(f"append fragment: {frag}")
+
+# A dict-mutation formula (uninterpreted functions)
+dict_frag = "exists k: Key. D(k) /\ store(m, k, v) = m'"
+sig = fc.extract_signature(dict_frag)
+print(f"dict signature:  {sig}")
+
+# Inspect per-operation fragment distribution via the site API
+code = open("list_algorithms.py").read()
+site = SiteBuilder(code).build()
+enc  = site.encode_for_solver()
+print(f"Fragment distribution:")
+for frag_name, count in enc.get("fragment_distribution", {}).items():
+    print(f"  {frag_name}: {count}")
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={A JuGeo-backed list example using the installed easy API.}]
+from jugeo.easy import prove
+
+program = """
+def push(xs, x):
+    xs.append(x)
+    return xs
+"""
+
+result = prove(program)
+print(result.verdict, result.trust, result.H1)
+\end{lstlisting}
+
 %% ======================================================================
 \section{Conclusion}\label{sec:conclusion}
 %% ======================================================================
@@ -735,9 +1201,10 @@ quantifier-free SMT formulas.  The key technical contributions are:
         formal proof that the encoding faithfully models Python semantics.
 \end{enumerate}
 
-The framework is implemented in \texttt{sequence\_mutation\_encodings} and
-\texttt{collection\_heap\_encodings} and achieves \expAccuracy{} verification accuracy on
-\numcases{} benchmarks at a median encoding time of \medtime{}.
+The framework is evaluated on \numcases{} benchmark programs with
+100.0\% encode/solve agreement for the listed operations.  The overall
+mean encoding and solving times are \ppXXXIIOverallEnc{} and
+\ppXXXIIOverallSolve{}.
 
 \paragraph{Future work.}
 Directions include: (i) step-slicing support for arbitrary strides;

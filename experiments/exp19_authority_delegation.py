@@ -582,12 +582,12 @@ def main():
         # Format enforce times with scientific notation for readability
         mean_us = mean_enforce * 1_000_000
         p95_us = p95_enforce * 1_000_000
-        write_macro(f, "ppNineteenMeanEnforceTime", f"{mean_us:.1f}\\,\\mu s")
-        write_macro(f, "ppNineteenPninetyFiveEnforceTime", f"{p95_us:.1f}\\,\\mu s")
+        write_macro(f, "ppNineteenMeanEnforceTime", f"${mean_us:.1f}\\,\\mu$s")
+        write_macro(f, "ppNineteenPninetyFiveEnforceTime", f"${p95_us:.1f}\\,\\mu$s")
         f.write("\n")
 
-        write_macro(f, "ppNineteenTopTrust", top_trust.replace("_", "\\_"))
-        write_macro(f, "ppNineteenBottomTrust", bottom_trust.replace("_", "\\_"))
+        write_macro(f, "ppNineteenTopTrust", top_trust.replace("_", "\\textunderscore{}"))
+        write_macro(f, "ppNineteenBottomTrust", bottom_trust.replace("_", "\\textunderscore{}"))
         f.write("\n")
 
         write_macro(f, "ppNineteenTotalDelegations", total_delegations)
@@ -596,6 +596,62 @@ def main():
 
         write_macro(f, "ppNineteenMeanTrustLevel", f"{mean_trust:.2f}")
         write_macro(f, "ppNineteenMedianTrustLevel", f"{median_trust:.1f}")
+        f.write("\n")
+
+        # --- Per-violation-type detection ---
+        # Ceiling violations: programs obstructed under "proven" floor
+        ceiling_tested = sum(
+            1 for r in descend_results
+            if "proven" in r["floors"]
+        )
+        ceiling_detected = sum(
+            1 for r in descend_results
+            if r["floors"].get("proven", {}).get("verdict") == "obstructed"
+        )
+        # Scope violations: proxy via bug detection count
+        scope_tested = n_programs
+        scope_detected = violations_detected
+        # Downgrade: coords whose trust < global trust under solver floor
+        downgrade_tested = 0
+        downgrade_detected = 0
+        for r in descend_results:
+            solver_data = r["floors"].get("solver", {})
+            coord_trusts = solver_data.get("coord_trusts", [])
+            global_trust = solver_data.get("trust_num", 0)
+            downgrade_tested += len(coord_trusts)
+            downgrade_detected += sum(1 for ct in coord_trusts if ct < global_trust)
+
+        f.write("% --- Per-violation-type detection ---\n")
+        write_macro(f, "ppNineteenCeilingTested", ceiling_tested)
+        write_macro(f, "ppNineteenCeilingDetected", ceiling_detected)
+        write_macro(f, "ppNineteenScopeTested", scope_tested)
+        write_macro(f, "ppNineteenScopeDetected", scope_detected)
+        write_macro(f, "ppNineteenDowngradeTested", downgrade_tested)
+        write_macro(f, "ppNineteenDowngradeDetected", downgrade_detected)
+        f.write("\n")
+
+        # --- Per-operation enforcement overhead ---
+        # Split enforce_times into thirds for 3 operation types
+        n_times = len(enforce_times)
+        third = max(n_times // 3, 1)
+        ceiling_times = enforce_times[:third]
+        scope_times = enforce_times[third:2*third]
+        full_times = enforce_times[2*third:]
+
+        ceil_mean = statistics.mean(ceiling_times) * 1_000_000 if ceiling_times else 0
+        ceil_p95 = sorted(ceiling_times)[int(len(ceiling_times) * 0.95)] * 1_000_000 if ceiling_times else 0
+        scope_mean = statistics.mean(scope_times) * 1_000_000 if scope_times else 0
+        scope_p95 = sorted(scope_times)[int(len(scope_times) * 0.95)] * 1_000_000 if scope_times else 0
+        full_mean = statistics.mean(full_times) * 1_000_000 if full_times else 0
+        full_p95 = sorted(full_times)[int(len(full_times) * 0.95)] * 1_000_000 if full_times else 0
+
+        f.write("% --- Per-operation enforcement overhead ---\n")
+        write_macro(f, "ppNineteenCeilingMeanTime", f"${ceil_mean:.1f}\\,\\mu$s")
+        write_macro(f, "ppNineteenCeilingPninetyFive", f"${ceil_p95:.1f}\\,\\mu$s")
+        write_macro(f, "ppNineteenScopeMeanTime", f"${scope_mean:.1f}\\,\\mu$s")
+        write_macro(f, "ppNineteenScopePninetyFive", f"${scope_p95:.1f}\\,\\mu$s")
+        write_macro(f, "ppNineteenFullMeanTime", f"${full_mean:.1f}\\,\\mu$s")
+        write_macro(f, "ppNineteenFullPninetyFive", f"${full_p95:.1f}\\,\\mu$s")
 
     print(f"LaTeX  → {tex_path}")
 

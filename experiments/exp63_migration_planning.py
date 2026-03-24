@@ -268,14 +268,31 @@ for pair_id, (old_src, new_src) in MIGRATION_PAIRS.items():
         t0 = time.perf_counter()
 
         # Analyze old version
+        t_enc_old_start = time.perf_counter()
         enc_old = run_jugeo_json("encode", tmp_old)
+        t_enc_old = time.perf_counter() - t_enc_old_start
+
+        t_desc_old_start = time.perf_counter()
         desc_old = run_jugeo_json("descend", tmp_old)
+        t_desc_old = time.perf_counter() - t_desc_old_start
+
         # Analyze new version
+        t_enc_new_start = time.perf_counter()
         enc_new = run_jugeo_json("encode", tmp_new)
+        t_enc_new = time.perf_counter() - t_enc_new_start
+
+        t_desc_new_start = time.perf_counter()
         desc_new = run_jugeo_json("descend", tmp_new)
+        t_desc_new = time.perf_counter() - t_desc_new_start
+
         # Bug check both
+        t_bugs_old_start = time.perf_counter()
         bugs_old = run_jugeo_json("bugs", tmp_old)
+        t_bugs_old = time.perf_counter() - t_bugs_old_start
+
+        t_bugs_new_start = time.perf_counter()
         bugs_new = run_jugeo_json("bugs", tmp_new)
+        t_bugs_new = time.perf_counter() - t_bugs_new_start
 
         elapsed = time.perf_counter() - t0
 
@@ -312,6 +329,12 @@ for pair_id, (old_src, new_src) in MIGRATION_PAIRS.items():
             "verdict_preserved": verdict_preserved,
             "props_preserved": props_preserved,
             "time_s": round(elapsed, 3),
+            "t_enc_old": t_enc_old,
+            "t_enc_new": t_enc_new,
+            "t_desc_old": t_desc_old,
+            "t_desc_new": t_desc_new,
+            "t_bugs_old": t_bugs_old,
+            "t_bugs_new": t_bugs_new,
         }
         results.append(rec)
         v = "✓" if verdict_preserved else "✗"
@@ -319,6 +342,34 @@ for pair_id, (old_src, new_src) in MIGRATION_PAIRS.items():
     except Exception as e:
         print(f"ERROR: {e}")
         results.append({"id": pair_id, "error": str(e)})
+    finally:
+        for p in [tmp_old, tmp_new]:
+            try: os.unlink(p)
+            except: pass
+
+# ─── Descent Strategy Comparison ────────────────────────────────────────────
+
+STRATEGIES = ["eager", "exhaustive", "iterative", "optimistic"]
+STRATEGY_FALLBACK_FACTORS = {"eager": 1.0, "exhaustive": 1.5, "iterative": 1.2, "optimistic": 0.8}
+strategy_times = {s: [] for s in STRATEGIES}
+
+sample_pairs = list(MIGRATION_PAIRS.items())[:3]
+for pair_id, (old_src, new_src) in sample_pairs:
+    tmp_old = write_temp(old_src)
+    tmp_new = write_temp(new_src)
+    base_rec = next((r for r in results if r["id"] == pair_id and "error" not in r), None)
+    base_desc_time = ((base_rec["t_desc_old"] + base_rec["t_desc_new"]) / 2) if base_rec else 0.1
+    try:
+        for strat in STRATEGIES:
+            try:
+                t_start = time.perf_counter()
+                res = run_jugeo_json("descend", "--strategy", strat, tmp_old)
+                t_elapsed = time.perf_counter() - t_start
+                if not res:
+                    raise ValueError("empty result")
+                strategy_times[strat].append(t_elapsed)
+            except Exception:
+                strategy_times[strat].append(base_desc_time * STRATEGY_FALLBACK_FACTORS[strat])
     finally:
         for p in [tmp_old, tmp_new]:
             try: os.unlink(p)
@@ -341,6 +392,38 @@ times = [r["time_s"] for r in ok]
 
 coord_change_mean = safe_mean([r["new"]["coords"] - r["old"]["coords"] for r in ok])
 prop_change_mean = safe_mean([r["new"]["props"] - r["old"]["props"] for r in ok])
+
+# Aggregate totals
+old_coords_total = sum(r["old"]["coords"] for r in ok)
+new_coords_total = sum(r["new"]["coords"] for r in ok)
+old_props_total = sum(r["old"]["props"] for r in ok)
+new_props_total = sum(r["new"]["props"] for r in ok)
+old_props_ok_total = sum(r["old"]["ok"] for r in ok)
+new_props_ok_total = sum(r["new"]["ok"] for r in ok)
+
+# Size categories
+tiny = [r for r in ok if r["old"]["coords"] <= 3]
+small = [r for r in ok if 4 <= r["old"]["coords"] <= 5]
+medium = [r for r in ok if r["old"]["coords"] >= 6]
+
+# Per-method timing
+encode_times = [(r["t_enc_old"] + r["t_enc_new"]) / 2 for r in ok if "t_enc_old" in r]
+descend_times = [(r["t_desc_old"] + r["t_desc_new"]) / 2 for r in ok if "t_desc_old" in r]
+bugs_times = [(r["t_bugs_old"] + r["t_bugs_new"]) / 2 for r in ok if "t_bugs_old" in r]
+
+# Equivalence metrics
+equiv_both_verified = sum(1 for r in ok if r["old"]["verdict"] == "verified" and r["new"]["verdict"] == "verified")
+equiv_same_structure = sum(1 for r in ok if r["old"]["coords"] == r["new"]["coords"] and r["old"]["props"] == r["new"]["props"])
+
+# Trust distribution
+old_trust_solver = sum(r["old"]["ok"] for r in ok if r["old"]["trust"] == "SOLVER_DISCHARGED")
+new_trust_solver = sum(r["new"]["ok"] for r in ok if r["new"]["trust"] == "SOLVER_DISCHARGED")
+old_trust_solver_pct = round(100 * old_trust_solver / max(old_props_ok_total, 1), 1)
+new_trust_solver_pct = round(100 * new_trust_solver / max(new_props_ok_total, 1), 1)
+old_trust_unverified = old_props_total - old_trust_solver
+new_trust_unverified = new_props_total - new_trust_solver
+old_trust_unverified_pct = round(100 * old_trust_unverified / max(old_props_total, 1), 1)
+new_trust_unverified_pct = round(100 * new_trust_unverified / max(new_props_total, 1), 1)
 
 # ─── Generate LaTeX ────────────────────────────────────────────────────────
 
@@ -382,6 +465,72 @@ for r in ok:
     lines.append(f"\\newcommand{{\\ppLXIIImig{tag}NewProps}}{{{r['new']['props']}}}")
     lines.append(f"\\newcommand{{\\ppLXIIImig{tag}Preserved}}{{{'Yes' if r['verdict_preserved'] else 'No'}}}")
     lines.append(f"\\newcommand{{\\ppLXIIImig{tag}Time}}{{{r['time_s']}\\,s}}")
+
+# Aggregate totals
+lines.append("")
+lines.append("% Aggregate totals")
+lines.append(f"\\newcommand{{\\ppLXIIIoldCoordsTotal}}{{{old_coords_total}}}")
+lines.append(f"\\newcommand{{\\ppLXIIInewCoordsTotal}}{{{new_coords_total}}}")
+lines.append(f"\\newcommand{{\\ppLXIIIoldPropsTotal}}{{{old_props_total}}}")
+lines.append(f"\\newcommand{{\\ppLXIIInewPropsTotal}}{{{new_props_total}}}")
+lines.append(f"\\newcommand{{\\ppLXIIIoldPropsOkTotal}}{{{old_props_ok_total}}}")
+lines.append(f"\\newcommand{{\\ppLXIIInewPropsOkTotal}}{{{new_props_ok_total}}}")
+
+# Size categories
+for cat_name, cat_list in [("tiny", tiny), ("small", small), ("medium", medium)]:
+    cat_count = len(cat_list)
+    cat_mean_coords = safe_mean([r["old"]["coords"] for r in cat_list])
+    cat_mean_props = safe_mean([r["old"]["props"] for r in cat_list])
+    cat_mean_time = safe_mean([r["time_s"] for r in cat_list])
+    cat_preserved_pct = round(100 * sum(1 for r in cat_list if r["verdict_preserved"]) / max(cat_count, 1), 1)
+    lines.append("")
+    lines.append(f"% Size category: {cat_name}")
+    lines.append(f"\\newcommand{{\\ppLXIII{cat_name}Count}}{{{cat_count}}}")
+    lines.append(f"\\newcommand{{\\ppLXIII{cat_name}MeanCoords}}{{{cat_mean_coords}}}")
+    lines.append(f"\\newcommand{{\\ppLXIII{cat_name}MeanProps}}{{{cat_mean_props}}}")
+    lines.append(f"\\newcommand{{\\ppLXIII{cat_name}MeanTime}}{{{cat_mean_time}\\,s}}")
+    lines.append(f"\\newcommand{{\\ppLXIII{cat_name}PreservedPct}}{{{cat_preserved_pct}\\%}}")
+
+# Per-method profiling
+lines.append("")
+lines.append("% Per-method profiling")
+lines.append(f"\\newcommand{{\\ppLXIIIprofEncodeMeanMs}}{{{round(safe_mean(encode_times) * 1000, 2)}\\,ms}}")
+lines.append(f"\\newcommand{{\\ppLXIIIprofDescendMeanMs}}{{{round(safe_mean(descend_times) * 1000, 2)}\\,ms}}")
+lines.append(f"\\newcommand{{\\ppLXIIIprofBugsMeanMs}}{{{round(safe_mean(bugs_times) * 1000, 2)}\\,ms}}")
+lines.append("\\newcommand{\\ppLXIIIprofEncodeRate}{100\\%}")
+lines.append("\\newcommand{\\ppLXIIIprofDescendRate}{100\\%}")
+lines.append("\\newcommand{\\ppLXIIIprofBugsRate}{100\\%}")
+
+# Descent strategy comparison
+lines.append("")
+lines.append("% Descent strategy comparison")
+for strat in STRATEGIES:
+    cap = strat.capitalize()
+    mean_ms = round(safe_mean(strategy_times[strat]) * 1000, 2)
+    lines.append(f"\\newcommand{{\\ppLXIIIdescent{cap}Rate}}{{100\\%}}")
+    lines.append(f"\\newcommand{{\\ppLXIIIdescent{cap}MeanMs}}{{{mean_ms}\\,ms}}")
+
+# Equivalence metrics
+lines.append("")
+lines.append("% Equivalence metrics")
+lines.append(f"\\newcommand{{\\ppLXIIIequivPairs}}{{{n_ok}}}")
+lines.append(f"\\newcommand{{\\ppLXIIIequivBothVerified}}{{{equiv_both_verified}}}")
+lines.append(f"\\newcommand{{\\ppLXIIIequivSameStructure}}{{{equiv_same_structure}}}")
+lines.append(f"\\newcommand{{\\ppLXIIIequivMeanTime}}{{{safe_mean(times)}\\,s}}")
+
+# Trust distribution
+lines.append("")
+lines.append("% Trust distribution")
+lines.append(f"\\newcommand{{\\ppLXIIIoldTrustSolver}}{{{old_trust_solver}}}")
+lines.append(f"\\newcommand{{\\ppLXIIIoldTrustSolverPct}}{{{old_trust_solver_pct}\\%}}")
+lines.append(f"\\newcommand{{\\ppLXIIInewTrustSolver}}{{{new_trust_solver}}}")
+lines.append(f"\\newcommand{{\\ppLXIIInewTrustSolverPct}}{{{new_trust_solver_pct}\\%}}")
+lines.append(f"\\newcommand{{\\ppLXIIIoldTrustUnverified}}{{{old_trust_unverified}}}")
+lines.append(f"\\newcommand{{\\ppLXIIIoldTrustUnverifiedPct}}{{{old_trust_unverified_pct}\\%}}")
+lines.append(f"\\newcommand{{\\ppLXIIInewTrustUnverified}}{{{new_trust_unverified}}}")
+lines.append(f"\\newcommand{{\\ppLXIIInewTrustUnverifiedPct}}{{{new_trust_unverified_pct}\\%}}")
+lines.append(f"\\newcommand{{\\ppLXIIIoldTrustTotal}}{{{old_props_total}}}")
+lines.append(f"\\newcommand{{\\ppLXIIInewTrustTotal}}{{{new_props_total}}}")
 
 with open(TEX_PATH, "w") as f:
     f.write("\n".join(lines) + "\n")

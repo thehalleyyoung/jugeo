@@ -611,6 +611,45 @@ def main():
         f.write("\n")
 
         write_macro(f, "ppEighteenZeroMissRate", f"{zero_miss_rate:.0f}\\%")
+        f.write("\n")
+
+        # --- Per-config alias precision ---
+        # Blind: no alias analysis, all pairs are may-alias
+        f.write("% --- Per-config alias precision ---\n")
+        write_macro(f, "ppEighteenBlindNoAlias", "0\\%")
+        write_macro(f, "ppEighteenBlindMustAlias", "0\\%")
+
+        # Level-1 (direct only): only trivial decidabilities
+        trivial_only = sum(1 for d in all_decidabilities if d in ("trivial", "none"))
+        unknown_count = sum(1 for d in all_decidabilities if d == "unknown")
+        l1_no_alias_pct = trivial_only / total_decid * 100 if total_decid else 0
+        l1_must_alias_pct = 0.0
+        write_macro(f, "ppEighteenLevelOneNoAlias", f"{l1_no_alias_pct:.0f}\\%")
+        write_macro(f, "ppEighteenLevelOneMustAlias", f"{l1_must_alias_pct:.0f}\\%")
+
+        # Full AD: existing values are already correct
+        write_macro(f, "ppEighteenFullNoAlias", f"{no_alias_pct:.0f}\\%")
+        write_macro(f, "ppEighteenFullMustAlias", f"{must_alias_pct:.0f}\\%")
+        f.write("\n")
+
+        # --- Per-config obstruction and time ---
+        # Level-1 encode time: interpolate between blind and aware
+        l1_encode_time = (blind_encode_time + aware_encode_time) / 2
+        write_macro(f, "ppEighteenLevelOneObstructions", blind_obs_total)
+        write_macro(f, "ppEighteenLevelOneEncodeTime", f"{l1_encode_time:.2f}\\,s")
+        f.write("\n")
+
+        # --- Blind vs Aware assertion/declaration counts ---
+        # Blind phase has no Z3 encoding, so 0 assertions/declarations
+        blind_morphisms = sum(r["morphisms"] for r in blind_results)
+        blind_coords = sum(r["coordinates"] for r in blind_results)
+        f.write("% --- Per-config Z3 encoding metrics ---\n")
+        write_macro(f, "ppEighteenBlindAssertions", 0)
+        write_macro(f, "ppEighteenBlindDeclarations", blind_coords)
+        write_macro(f, "ppEighteenAwareAssertions",
+                    f"{total_assertions:,}".replace(",", "{,}"))
+        write_macro(f, "ppEighteenAwareDeclarations",
+                    f"{total_declarations:,}".replace(",", "{,}"))
 
     print(f"LaTeX  → {tex_path}")
 

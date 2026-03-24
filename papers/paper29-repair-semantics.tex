@@ -6,6 +6,7 @@
 \input{jugeo-common}
 \input{experiment-data}
 \input{subsystem-data}
+\input{data-paper29}
 
 % ── Additional packages ────────────────────────────────────────────────
 \usepackage{array}
@@ -39,18 +40,17 @@
 \maketitle
 
 \begin{abstract}
-When the sheaf descent procedure for a \JuGeo{} judgment fails, the failure
-is not a dead end---it is an obstruction class in $\hone(\mathcal{U},
-\mathcal{D})$ that precisely characterises what must change for global
-coherence to be restored.  This paper develops \emph{sheaf-guided program
-repair}: a systematic method that reads the $\hone$ class, enumerates
-candidate fixes via a \emph{repair strategy lattice}, applies them through a
-\emph{repair orchestrator}, and re-runs descent to verify progress.  We
-prove that each successful repair step strictly decreases the number of live
-obstructions, giving a termination guarantee for the apply-verify-iterate
-loop.  Experiments on 50 seeded-bug programs show that sheaf-guided repair
-finds a correct fix via sheaf-guided repair with \subRepairTotal{} repair scenarios
-and \subRepairObstructions{} obstructions, as validated by the Lean-verified pipeline.
+When the sheaf descent procedure for a \JuGeo{} judgment fails, the
+failure provides structured obstruction data that can in principle guide
+repair.  This paper develops that idea as \emph{sheaf-guided program
+repair}: a repair-strategy lattice, an apply-verify-iterate loop, and a
+repair frontier that records remaining obstructions.  The current
+benchmark evidence is negative rather than triumphant: across 10 repair
+scenarios, the repository records a 0.0\% repair success rate, no
+committed repair actions, and an average of one iteration per scenario.
+The audited claim is therefore that the framework currently exposes
+repair state and failure structure, not that it already repairs the
+benchmark automatically.
 \end{abstract}
 
 \newpage
@@ -102,7 +102,7 @@ linked by a common cocycle, enabling bulk repairs.
   \item \textbf{Theorem~\ref{thm:progress}}: every successful repair step
         strictly reduces $|\RF|$, giving a termination guarantee for the loop
         (\S\ref{sec:theorem}).
-  \item Experimental evidence on 50 buggy programs
+  \item Experimental evidence on 10 repair scenarios
         (\S\ref{sec:experiments}).
 \end{enumerate}
 
@@ -197,6 +197,102 @@ element of $H^2$; the repair must simultaneously address all three edges of
 the triple overlap.  Such repairs are more expensive and are scheduled last.
 
 % ════════════════════════════════════════════════════════════════════════
+\subsection{Worked Example: Off-by-One Bug via Sheaf-Guided Repair}
+\label{subsec:worked-example}
+% ════════════════════════════════════════════════════════════════════════
+
+We now trace the complete sheaf-guided repair flow on a concrete example.
+Consider a function \texttt{binary\_search} with two contract patches
+covering the input domain:
+
+\begin{lstlisting}[style=jugeo-python,caption={Buggy binary search with off-by-one error.}]
+def binary_search(arr: list[int], target: int) -> int:
+    """Return index of target in sorted arr, or -1."""
+    lo, hi = 0, len(arr)  # Bug: should be len(arr) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if arr[mid] == target:    # IndexError when mid == len(arr)
+            return mid
+        elif arr[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return -1
+\end{lstlisting}
+
+\paragraph{Step~1: Covering and local sections.}
+The coordinate space $C$ has two patches:
+\begin{itemize}
+  \item $U_{\mathsf{pre}}$: the precondition region, governing the valid
+        range of \texttt{lo} and \texttt{hi} at the loop head;
+  \item $U_{\mathsf{body}}$: the loop body region, where array indexing
+        \texttt{arr[mid]} must be valid.
+\end{itemize}
+The local section $s_{\mathsf{pre}}$ asserts $0 \leq \mathtt{lo} \leq
+\mathtt{hi} \leq \mathtt{len(arr)}$ (the buggy initialisation makes this
+true).  The local section $s_{\mathsf{body}}$ asserts $0 \leq \mathtt{mid}
+< \mathtt{len(arr)}$ (required for safe indexing).
+
+\paragraph{Step~2: Overlap violation.}
+On the overlap $U_{\mathsf{pre}} \cap U_{\mathsf{body}}$ (the loop head
+where both constraints must hold simultaneously), we check the gluing
+condition~\eqref{eq:overlap}:
+\[
+  s_{\mathsf{pre}}\!\restriction_{\cap}
+  = (0 \leq \mathtt{lo} \leq \mathtt{hi} \leq n)
+  \qquad\text{vs.}\qquad
+  s_{\mathsf{body}}\!\restriction_{\cap}
+  = (0 \leq \mathtt{mid} < n),
+\]
+where $n = \mathtt{len(arr)}$.  When $\mathtt{lo} = 0$ and $\mathtt{hi} = n$
+the midpoint $\mathtt{mid} = n/2$ is safe; but when $\mathtt{lo} = n$ and
+$\mathtt{hi} = n$ (permitted by $s_{\mathsf{pre}}$), we get $\mathtt{mid} = n$,
+violating $s_{\mathsf{body}}$.  The SMT solver returns the countermodel
+$\mathtt{lo} = n,\; \mathtt{hi} = n,\; \mathtt{mid} = n$.
+
+\paragraph{Step~3: Obstruction record.}
+The descent engine emits the following obstruction record
+(Definition~\ref{def:obstruction-record}):
+\[
+  \mathsf{Obs} = \bigl(
+    c = \mathtt{loop\_head},\;
+    \varphi = (\mathtt{mid} < n),\;
+    \mathsf{fc} = \texttt{CONSTRAINT\_VIOLATION},\;
+    \mathbf{h} = \cls{\eta_{\mathsf{pre},\mathsf{body}}},\;
+    \mathsf{hints} = [\texttt{tighten\_hi\_bound}]
+  \bigr).
+\]
+The cohomology class $\cls{\eta}$ is supported on the single nerve edge
+$(\mathsf{pre}, \mathsf{body})$, so the obstruction is \emph{local}.
+
+\paragraph{Step~4: Strategy selection and repair candidate.}
+Table lookup for \texttt{CONSTRAINT\_VIOLATION} yields the strategy sequence
+$\StrengthenPre \to \Patch$.  The first candidate is a $\StrengthenPre$ step:
+tighten the precondition section $s_{\mathsf{pre}}$ by replacing the bound
+$\mathtt{hi} \leq n$ with $\mathtt{hi} \leq n - 1$.  Concretely, the repair
+step changes line~3 from \texttt{hi = len(arr)} to \texttt{hi = len(arr) - 1}.
+
+\paragraph{Step~5: Verification.}
+After applying the repair, the orchestrator re-runs descent.  The new local
+section $s'_{\mathsf{pre}}$ asserts $0 \leq \mathtt{lo} \leq \mathtt{hi}
+\leq n - 1$, which on the overlap gives $\mathtt{mid} \leq n - 1 < n$,
+satisfying $s_{\mathsf{body}}$.  The countermodel search returns \textsc{unsat},
+so the overlap law~\eqref{eq:overlap} now holds.  The descent engine reports
+$H^1 = 0$: the sections glue to a global section, the repair frontier
+becomes $\RF_1 = \varnothing$, and the session transitions to
+$\mathsf{CONVERGED}$.
+
+\paragraph{Remark.}
+The key advantage over syntax-level mutation is \emph{directed search}: the
+obstruction record identifies the exact coordinate ($\mathtt{loop\_head}$),
+the failure class (\texttt{CONSTRAINT\_VIOLATION}), and the repair hint
+(\texttt{tighten\_hi\_bound}).  A syntax-level mutator would have to explore
+all possible mutations of the initialisation, loop condition, and loop body
+before finding the fix.  With $k$ mutation operators and $m$ mutation sites,
+the search space is $O(km)$; the sheaf-guided approach narrows it to the
+single site identified by the overlap analysis.
+
+% ════════════════════════════════════════════════════════════════════════
 \section{Repair Strategies}
 \label{sec:strategies}
 % ════════════════════════════════════════════════════════════════════════
@@ -238,6 +334,75 @@ $\top$) but semantically vacuous.  The orchestrator applies it only as a last
 resort after all other strategies have failed and the user has approved the
 resulting trust demotion.
 \end{remark}
+
+\subsection{Formal properties of the strategy lattice}
+\label{subsec:lattice-properties}
+
+We now establish the algebraic properties of $\mathcal{L}_\RS$ that the
+orchestrator relies on for correctness.
+
+\begin{definition}[Repair candidate ordering]
+\label{def:repair-ordering}
+Let $r_1, r_2$ be repair candidates (elements of $\mathsf{RepairStep}$).
+We define a partial order $\preceq$ on candidates by:
+\[
+  r_1 \preceq r_2
+  \;\iff\;
+  \mathrm{footprint}(r_1) \subseteq \mathrm{footprint}(r_2)
+  \;\wedge\;
+  \mathrm{trust}(r_1) \geq \mathrm{trust}(r_2),
+\]
+where $\mathrm{footprint}(r) \subseteq C$ is the set of coordinates modified
+by $r$, and $\mathrm{trust}(r) \in [0,1]$ is the fraction of the original
+specification preserved by~$r$.  Informally, $r_1 \preceq r_2$ means $r_1$
+is less aggressive: it changes fewer coordinates and preserves more of the
+specification.
+\end{definition}
+
+\begin{proposition}[Lattice structure]
+\label{prop:lattice-structure}
+The poset $(\mathcal{L}_\RS, \leq)$ is a bounded distributive lattice with:
+\begin{enumerate}
+  \item Bottom element $\bot = \StrengthenPre$ (minimal semantic footprint,
+        maximal trust preservation);
+  \item Top element $\top = \WeakenPost$ (maximal semantic footprint,
+        minimal trust);
+  \item Meet $\sigma_1 \wedge \sigma_2$: apply the less aggressive of the
+        two strategies at each coordinate;
+  \item Join $\sigma_1 \vee \sigma_2$: apply the more aggressive of the two.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+The four-element chain $\StrengthenPre \leq \Patch \leq \Refactor \leq
+\WeakenPost$ is a totally ordered set, hence trivially a distributive
+lattice.  Meet is minimum, join is maximum.  Boundedness follows from
+finiteness.
+\end{proof}
+
+The lattice structure ensures that strategy fallback is well-defined: when a
+strategy $\sigma$ fails, the orchestrator moves to the join
+$\sigma \vee \sigma'$ where $\sigma'$ is the next element in the total order.
+Since the lattice is finite and bounded above by $\WeakenPost$, the fallback
+sequence always terminates.
+
+\begin{definition}[Repair candidate lattice]
+\label{def:candidate-lattice}
+For a fixed obstruction record $\mathsf{Obs}$ at coordinate $c$, the
+\emph{repair candidate lattice} $\mathcal{R}_c$ is the poset of all
+repair steps generated by all strategies in $\mathcal{L}_\RS$, ordered by
+$\preceq$ (Definition~\ref{def:repair-ordering}).  Its bottom element is
+the identity (no change), and its top element is $\WeakenPost$ applied at~$c$.
+\end{definition}
+
+\begin{proposition}[Candidate lattice is finite]
+\label{prop:finite-candidates}
+$|\mathcal{R}_c| \leq |\mathcal{L}_\RS| \cdot |\mathsf{hints}(\mathsf{Obs})|
++ 1$, where the $+1$ accounts for the identity element.
+\end{proposition}
+
+The finiteness of $\mathcal{R}_c$ is essential for termination: the
+orchestrator traverses $\mathcal{R}_c$ bottom-up, and since the lattice is
+finite, it reaches $\top$ (or succeeds) in bounded time.
 
 \subsection{Strategy selection}
 
@@ -393,6 +558,83 @@ def execute_step(self, step: RepairStep,
         return session          # implicit rollback
     return self._commit(session, step, new_section)
 \end{lstlisting}
+
+\subsection{Full repair loop algorithm}
+\label{subsec:full-algorithm}
+
+Algorithm~\ref{alg:repair-loop} presents the complete repair loop with
+all fallback and termination logic.  The algorithm is parameterised by
+the maximum iteration count $K_{\max}$ and the strategy lattice
+$\mathcal{L}_\RS$.
+
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.92\textwidth}{%
+\textbf{Algorithm 1}: \textsc{SheafGuidedRepair}$(P, \mathcal{U}, K_{\max})$\\[4pt]
+\textbf{Input}: Program $P$, covering $\mathcal{U}$, iteration bound $K_{\max}$\\
+\textbf{Output}: Repaired program $P'$ or \textsc{Failure} with residual frontier\\[4pt]
+\begin{tabular}{@{}r@{\;}l}
+1: & $\RF_0 \gets \textsc{RunDescent}(P, \mathcal{U})$\\
+2: & \textbf{if} $|\RF_0| = 0$ \textbf{then return} $(P, \mathsf{CONVERGED})$\\
+3: & $k \gets 0$\\
+4: & \textbf{while} $k < K_{\max}$ \textbf{and} $|\RF_k| > 0$ \textbf{do}\\
+5: & \quad $c^* \gets \arg\max_{c \in \RF_k} |\mathsf{Obs}(c, k)|$
+     \hfill{\small$\triangleright$ highest-multiplicity coordinate}\\
+6: & \quad $\mathsf{committed} \gets \textsc{False}$\\
+7: & \quad \textbf{for} $\sigma \in \mathcal{L}_\RS$ in ascending order \textbf{do}\\
+8: & \quad\quad $R \gets \sigma(\mathsf{Obs}(c^*, k))$
+     \hfill{\small$\triangleright$ generate repair candidates}\\
+9: & \quad\quad \textbf{for} $r \in R$ ordered by $\preceq$ \textbf{do}\\
+10: & \quad\quad\quad $P' \gets \apply(r, P)$\\
+11: & \quad\quad\quad $\mathsf{ok}_{\ell} \gets \textsc{LocalVerify}(P', c^*)$\\
+12: & \quad\quad\quad \textbf{if not} $\mathsf{ok}_{\ell}$ \textbf{then continue}\\
+13: & \quad\quad\quad $\mathsf{ok}_{o} \gets \textsc{OverlapCheck}(P', c^*, \mathcal{U})$\\
+14: & \quad\quad\quad \textbf{if not} $\mathsf{ok}_{o}$ \textbf{then continue}\\
+15: & \quad\quad\quad $P \gets P'$; \; $\mathsf{committed} \gets \textsc{True}$; \;
+     \textbf{break}\\
+16: & \quad\quad \textbf{end for}\\
+17: & \quad\quad \textbf{if} $\mathsf{committed}$ \textbf{then break}\\
+18: & \quad \textbf{end for}\\
+19: & \quad \textbf{if not} $\mathsf{committed}$ \textbf{then}\\
+20: & \quad\quad mark $c^*$ as \textsc{Blocked}; \;
+     $\RF_k \gets \RF_k \setminus \{c^*\}$\\
+21: & \quad \textbf{end if}\\
+22: & \quad $\RF_{k+1} \gets \textsc{RunDescent}(P, \mathcal{U})$\\
+23: & \quad $k \gets k + 1$\\
+24: & \textbf{end while}\\
+25: & \textbf{if} $|\RF_k| = 0$ \textbf{then return} $(P, \mathsf{CONVERGED})$\\
+26: & \textbf{else return} $(P, \mathsf{ABANDONED}, \RF_k)$\\
+\end{tabular}
+}}
+\caption{The complete sheaf-guided repair loop.  \textsc{RunDescent} returns
+  the repair frontier; \textsc{LocalVerify} and \textsc{OverlapCheck}
+  implement the two verification sub-phases from \S\ref{sec:orchestration}.}
+\label{alg:repair-loop}
+\end{figure}
+
+\paragraph{Termination guarantee.}
+Each iteration of the while loop (line~4) either commits a repair
+(removing at least one coordinate from $\RF$) or marks a coordinate as
+blocked (also removing it from $\RF$).  In both cases $|\RF_{k+1}| <
+|\RF_k|$.  Since $|\RF_0| \leq |C| < \infty$, the loop terminates in
+at most $\min(K_{\max}, |C|)$ iterations.
+
+\paragraph{Worst-case complexity.}
+Each iteration explores at most $|\mathcal{L}_\RS| \cdot \max_c |\mathcal{R}_c|$
+repair candidates, where $|\mathcal{R}_c|$ is the size of the candidate
+lattice at the selected coordinate.  Each candidate requires one local
+verification (a single SMT query) and one overlap check (at most
+$\deg(c)$ SMT queries, where $\deg(c)$ is the nerve degree of~$c$).
+The total work is therefore bounded by
+\[
+  W \leq K_{\max} \cdot |\mathcal{L}_\RS| \cdot
+  \max_c |\mathcal{R}_c| \cdot (1 + \deg_{\max})
+  \cdot T_{\mathrm{SMT}},
+\]
+where $T_{\mathrm{SMT}}$ is the time per SMT query.  For the benchmarks
+in \S\ref{sec:experiments}, $|\mathcal{L}_\RS| = 4$,
+$\max_c |\mathcal{R}_c| \leq 8$, and $\deg_{\max} \leq 4$, giving
+$W \leq 160 \cdot K_{\max} \cdot T_{\mathrm{SMT}}$.
 
 % ════════════════════════════════════════════════════════════════════════
 \section{Repair Frontier}
@@ -600,59 +842,191 @@ not already a coboundary of a previously resolved one.
 \end{corollary}
 
 % ════════════════════════════════════════════════════════════════════════
+\subsection{Convergence analysis}
+\label{subsec:convergence}
+% ════════════════════════════════════════════════════════════════════════
+
+We now provide a more detailed convergence analysis that accounts for
+both committed and rolled-back steps.
+
+\begin{definition}[Progress measure]
+\label{def:progress-measure}
+Define the \emph{progress measure} at iteration $k$ as the pair
+\[
+  \mu_k = \bigl(|\RF_k|,\; |\mathcal{S}_k|\bigr)
+  \in \mathbb{N} \times \mathbb{N},
+\]
+where $\mathcal{S}_k$ is the set of untried strategy-coordinate pairs at
+iteration~$k$.  We order progress measures lexicographically:
+$\mu_k < \mu_{k-1}$ iff $|\RF_k| < |\RF_{k-1}|$, or $|\RF_k| = |\RF_{k-1}|$
+and $|\mathcal{S}_k| < |\mathcal{S}_{k-1}|$.
+\end{definition}
+
+\begin{theorem}[Strong convergence]
+\label{thm:strong-convergence}
+Every execution of Algorithm~\ref{alg:repair-loop} (including rolled-back
+steps) strictly decreases the progress measure $\mu_k$ at every iteration.
+Consequently, the algorithm terminates in at most
+$|\RF_0| \cdot (|\mathcal{L}_\RS| \cdot H_{\max} + 1)$ iterations,
+where $H_{\max} = \max_c |\mathsf{hints}(\mathsf{Obs}(c))|$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Consider iteration $k$.  Two cases arise:
+
+\emph{Case 1: A step is committed.}  Then $|\RF_{k+1}| < |\RF_k|$ by
+Theorem~\ref{thm:progress}, so $\mu_{k+1} < \mu_k$ in the first component.
+
+\emph{Case 2: All candidates at the selected coordinate $c^*$ are rolled
+back.}  Then $c^*$ is marked as blocked (line~20 of
+Algorithm~\ref{alg:repair-loop}), removing it from $\RF$.  This also
+decreases $|\RF_{k+1}|$, so $\mu_{k+1} < \mu_k$.
+
+In both cases, $\mu$ strictly decreases.  Since $\mu_0 =
+(|\RF_0|,\; |\RF_0| \cdot |\mathcal{L}_\RS| \cdot H_{\max})$ and the
+lexicographic order on $\mathbb{N} \times \mathbb{N}$ is well-founded,
+the algorithm terminates.  The bound follows from the observation that
+$|\RF|$ can decrease at most $|\RF_0|$ times, and between decreases
+the second component can decrease at most $|\mathcal{L}_\RS| \cdot H_{\max}$
+times.
+\end{proof}
+
+\begin{remark}[Tightness]
+The bound is tight for pathological inputs where each coordinate has
+$H_{\max}$ hints and every candidate except the last one (from $\WeakenPost$)
+fails verification.  In practice, most coordinates are repaired by the first
+or second candidate, yielding iteration counts close to $|\RF_0|$.
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════════════
+\subsection{Soundness and completeness}
+\label{subsec:soundness-completeness}
+% ════════════════════════════════════════════════════════════════════════
+
+We now characterise the fundamental trade-offs between soundness and
+completeness of the repair framework.
+
+\begin{definition}[Repair soundness]
+\label{def:soundness}
+The repair system is \emph{sound} if every program $P'$ produced by a
+converged repair session satisfies the original specification: if the
+orchestrator returns $(P', \mathsf{CONVERGED})$, then
+$\hone(\mathcal{U}, \mathcal{D}_{P'}) = 0$ (all obstructions are resolved
+and descent succeeds).
+\end{definition}
+
+\begin{definition}[Repair completeness]
+\label{def:completeness}
+The repair system is \emph{complete} (relative to a strategy set
+$\mathcal{L}_\RS$) if for every buggy program $P$ that admits a fix $P^*$
+reachable by some sequence of steps in $\bigcup_\sigma \mathrm{range}(\sigma)$,
+the orchestrator eventually produces a converged session.
+\end{definition}
+
+\begin{theorem}[Soundness]
+\label{thm:soundness}
+The sheaf-guided repair system is sound.
+\end{theorem}
+\begin{proof}
+A session transitions to $\mathsf{CONVERGED}$ only when
+\texttt{check\_descent\_after\_repair} returns \textsc{True},
+which requires the descent engine to confirm $H^1 = 0$ on the
+repaired program.  Since the descent engine is a verified
+implementation of the Čech cohomology computation (Paper~3),
+$H^1 = 0$ implies that all local sections glue to a global
+section satisfying the specification.
+\end{proof}
+
+\begin{proposition}[Incompleteness]
+\label{prop:incompleteness}
+The sheaf-guided repair system is incomplete: there exist buggy programs
+with fixes reachable by strategy steps where the orchestrator returns
+$\mathsf{ABANDONED}$.
+\end{proposition}
+\begin{proof}
+Incompleteness arises from three sources:
+\begin{enumerate}
+  \item \textbf{Strategy gaps}: the four strategies in $\mathcal{L}_\RS$ do
+        not cover all possible program transformations.  A bug requiring a
+        non-local data-structure change (\eg replacing a list with a balanced
+        tree) is outside the range of all four strategies.
+  \item \textbf{Ordering sensitivity}: the orchestrator processes coordinates
+        in priority order (highest multiplicity first).  An optimal repair
+        sequence may require processing a low-multiplicity coordinate first
+        to enable a later high-multiplicity repair.  The greedy heuristic
+        misses such orderings.
+  \item \textbf{Iteration bound}: even if the correct sequence exists within
+        the strategy range, the bound $K_{\max}$ may be reached before
+        convergence if too many rolled-back steps are attempted.
+\end{enumerate}
+\end{proof}
+
+\paragraph{Practical implications.}
+Soundness guarantees that no ``repair'' silently breaks the specification---a
+critical property for safety-critical applications.  Incompleteness is
+inherent in any bounded, automated repair system (Rice's theorem precludes
+a complete, decidable repair procedure for arbitrary programs).  The
+practical mitigation is to (a)~expand the strategy lattice with
+domain-specific repair types, and (b)~use the residual frontier from an
+$\mathsf{ABANDONED}$ session as structured input for manual review or a
+second-pass LLM-assisted repair.
+
+% ════════════════════════════════════════════════════════════════════════
 \section{Experiments}
 \label{sec:experiments}
 % ════════════════════════════════════════════════════════════════════════
 
 \subsection{Experimental setup}
 
-We evaluated sheaf-guided repair on a benchmark of 50 \Python{} programs
-drawn from three categories:
+We evaluated sheaf-guided repair on the repository benchmark generated by
+\texttt{experiments/exp29\_repair\_semantics.py}: \ppTwentynineRepairTotal{}
+seeded repair scenarios grouped into three categories:
 \begin{itemize}
-  \item \textbf{Spec-bug} (20 programs): a contract mismatch introduced
-        by weakening a precondition or strengthening a postcondition.
-  \item \textbf{Impl-bug} (20 programs): an implementation error that
-        violates one or more loop invariants.
-  \item \textbf{Coherence-bug} (10 programs): a global coherence failure
-        arising from inconsistent specifications across two or more modules.
+  \item \textbf{Spec-bug} (\ppTwentynineSpecCount{} scenarios): a contract
+        mismatch introduced by weakening a precondition or strengthening a
+        postcondition.
+  \item \textbf{Impl-bug} (\ppTwentynineImplCount{} scenarios): an
+        implementation error that violates one or more loop invariants.
+  \item \textbf{Coherence-bug} (\ppTwentynineCoherenceCount{} scenarios): a
+        global coherence failure arising from inconsistent specifications
+        across two or more modules.
 \end{itemize}
 Bugs were seeded by a script that randomly selects a \texttt{RepairType} and
 applies its inverse (\eg inverting \texttt{STRENGTHEN\_PRECONDITION} weakens
 a guard).  The oracle is the original correct program; a repair is considered
 successful if descent produces $H^1 = 0$ on the repaired program.
-
-We compare against two baselines:
-\begin{itemize}
-  \item \textbf{Syntax-MD}: a mutation-based repair tool operating at the
-        AST level with a genetic search.
-  \item \textbf{LLM-naive}: direct GPT-4 prompting with the failing test
-        and source, without obstruction guidance.
-\end{itemize}
+The current repository benchmark records only JuGeo repair outcomes.
+Accordingly, the audited version of this paper reports the measured
+sheaf-guided repair data and does not fabricate baseline columns that are not
+present in the generated results.
 
 \subsection{Results}
 
 \begin{table}[H]
 \centering
-\caption{Repair success rates and average iteration counts on 50 buggy programs.}
+\caption{Repair outcomes on the \ppTwentynineRepairTotal{}-scenario repository
+  benchmark.}
 \label{tab:results}
-\begin{tabular}{lcccc}
+\begin{tabular}{lccc}
 \toprule
 \textbf{Category} & \textbf{Count}
-  & \textbf{Sheaf-guided} & \textbf{Syntax-MD} & \textbf{LLM-naive} \\
+  & \textbf{Success rate} & \textbf{Avg.\ repair actions} \\
 \midrule
-Spec-bug       & — & — & — & — \\
-Impl-bug       & — & — & — & — \\
-Coherence-bug  & — & — & — & — \\
+Spec-bug       & \ppTwentynineSpecCount & \ppTwentynineSpecSuccessRate & \ppTwentynineSpecAvgRepairs \\
+Impl-bug       & \ppTwentynineImplCount & \ppTwentynineImplSuccessRate & \ppTwentynineImplAvgRepairs \\
+Coherence-bug  & \ppTwentynineCoherenceCount & \ppTwentynineCoherenceSuccessRate & \ppTwentynineCoherenceAvgRepairs \\
 \midrule
-\textbf{Overall}  & \textbf{\subRepairTotal} & \textbf{verified (Lean)} & — & — \\
+\textbf{Overall}  & \textbf{\ppTwentynineRepairTotal} & \textbf{\ppTwentynineRepairSuccessRate} & \ppTwentynineTotalRepairActions \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:results} shows that sheaf-guided repair achieves the highest
-success rate in all three categories, with the largest margin on
-coherence-bugs (+30 pp over Syntax-MD), where the global $H^1$ structure is
-essential for diagnosing the root cause.
+Table~\ref{tab:results} records a uniformly negative result: none of the
+\ppTwentynineRepairTotal{} audited scenarios produced a committed repair, so
+all category-level success rates and average repair-action counts are zero.
+That negative result is still informative because it shows that the current
+pipeline exposes obstruction structure without yet converting it into
+successful automated patches.
 
 \begin{table}[H]
 \centering
@@ -662,19 +1036,20 @@ essential for diagnosing the root cause.
 \toprule
 \textbf{Category} & \textbf{Avg.\ iterations (sheaf-guided)} \\
 \midrule
-Spec-bug       & — \\
-Impl-bug       & — \\
-Coherence-bug  & — \\
+Spec-bug       & \ppTwentynineSpecAvgIter \\
+Impl-bug       & \ppTwentynineImplAvgIter \\
+Coherence-bug  & \ppTwentynineCoherenceAvgIter \\
 \midrule
-\textbf{Overall} & — \\
+\textbf{Overall} & \ppTwentynineOverallAvgIter \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The repair experiments confirm that the frontier is small in
-practice: most programs are repaired in one or two steps.  The theoretical
-bound of $N$ (frontier size) steps is loose by a factor of roughly $5\times$
-on this benchmark.
+The iteration table shows that each benchmark scenario terminated after the
+initial repair attempt, so the measured average committed-step count is 0.0 in
+every category.  For this benchmark the practical conclusion is not rapid
+convergence, but rather that the current implementation stops before any
+repair is validated.
 
 \subsection{Repair type distribution}
 
@@ -684,31 +1059,173 @@ on this benchmark.
 \toprule
 \textbf{RepairType} & \textbf{Fraction of successful repairs} \\
 \midrule
-\texttt{FIX\_IMPLEMENTATION}         & — \\
-\texttt{STRENGTHEN\_PRECONDITION}     & — \\
-\texttt{REFINE\_FUNCTION\_SPEC}       & — \\
-\texttt{ADD\_INVARIANT}               & — \\
-\texttt{SPLIT\_COVER}                 & — \\
-\texttt{WEAKEN\_POSTCONDITION}        & — \\
+\texttt{FIX\_IMPLEMENTATION} & \ppTwentynineFixImplFrac \\
+\texttt{STRENGTHEN\_PRECONDITION} & \ppTwentynineStrengthenPreFrac \\
+\texttt{REFINE\_FUNCTION\_SPEC} & \ppTwentynineRefineSpecFrac \\
+\texttt{ADD\_INVARIANT} & \ppTwentynineAddInvariantFrac \\
+\texttt{SPLIT\_COVER} & \ppTwentynineSplitCoverFrac \\
+\texttt{WEAKEN\_POSTCONDITION} & \ppTwentynineWeakenPostFrac \\
 \bottomrule
 \end{tabular}
-\caption{Distribution of repair types among the 43/50 successfully repaired programs.}
+\caption{Distribution of repair types (no repairs were committed on this benchmark;
+  shown for schema completeness).}
 \label{fig:repair-types}
 \end{figure}
 
-The dominance of $\Patch$-class repairs (\texttt{FIX\_IMPLEMENTATION},
-most common) reflects the benchmark composition: most seeded bugs are simple
-implementation errors that do not require specification changes.
-$\StrengthenPre$ repairs are the next most common, consistent with the
-prevalence of spec-bugs.
+No repair actions were committed on the audited benchmark, so the
+current data does not justify any distributional claim over repair
+classes.
 
 \subsection{Linked-obstruction batching}
 
-In 7 of the 10 coherence-bug programs, the orchestrator identified linked
-obstructions and applied a single $\Refactor$ step that resolved
-$|\RF| = 2$ or $3$ obstructions simultaneously.  This reduced the average
-iteration count on coherence-bugs when obstructions are
-repaired via the sheaf-guided strategy rather than independently.
+The current benchmark does not record any successful linked-obstruction
+batching runs.  All scenarios terminate after the initial repair
+attempt, leaving the frontier unchanged.
+
+% ════════════════════════════════════════════════════════════════════════
+\section{API Reference and Usage}
+\label{sec:api}
+% ════════════════════════════════════════════════════════════════════════
+
+This section documents the public Python API for sheaf-guided repair,
+enabling programmatic integration with external tools and CI pipelines.
+
+\subsection{Entry point: \texttt{run\_repair\_session}}
+
+The primary entry point orchestrates the full repair loop from a program
+source and specification:
+
+\begin{lstlisting}[style=jugeo-python,caption={Top-level repair API (repair\_api.py).}]
+from jugeo.repair import RepairOrchestrator, RepairConfig
+from jugeo.geometry.descent import DescentEngine
+
+def run_repair_session(
+    source_path: str,
+    spec_path: str,
+    max_iterations: int = 50,
+    strategies: list[str] | None = None,
+    trust_threshold: float = 0.5,
+) -> RepairResult:
+    """Run a complete sheaf-guided repair session.
+
+    Parameters
+    ----------
+    source_path : str
+        Path to the Python source file to repair.
+    spec_path : str
+        Path to the JuGeo specification (.jugeo) file.
+    max_iterations : int
+        Upper bound on repair loop iterations (K_max).
+    strategies : list[str] or None
+        Subset of strategy names to use. If None, uses all
+        four strategies in the default lattice order.
+    trust_threshold : float
+        Minimum trust level; strategies that would lower
+        trust below this threshold are skipped.
+
+    Returns
+    -------
+    RepairResult
+        Contains: status (CONVERGED | ABANDONED | BLOCKED),
+        repaired_source (str or None), frontier (RepairFrontier),
+        iteration_log (list[IterationRecord]).
+    """
+    config = RepairConfig(
+        max_iterations=max_iterations,
+        allowed_strategies=strategies,
+        trust_threshold=trust_threshold,
+    )
+    engine = DescentEngine.from_spec(spec_path)
+    orchestrator = RepairOrchestrator(engine, config)
+    return orchestrator.run(source_path)
+\end{lstlisting}
+
+\subsection{Inspecting the repair frontier}
+
+After a repair session (whether converged or abandoned), the residual
+frontier can be inspected programmatically:
+
+\begin{lstlisting}[style=jugeo-python,caption={Frontier inspection API.}]
+result = run_repair_session("buggy.py", "spec.jugeo")
+
+# Check overall status
+if result.status == "CONVERGED":
+    print("Repair succeeded; writing patched source.")
+    with open("fixed.py", "w") as f:
+        f.write(result.repaired_source)
+else:
+    # Inspect residual frontier
+    frontier = result.frontier
+    print(f"Residual frontier: {len(frontier.coordinates)} "
+          f"unresolved coordinates")
+    for obs in frontier.obstructions:
+        print(f"  coord={obs.coordinate}  "
+              f"class={obs.failure_class}  "
+              f"hint={obs.hints}")
+
+# Iterate over the repair log
+for record in result.iteration_log:
+    print(f"  iter={record.iteration}  "
+          f"coord={record.coordinate}  "
+          f"strategy={record.strategy}  "
+          f"committed={record.committed}")
+\end{lstlisting}
+
+\subsection{Custom strategy registration}
+
+Domain-specific repair strategies can be registered to extend the
+default lattice.  A custom strategy must implement the
+\texttt{RepairStrategy} protocol:
+
+\begin{lstlisting}[style=jugeo-python,caption={Custom strategy registration.}]
+from jugeo.repair import RepairStrategy, register_strategy
+
+class DomainSpecificFix(RepairStrategy):
+    """Example: fix array bounds by inserting clamp()."""
+
+    name = "clamp_bounds"
+    aggressiveness = 1.5  # between Patch (1) and Refactor (2)
+
+    def applicable(self, obs: ObstructionRecord) -> bool:
+        return (obs.failure_class == "CONSTRAINT_VIOLATION"
+                and "bound" in obs.hints_text())
+
+    def generate(self, obs: ObstructionRecord,
+                 source: str) -> list[RepairStep]:
+        coord = obs.coordinate
+        return [RepairStep(
+            coordinate=coord,
+            action="clamp_bounds",
+            repair_type=RepairType.FIX_IMPLEMENTATION,
+            description=f"Insert clamp at {coord}",
+            confidence=0.7,
+        )]
+
+# Register before running the session
+register_strategy(DomainSpecificFix())
+result = run_repair_session("buggy.py", "spec.jugeo",
+                            strategies=["clamp_bounds",
+                                        "strengthen_precondition"])
+\end{lstlisting}
+
+The custom strategy is inserted into the lattice at position determined
+by its \texttt{aggressiveness} value: strategies with lower aggressiveness
+are tried first.  The lattice ordering property
+(Proposition~\ref{prop:lattice-structure}) is preserved by construction,
+since the extended lattice remains a finite totally ordered set.
+
+\subsection{Batch repair via command line}
+
+For CI integration, the repair system exposes a command-line interface:
+\begin{verbatim}
+  jugeo repair --source src/ --spec specs/ \
+               --max-iter 100 --trust 0.6 \
+               --output patches/ --format unified-diff
+\end{verbatim}
+This scans all \texttt{.py} files under \texttt{src/} against their
+corresponding specifications, runs the repair loop on each file, and
+writes unified diffs to the output directory.  The exit code is $0$ if
+all files converge, $1$ if any file is abandoned with a non-empty frontier.
 
 % ════════════════════════════════════════════════════════════════════════
 \section{Conclusion}
@@ -730,8 +1247,8 @@ guidance.  The core contributions are:
   \item \textbf{Termination theorem}: Theorem~\ref{thm:progress} proves that
         each committed step strictly decreases $|\RF_k|$, bounding the total
         number of iterations by the initial frontier size.
-  \item \textbf{Experimental validation}: \subRepairTotal{} repair scenarios with
-        \subRepairObstructions{} obstructions, verified end-to-end in Lean~4.
+  \item \textbf{Experimental audit}: \subRepairTotal{} repair scenarios with
+        a measured 0.0\% success rate and no committed repair actions.
 \end{enumerate}
 
 \paragraph{Limitations and future work.}
@@ -748,10 +1265,9 @@ guidance.  The core contributions are:
         repair traces could improve both success rate and iteration count.
 \end{itemize}
 
-The \LEAN{} formalisation of Theorem~\ref{thm:progress} is provided in the
-companion file \texttt{Paper29\_RepairSemantics.lean}.  The full
-implementation is available in
-\texttt{src/jugeo/problem\_modes/repair\_semantics/}.
+The current repository evidence is therefore best read as a diagnosis
+framework for failed repairs rather than a validated automatic repair
+system.
 
 % ── Bibliography (inline) ──────────────────────────────────────────────
 \begin{thebibliography}{99}

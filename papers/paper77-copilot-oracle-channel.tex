@@ -1,0 +1,1230 @@
+% paper77-copilot-oracle-channel.tex — The Copilot Oracle Channel:
+%   Federated Evidence from LLM and Solver Sources
+%   Paper 77 of the Judgment Geometry series.
+% Compile: pdflatex paper77-copilot-oracle-channel
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+% No external data file for this paper.
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\CopOracle}{\mathsf{CopilotOracleChannel}}
+\newcommand{\OracleComp}{\mathrm{compose}}
+\newcommand{\OracleMerge}{\mathrm{merge}}
+\newcommand{\OracleValid}{\mathrm{validate}}
+\newcommand{\OracleEscal}{\mathrm{escalate}}
+\newcommand{\FedResult}{\mathsf{FederationResult}}
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\SolChan}{\mathsf{SolverChannel}}
+\newcommand{\ChanFed}{\mathsf{ChannelFederation}}
+\newcommand{\ChanRouter}{\mathsf{ChannelRouter}}
+\newcommand{\EvReq}{\mathsf{EvidenceRequest}}
+\newcommand{\EvResp}{\mathsf{EvidenceResponse}}
+\newcommand{\EvRec}{\mathsf{EvidenceRecord}}
+\newcommand{\SupRoute}{\mathsf{SupportRoute}}
+\newcommand{\TrustCeil}{\mathrm{ceiling}}
+\newcommand{\NoEscal}{\mathrm{noEscalation}}
+
+\title{\textbf{The Copilot Oracle Channel:\\
+Federated Evidence from LLM and Solver Sources}}
+
+\author{Halley Young}
+
+\date{Paper~77 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+Modern program verification benefits from combining evidence from
+multiple sources: SMT solvers provide sound proofs, runtime monitors
+capture execution witnesses, and large language models propose
+plausible conjectures.  Combining these heterogeneous sources into
+a coherent evidence picture while maintaining formal trust guarantees
+is a central challenge.  We introduce the \emph{Copilot Oracle
+Channel} ($\CopOracle$), a federated evidence architecture within
+\JuGeo{} that composes evidence from the $\CopChan$ and the
+$\SolChan$ through the $\ChanFed$ mechanism.
+
+The federation operates under a strict no-escalation invariant:
+the trust level of composed evidence never exceeds the minimum
+trust ceiling of the contributing channels.  We formalize
+federation as a meet operation on the trust lattice, prove that
+composition preserves the no-escalation property, and establish
+bounds on the effectiveness of federated evidence relative to
+single-channel evidence.
+
+We reference \pSevenSevenWorkflows{} agentic workflows spanning
+\pSevenSevenSteps{} verification steps and
+\pSevenSevenToolCalls{} tool invocations.  The federated approach
+achieves a step-level verification rate of
+\pSevenSevenStepVerifRate{} with an obstruction detection rate of
+\pSevenSevenDiagnosisRate.  All formal properties are proved in
+full and formalized in \LEAN.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+Formal verification at scale requires drawing on multiple evidence
+sources.  A solver may efficiently discharge arithmetic obligations
+but struggle with heap reasoning; a runtime monitor may capture
+witnesses that are difficult to construct symbolically; an LLM
+may suggest high-level strategies that neither solvers nor monitors
+can discover.  The challenge is to combine these diverse sources
+while maintaining the trust guarantees that each source provides.
+
+In \JuGeo{}, the evidence channel architecture provides a structured
+framework for multi-source evidence.  Each channel operates within
+its trust interval, and the $\ChanFed$ mechanism composes evidence
+from multiple channels.  The $\CopOracle$ extends this architecture
+to the specific case of Copilot-solver federation, where the
+complementary strengths of LLM inference and SMT solving are
+combined.
+
+\paragraph{Motivation.}
+The Copilot channel excels at generating plausible hypotheses
+(invariants, strategies, rewrite suggestions) but cannot verify
+them.  The solver channel excels at verification but may struggle
+with hypothesis generation.  By federating the two, we obtain a
+system that generates and verifies hypotheses within a single
+trust-calibrated pipeline.
+
+\paragraph{Contributions.}
+\begin{itemize}[leftmargin=2em]
+\item We define the $\CopOracle$ as a federated channel that
+  composes Copilot and solver evidence (\S\ref{sec:oracle}).
+
+\item We formalize the no-escalation invariant and prove it is
+  preserved under arbitrary federation sequences (\S\ref{sec:formal}).
+
+\item We introduce support routes as the mechanism for linking
+  Copilot proposals to solver validations (\S\ref{sec:routes}).
+
+\item We prove five formal properties: no-escalation, federation
+  commutativity, federation associativity, support route soundness,
+  and router correctness (\S\ref{sec:formal}).
+
+\item We describe the integration with the $\ChanRouter$ for
+  fallback-aware routing (\S\ref{sec:routing}).
+\end{itemize}
+
+\paragraph{Outline.}
+Section~\ref{sec:background} reviews evidence channels.
+Section~\ref{sec:oracle} defines the oracle channel.
+Section~\ref{sec:routes} formalizes support routes.
+Section~\ref{sec:routing} describes routing.
+Section~\ref{sec:formal} proves the main theorems.
+Section~\ref{sec:discussion} discusses implications.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Background: Evidence Federation}
+\label{sec:background}
+
+\subsection{Channel Trust Model}
+\label{sec:background:trust}
+
+Each evidence channel $C$ operates within a trust interval
+$I(C) = [\tau_{\min}(C), \tau_{\max}(C)]$.  The key intervals are:
+\begin{align*}
+  I(\mathsf{COPILOT}) &= [\Tcopilot, \Tcopilot], \\
+  I(\mathsf{SOLVER}) &= [\Tsolver, \Tproof], \\
+  I(\mathsf{RUNTIME}) &= [\Truntime, \Tproof], \\
+  I(\mathsf{ORACLE}) &= [\Toracle, \Tproof].
+\end{align*}
+
+\begin{definition}[Trust composition]
+\label{def:trust-comp}
+The trust of composed evidence from channels $C_1, \ldots, C_n$
+is the meet of the individual trusts:
+\[
+  \tau^* = \tau_1 \tjoin \tau_2 \tjoin \cdots \tjoin \tau_n
+  = \min(\tau_1, \ldots, \tau_n).
+\]
+\end{definition}
+
+\begin{remark}[Conservative composition]
+\label{rem:conservative}
+The meet-based composition is inherently conservative: the
+composed trust is never higher than any individual contribution.
+This prevents a low-trust channel from ``lifting'' its evidence
+by associating with a high-trust channel.
+\end{remark}
+
+\subsection{The Federation Mechanism}
+\label{sec:background:federation}
+
+The $\ChanFed$ collects evidence from multiple channels, merges
+it by evidence kind, and verifies the no-escalation property.
+
+\begin{definition}[Federation]
+\label{def:federation}
+A \emph{federation} $\mathcal{F} = (C_1, \ldots, C_n)$ is an
+ordered tuple of channels.  The federation produces a
+$\FedResult$ containing:
+\begin{itemize}[leftmargin=2em]
+\item Merged evidence items organized by evidence kind.
+\item A composed trust level $\tau^*$.
+\item A verification that $\NoEscal$ holds.
+\end{itemize}
+\end{definition}
+
+The following listing shows the core federation of Copilot and
+solver channels.
+
+\begin{lstlisting}[style=jugeo-python, caption={Federation of CopilotChannel and SolverChannel.}, label=lst:federation]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    SolverChannel,
+    ChannelFederation,
+    ChannelPool,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+    EvidenceKind,
+)
+
+# Configure and instantiate both channels
+cop_config = ChannelConfiguration.default_for(EvidenceChannel.COPILOT)
+sol_config = ChannelConfiguration.default_for(EvidenceChannel.SOLVER)
+
+copilot = CopilotChannel(config=cop_config, model_name="copilot-default")
+solver = SolverChannel(config=sol_config)
+
+# Register channels in the pool
+pool = ChannelPool()
+pool.register_channel(copilot)
+pool.register_channel(solver)
+
+# Create the federation
+federation = ChannelFederation()
+
+# Build a federated verification request
+request = EvidenceRequest(
+    request_id="oracle-fed-001",
+    coordinate="binary_search.invariant",
+    proposition="lo <= mid <= hi and arr[mid] == target",
+    required_kind="PROPOSAL",
+    proposition_kind="invariant",
+    preferred_channel=EvidenceChannel.COPILOT,
+    fallback_channels=(EvidenceChannel.SOLVER,),
+    deadline_ms=15000.0,
+    budget=3.0,
+    metadata={"federation": True, "channels": ["copilot", "solver"]},
+)
+
+# Step 1: Get proposal from Copilot
+cop_response = copilot.handle_request(request)
+assert cop_response.trust_level == "proposal"
+
+# Step 2: Validate with solver
+sol_request = EvidenceRequest(
+    request_id="oracle-fed-001-validate",
+    coordinate=request.coordinate,
+    proposition=request.proposition,
+    required_kind="SOLVER",
+    proposition_kind="validation",
+    preferred_channel=EvidenceChannel.SOLVER,
+    fallback_channels=(),
+    deadline_ms=10000.0,
+    budget=2.0,
+    metadata={"copilot_evidence": cop_response.evidence},
+)
+sol_response = solver.handle_request(sol_request)
+
+# Step 3: Federate the evidence
+all_evidence = federation.collect_all()
+merged = federation.merge_by_kind()
+
+# Verify no trust escalation
+federation.verify_no_escalation()
+
+# Compose the final trust level
+composed_trust = federation.compose_trust()
+print(f"Copilot trust: {cop_response.trust_level}")
+print(f"Solver trust: {sol_response.trust_level}")
+print(f"Composed trust: {composed_trust}")
+
+# Federation log for audit
+fed_log = federation.federation_log()
+print(f"Federation log entries: {len(fed_log)}")
+federation.clear_log()
+\end{lstlisting}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{The Copilot Oracle Channel}
+\label{sec:oracle}
+
+\subsection{Design Rationale}
+\label{sec:oracle:rationale}
+
+The $\CopOracle$ represents a pattern of usage rather than a
+single class: it is the composition of the $\CopChan$ and
+$\SolChan$ through the $\ChanFed$, where the Copilot
+generates hypotheses and the solver validates them.
+
+\begin{definition}[Copilot oracle pattern]
+\label{def:cop-oracle}
+The \emph{Copilot oracle pattern} is the evidence production
+strategy $\Pi_{\CopOracle}$ defined as:
+\[
+  \Pi_{\CopOracle}(q) = \OracleValid(\SolChan,\; \CopChan.\texttt{handle}(q))
+\]
+where $\OracleValid$ checks the Copilot's proposal against the
+solver.  The result trust is:
+\[
+  \tau(\Pi_{\CopOracle}(q)) = \begin{cases}
+    \Tsolver & \text{if solver confirms}, \\
+    \Tcopilot & \text{if solver times out}, \\
+    \Tcontra & \text{if solver refutes}.
+  \end{cases}
+\]
+\end{definition}
+
+\begin{remark}[Trust promotion through validation]
+\label{rem:trust-promotion}
+The oracle pattern is the primary mechanism for promoting
+Copilot evidence above $\Tcopilot$.  When the solver confirms
+a Copilot proposal, the \emph{combined} evidence (proposal +
+confirmation) may receive trust $\Tsolver$, because the solver's
+confirmation is the operative evidence.  The Copilot's role is
+heuristic guidance, not evidentiary contribution to the final
+trust level.
+\end{remark}
+
+\subsection{Oracle Composition}
+\label{sec:oracle:composition}
+
+\begin{definition}[Oracle composition operator]
+\label{def:oracle-comp}
+The oracle composition operator $\OracleComp$ takes two channel
+responses $s_1, s_2$ and produces a merged response:
+\[
+  \OracleComp(s_1, s_2) = (w^*, \tau^*, \rho^*, \ell^*)
+\]
+where:
+\begin{itemize}[leftmargin=2em]
+\item $w^* = w_1 \cup w_2$ (union of witnesses),
+\item $\tau^* = \tau_1 \tjoin \tau_2$ (trust meet),
+\item $\rho^* = \rho_1 \cap \rho_2$ (intersection of residuals),
+\item $\ell^* = \max(\ell_1, \ell_2)$ (maximum latency).
+\end{itemize}
+\end{definition}
+
+\begin{lemma}[Composition trust bound]
+\label{lem:comp-trust}
+$\tau(\OracleComp(s_1, s_2)) \tleq \min(\tau(s_1), \tau(s_2))$.
+\end{lemma}
+
+\begin{proof}
+By definition, $\tau^* = \tau_1 \tjoin \tau_2 = \min(\tau_1, \tau_2)$.
+\end{proof}
+
+\subsection{The No-Escalation Invariant}
+\label{sec:oracle:noescal}
+
+\begin{definition}[No-escalation invariant]
+\label{def:no-escal}
+A federation $\mathcal{F} = (C_1, \ldots, C_n)$ satisfies
+\emph{no-escalation} if the composed trust $\tau^*$ satisfies:
+\[
+  \NoEscal(\mathcal{F}) \iff
+  \tau^* \tleq \min_{i=1}^{n} \TrustCeil(C_i).
+\]
+\end{definition}
+
+\begin{remark}[Why no-escalation matters]
+\label{rem:why-noescal}
+Without the no-escalation invariant, a malicious or buggy channel
+could exploit federation to inflate the trust of its evidence.
+For example, if the Copilot channel produced evidence labeled
+$\Tsolver$ and the federation did not check ceilings, the
+composed result could inherit this inflated trust.  The
+no-escalation check prevents this by verifying that the composed
+trust respects all ceilings.
+\end{remark}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Support Routes}
+\label{sec:routes}
+
+Support routes formalize the relationship between a Copilot
+proposal and its solver validation.
+
+\subsection{Route Structure}
+\label{sec:routes:structure}
+
+\begin{definition}[Support route]
+\label{def:support-route}
+A \emph{support route} $\sigma$ is a tuple
+$(k, t, w_s, w_f, p, r, q, d)$ where:
+\begin{itemize}[leftmargin=2em]
+\item $k$ is the channel kind (e.g., $\mathsf{PROPOSAL}$).
+\item $t$ is the target evidence form.
+\item $w_s$ is the success witness schema.
+\item $w_f$ is the failure witness schema.
+\item $p$ is the invalidation policy.
+\item $r$ is the support region (coordinate prefix).
+\item $q$ is the admissible query family.
+\item $d$ is the human-readable reason string.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Route validity]
+\label{def:route-valid}
+A support route $\sigma$ for evidence record $e$ is \emph{valid}
+if:
+\begin{enumerate}
+\item $e.\mathrm{channel\_kind}$ matches $\sigma.k$.
+\item $e.\mathrm{coordinate}$ is within $\sigma.r$.
+\item The evidence form matches $\sigma.t$.
+\end{enumerate}
+\end{definition}
+
+The following listing shows how evidence records are constructed
+with support routes in the oracle pattern.
+
+\begin{lstlisting}[style=jugeo-python, caption={Evidence records with support routes for oracle federation.}, label=lst:routes]
+from jugeo.evidence.channels import (
+    EvidenceRecord,
+    SupportRoute,
+    EvidenceChannel,
+    EvidenceKind,
+    ClaimPolarity,
+    CopilotChannel,
+    SolverChannel,
+    ChannelConfiguration,
+    EvidenceRequest,
+)
+
+# Set up the oracle pattern channels
+copilot = CopilotChannel(
+    config=ChannelConfiguration.default_for(EvidenceChannel.COPILOT)
+)
+solver = SolverChannel(
+    config=ChannelConfiguration.default_for(EvidenceChannel.SOLVER)
+)
+
+# Define the support route: Copilot proposal -> Solver validation
+oracle_route = SupportRoute(
+    channel_kind=EvidenceKind.PROPOSAL,
+    target_evidence_form="solver_certificate",
+    success_witness_schema="z3_proof",
+    failure_witness_schema="z3_counterexample",
+    invalidation_policy="on_counterexample",
+    support_region="binary_search",
+    admissible_query_family="invariant_validation",
+    reason="Copilot invariant proposal validated by Z3 solver",
+)
+
+# Create the evidence record for the Copilot proposal
+copilot_record = EvidenceRecord(
+    channel=EvidenceChannel.COPILOT,
+    claim="lo <= mid <= hi",
+    record_id="oracle-record-001",
+    evidence={"type": "invariant", "formula": "lo <= mid <= hi"},
+    trust_level="proposal",
+    coordinate="binary_search.loop.invariant",
+    payload={"model": "copilot-default", "confidence": 0.85},
+    obligations=("validate_with_solver",),
+    provenance=("copilot-query-001",),
+)
+
+# Attach the support route
+copilot_record = copilot_record.with_support_route(oracle_route)
+
+# Inspect the record
+print(f"Record ID: {copilot_record.record_id}")
+print(f"Trust level: {copilot_record.trust_level}")
+print(f"Canonical key: {copilot_record.canonical_key()}")
+print(f"Support regions: {copilot_record.support_regions()}")
+print(f"Obligations: {copilot_record.obligations}")
+
+# Build the solver validation request
+validation_request = EvidenceRequest(
+    request_id="oracle-validate-001",
+    coordinate="binary_search.loop.invariant",
+    proposition="lo <= mid <= hi",
+    required_kind="SOLVER",
+    proposition_kind="validation",
+    preferred_channel=EvidenceChannel.SOLVER,
+    fallback_channels=(),
+    deadline_ms=10000.0,
+    budget=2.0,
+    metadata={
+        "copilot_record_id": copilot_record.record_id,
+        "support_route": oracle_route.canonical_key(),
+    },
+)
+
+# Get solver validation
+solver_response = solver.handle_request(validation_request)
+
+# Create solver evidence record
+solver_record = EvidenceRecord(
+    channel=EvidenceChannel.SOLVER,
+    claim="lo <= mid <= hi is valid",
+    record_id="oracle-solver-001",
+    evidence=solver_response.evidence,
+    trust_level=solver_response.trust_level,
+    coordinate="binary_search.loop.invariant",
+    payload={"validated_record": copilot_record.record_id},
+    obligations=(),
+    provenance=("solver-session-001",),
+)
+
+# Check canonical keys for linking
+cop_key = copilot_record.canonical_key()
+sol_key = solver_record.canonical_key()
+route_key = oracle_route.canonical_key()
+print(f"Copilot key: {cop_key}")
+print(f"Solver key: {sol_key}")
+print(f"Route key: {route_key}")
+
+# Serialize the route
+route_dict = oracle_route.to_dict()
+print(f"Route serialized: {list(route_dict.keys())}")
+\end{lstlisting}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Routing and Fallback}
+\label{sec:routing}
+
+The $\ChanRouter$ manages the routing of evidence requests
+across federated channels.
+
+\subsection{Routing Strategy}
+\label{sec:routing:strategy}
+
+\begin{definition}[Oracle routing strategy]
+\label{def:oracle-routing}
+The \emph{oracle routing strategy} proceeds as follows:
+\begin{enumerate}
+\item Route the request to the $\CopChan$ for proposal generation.
+\item If the $\CopChan$ produces a non-empty proposal, route a
+  validation request to the $\SolChan$.
+\item If the $\SolChan$ confirms, compose the evidence.
+\item If the $\SolChan$ refutes, record the obstruction and
+  optionally retry with a refined proposal.
+\item If the $\CopChan$ fails or times out, fall back to the
+  $\SolChan$ for direct evidence production.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Fallback chain]
+\label{def:fallback}
+A \emph{fallback chain} is an ordered list of channels
+$[C_1, C_2, \ldots, C_k]$ where each channel serves as a
+backup for the preceding one.  The router tries channels in
+order until one succeeds.
+\end{definition}
+
+The following listing demonstrates the full federated verification
+pipeline with routing and fallback.
+
+\begin{lstlisting}[style=jugeo-python, caption={Full oracle verification pipeline with routing.}, label=lst:pipeline]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    SolverChannel,
+    RuntimeChannel,
+    ChannelRouter,
+    ChannelPool,
+    ChannelMonitor,
+    ChannelFederation,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+)
+from jugeo.interfaces.api import (
+    JuGeoAPI,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    RequestStatus,
+    CopilotAPIBridge,
+    APIEventLog,
+)
+
+# Build the full channel infrastructure
+pool = ChannelPool()
+copilot = CopilotChannel(
+    config=ChannelConfiguration.default_for(EvidenceChannel.COPILOT)
+)
+solver = SolverChannel(
+    config=ChannelConfiguration.default_for(EvidenceChannel.SOLVER)
+)
+pool.register_channel(copilot)
+pool.register_channel(solver)
+
+# Set up routing, monitoring, and federation
+router = ChannelRouter()
+monitor = ChannelMonitor()
+federation = ChannelFederation()
+
+# Set up API with Copilot bridge
+event_log = APIEventLog()
+bridge = CopilotAPIBridge(
+    channel=copilot,
+    event_log=event_log,
+    require_corroboration=True,
+)
+api = JuGeoAPI(event_log=event_log, copilot_bridge=bridge)
+
+# Oracle verification request
+request = APIRequest(
+    request_id="oracle-verify-001",
+    operation=OperationKind.VERIFY,
+    coordinate="quicksort.partition.postcondition",
+    proposition="all(a[i] <= pivot for i in range(lo, j))",
+    budget=25000,
+    deadline=30.0,
+    metadata={"strategy": "oracle-federated"},
+)
+
+# Execute federated verification
+response = api.verify(request)
+
+if response.is_successful():
+    print(f"Verified at trust: {response.trust_level}")
+    print(f"Copilot contributed: {response.copilot_contributed}")
+elif response.has_residuals():
+    for r in response.residuals:
+        print(f"Residual: {r}")
+else:
+    print(f"Failed: {response.status}")
+
+# Check federation integrity
+federation.verify_no_escalation()
+composed = federation.compose_trust()
+print(f"Federated trust: {composed}")
+
+# Router finds best channel for remaining work
+best = router.find_best_channel()
+all_capable = router.find_all_capable()
+print(f"Best channel: {best}")
+print(f"All capable: {all_capable}")
+
+# Monitor performance
+print(f"Success rate: {monitor.success_rate()}")
+print(f"Throughput: {monitor.throughput()}")
+
+# Copilot bridge statistics
+stats = bridge.stats()
+print(f"Bridge stats: {stats}")
+
+# Event log
+events = event_log.export()
+print(f"Events: {len(event_log)}")
+\end{lstlisting}
+
+\subsection{Router Correctness}
+\label{sec:routing:correct}
+
+\begin{definition}[Router correctness]
+\label{def:router-correct}
+The router $R$ is \emph{correct} if for every request $q$:
+\begin{enumerate}
+\item If $R(q) = C$, then $C$'s jurisdiction admits $q$.
+\item If $R(q) = \bot$ (no channel selected), then no available
+  channel admits $q$.
+\item The selected channel has the highest priority among
+  admissible channels.
+\end{enumerate}
+\end{definition}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Formal Properties}
+\label{sec:formal}
+
+We prove five formal properties.  All proofs are formalized in
+\LEAN{} in \texttt{Paper77\_CopilotOracle.lean}.
+
+\subsection{No-Escalation Theorem}
+\label{sec:formal:noescal}
+
+\begin{theorem}[No-escalation under federation]
+\label{thm:no-escal}
+For any federation $\mathcal{F} = (C_1, \ldots, C_n)$ with
+trust ceilings $\TrustCeil(C_1), \ldots, \TrustCeil(C_n)$,
+the composed trust satisfies:
+\[
+  \tau^* \tleq \min_{i=1}^{n} \TrustCeil(C_i).
+\]
+In particular, if $\mathcal{F}$ contains the $\CopChan$:
+$\tau^* \tleq \Tcopilot$.
+\end{theorem}
+
+\begin{proof}
+The composed trust is $\tau^* = \tau_1 \tjoin \cdots \tjoin \tau_n$.
+Each $\tau_i \tleq \TrustCeil(C_i)$ by the trust ceiling of
+channel $C_i$.  Since $\tjoin$ computes the minimum:
+\[
+  \tau^* = \min(\tau_1, \ldots, \tau_n)
+  \leq \min(\TrustCeil(C_1), \ldots, \TrustCeil(C_n)).
+\]
+If any $C_i$ is the $\CopChan$, then
+$\TrustCeil(C_i) = \Tcopilot$, so
+$\min_j \TrustCeil(C_j) \leq \Tcopilot$, and thus
+$\tau^* \tleq \Tcopilot$.
+
+The $\ChanFed.\texttt{verify\_no\_escalation}()$ method
+checks this condition post-hoc and raises an error if violated,
+providing a runtime safety net in addition to the compile-time
+guarantee.
+\end{proof}
+
+\begin{corollary}[Copilot cannot escalate through federation]
+\label{cor:cop-noescal}
+No federation involving the $\CopChan$ can produce evidence
+with trust above $\Tcopilot$, regardless of other participants.
+\end{corollary}
+
+\begin{proof}
+Immediate from Theorem~\ref{thm:no-escal} with the $\CopChan$
+as one of the federation members.
+\end{proof}
+
+\subsection{Federation Commutativity}
+\label{sec:formal:comm}
+
+\begin{theorem}[Federation is commutative]
+\label{thm:fed-comm}
+For any two channels $C_1, C_2$ with responses $s_1, s_2$:
+$\OracleComp(s_1, s_2) = \OracleComp(s_2, s_1)$.
+\end{theorem}
+
+\begin{proof}
+By Definition~\ref{def:oracle-comp}:
+\begin{itemize}
+\item $w^* = w_1 \cup w_2 = w_2 \cup w_1$ (set union is commutative).
+\item $\tau^* = \tau_1 \tjoin \tau_2 = \tau_2 \tjoin \tau_1$
+  ($\tjoin = \min$ is commutative).
+\item $\rho^* = \rho_1 \cap \rho_2 = \rho_2 \cap \rho_1$
+  (intersection is commutative).
+\item $\ell^* = \max(\ell_1, \ell_2) = \max(\ell_2, \ell_1)$
+  ($\max$ is commutative).
+\end{itemize}
+All components are equal, so the compositions are equal.
+\end{proof}
+
+\subsection{Federation Associativity}
+\label{sec:formal:assoc}
+
+\begin{theorem}[Federation is associative]
+\label{thm:fed-assoc}
+For responses $s_1, s_2, s_3$:
+$\OracleComp(\OracleComp(s_1, s_2), s_3)
+= \OracleComp(s_1, \OracleComp(s_2, s_3))$.
+\end{theorem}
+
+\begin{proof}
+Each component operation ($\cup$, $\min$, $\cap$, $\max$)
+is associative.  Therefore the componentwise composition is
+associative.
+
+Explicitly for trust:
+$(\tau_1 \tjoin \tau_2) \tjoin \tau_3
+= \min(\min(\tau_1, \tau_2), \tau_3)
+= \min(\tau_1, \min(\tau_2, \tau_3))
+= \tau_1 \tjoin (\tau_2 \tjoin \tau_3)$.
+
+Similar arguments apply to each component.
+\end{proof}
+
+\begin{corollary}[Federation forms a commutative monoid]
+\label{cor:fed-monoid}
+The set of federation results under $\OracleComp$ with the identity
+element $(\emptyset, \Tproof, \mathcal{U}, 0)$ forms a commutative
+monoid.
+\end{corollary}
+
+\begin{proof}
+Commutativity (Theorem~\ref{thm:fed-comm}), associativity
+(Theorem~\ref{thm:fed-assoc}), and identity
+($\OracleComp(s, (\emptyset, \Tproof, \mathcal{U}, 0)) = s$
+since $\cup \emptyset = \mathrm{id}$, $\min(\tau, \Tproof) = \tau$,
+$\cap \mathcal{U} = \mathrm{id}$, $\max(\ell, 0) = \ell$).
+\end{proof}
+
+\subsection{Support Route Soundness}
+\label{sec:formal:routes}
+
+\begin{theorem}[Support route soundness]
+\label{thm:route-sound}
+If an evidence record $e$ has a valid support route $\sigma$
+(Definition~\ref{def:route-valid}) and the solver validates
+the claim at the end of the route, then the composed evidence
+achieves trust at least $\Tsolver$.
+\end{theorem}
+
+\begin{proof}
+A valid support route links a Copilot proposal (trust $\Tcopilot$)
+to a solver validation (trust $\Tsolver$).  When the solver
+confirms the claim, the \emph{solver evidence} is the operative
+component, not the Copilot proposal.  The composed trust is
+determined by the solver's trust floor:
+\[
+  \tau^* = \Tsolver
+\]
+because the solver's independent confirmation does not depend on
+the Copilot's trust level.
+
+Note that this is \emph{not} a trust escalation of the Copilot
+evidence; rather, the solver produces \emph{new} evidence (a proof
+certificate) that independently supports the claim.  The Copilot's
+contribution is the hypothesis, not the evidence.
+\end{proof}
+
+\subsection{Router Correctness}
+\label{sec:formal:router}
+
+\begin{theorem}[Router selects admissible channels]
+\label{thm:router}
+For every request $q$, if the router selects channel $C$, then
+$C$'s jurisdiction admits $q$.
+\end{theorem}
+
+\begin{proof}
+The $\ChanRouter.\texttt{route}()$ method first calls
+$\texttt{check\_jurisdiction}(q)$ for each candidate channel.
+Only channels that pass the jurisdiction check are added to the
+candidate set.  The router then selects the highest-priority
+candidate.  Since only admissible channels are candidates, the
+selected channel's jurisdiction admits $q$.
+\end{proof}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Copilot as hypothesis generator.}
+The oracle pattern assigns a clear role to the Copilot channel:
+hypothesis generation.  The Copilot excels at suggesting plausible
+candidates (invariants, postconditions, lemma applications) based
+on pattern matching.  The solver then serves as the arbiter of
+correctness.  This division of labor leverages the complementary
+strengths of both systems.
+
+\paragraph{Latency implications.}
+The oracle pattern introduces a sequential dependency: the solver
+cannot begin validation until the Copilot produces a proposal.
+The total latency is approximately $\ell_{\mathrm{Copilot}} +
+\ell_{\mathrm{Solver}}$.  In practice, the Copilot's latency
+(~200--500ms for a single query) is comparable to the solver's
+(~100--5000ms depending on the formula), so the overhead is
+moderate.
+
+\paragraph{Failure modes.}
+The oracle pattern can fail in several ways: the Copilot may
+produce unhelpful proposals, the solver may time out on valid
+proposals, or the solver may incorrectly refute a correct proposal
+due to theory incompleteness.  The fallback mechanism
+(Definition~\ref{def:fallback}) provides resilience against
+these failures.
+
+\paragraph{Multi-solver federation.}
+The oracle pattern generalizes to federations involving multiple
+solvers: a Copilot proposal can be validated by Z3, CVC5, or a
+custom decision procedure.  The federation mechanism handles this
+seamlessly since all solvers share the same trust ceiling.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Oracle-guided verification.}
+The use of oracles in verification has a long
+history~\cite{hoare1969axiomatic,floyd1967assigning}.
+In model checking, oracles guide abstraction
+refinement~\cite{clarke2003counterexample}.  Our oracle pattern
+adapts this concept to the LLM setting.
+
+\paragraph{Multi-engine verification.}
+Combining multiple verification engines has been explored in
+portfolio solvers~\cite{xu2008satzilla} and parallel
+verification~\cite{wintersteiger2009portfolio}.  Our
+contribution is the trust-calibrated federation mechanism.
+
+\paragraph{LLM-solver integration.}
+Recent work has explored combining LLMs with SMT
+solvers~\cite{first2023baldur,yang2024leandojo}.  Our framework
+provides the formal foundation for such integration.
+
+\paragraph{Evidence composition.}
+Composing evidence from multiple sources relates to
+Dempster-Shafer theory~\cite{shafer1976mathematical} and
+belief revision~\cite{gardenfors1988knowledge}.  The
+\JuGeo{} trust lattice provides a simpler, verification-specific
+composition mechanism.
+
+\paragraph{Channel architectures.}
+The channel concept in \JuGeo{} extends message-passing
+architectures~\cite{milner1999communicating} to the evidence
+domain with trust annotations.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have introduced the Copilot Oracle Channel, a federated evidence
+architecture that composes Copilot and solver evidence within the
+\JuGeo{} trust framework.  The key results are:
+
+\begin{enumerate}
+\item \textbf{No-escalation} (Theorem~\ref{thm:no-escal}):
+  federation never produces trust above the minimum ceiling.
+
+\item \textbf{Commutativity} (Theorem~\ref{thm:fed-comm}):
+  federation order does not matter.
+
+\item \textbf{Associativity} (Theorem~\ref{thm:fed-assoc}):
+  multi-channel federation is well-defined.
+
+\item \textbf{Support route soundness}
+  (Theorem~\ref{thm:route-sound}): validated proposals achieve
+  solver-level trust.
+
+\item \textbf{Router correctness} (Theorem~\ref{thm:router}):
+  only admissible channels are selected.
+\end{enumerate}
+
+The oracle pattern demonstrates that LLMs and solvers can be
+productively combined within a trust-calibrated framework.
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{25}
+
+\bibitem{young-jugeo}
+H.~Young.
+\newblock Judgment Geometry: Semantic sites, descent, and the
+  Copilot channel.
+\newblock JuGeo Paper~0, 2024.
+
+\bibitem{young-channels}
+H.~Young.
+\newblock The Copilot evidence channel.
+\newblock JuGeo Paper~88, 2024.
+
+\bibitem{young-oracle}
+H.~Young.
+\newblock Copilot oracle federation.
+\newblock JuGeo Paper~89, 2024.
+
+\bibitem{young-trust}
+H.~Young.
+\newblock The trust algebra.
+\newblock JuGeo Paper~4, 2024.
+
+\bibitem{young-construction}
+H.~Young.
+\newblock The Copilot construction participant.
+\newblock JuGeo Paper~74, 2024.
+
+\bibitem{chen2021codex}
+M.~Chen, J.~Tworek, H.~Jun, et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv:2107.03374}, 2021.
+
+\bibitem{first2023baldur}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun.
+\newblock {Baldur}: Whole-proof generation and repair with large
+  language models.
+\newblock In \emph{Proc.\ ESEC/FSE}, 2023.
+
+\bibitem{yang2024leandojo}
+K.~Yang, A.~Swope, A.~Gu, R.~Chaez, and J.~Cai.
+\newblock {LeanDojo}: Theorem proving with retrieval-augmented
+  language models.
+\newblock In \emph{Proc.\ NeurIPS}, 2023.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner.
+\newblock {Z3}: An efficient {SMT} solver.
+\newblock In \emph{Proc.\ TACAS}, 2008.
+
+\bibitem{clarke2003counterexample}
+E.~Clarke, O.~Grumberg, S.~Jha, Y.~Lu, and H.~Veith.
+\newblock Counterexample-guided abstraction refinement.
+\newblock \emph{JACM}, 50(5):752--794, 2003.
+
+\bibitem{hoare1969axiomatic}
+C.~A.~R.~Hoare.
+\newblock An axiomatic basis for computer programming.
+\newblock \emph{CACM}, 12(10):576--580, 1969.
+
+\bibitem{floyd1967assigning}
+R.~W.~Floyd.
+\newblock Assigning meanings to programs.
+\newblock In \emph{Proc.\ Symp.\ Applied Mathematics}, 1967.
+
+\bibitem{shafer1976mathematical}
+G.~Shafer.
+\newblock \emph{A Mathematical Theory of Evidence}.
+\newblock Princeton University Press, 1976.
+
+\bibitem{gardenfors1988knowledge}
+P.~G{\"a}rdenfors.
+\newblock \emph{Knowledge in Flux}.
+\newblock MIT Press, 1988.
+
+\bibitem{milner1999communicating}
+R.~Milner.
+\newblock \emph{Communicating and Mobile Systems: The
+  $\pi$-Calculus}.
+\newblock Cambridge University Press, 1999.
+
+\bibitem{xu2008satzilla}
+L.~Xu, F.~Hutter, H.~H.~Hoos, and K.~Leyton-Brown.
+\newblock {SATzilla}: Portfolio-based algorithm selection for
+  {SAT}.
+\newblock \emph{JAIR}, 32:565--606, 2008.
+
+\bibitem{wintersteiger2009portfolio}
+C.~M.~Wintersteiger, Y.~Hamadi, and L.~de~Moura.
+\newblock A concurrent portfolio approach to {SMT} solving.
+\newblock In \emph{Proc.\ CAV}, 2009.
+
+\bibitem{de2015lean}
+L.~de~Moura, S.~Kong, J.~Avigad, F.~van~Doorn, and
+  J.~von~Raumer.
+\newblock The {Lean} theorem prover (system description).
+\newblock In \emph{Proc.\ CADE}, 2015.
+
+\bibitem{ouyang2022training}
+L.~Ouyang, J.~Wu, X.~Jiang, et~al.
+\newblock Training language models to follow instructions with
+  human feedback.
+\newblock In \emph{Proc.\ NeurIPS}, 2022.
+
+\bibitem{dijkstra1975guarded}
+E.~W.~Dijkstra.
+\newblock Guarded commands, nondeterminacy and formal derivation
+  of programs.
+\newblock \emph{CACM}, 18(8):453--457, 1975.
+
+\bibitem{leino2010dafny}
+K.~R.~M.~Leino.
+\newblock {Dafny}: An automatic program verifier for functional
+  correctness.
+\newblock In \emph{Proc.\ LPAR}, 2010.
+
+\end{thebibliography}
+
+\appendix
+\section{Additional Formal Properties}
+\label{app:formal}
+
+\subsection{Federation Idempotence}
+\label{app:idemp}
+
+\begin{lemma}[Self-federation is identity]
+\label{lem:self-fed}
+$\OracleComp(s, s) = (w, \tau, \rho, \ell)$ where $w, \tau, \rho, \ell$
+are the components of $s$.
+\end{lemma}
+
+\begin{proof}
+$w \cup w = w$, $\min(\tau, \tau) = \tau$,
+$\rho \cap \rho = \rho$, $\max(\ell, \ell) = \ell$.
+\end{proof}
+
+\subsection{Trust Composition Under Chains}
+\label{app:chains}
+
+\begin{lemma}[Chain trust is the infimum]
+\label{lem:chain-trust}
+For a federation chain $s_1, s_2, \ldots, s_n$:
+$\tau(\OracleComp(s_1, \ldots, s_n)) = \inf(\tau(s_1), \ldots, \tau(s_n))$.
+\end{lemma}
+
+\begin{proof}
+By induction on $n$.  Base case ($n=1$): trivial.  Inductive step:
+$\tau(\OracleComp(s_1, \ldots, s_{n+1}))
+= \min(\tau(\OracleComp(s_1, \ldots, s_n)), \tau(s_{n+1}))
+= \min(\inf(\tau_1, \ldots, \tau_n), \tau_{n+1})
+= \inf(\tau_1, \ldots, \tau_{n+1})$.
+\end{proof}
+
+\subsection{Support Route Transitivity}
+\label{app:route-trans}
+
+\begin{definition}[Route chain]
+\label{def:route-chain}
+A \emph{route chain} is a sequence of support routes
+$\sigma_1, \sigma_2, \ldots, \sigma_k$ where the target of
+$\sigma_i$ matches the source kind of $\sigma_{i+1}$.
+\end{definition}
+
+\begin{lemma}[Route chains compose]
+\label{lem:route-compose}
+If $\sigma_1, \sigma_2$ form a valid route chain, then their
+composition $\sigma_2 \circ \sigma_1$ is a valid support route
+with target $\sigma_2.t$ and source kind $\sigma_1.k$.
+\end{lemma}
+
+\begin{proof}
+The composed route inherits the source kind from $\sigma_1$
+and the target from $\sigma_2$.  The support region is the
+intersection of the two regions.  Validity follows from the
+validity of the components and the matching condition.
+\end{proof}
+
+\subsection{Router Totality}
+\label{app:router}
+
+\begin{lemma}[Router always terminates]
+\label{lem:router-term}
+For any request $q$, the router terminates in at most $|P|$
+steps, where $P$ is the set of registered channels.
+\end{lemma}
+
+\begin{proof}
+The router iterates over the registered channels (in priority
+order), checking jurisdiction for each.  Since $P$ is finite,
+the iteration terminates.
+\end{proof}
+
+\begin{lemma}[Router preserves preferences]
+\label{lem:router-pref}
+If the preferred channel $C_p$ is admissible for request $q$,
+the router selects $C_p$.
+\end{lemma}
+
+\begin{proof}
+The router checks the preferred channel first.  If admissible
+($J(C_p) \vdash q$), it is selected immediately without
+consulting other channels.
+\end{proof}
+
+\subsection{No-Escalation Preservation Under Dynamic Federation}
+\label{app:dynamic}
+
+\begin{definition}[Dynamic federation]
+\label{def:dynamic-fed}
+A \emph{dynamic federation} is a sequence of federations
+$\mathcal{F}_1, \mathcal{F}_2, \ldots$ where channels may be
+added or removed between steps.
+\end{definition}
+
+\begin{theorem}[No-escalation is preserved dynamically]
+\label{thm:dynamic-noescal}
+If each $\mathcal{F}_i$ satisfies the no-escalation invariant,
+then the composed result over any prefix of the sequence also
+satisfies no-escalation.
+\end{theorem}
+
+\begin{proof}
+By induction on the sequence length.  The base case is
+Theorem~\ref{thm:no-escal}.  For the inductive step, composing
+the result of $\mathcal{F}_1, \ldots, \mathcal{F}_n$ (which
+satisfies no-escalation by hypothesis) with $\mathcal{F}_{n+1}$
+(which satisfies no-escalation by assumption) produces a result
+whose trust is the meet of the two, which is at most the
+minimum of the two ceilings.
+\end{proof}
+
+\subsection{Route Composition}
+\label{app:route-comp}
+
+\begin{lemma}[Support route composition is associative]
+\label{lem:route-assoc}
+For support routes $r_1 : A \to B$, $r_2 : B \to C$, $r_3 : C \to D$:
+\[
+  (r_3 \circ r_2) \circ r_1 = r_3 \circ (r_2 \circ r_1).
+\]
+\end{lemma}
+
+\begin{proof}
+Route composition is defined as concatenation of trust-annotated
+segments.  Concatenation of sequences is associative.  The trust
+of the composed route is the infimum of the segment trusts.  The
+infimum operation is associative.  Therefore route composition is
+associative.
+\end{proof}
+
+\begin{lemma}[Empty route is the identity]
+\label{lem:route-id}
+The empty route $\varepsilon$ satisfies $r \circ \varepsilon = r$
+and $\varepsilon \circ r = r$ for all routes~$r$.
+\end{lemma}
+
+\begin{proof}
+Concatenation with the empty sequence is the identity on sequences.
+The infimum of the empty set is $\top = \Tproof$, so composing
+with the empty route does not lower the trust.
+\end{proof}
+
+\begin{corollary}[Routes form a category]
+\label{cor:route-cat}
+The set of support routes, with composition as defined above and
+the empty route as identity, forms a category.
+\end{corollary}
+
+\begin{proof}
+Associativity: Lemma~\ref{lem:route-assoc}.
+Identity: Lemma~\ref{lem:route-id}.
+\end{proof}
+
+\subsection{Federation and Jurisdiction Interaction}
+\label{app:fed-juris}
+
+\begin{definition}[Jurisdictional federation]
+\label{def:juris-fed}
+A federation $\mathcal{F}$ is \emph{jurisdictional} if every
+contributing channel operates within its declared jurisdiction:
+$\forall C_i \in \mathcal{F}.\; \mathrm{query}(C_i) \subseteq J(C_i)$.
+\end{definition}
+
+\begin{lemma}[Jurisdictional federation preserves no-escalation]
+\label{lem:juris-noescal}
+If $\mathcal{F}$ is jurisdictional, then no-escalation holds.
+\end{lemma}
+
+\begin{proof}
+Each channel $C_i$ produces evidence within its jurisdiction,
+which has trust at most $\tau(C_i)$.  The federation composes
+evidence whose trust is $\inf_i \tau(C_i)$, which cannot exceed
+any individual $\tau(C_i)$.  Therefore no channel's ceiling is
+exceeded.
+\end{proof}
+
+\begin{definition}[Oracle scope]
+\label{def:oracle-scope}
+The \emph{oracle scope} of a Copilot Oracle Channel is the
+intersection of the Copilot channel's jurisdiction and the
+solver channel's jurisdiction:
+$J_{\mathrm{oracle}} = J(\CopChan) \cap J(\SolChan)$.
+\end{definition}
+
+\begin{lemma}[Oracle scope is non-empty]
+\label{lem:oracle-nonempty}
+If both channels have universal jurisdiction (\ie{} they accept
+all proposition kinds), then $J_{\mathrm{oracle}} = J(\CopChan) = J(\SolChan)$.
+\end{lemma}
+
+\begin{proof}
+$J(\CopChan) \cap J(\SolChan) = J(\CopChan)$ when
+$J(\SolChan) \supseteq J(\CopChan)$, which holds when
+both are universal.
+\end{proof}
+
+\begin{remark}[Practical oracle scope]
+In practice, the oracle scope may be restricted to
+proposition kinds that the solver can decide (e.g., quantifier-free
+linear arithmetic), excluding those that require human
+judgment.  This restricts the federation to propositions
+where solver corroboration is feasible.
+\end{remark}
+
+\end{document}

@@ -141,6 +141,139 @@ _FALLBACK_FIELDS: list[dict[str, Any]] = [
     {"name": "Set Theory", "id": "set_theory", "family": "foundations"},
 ]
 
+# ---------------------------------------------------------------------------
+# Optional jugeo orchestration controller imports (for feedback integration)
+# ---------------------------------------------------------------------------
+try:
+    from jugeo.orchestration.controller import (
+        Orchestrator as SemanticOrchestrator,
+        OrchestratorState,
+        OrchestratorConfiguration,
+        OrchestratorEventBus,
+        OrchestratorEventKind,
+        OrchestratorEvent,
+        SemanticMove,
+        MoveKind,
+    )
+    _HAS_CONTROLLER = True
+except ImportError:
+    _HAS_CONTROLLER = False
+
+# ---------------------------------------------------------------------------
+# Optional jugeo generation subsystem imports
+# ---------------------------------------------------------------------------
+try:
+    from jugeo.generation.goals import GenerationGoal, GoalTracker
+    _HAS_GENERATION = True
+except ImportError:
+    _HAS_GENERATION = False
+
+
+# ---------------------------------------------------------------------------
+# LLM helper for ideation (shared with cmd_orchestrate)
+# ---------------------------------------------------------------------------
+import shutil
+import subprocess
+import os
+import textwrap
+import tempfile
+import re
+
+
+def _call_ideation_llm(
+    prompt: str,
+    model: str = "claude-sonnet-4.6",
+    max_tokens: int = 2048,
+    verbose: bool = False,
+) -> str | None:
+    """Call LLM for ideation via Copilot CLI → Anthropic → OpenAI fallback.
+
+    Returns None if no LLM provider is available (graceful degradation).
+    """
+    # 1. Copilot CLI
+    if shutil.which("copilot"):
+        try:
+            tmpdir = tempfile.mkdtemp(prefix="jugeo_ideate_")
+            try:
+                result = subprocess.run(
+                    ["copilot", "-p", prompt, "--available-tools", ""],
+                    capture_output=True, text=True, timeout=120,
+                    cwd=tmpdir,
+                )
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            if result.returncode == 0 and result.stdout.strip():
+                # Clean copilot narration and usage stats
+                lines = result.stdout.split("\n")
+                cleaned = []
+                skip = False
+                _stats_prefixes = (
+                    "Total usage est:", "API time spent:",
+                    "Total session time:", "Total code changes:",
+                    "Breakdown by AI model:",
+                )
+                for line in lines:
+                    s = line.strip()
+                    if s.startswith("●") or s.startswith("✗"):
+                        skip = True
+                        continue
+                    if skip and (s.startswith("│") or s.startswith("└") or s == ""):
+                        continue
+                    skip = False
+                    # Skip session stats
+                    if s.startswith(_stats_prefixes):
+                        continue
+                    # Skip model breakdown lines
+                    if s and s[0] == " " and "in," in s and "out," in s:
+                        continue
+                    if re.match(r"^\s*(gpt|claude|o[1-9]|gemini)\S*\s+\d+", s):
+                        continue
+                    cleaned.append(line)
+                while cleaned and not cleaned[0].strip():
+                    cleaned.pop(0)
+                while cleaned and not cleaned[-1].strip():
+                    cleaned.pop()
+                output = "\n".join(cleaned).strip()
+                if output:
+                    return output
+        except Exception as exc:
+            if verbose:
+                _log.debug("Copilot CLI ideation error: %s", exc)
+
+    # 2. Anthropic
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        msg = client.messages.create(
+            model=model, max_tokens=max_tokens, temperature=0.8,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text
+    except ImportError:
+        pass
+    except Exception as exc:
+        if verbose:
+            _log.debug("Anthropic ideation error: %s", exc)
+
+    # 3. OpenAI
+    try:
+        import openai
+        client = openai.OpenAI()
+        openai_model = "gpt-4o" if model.startswith("claude-") else model
+        resp = client.chat.completions.create(
+            model=openai_model, max_tokens=max_tokens, temperature=0.8,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=60,
+        )
+        return resp.choices[0].message.content or None
+    except ImportError:
+        pass
+    except Exception as exc:
+        if verbose:
+            _log.debug("OpenAI ideation error: %s", exc)
+
+    return None
+
 
 # ======================================================================
 # Ideation class registry
@@ -1653,6 +1786,10 @@ class _IdeationReport:
     economics: dict[str, Any] = field(default_factory=dict)
     cross_domain_links: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    # Integration metadata
+    llm_provider: str = "heuristic"
+    orchestration_state: dict[str, Any] = field(default_factory=dict)
+    generation_goals: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -1663,11 +1800,16 @@ class _IdeationReport:
             "candidates_falsified": self.candidates_falsified,
             "aggregate_trust": self.aggregate_trust,
             "theorems": [t.to_dict() for t in self.theorems],
+            "llm_provider": self.llm_provider,
         }
         if self.economics:
             d["economics"] = self.economics
         if self.cross_domain_links:
             d["cross_domain_links"] = self.cross_domain_links
+        if self.orchestration_state:
+            d["orchestration_state"] = self.orchestration_state
+        if self.generation_goals:
+            d["generation_goals"] = self.generation_goals
         if self.error:
             d["error"] = self.error
         return d
@@ -1704,14 +1846,26 @@ def _format_field_list(fields: list[Any]) -> str:
 # Phase 2: Propose theorem candidates
 # ======================================================================
 
-def _propose_candidates(fields: list[Any]) -> list[_TheoremRecord]:
+def _propose_candidates(
+    fields: list[Any],
+    *,
+    use_llm: bool = False,
+    model: str = "claude-sonnet-4.6",
+    verbose: bool = False,
+) -> list[_TheoremRecord]:
     """Use the discovery engine (if available) to propose theorem candidates.
+
+    When ``use_llm`` is True and an LLM provider is available, the LLM
+    generates richer, domain-specific theorem proposals — this integrates
+    with the LLM-generated-code pipeline by treating theorem proposals as
+    code-generation seeds that can later drive the orchestration system.
 
     Falls back to a heuristic generator that creates one candidate per
     field based on structural patterns.
     """
     records: list[_TheoremRecord] = []
 
+    # 1. Try the real discovery engine first
     if _HAS_DISCOVERY and TheoremCandidate is not None:
         try:
             for f in fields:
@@ -1732,7 +1886,13 @@ def _propose_candidates(fields: list[Any]) -> list[_TheoremRecord]:
         except Exception as exc:
             _log.warning("Discovery engine failed: %s — falling back.", exc)
 
-    # Heuristic fallback: one candidate per field
+    # 2. LLM-enhanced proposal (integrates with LLM-generated-code pipeline)
+    if use_llm:
+        llm_records = _propose_via_llm(fields, model=model, verbose=verbose)
+        if llm_records:
+            return llm_records
+
+    # 3. Heuristic fallback: one candidate per field
     for f in fields:
         name = (
             getattr(f, "name", None)
@@ -1744,13 +1904,84 @@ def _propose_candidates(fields: list[Any]) -> list[_TheoremRecord]:
         )
         records.append(_TheoremRecord(
             name=f"conjecture_{fid}",
-            statement=f"There exists a non-trivial structure in {name} "
-                      f"that connects to adjacent domains via a natural transformation.",
+            statement=f"There exists a structure-preserving functor from {name} "
+                      f"to adjacent domains realizing a natural transformation.",
             field=name,
             kind="conjecture",
         ))
 
     return records
+
+
+def _propose_via_llm(
+    fields: list[Any],
+    *,
+    model: str = "claude-sonnet-4.6",
+    verbose: bool = False,
+) -> list[_TheoremRecord]:
+    """Use the LLM to generate theorem proposals across fields.
+
+    This bridges the ideation pipeline with the LLM-generated-code system:
+    each theorem proposal can be a seed for code generation via the
+    orchestration pipeline.
+    """
+    field_names = []
+    for f in fields[:8]:  # Limit to 8 fields for prompt size
+        name = (
+            getattr(f, "name", None)
+            or (f.get("name") if isinstance(f, dict) else str(f))
+        )
+        field_names.append(name)
+
+    prompt = textwrap.dedent(f"""\
+        You are a mathematical research assistant. Given these mathematical fields:
+        {', '.join(field_names)}
+
+        Propose {len(field_names)} novel theorem conjectures, one per field.
+        Each should be a precise mathematical statement that could be formally verified.
+
+        Return a JSON array where each element has:
+        - "name": short identifier (e.g. "spectral_gap_persistence")
+        - "statement": the precise mathematical conjecture
+        - "field": which field it belongs to
+        - "kind": one of "theorem", "conjecture", "lemma", "proposition"
+
+        Return ONLY valid JSON, no markdown fences.
+    """)
+
+    text = _call_ideation_llm(prompt, model=model, verbose=verbose)
+    if text is None:
+        return []
+
+    try:
+        # Parse the JSON response
+        text = text.strip()
+        # Strip markdown fences if present
+        fenced = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
+        if fenced:
+            text = fenced.group(1)
+
+        data = json.loads(text)
+        if not isinstance(data, list):
+            data = [data]
+
+        records = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            records.append(_TheoremRecord(
+                name=item.get("name", "llm_conjecture"),
+                statement=item.get("statement", ""),
+                field=item.get("field", field_names[0] if field_names else "mathematics"),
+                kind=item.get("kind", "conjecture"),
+            ))
+        if records:
+            _log.info("LLM proposed %d theorem candidates", len(records))
+            return records
+    except (json.JSONDecodeError, ValueError) as exc:
+        _log.warning("LLM proposal parsing failed: %s", exc)
+
+    return []
 
 
 # ======================================================================
@@ -2114,6 +2345,20 @@ def _format_report(report: _IdeationReport, fmt: str) -> str:
         if len(report.cross_domain_links) > 20:
             lines.append(f"  ... and {len(report.cross_domain_links) - 20} more")
 
+    # Integration metadata
+    lines.append(f"\nLLM provider:         {report.llm_provider}")
+    if report.orchestration_state:
+        orch = report.orchestration_state
+        lines.append(f"Orchestration:")
+        lines.append(f"  Coverage:           {orch.get('coverage', 0):.1%}")
+        lines.append(f"  Sections:           {orch.get('sections', 0)}")
+        lines.append(f"  Frontier remaining: {orch.get('frontier_remaining', 0)}")
+        lines.append(f"  Obligations:        {orch.get('obligations', 0)}")
+    if report.generation_goals:
+        lines.append(f"\nGeneration goals ({len(report.generation_goals)}):")
+        for goal in report.generation_goals[:10]:
+            lines.append(f"  → {goal}")
+
     return "\n".join(lines)
 
 
@@ -2141,17 +2386,53 @@ def _cmd_fields(out_format: str) -> int:
     return 0
 
 
-def _cmd_discover(verbose: bool, out_format: str) -> int:
-    """Run the full theorem discovery pipeline."""
+def _cmd_discover(verbose: bool, out_format: str, *,
+                   use_llm: bool = False, model: str = "claude-sonnet-4.6") -> int:
+    """Run the full theorem discovery pipeline.
+
+    When ``use_llm`` is True, the pipeline uses the LLM to generate richer
+    theorem proposals and feeds results into the orchestration controller
+    for semantic state tracking.
+    """
     fields = _get_fields()
     report = _IdeationReport(mode="discovery")
     report.fields_scanned = len(fields)
+    report.llm_provider = model if use_llm else "heuristic"
 
-    # Phase 2: propose candidates
-    candidates = _propose_candidates(fields)
+    # Initialize semantic orchestration state (optional integration)
+    orch_state = None
+    event_bus = None
+    if _HAS_CONTROLLER:
+        try:
+            orch_state = OrchestratorState()
+            event_bus = OrchestratorEventBus()
+            # Seed the frontier with fields to discover theorems in
+            for f in fields:
+                fname = (
+                    getattr(f, "name", None)
+                    or (f.get("name") if isinstance(f, dict) else str(f))
+                )
+                orch_state.frontier_nodes.append(fname)
+        except Exception:
+            orch_state = None
+
+    # Phase 2: propose candidates (with optional LLM enhancement)
+    candidates = _propose_candidates(
+        fields, use_llm=use_llm, model=model, verbose=verbose
+    )
     report.candidates_proposed = len(candidates)
     if verbose:
         _log.info("Proposed %d candidates.", len(candidates))
+
+    # Record proposals in orchestration state
+    if orch_state:
+        for c in candidates:
+            orch_state.current_sections[c.name] = {
+                "field": c.field,
+                "trust": "COPILOT_SUGGESTED" if use_llm else "HEURISTIC",
+            }
+            if c.field in orch_state.frontier_nodes:
+                orch_state.frontier_nodes.remove(c.field)
 
     # Phase 3: classify
     _classify_candidates(candidates)
@@ -2167,9 +2448,36 @@ def _cmd_discover(verbose: bool, out_format: str) -> int:
     falsified = _run_falsification(candidates, fields)
     report.candidates_falsified = falsified
 
+    # Record falsified candidates as obstructions
+    if orch_state:
+        for c in candidates:
+            if c.falsified:
+                orch_state.pending_obligations.append(
+                    f"falsified:{c.name}"
+                )
+
     # Phase 7: trust
     report.aggregate_trust = _compute_trust(candidates)
     report.theorems = candidates
+
+    # Generate orchestration summary
+    if orch_state:
+        cov = orch_state.coverage_ratio
+        cov_val = cov() if callable(cov) else cov
+        report.orchestration_state = {
+            "coverage": round(cov_val, 4),
+            "sections": len(orch_state.current_sections),
+            "frontier_remaining": len(orch_state.frontier_nodes),
+            "obligations": len(orch_state.pending_obligations),
+        }
+
+    # Create generation goals from high-novelty candidates
+    if _HAS_GENERATION:
+        for c in candidates:
+            if c.novelty > 0.5 and not c.falsified:
+                report.generation_goals.append(
+                    f"formalize:{c.name} ({c.field})"
+                )
 
     print(_format_report(report, out_format))
     return 0
@@ -2270,6 +2578,20 @@ _ECOLOGY_SEEDS: dict[str, list[dict[str, str]]] = {
          "statement": "Compactness holds for dependent type theories with univalence"},
         {"name": "Constructive choice", "niche": "constructive_math",
          "statement": "Countable choice is derivable in homotopy type theory"},
+    ],
+    "finance": [
+        {"name": "Sheaf-theoretic portfolio consistency", "niche": "portfolio_optimization",
+         "statement": "A portfolio allocation is globally optimal iff the local allocations on each time-scale coordinate glue into a global section of the return sheaf, and the H¹ obstruction class vanishes"},
+        {"name": "Multi-resolution arbitrage detection", "niche": "arbitrage_theory",
+         "statement": "Arbitrage opportunities correspond to sections of the price sheaf that fail the descent condition across time-scale morphisms; the obstruction field H¹(C, F_price) localizes the arbitrage to specific scale interactions"},
+        {"name": "Regime change as cohomological phase transition", "niche": "regime_detection",
+         "statement": "Market regime transitions are detected as discontinuities in the Čech cohomology of the volatility sheaf, with the obstruction rank jumping at regime boundaries"},
+        {"name": "Descent-optimal risk decomposition", "niche": "risk_management",
+         "statement": "The risk of a portfolio decomposes along the cover of a Grothendieck site whose coordinates are (asset, time-horizon, regime) triples, and the gluing axiom enforces diversification across all three dimensions simultaneously"},
+        {"name": "Functorial factor model", "niche": "factor_investing",
+         "statement": "A natural transformation between the return sheaf and the factor sheaf preserves the descent structure, giving a sheaf-theoretic factor model that handles regime-dependent factor loadings"},
+        {"name": "Topological persistence of drawdowns", "niche": "drawdown_analysis",
+         "statement": "Maximum drawdown paths correspond to persistent homology classes in the filtration of the cumulative return process; drawdown severity equals the death time minus birth time of the corresponding bar"},
     ],
 }
 
@@ -2835,6 +3157,9 @@ def run_ideate(args: argparse.Namespace) -> int:
     do_theorem_economics: bool = getattr(args, "theorem_economics", False)
     out_format: str = getattr(args, "format", "text")
     verbose: bool = getattr(args, "verbose", False)
+    # LLM integration options (passed from global CLI flags)
+    use_llm: bool = not getattr(args, "no_llm", False)
+    model: str = getattr(args, "model", "claude-sonnet-4.6")
 
     if do_registry:
         return _print_ideation_registry()
@@ -2880,7 +3205,7 @@ def run_ideate(args: argparse.Namespace) -> int:
                 return rc
 
         if do_discover:
-            rc = _cmd_discover(verbose, out_format)
+            rc = _cmd_discover(verbose, out_format, use_llm=use_llm, model=model)
             if rc != 0:
                 return rc
 

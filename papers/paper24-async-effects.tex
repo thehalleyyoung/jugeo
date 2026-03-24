@@ -5,6 +5,7 @@
 \input{jugeo-common}
 \input{experiment-data}
 \input{subsystem-data}
+\input{data-paper24}
 
 % ── Paper-specific macros ─────────────────────────────────────────────
 \newcommand{\Async}{\mathsf{Async}}          % async region label
@@ -68,7 +69,9 @@ The framework is implemented in the \JuGeo{} \Python{} runtime as the
 \texttt{AsyncAnalyzer} and \texttt{ConcurrencyBoundary} components, and
 integration with \texttt{ScopeAnalyzer} / \texttt{StateTracker} provides
 ambient scope and state context for each region.
-All main results are formalized in \LEAN{} (no \texttt{sorry}).
+The current repository-backed results should be read as an exploratory
+evaluation of JuGeo's async-effect decomposition rather than as a
+complete proof of race detection coverage.
 \end{abstract}
 
 \bigskip
@@ -778,63 +781,35 @@ corpus was partitioned as follows:
     \toprule
     Category & Effect acc.\ & CB clean & CB dirty & False pos. \\
     \midrule
-    Pure async           & — & —   & —  & — \\
-    Shared-state (benign) & — & —  & —    & — \\
-    Shared-state (races) & — & —   & —   & — \\
-    Mixed IO             & — & —   & —    & — \\
+    Pure async           & \ppTwentyfourPureAcc & \ppTwentyfourPureClean   & \ppTwentyfourPureDirty  & \ppTwentyfourPureFalsePos \\
+    Shared-state (benign) & \ppTwentyfourSharedBenignAcc & \ppTwentyfourSharedBenignClean  & \ppTwentyfourSharedBenignDirty    & \ppTwentyfourSharedBenignFalsePos \\
+    Shared-state (races) & \ppTwentyfourSharedRacesAcc & \ppTwentyfourSharedRacesClean   & \ppTwentyfourSharedRacesDirty   & \ppTwentyfourSharedRacesFalsePos \\
+    Mixed IO             & \ppTwentyfourMixedIoAcc & \ppTwentyfourMixedIoClean   & \ppTwentyfourMixedIoDirty    & \ppTwentyfourMixedIoFalsePos \\
     \midrule
-    Overall (universal benchmark) & \expAccuracy & \expPropsSum & — & \expObstructionTotal \\
+    Overall (universal benchmark) & \ppTwentyfourOverallAccuracy & \ppTwentyfourOverallClean & \ppTwentyfourOverallDirty & \ppTwentyfourOverallFalsePos \\
     \bottomrule
   \end{tabular}
 \end{table}
 
 \paragraph{Effect classification.}
-The \texttt{AsyncAnalyzer} achieves \expAccuracy{} accuracy on the universal benchmark of \expTotalPrograms{} programs.
-On the CLI verification suite, \subCliAccuracy{} of programs verify successfully.  Any misclassifications arise
-primarily from dynamic dispatch (effect class of a called function depends on
-the runtime type of an argument) and reflection (\texttt{getattr} on a shared
-object).
+The current benchmark contains \ppTwentyfourTotalPrograms{} programs and
+reports an overall effect-classification accuracy of
+\expAccuracy{}.  The prototype cleanly handles the pure and benign
+shared-state categories (100.0\% each), but it does not yet classify the
+seeded shared-race or mixed-IO examples correctly (0.0\% in both
+categories).
 
 \paragraph{Boundary detection.}
-Of the 293 concurrency boundaries, \texttt{ConcurrencyBoundary} correctly
-identifies 69 dirty boundaries (all known races are flagged).  There are 14
-false positives, all arising from over-approximation of the alias analysis:
-the analyzer conservatively treats two variables as aliased when they are in
-fact distinct objects.
+The measured run records no dirty boundaries and no false positives.
+That makes the current implementation conservative but incomplete on the
+seeded race benchmark: it is not yet surfacing the intended dirty
+boundaries for the race-heavy categories.
 
 \paragraph{Performance.}
-Analysis time is sub-linear in the number of regions: on the full corpus of
-the analysis completes with mean time \expTimeMean{} on the universal benchmark.  The
-dominant cost is scope analysis (ScopeAnalyzer traversal), which accounts for
-the majority of the total time.
-
-\subsection{Case study: asyncio web crawler}
-
-We applied the analysis to a 400-line asyncio web crawler with 18 coroutines
-and 62 async regions.  The \texttt{AsyncAnalyzer} identified 4 dirty
-boundaries, all involving a shared \texttt{visited\_urls} set.  Inspection
-confirmed that two of these were genuine logical races; the other two were
-false positives from URL-object aliasing.  After the developer added
-\texttt{asyncio.Lock} guards, all four boundaries became clean and the
-analysis passed.
-
-\subsection{Comparison with existing tools}
-
-\begin{table}[H]
-  \centering
-  \caption{Comparison with related async analysis tools.}
-  \label{tab:comparison}
-  \begin{tabular}{lcccc}
-    \toprule
-    Tool & Formal guarantee & Effect classes & Cancellation & Speed \\
-    \midrule
-    \JuGeo{} (this work) & Race-free theorem & 4           & Yes & $<2$\,s \\
-    pyright             & Type checking only & 0           & No  & $<1$\,s \\
-    mypy + await-lints  & Type checking only & 0           & No  & $<5$\,s \\
-    asyncio-lock-checker & None             & 1 (stateful) & No  & $<1$\,s \\
-    \bottomrule
-  \end{tabular}
-\end{table}
+Mean analysis time is \expTimeMean{} across the benchmark.  Given the
+50.0\% classification result and zero dirty-boundary detections, this
+cost should be interpreted as prototype overhead rather than validated
+production performance.
 
 % ======================================================================
 \section{Conclusion}\label{sec:conclusion}
@@ -846,14 +821,19 @@ regions are naturally the coordinates of a Grothendieck site, and
 \texttt{await} points are restriction morphisms.  This reformulation
 transforms a global concurrency problem---is this program race-free?---into a
 collection of local verification problems plus a boundary-cleanliness check.
-The resulting modular proof principle (the Async Safety Theorem,
-\cref{thm:async-safety}) reduces global verification to:
+The resulting modular proof principle reduces global verification to:
 \begin{enumerate}
   \item Local effect annotation of each async region (done automatically by
         \texttt{AsyncAnalyzer}).
   \item A boundary scan by \texttt{ConcurrencyBoundary} that checks each
         pair of concurrently-reachable regions for conflicting state access.
 \end{enumerate}
+
+The benchmarked implementation remains incomplete for the harder async
+cases: it reaches 50.0\% overall classification accuracy and does not yet
+mark the seeded shared-race or mixed-IO examples as dirty.  The audited
+claim for this repository is therefore limited to the decomposition
+machinery and the measured prototype behaviour above.
 
 \noindent
 The approach handles all four effect classes (pure, exception, stateful, IO),

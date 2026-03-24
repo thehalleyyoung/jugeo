@@ -9,6 +9,7 @@
 \input{comprehensive-data}
 
 \input{supplementary-data}
+\input{data-paper62}
 
 % ── Additional packages ────────────────────────────────────────────
 \usepackage{array}
@@ -44,24 +45,18 @@ Cohomological Metrics for Interface Quality}}
 
 % ─────────────────────────────────────────────────────────────────────
 \begin{abstract}
-We present a novel approach to evaluating and improving API surface design
-using the topological structure of \JuGeo's semantic sites.  Traditional
-API quality metrics focus on naming conventions, parameter counts, and
-documentation coverage.  Our approach introduces \emph{cohomological API
-metrics}: the \emph{cohesion index} $\CohIndex(\APISurface)$, measuring how
-tightly the public interface's covering families bind its components; the
-\emph{coupling index} $\CoupIndex(\APISurface)$, measuring cross-boundary
-morphism density; and the \emph{exposure index} $\ExpIndex(\APISurface)$,
-measuring the fraction of internal coordinates visible through the API
-boundary $\APIBoundary$.  Using the \InterfRoute, \PubAlign, and \ProbAtlas\
-API methods, we compute these metrics for \compTotalPrograms\ benchmark
-programs spanning \compSiteTotalFunctions\ functions and
-\compSiteTotalClasses\ classes.  We prove that high cohesion and low coupling
-imply that the API boundary is a \emph{closed sub-site}, ensuring that
-changes to internal coordinates do not leak through the public interface.
-The Lean~4 formalization of this closure property is presented, and
-experiments demonstrate that our metrics correlate with established
-software quality indicators.
+We study API-surface structure using the topology of \JuGeo's semantic sites.
+Rather than claiming external usability correlations, this paper focuses on
+three structural summaries computed over a curated JuGeo corpus: the cohesion
+index $\CohIndex(\APISurface)$, the coupling index
+$\CoupIndex(\APISurface)$, and the exposure index
+$\ExpIndex(\APISurface)$. Across \ppLXIIprogramCount{} API-style programs in
+four size tiers, the corpus averages \ppLXIIcoordsMean{} coordinates and
+\ppLXIImorphMean{} morphisms per program, with mean analysis time
+\ppLXIItimeMean{}. All \ppLXIIpropsOk{} recorded propositions in this
+benchmark are solver-discharged. The paper's empirical claims are therefore
+limited to these descriptive JuGeo measurements and the mathematical
+properties proved about the indices.
 \end{abstract}
 
 \newpage
@@ -368,10 +363,19 @@ endpoints private), \emph{boundary} (one public, one private---representing
 API leakage), or \emph{external} (both public---defining API structure):
 
 \begin{lstlisting}[style=jugeo-python]
+from jugeo.geometry.site import Coordinate, CoordinateKind
+
+def all_morphisms(site):
+    return [
+        morphism
+        for coord in site.objects()
+        for morphism in site.morphisms_from(coord)
+    ]
+
 def classify_morphisms(site, public_coords):
     """Classify morphisms relative to API boundary."""
     internal, boundary, external = [], [], []
-    for morph in site.morphisms():
+    for morph in all_morphisms(site):
         src_pub = morph.source in public_coords
         tgt_pub = morph.target in public_coords
         if src_pub and tgt_pub:     external.append(morph)
@@ -386,40 +390,47 @@ Consider a small \Python\ library \texttt{mylib} with both public and
 private components:
 
 \begin{lstlisting}[style=jugeo-python]
-from jugeo import SiteBuilder, DescentEngine
-from jugeo import DescentConfiguration, DescentStrategy
+from jugeo.geometry.site import (
+    Coordinate, CoordinateKind, Morphism, MorphismKind, SiteBuilder,
+)
 
-# Build the semantic site
-site = SiteBuilder("mylib/__init__.py").build()
+public_mod = Coordinate(("mylib",), kind=CoordinateKind.MODULE)
+public_api = Coordinate(("mylib", "api"), kind=CoordinateKind.FUNCTION)
+private_impl = Coordinate(("mylib", "_impl"), kind=CoordinateKind.FUNCTION)
 
-# Identify public coordinates
-public_coords = [c for c in site.coordinates
-                 if not c.name.startswith('_')]
-print(f"Total coordinates: {len(site.coordinates)}")
-print(f"Public coordinates: {len(public_coords)}")
+site = (
+    SiteBuilder("mylib")
+    .add_coordinate(public_mod)
+    .add_coordinate(public_api)
+    .add_coordinate(private_impl)
+    .add_morphism(Morphism(
+        source=public_api,
+        target=public_mod,
+        kind=MorphismKind.RESTRICTION,
+    ))
+    .add_morphism(Morphism(
+        source=private_impl,
+        target=public_mod,
+        kind=MorphismKind.RESTRICTION,
+    ))
+    .add_morphism(Morphism(
+        source=private_impl,
+        target=public_api,
+        kind=MorphismKind.TRANSPORT,
+    ))
+    .build()
+)
 
-# Classify morphisms
-internal, boundary, external = [], [], []
-for m in site.morphisms():
-    src_pub = m.source in public_coords
-    tgt_pub = m.target in public_coords
-    if src_pub and tgt_pub:     external.append(m)
-    elif src_pub or tgt_pub:    boundary.append(m)
-    else:                       internal.append(m)
-
-print(f"Internal: {len(internal)}, "
-      f"Boundary: {len(boundary)}, "
-      f"External: {len(external)}")
-# Output: Total coordinates: 12
-#         Public coordinates: 5
-#         Internal: 8, Boundary: 3, External: 6
+public_coords = {public_mod, public_api}
+internal, boundary, external = classify_morphisms(site, public_coords)
+print(len(internal), len(boundary), len(external))
 \end{lstlisting}
 
-In this example, the 5~public coordinates out of 12~total give an exposure
-index of $\ExpIndex = 5/12 \approx 0.42$.  The 6~external morphisms out
-of $\binom{5}{2} = 10$ possible pairs give $\CohIndex = 0.60$.  The
-3~boundary morphisms out of $8 + 3 + 6 = 17$ total yield
-$\CoupIndex = 3/17 \approx 0.18$.
+In this minimal example, the 2~public coordinates out of 3~total give an
+exposure index of $\ExpIndex = 2/3 \approx 0.67$.  The single
+public-to-public morphism saturates the public API relation in this toy
+model, while the two private-to-public morphisms are precisely the
+boundary couplings a reviewer would inspect.
 
 \subsection{Induced Covering Families on the Boundary}\label{sec:induced-covers}
 
@@ -660,56 +671,34 @@ The following code demonstrates computing the full suite of API metrics
 using the \JuGeo\ descent engine:
 
 \begin{lstlisting}[style=jugeo-python]
-from jugeo import SiteBuilder, DescentEngine
-from jugeo import DescentConfiguration, DescentStrategy
-import math
+from jugeo.geometry.site import Site
 
-# Build site and configure engine
-site = SiteBuilder("mylib/__init__.py").build()
-config = DescentConfiguration(
-    strategy=DescentStrategy.EAGER, depth_limit=5)
-engine = DescentEngine(configuration=config)
+site = Site.formal_core_site()
+public = [coord for coord in site.objects()
+          if not coord.name.startswith("_")]
+public_names = {coord.name for coord in public}
 
-# Identify public coordinates
-public = {c for c in site.coordinates
-          if not c.name.startswith('_')}
-private = set(site.coordinates) - public
+boundary = []
+internal = []
+for coord in public:
+    for morph in site.morphisms_from(coord):
+        if morph.target.name in public_names:
+            internal.append(morph)
+        else:
+            boundary.append(morph)
 
-# Classify morphisms
-ext = [m for m in site.morphisms()
-       if m.source in public and m.target in public]
-bdy = [m for m in site.morphisms()
-       if (m.source in public) != (m.target in public)]
-total_m = len(site.morphisms())
+n_public = len(public)
+cohesion = (
+    len(internal) / (n_public * (n_public - 1) / 2)
+    if n_public > 1 else 1.0
+)
+total_edges = len(internal) + len(boundary)
+coupling = len(boundary) / total_edges if total_edges else 0.0
+exposure = n_public / site.coordinate_count()
 
-# Primary metrics
-n = len(public)
-coh = len(ext) / (n * (n - 1) / 2) if n > 1 else 1.0
-coup = len(bdy) / total_m if total_m > 0 else 0.0
-exp = n / len(site.coordinates)
-
-# Derived: API complexity
-api_comp = sum(1 for m in site.morphisms()
-               if m.source in public
-               and m.target not in public)
-
-# Derived: Interface entropy
-degrees = {}
-for m in ext:
-    degrees[m.source] = degrees.get(m.source, 0) + 1
-    degrees[m.target] = degrees.get(m.target, 0) + 1
-D = sum(degrees.values())
-entropy = 0.0
-if D > 0:
-    for p in public:
-        d = degrees.get(p, 0)
-        if d > 0:
-            entropy -= (d / D) * math.log2(d / D)
-
-print(f"Cohesion: {coh:.3f}, Coupling: {coup:.3f}")
-print(f"Exposure: {exp:.3f}")
-print(f"API Complexity: {api_comp}")
-print(f"Interface Entropy: {entropy:.3f}")
+print(f"Cohesion: {cohesion:.3f}")
+print(f"Coupling: {coupling:.3f}")
+print(f"Exposure: {exposure:.3f}")
 \end{lstlisting}
 
 % =====================================================================
@@ -1294,13 +1283,13 @@ Sites are built with a mean of \compSiteMeanCoords\ coordinates and
 \textbf{Size} & \textbf{Count} & \textbf{Mean Coords} &
 \textbf{Mean Morphisms} & \textbf{Mean Time} \\
 \midrule
-Tiny & \compTinyCount & \compTinyMeanCoords & --- &
+Tiny & \compTinyCount & \compTinyMeanCoords & \ppLXIITinyMeanMorph &
 \compTinyMeanTime \\
-Small & \compSmallCount & \compSmallMeanCoords & --- &
+Small & \compSmallCount & \compSmallMeanCoords & \ppLXIISmallMeanMorph &
 \compSmallMeanTime \\
-Medium & \compMediumCount & \compMediumMeanCoords & --- &
+Medium & \compMediumCount & \compMediumMeanCoords & \ppLXIIMediumMeanMorph &
 \compMediumMeanTime \\
-Large & \compLargeCount & \compLargeMeanCoords & --- &
+Large & \compLargeCount & \compLargeMeanCoords & \ppLXIILargeMeanMorph &
 \compLargeMeanTime \\
 \midrule
 All & \compTotalPrograms & \compCoordsMean &

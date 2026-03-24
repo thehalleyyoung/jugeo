@@ -5,6 +5,7 @@
 \input{jugeo-common}
 \input{experiment-data}
 \input{subsystem-data}
+\input{data-paper18}
 \input{comprehensive-data}
 
 % ── Additional packages ────────────────────────────────────────────────
@@ -338,6 +339,21 @@ callee-side bindings, producing edges of kind
 $\mathtt{argument\_alias}$.  Return-value aliasing is tracked
 analogously.
 
+\begin{lstlisting}[style=jugeo-python, caption={Core alias-analysis API exposed by the runtime.}]
+class AliasDetector:
+    def detect_direct_aliases(self, refs: list[object]) -> list[AliasEdge]:
+        """Level-1 identity checks using Python's `is` relation."""
+
+    def detect_container_aliases(self, container: object) -> list[AliasEdge]:
+        """Level-2 container-membership aliases."""
+
+    def detect_argument_aliases(self, fn: Callable[..., object]) -> list[AliasEdge]:
+        """Level-3 call-boundary aliases from arguments and returns."""
+
+    def classify(self, left: object, right: object) -> AliasLevel:
+        """Return MustAlias, MayAlias, or NoAlias."""
+\end{lstlisting}
+
 \begin{definition}[May-, Must-, No-Alias]
   \label{def:alias-levels}
   Let $r_1, r_2 \in \mathcal{R}$.
@@ -597,6 +613,27 @@ mutually aliased,'' $\evid_P$ is the union-find evidence, and
 $\trust_P = \Truntime$ (runtime-witnessed identity check via
 \texttt{id()}).
 
+\begin{lstlisting}[language=Python, caption={Using the \JuGeo{} API to inspect heap alias information embedded in the semantic site.}]
+from jugeo.geometry import SiteBuilder
+
+code = open("data_structures/linked_list.py").read()
+site = SiteBuilder(code).build()
+
+print(f"Coordinates:      {site.coordinate_count()}")
+print(f"Covering families:{len(site.covering_families())}")
+
+# Retrieve alias annotations from the evaluation design
+design = site.evaluation_design()
+alias_info = design.get("alias_annotations", {})
+print(f"MustAlias pairs:  {alias_info.get('must_alias_count', 0)}")
+print(f"MayAlias pairs:   {alias_info.get('may_alias_count', 0)}")
+print(f"NoAlias pairs:    {alias_info.get('no_alias_count', 0)}")
+
+# Summarise obstruction classes tied to alias violations
+for obs in design.get("alias_obstructions", []):
+    print(f"  coord={obs['coord']}  kind={obs['alias_level']}")
+\end{lstlisting}
+
 % =====================================================================
 \section{Soundness}
 \label{sec:soundness}
@@ -735,34 +772,53 @@ Overall verification accuracy is \compOverallAccuracy{}.
 
 \subsection{Alias Precision}
 
-We compare three analysis configurations:
+We compare two measured configurations:
 \begin{enumerate}[noitemsep]
-  \item \textbf{Blind}: no alias analysis; all pairs treated as
-    \MayAlias{}.
-  \item \textbf{Direct-only (L1)}: only Level-1 direct \texttt{is}
-    checks.
-  \item \textbf{Full ($\AD$)}: all three levels including container and
-    argument aliasing.
+  \item \textbf{Blind}: the baseline site pass without alias-sensitive
+    refinement.
+  \item \textbf{Alias-aware}: the full $\AD$ pipeline combining direct,
+    container, and argument-sensitive reasoning.
 \end{enumerate}
 
+\begin{lstlisting}[language=Python, caption={Measuring alias precision and obstruction reduction using the \JuGeo{} evaluation design API.}]
+import subprocess, json
+
+# Run the heap alias analysis via the CLI
+result = subprocess.run(
+    ["python3", "-m", "jugeo", "--format", "json",
+     "evaluate", "data_structures/linked_list.py"],
+    capture_output=True, text=True
+)
+data = json.loads(result.stdout)
+
+alias_summary = data.get("alias_analysis", {})
+print(f"NoAlias pairs:     {alias_summary['no_alias_pairs']}")
+print(f"MustAlias pairs:   {alias_summary['must_alias_pairs']}")
+print(f"Obstructions (blind): {alias_summary['blind_obstructions']}")
+print(f"Obstructions (full):  {alias_summary['full_obstructions']}")
+reduction = (alias_summary['blind_obstructions']
+             - alias_summary['full_obstructions'])
+print(f"Obstruction reduction: {reduction} "
+      f"({reduction / max(alias_summary['blind_obstructions'], 1) * 100:.0f}%)")
+\end{lstlisting}
+
 \begin{center}
-\begin{tabular}{lrrrr}
+\begin{tabular}{lrrr}
   \toprule
-  Config & \NoAlias{} pairs (\%) & Must-alias (\%) & Descent obstr.\ & Time (ms) \\
+  Config & \NoAlias{} pairs (\%) & Must-alias (\%) & Pipeline time \\
   \midrule
-  \multicolumn{5}{l}{\emph{Evaluated on the \expTotalPrograms-program benchmark.}} \\
-  \multicolumn{5}{l}{\emph{Full $\AD$ eliminates spurious obstructions (\expObstructionTotal{} obstructions}} \\
-  \multicolumn{5}{l}{\emph{in universal benchmark); mean time \expTimeMean.}} \\
-  \multicolumn{5}{l}{\emph{Soundness guaranteed by Theorem~\ref{thm:soundness}.}} \\
+  Blind baseline & --- & --- & \ppEighteenBlindEncodeTime{} \\
+  Alias-aware $\AD$ & \ppEighteenNoAliasPairs{} & \ppEighteenMustAliasPairs{} & \ppEighteenAwareEncodeTime{} \\
   \bottomrule
 \end{tabular}
 \end{center}
 
-The full $\AD$ configuration eliminates spurious Čech
-obstructions, as confirmed on the \expTotalPrograms-program benchmark
+The alias-aware $\AD$ configuration reports explicit \NoAlias{} and
+\MustAlias{} classifications while the blind baseline only measures raw
+pipeline cost.  On the \expTotalPrograms-program benchmark
 (\expObstructionTotal{} obstructions, \expAccuracy{} accuracy,
-mean time \expTimeMean).  Level-2 and Level-3 detection contribute
-additional \NoAlias{} classification over Level-1 alone.
+mean time \expTimeMean), the alias-aware pass remains practical despite the
+additional encoding work.
 
 \subsection{Soundness Validation}
 
@@ -776,11 +832,9 @@ identity.
 \begin{center}
 \begin{tabular}{lrr}
   \toprule
-  Benchmark subset & \NoAlias{} judgments & Misses \\
+  Benchmark subset & Judgments checked & Zero-miss rate \\
   \midrule
-  \multicolumn{3}{l}{\emph{Across all \expTotalPrograms{} programs: zero misses.}} \\
-  \multicolumn{3}{l}{\emph{\expPropsSum{} properties checked, \expPropsOkSum{} OK.}} \\
-  \multicolumn{3}{l}{\emph{Soundness guaranteed by Theorem~\ref{thm:soundness}.}} \\
+  All programs & \ppEighteenPropsTotal{} & \ppEighteenZeroMissRate{} \\
   \bottomrule
 \end{tabular}
 \end{center}
@@ -794,13 +848,11 @@ We measure the overhead of alias-aware Z3 encoding versus alias-blind
 encoding.
 
 \begin{center}
-\begin{tabular}{lrr}
+\begin{tabular}{lrrrr}
   \toprule
-  Metric & Blind & Alias-aware \\
+  Scope & Total declarations & Total assertions & Blind time & Alias-aware time \\
   \midrule
-  \multicolumn{3}{l}{\emph{Alias-aware encoding increases assertion count but enables}} \\
-  \multicolumn{3}{l}{\emph{additional lemma proofs.  Overall benchmark: \expPropsSum{} properties,}} \\
-  \multicolumn{3}{l}{\emph{\expAccuracy{} accuracy, mean time \expTimeMean.}} \\
+  All programs & \ppEighteenTotalDeclarations{} & \ppEighteenTotalAssertions{} & \ppEighteenBlindEncodeTime{} & \ppEighteenAwareEncodeTime{} \\
   \bottomrule
 \end{tabular}
 \end{center}

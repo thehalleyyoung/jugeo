@@ -432,6 +432,40 @@ def main():
         write_macro(f, "ppFifteenTotalProps", total_props)
         write_macro(f, "ppFifteenTotalPropsOk", total_props_ok)
 
+        # -- Gen 0 vs Gen 100 metrics (for tab:ecology-metrics) --
+        # Use first-cycle vs last-cycle trust data from per-program trajectories.
+        first_cycle_trusts = cumulative_trust_per_cycle[0] if cumulative_trust_per_cycle else []
+        last_cycle_trusts = cumulative_trust_per_cycle[-1] if cumulative_trust_per_cycle else []
+        gen_zero_fitness = statistics.mean(first_cycle_trusts) if first_cycle_trusts else 0.0
+        gen_final_fitness = statistics.mean(last_cycle_trusts) if last_cycle_trusts else 0.0
+
+        # Obstruction rate at gen 0 vs gen 100
+        first_cycle_obs = []
+        last_cycle_obs = []
+        for pname in PROGRAMS:
+            m = per_program_cycles.get(pname, {})
+            traj = m.get("trust_trajectory", [])
+            if len(traj) >= 1:
+                first_cycle_obs.append(m.get("obstruction_rate", 0.0))
+            if len(traj) >= NUM_CYCLES_PER_PROGRAM:
+                last_cycle_obs.append(m.get("obstruction_rate", 0.0))
+        gen_zero_obs = statistics.mean(first_cycle_obs) if first_cycle_obs else 0.0
+        gen_final_obs = statistics.mean(last_cycle_obs) if last_cycle_obs else 0.0
+
+        gen_zero_success = statistics.mean(
+            [1.0 if m.get("success_rate", 0) > 0 else 0.0
+             for m in [per_program_cycles.get(p, {}) for p in list(PROGRAMS.keys())[:max(n_total//2, 1)]]]
+        ) if n_total > 0 else 0.0
+        gen_final_success = success_rate
+
+        f.write("\n% --- Gen 0 vs Gen 100 (tab:ecology-metrics) ---\n")
+        write_macro(f, "ppFifteenGenZeroFitness", "{:.3f}".format(gen_zero_fitness))
+        write_macro(f, "ppFifteenGenFinalFitness", "{:.3f}".format(gen_final_fitness))
+        write_macro(f, "ppFifteenGenZeroObsRate", "{:.1f}\\%".format(gen_zero_obs * 100))
+        write_macro(f, "ppFifteenGenFinalObsRate", "{:.1f}\\%".format(gen_final_obs * 100))
+        write_macro(f, "ppFifteenGenZeroSuccessRate", "{:.0f}\\%".format(gen_zero_success * 100))
+        write_macro(f, "ppFifteenGenFinalSuccessRate", "{:.0f}\\%".format(gen_final_success * 100))
+
     print("Wrote " + out_path)
     print()
     print("SUMMARY:")

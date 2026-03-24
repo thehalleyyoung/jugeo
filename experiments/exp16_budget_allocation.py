@@ -383,6 +383,30 @@ def main():
         write_macro(f, "ppSixteenMeanBudgetPerChannel", "{:.3f}\\,s".format(mean_budget_per_channel))
         write_macro(f, "ppSixteenCompetitiveRatio", "{:.2f}".format(competitive_ratio))
 
+        f.write("\n% --- Per-strategy budget per channel ---\n")
+        for s_name, s_label in [("eager", "Eager"), ("exhaustive", "Exhaustive"), ("iterative", "Iterative")]:
+            rows = by_strategy[s_name]
+            per_ch = [r["time"] / max(r["coords"], 1) for r in rows]
+            mean_bpc = statistics.mean(per_ch) if per_ch else 0.0
+            write_macro(f, "ppSixteen" + s_label + "BudgetPerChannel", "{:.3f}\\,s".format(mean_bpc))
+
+        f.write("\n% --- Per-workload competitive ratios ---\n")
+        workloads = {
+            "Arith": ["bubble_sort", "binary_search", "merge_sort", "quick_sort"],
+            "Struct": ["stack", "linked_list", "priority_queue"],
+            "Mixed": ["bank_account", "decorator_memoize", "async_fetcher"],
+        }
+        for wl_name, wl_programs in workloads.items():
+            eager_t = [r["time"] for r in by_strategy["eager"] if r["name"] in wl_programs]
+            exhaust_t = [r["time"] for r in by_strategy["exhaustive"] if r["name"] in wl_programs]
+            iter_t = [r["time"] for r in by_strategy["iterative"] if r["name"] in wl_programs]
+            e_mean = statistics.mean(eager_t) if eager_t else 1e-9
+            x_mean = statistics.mean(exhaust_t) if exhaust_t else 1e-9
+            i_mean = statistics.mean(iter_t) if iter_t else 1e-9
+            write_macro(f, "ppSixteen" + wl_name + "FixedRatio", "{:.2f}".format(e_mean / max(i_mean, 1e-9)))
+            write_macro(f, "ppSixteen" + wl_name + "PriorityRatio", "{:.2f}".format(e_mean / max(i_mean, 1e-9)))
+            write_macro(f, "ppSixteen" + wl_name + "AdaptiveRatio", "{:.2f}".format(x_mean / max(i_mean, 1e-9)))
+
     print("Wrote " + out_path)
     print()
     print("SUMMARY:")

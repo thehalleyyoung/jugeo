@@ -52,36 +52,18 @@ Trust-Calibrated LLM Contributions}}
 
 % ─────────────────────────────────────────────────────────────────────
 \begin{abstract}
-Large language models (LLMs) can supply useful \emph{evidence} for
-program verification---suggested invariants, contract summaries,
-complexity bounds---but their outputs carry no intrinsic soundness
-guarantee.  We present the \emph{Copilot evidence channel}, a
-first-class integration of LLM-generated evidence into the
-Judgment Geometry framework with a hard trust ceiling that prevents
-LLM suggestions from silently inflating the trust level of a judgment.
-The design centres on four components:
-(i)~the $\EvCh$ enum, which classifies evidence sources into
-    $\mathsf{SOLVER}$, $\mathsf{RUNTIME}$, $\mathsf{ORACLE}$,
-    $\mathsf{COPILOT}$, $\mathsf{FORMAL\_PROOF}$, $\mathsf{HUMAN}$,
-    and $\mathsf{COMPOSED}$;
-(ii)~the $\CopCh$ class, which wraps \queryLLM{} calls behind
-    rate limiting and a configurable timeout;
-(iii)~the $\CopGate$ trust gateway, which enforces the ceiling
-    $\TrustCeil$ and blocks every promotion attempt that lacks
-    independent corroboration; and
-(iv)~the $\CopAdapt$ adapter, which routes queries to
-    heterogeneous model back-ends while tracking per-model token
-    budgets.
-We prove three formal properties---\emph{trust-ceiling enforcement},
-\emph{no-silent-promotion}, and \emph{audit completeness}---and
-verify them in \LEAN.
-Experiments on \ppLXXXVIIItotalQueries{} queries across
-\ppLXXXVIIIadapterCount{} model adapters confirm that the ceiling
-holds in \ppLXXXVIIIceilingHeldPct{} of routed evidence,
-rate limiting rejects \ppLXXXVIIIrateLimitHitPct{} of burst traffic,
-and the audit log is \ppLXXXVIIIauditComplete{} complete.
-The full pipeline is implemented in the \JuGeo{} \Python{} library
-and formalized in \LEAN.
+Large language models can contribute useful candidate evidence for
+program verification, but JuGeo must keep those contributions inside an
+explicit trust boundary.  This paper now limits itself to the
+repository-backed channel and oracle infrastructure found in
+\texttt{jugeo.evidence.channels} and
+\texttt{jugeo.foundations.oracle\_federation.controlled\_oracles}.  We
+describe the implemented evidence-channel taxonomy, the copilot/oracle
+ceiling discipline, and the additive corroboration record used by the
+current code.  Earlier claims about reproduced large-scale throughput,
+token-budget experiments, and Lean formalization have been removed
+because they are not directly substantiated by the checked-in
+repository.
 \end{abstract}
 
 % ─────────────────────────────────────────────────────────────────────
@@ -136,17 +118,15 @@ This paper makes the following contributions:
   ceiling, route queries to model back-ends, and maintain a
   complete audit trail via $\QRec$ records (\S\ref{sec:gateway}).
 
-\item \textbf{Formal guarantees.}
-  We state and prove three theorems---trust-ceiling enforcement,
-  no-silent-promotion, and audit completeness---and formalize
-  them in \LEAN{} (\S\ref{sec:formal}).
+  \item \textbf{Repository-backed guarantees.}
+  We connect the paper's discussion to the implemented ceiling and
+  corroboration checks exposed by the current Python modules
+  (\S\ref{sec:formal}).
 
-\item \textbf{Empirical evaluation.}
-  We exercise the pipeline on \ppLXXXVIIItotalQueries{} queries,
-  confirming that the ceiling holds universally, rate limiting
-  behaves as specified, and corroboration lifts
-  \ppLXXXVIIIcorrobRate{} of Copilot evidence to higher tiers
-  (\S\ref{sec:experiments}).
+ \item \textbf{Methodology-only evaluation.}
+  The evaluation section is retained as a description of what one would
+  measure, but earlier headline percentages have been removed from the
+  paper's claims (\S\ref{sec:experiments}).
 \end{enumerate}
 
 \paragraph{Notation.}
@@ -180,6 +160,10 @@ tagged with the channel through which it was produced.  The
 $\EvCh$ enum captures the seven channel kinds currently supported:
 
 \begin{lstlisting}[style=jugeo-python,caption={The \texttt{EvidenceChannel} enum.},label=lst:evidencechannel]
+from jugeo.evidence.channels import (
+    EvidenceChannel, CopilotChannel, ChannelConfiguration,
+)
+
 class EvidenceChannel(Enum):
     SOLVER       = auto()
     RUNTIME      = auto()
@@ -503,6 +487,10 @@ and serves as the policy-enforcement layer between the Copilot
 channel and the rest of the evidence pipeline.
 
 \begin{lstlisting}[style=jugeo-python,caption={The \texttt{CopilotTrustGateway} class (simplified).},label=lst:gateway]
+from jugeo.orchestration.mixed_evidence_routing.integration import (
+    CopilotTrustGateway,
+)
+
 class CopilotTrustGateway:
     def __init__(self, gateway_id: str,
                  max_trust: str = "COPILOT_SUGGESTED",

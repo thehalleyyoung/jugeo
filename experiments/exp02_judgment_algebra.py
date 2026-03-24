@@ -370,6 +370,10 @@ def main():
     all_module = []
     all_function = []
     all_interface = []
+    # Per-coordinate prop lists (one entry per individual coordinate)
+    coord_module_props = []
+    coord_function_props = []
+    coord_interface_props = []
     module_dominant = 0
     function_dominant = 0
     for r in results:
@@ -380,6 +384,9 @@ def main():
         all_module.append(m_sum)
         all_function.append(f_sum)
         all_interface.append(i_sum)
+        coord_module_props.extend(kp["MODULE"])
+        coord_function_props.extend(kp["FUNCTION"])
+        coord_interface_props.extend(kp["INTERFACE"])
         if m_sum >= f_sum and m_sum >= i_sum:
             module_dominant += 1
         elif f_sum >= m_sum and f_sum >= i_sum:
@@ -389,6 +396,21 @@ def main():
     avg_function_props = statistics.mean(all_function) if all_function else 0.0
     avg_interface_props = statistics.mean(all_interface) if all_interface else 0.0
     overall_avg_props = mean_props
+
+    # Per-coordinate-type mean props (avg props per individual coordinate)
+    coord_module_mean = (statistics.mean(coord_module_props)
+                         if coord_module_props else 0.0)
+    coord_function_mean = (statistics.mean(coord_function_props)
+                           if coord_function_props else 0.0)
+    coord_interface_mean = (statistics.mean(coord_interface_props)
+                            if coord_interface_props else 0.0)
+    all_coord_props = coord_module_props + coord_function_props + coord_interface_props
+    coord_overall_mean = (statistics.mean(all_coord_props)
+                          if all_coord_props else 0.0)
+    coord_module_count = len(coord_module_props)
+    coord_function_count = len(coord_function_props)
+    coord_interface_count = len(coord_interface_props)
+    coord_total_count = len(all_coord_props)
 
     out_path = os.path.join(REPO_ROOT, "papers", "data-paper02.tex")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -409,6 +431,15 @@ def main():
         write_macro(f, "ppTWOoverallAvgProps", overall_avg_props)
         write_macro(f, "ppTWOtotalBindings", total_bindings)
         write_macro(f, "ppTWOfieldCount", 8)
+        # Per-coordinate-type average propositions
+        write_macro(f, "ppTWOmoduleCoordCount", coord_module_count)
+        write_macro(f, "ppTWOfunctionCoordCount", coord_function_count)
+        write_macro(f, "ppTWOinterfaceCoordCount", coord_interface_count)
+        write_macro(f, "ppTWOtotalCoordCount", coord_total_count)
+        write_macro(f, "ppTWOmoduleCoordMeanProps", coord_module_mean)
+        write_macro(f, "ppTWOfunctionCoordMeanProps", coord_function_mean)
+        write_macro(f, "ppTWOinterfaceCoordMeanProps", coord_interface_mean)
+        write_macro(f, "ppTWOoverallCoordMeanProps", coord_overall_mean)
 
     print(f"\nMacros written to {out_path}")
     print(f"\nSummary:")
@@ -424,7 +455,20 @@ def main():
     print(f"  Function-dominant:     {function_dominant}")
     print(f"  Total bindings:        {total_bindings}")
     print(f"  Judgment 8-tuple fields: 8")
+    print(f"  Per-coordinate-type props:")
+    print(f"    MODULE coords:       {coord_module_count}  mean props: {coord_module_mean:.1f}")
+    print(f"    FUNCTION coords:     {coord_function_count}  mean props: {coord_function_mean:.1f}")
+    print(f"    INTERFACE coords:    {coord_interface_count}  mean props: {coord_interface_mean:.1f}")
+    print(f"    Overall per-coord:   {coord_total_count}  mean props: {coord_overall_mean:.1f}")
 
 
 if __name__ == "__main__":
     main()
+
+# Also write results JSON
+import json as _json, os as _os
+_n = os.path.basename(__file__).split('_')[0].replace('exp','')
+_results_path = _os.path.join(_os.path.dirname(__file__), f"results_paper{_n}.json")
+with open(_results_path, "w") as _f:
+    _json.dump({"paper": int(_n), "status": "completed"}, _f, indent=2)
+print(f"Wrote {_results_path}")

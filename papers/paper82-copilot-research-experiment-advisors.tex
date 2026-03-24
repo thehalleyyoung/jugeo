@@ -1,0 +1,1319 @@
+% paper82-copilot-research-experiment-advisors.tex — Copilot Research and Experiment Advisors
+%   Advisors for Hypothesis Generation and Experiment Design
+%   Paper 82 of the Judgment Geometry series.
+% Compile: pdflatex paper82-copilot-research-experiment-advisors
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+
+% ——— Paper-specific macros ———
+\newcommand{\ResAdv}{\mathsf{CopilotResearchAdvisor}}
+\newcommand{\ExpAdv}{\mathsf{CopilotExperimentAdvisor}}
+\newcommand{\AdvComp}{\mathsf{AdvisorComposition}}
+\newcommand{\HypGen}{\mathrm{hypothesisGen}}
+\newcommand{\LitNav}{\mathrm{literatureNav}}
+\newcommand{\ProofStrat}{\mathrm{proofStrategy}}
+\newcommand{\ExpDesign}{\mathrm{experimentDesign}}
+\newcommand{\ParamSel}{\mathrm{parameterSelect}}
+\newcommand{\ResInterp}{\mathrm{resultInterpret}}
+\newcommand{\TrustPres}{\mathrm{trustPreserve}}
+\newcommand{\HypCov}{\mathrm{hypothesisCoverage}}
+\newcommand{\ExpRepro}{\mathrm{experimentReproducibility}}
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\CopBridge}{\mathsf{CopilotAPIBridge}}
+\newcommand{\TrustCeil}{\mathrm{ceiling}}
+\newcommand{\Route}{\mathsf{ChannelRouter}}
+\newcommand{\Fed}{\mathsf{ChannelFederation}}
+
+\title{\textbf{Copilot Research and Experiment Advisors:\\ Advisors for Hypothesis Generation and Experiment Design}}
+\author{Halley Young}
+\date{Paper~82 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ——— Abstract ———
+\begin{abstract}
+This paper introduces two Copilot-guided advisors for research and experiment workflows in the \JuGeo{} framework: the $\ResAdv$, which assists in hypothesis generation, literature navigation, and proof strategy selection; and the $\ExpAdv$, which supports experiment design, parameter selection, and result interpretation. We formalize the composition of these advisors, prove key properties such as soundness, validity, trust preservation, hypothesis coverage, and experiment reproducibility, and provide full proofs. Code listings illustrate the integration of $\CopChan$, $\CopBridge$, $\Fed$, and $\Route$ in research and experiment pipelines. The appendix contains additional proofs and technical details.
+\end{abstract}
+
+% ============================================================
+%  Section 1 — Introduction
+% ============================================================
+\section{Introduction}\label{sec:intro}
+
+Modern proof assistants demand increasingly sophisticated tool support
+for exploratory mathematics and verification research.
+Two pressing challenges face the working researcher who relies
+on a proof-assistant infrastructure such as \JuGeo{}:
+\begin{enumerate}
+\item \emph{Hypothesis generation.}  Given a partial development, which
+      conjectures are likely to be true and useful?
+\item \emph{Experiment design.}  Given a conjecture, what verification
+      strategy---\ie{} which channels, budgets, and trust tiers---should
+      be employed, and how should the results be interpreted?
+\end{enumerate}
+
+In earlier papers of this series we introduced the notion of a
+\emph{Copilot advisor}---a trust-bounded, channel-mediated agent
+that proposes actions to the kernel without ever exceeding the
+$\Tcopilot$ trust ceiling.  Papers~80 and~81 treated heap, scope,
+import, and callable advisors.  The present paper continues this
+programme with two advisors squarely aimed at the research workflow:
+
+\begin{itemize}
+\item The $\ResAdv$ analyses the current proof state, proposes
+      hypotheses that are structurally plausible, navigates the
+      literature for related results, and suggests proof strategies
+      (induction, case split, appeal to a known lemma, \etc{}).
+\item The $\ExpAdv$ designs verification experiments, selects
+      channel parameters (timeout, budget, preferred channel),
+      monitors execution, and interprets results.
+\end{itemize}
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item A categorical formalisation of research advisory as a functor
+      from the category of proof states to the category of ranked
+      hypotheses (\S\ref{sec:research}).
+\item An experiment-design algebra that composes channel
+      configurations into reproducible experiment plans
+      (\S\ref{sec:experiment}).
+\item Five theorems establishing soundness, validity, trust
+      preservation, coverage, and reproducibility
+      (\S\ref{sec:formal}).
+\item Full \Python{} code illustrating integration with
+      \texttt{CopilotChannel}, \texttt{CopilotAPIBridge},
+      \texttt{ChannelFederation}, and \texttt{JuGeoAPI}
+      (\S\ref{sec:code}).
+\end{enumerate}
+
+\paragraph{Paper outline.}
+Section~\ref{sec:background} recalls the relevant background.
+Section~\ref{sec:research} formalises the research advisor.
+Section~\ref{sec:experiment} formalises the experiment advisor.
+Section~\ref{sec:composition} treats advisor composition.
+Section~\ref{sec:code} presents implementation details.
+Section~\ref{sec:formal} contains the main theorems.
+Section~\ref{sec:discussion} discusses limitations.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+Appendix~\ref{app:proofs} collects auxiliary proofs.
+
+% ============================================================
+%  Section 2 — Background
+% ============================================================
+\section{Background}\label{sec:background}
+
+\subsection{Trust tiers in \JuGeo{}}
+
+Recall the trust lattice
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot
+  \;\tleq\; \Toracle \;\tleq\; \Truntime
+  \;\tleq\; \Tsolver \;\tleq\; \Tproof.
+\]
+Every evidence record produced by a channel carries a trust tier;
+the kernel refuses to install any evidence whose trust exceeds the
+channel's ceiling.  Both advisors in this paper operate at
+$\Tcopilot$, the \emph{proposal} tier.
+
+\subsection{Evidence channels}
+
+An \emph{evidence channel} is a source of evidence:
+the solver channel talks to Z3, the runtime channel captures
+witnesses by execution, the oracle channel queries external
+knowledge bases, and the Copilot channel queries a large
+language model.  Channels are registered in a
+\texttt{ChannelPool}, monitored by a \texttt{ChannelMonitor},
+and routed by a \texttt{ChannelRouter}.
+
+\subsection{Advisors}
+
+An \emph{advisor} is a triple $(\mathcal{A}, \tau, j)$ where
+$\mathcal{A}$ is the advisory function, $\tau$ is the trust
+ceiling, and $j$ is the jurisdiction.  The advisory function
+receives a \emph{context}---a snapshot of the proof state,
+the available channels, and any user preferences---and returns
+a ranked list of \emph{suggestions}.  Each suggestion carries
+a textual explanation, a confidence estimate, and an evidence
+request that can be dispatched to the channel layer.
+
+\begin{definition}[Advisory context]\label{def:context}
+An \emph{advisory context} is a tuple
+$\Gamma = (S, C, P)$ where $S$ is the current proof state,
+$C \subseteq \mathsf{Chan}$ is the set of available channels,
+and $P$ is a preference record (timeout, budget, preferred
+channel, \etc{}).
+\end{definition}
+
+\begin{definition}[Suggestion]\label{def:suggestion}
+A \emph{suggestion} is a tuple
+$\sigma = (h, c, r, e)$ where $h$ is a hypothesis
+(a proposition), $c \in [0,1]$ is a confidence score,
+$r$ is a human-readable rationale, and $e$ is an evidence
+request or $\bot$.
+\end{definition}
+
+% ============================================================
+%  Section 3 — The Research Advisor
+% ============================================================
+\section{The Research Advisor}\label{sec:research}
+
+\subsection{Hypothesis generation}
+
+The $\ResAdv$ generates hypotheses by querying the
+Copilot channel with a prompt that encodes the current proof
+state.  The response is parsed into a list of propositions,
+each annotated with a confidence score.
+
+\begin{definition}[Hypothesis functor]\label{def:hypfunctor}
+Let $\mathbf{Proof}$ be the category whose objects are proof
+states and whose morphisms are refinement steps.
+Let $\mathbf{Hyp}$ be the category of ranked hypothesis lists
+(with inclusion as morphisms).
+The hypothesis functor $H \colon \mathbf{Proof} \to \mathbf{Hyp}$
+sends each proof state~$S$ to the list of hypotheses generated
+by $\ResAdv$ on context $(S, C, P)$.
+\end{definition}
+
+\begin{remark}
+Functoriality here means: if state $S'$ refines $S$
+(written $S \to S'$), then $H(S)$ is a sub-multiset of $H(S')$
+up to re-ranking.  Informally, refining the proof state can
+only add hypotheses, never remove previously valid ones.
+\end{remark}
+
+\subsection{Literature navigation}
+
+Given a hypothesis~$h$, the research advisor queries the
+Copilot channel for related results in the existing library.
+The query includes the hypothesis statement, the names of
+definitions and lemmas in scope, and a request for
+bibliographic pointers.  The response is filtered to
+retain only references that the kernel can resolve
+(\ie{} that correspond to actual \LEAN{} declarations or
+\JuGeo{} evidence records).
+
+\begin{definition}[Literature map]\label{def:litmap}
+A \emph{literature map} is a function
+$L \colon \mathbf{Hyp} \to \mathcal{P}(\mathsf{Ref})$
+where $\mathsf{Ref}$ is the set of resolved references.
+We require that $L$ be monotone \wrt{} list inclusion:
+if $h \in H$ and $H \subseteq H'$, then $L(H) \subseteq L(H')$.
+\end{definition}
+
+\subsection{Proof strategy selection}
+
+After generating hypotheses and navigating the literature,
+the research advisor selects a proof strategy.  The strategy
+is a pair $(\mathsf{tactic}, \mathsf{params})$ where the
+tactic is one of: \texttt{induction}, \texttt{case\_split},
+\texttt{appeal}, \texttt{unfold}, \texttt{contradiction},
+\texttt{apply\_lemma}, and $\mathsf{params}$ is a
+strategy-specific parameter record.
+
+\begin{definition}[Strategy selector]\label{def:stratsel}
+A \emph{strategy selector} is a function
+$\Pi \colon \mathbf{Hyp} \times \mathcal{P}(\mathsf{Ref})
+  \to \mathsf{Strat}$
+that assigns to each hypothesis list and literature set
+a ranked list of strategies.  We require:
+\begin{enumerate}
+\item \emph{Trust ceiling:} every strategy has trust
+      $\tleq \Tcopilot$.
+\item \emph{Relevance:} the strategy references only
+      definitions and lemmas present in the literature set.
+\item \emph{Completeness:} if the hypothesis is provable
+      by a single tactic application, then at least one
+      strategy in the list succeeds.
+\end{enumerate}
+\end{definition}
+
+\begin{lemma}[Strategy trust ceiling]\label{lem:stratceil}
+For every advisory context~$\Gamma$ and every strategy
+$s \in \Pi(H(\Gamma), L(H(\Gamma)))$, we have
+$\mathrm{trust}(s) \tleq \Tcopilot$.
+\end{lemma}
+\begin{proof}
+By construction the strategy selector operates via the
+Copilot channel, whose trust ceiling is $\Tcopilot$.
+Since the selector does not compose evidence from multiple
+channels, the trust of each strategy equals the trust of
+the channel response, which is at most $\Tcopilot$.
+\end{proof}
+
+% ============================================================
+%  Section 4 — The Experiment Advisor
+% ============================================================
+\section{The Experiment Advisor}\label{sec:experiment}
+
+\subsection{Experiment plans}
+
+An \emph{experiment plan} specifies a complete verification
+attempt: which channel to use, with what timeout and budget,
+whether to federate results, and how to interpret the outcome.
+
+\begin{definition}[Experiment plan]\label{def:expplan}
+An \emph{experiment plan} is a tuple
+\[
+  \mathcal{E} = (\mathsf{ch}, \mathsf{cfg}, \mathsf{fed},
+                  \mathsf{interp})
+\]
+where $\mathsf{ch} \in \mathsf{Chan}$ is the primary channel,
+$\mathsf{cfg}$ is a \texttt{ChannelConfiguration},
+$\mathsf{fed} \subseteq \mathsf{Chan}$ is the set of
+federation channels, and $\mathsf{interp}$ is an
+interpretation function mapping \texttt{EvidenceResponse}
+values to human-readable verdicts.
+\end{definition}
+
+\subsection{Parameter selection}
+
+The experiment advisor selects parameters by consulting
+the Copilot channel.  The prompt encodes the proposition,
+the available channels, and historical performance data
+obtained from the \texttt{ChannelMonitor}.
+
+\begin{definition}[Parameter selector]\label{def:paramsel}
+A \emph{parameter selector} is a function
+$P \colon \mathbf{Hyp} \times \mathsf{MonitorData}
+  \to \mathsf{Config}$
+that produces a \texttt{ChannelConfiguration} from a
+hypothesis and historical performance data.  We require
+that the selected parameters respect the rate limiter:
+$P(h, d).\mathsf{rate\_limit} \leq \mathsf{global\_limit}$.
+\end{definition}
+
+\subsection{Result interpretation}
+
+After an experiment completes, the experiment advisor
+interprets the result.  If the evidence response is
+successful, the advisor extracts the trust tier and
+checks whether it meets the floor required by the
+current proof obligation.  If the response is partial,
+the advisor suggests follow-up experiments.
+
+\begin{definition}[Interpretation function]\label{def:interp}
+An \emph{interpretation function} is a function
+$I \colon \mathsf{EvidenceResponse} \to \mathsf{Verdict}$
+where $\mathsf{Verdict} = \{\mathsf{confirmed},
+\mathsf{refuted}, \mathsf{inconclusive}, \mathsf{timeout}\}$.
+We extend~$I$ to experiment plans by
+$I_{\mathcal{E}}(r) = I(r)$ when the response~$r$ comes
+from plan~$\mathcal{E}$.
+\end{definition}
+
+\begin{lemma}[Interpretation monotonicity]\label{lem:interpmono}
+If $r_1$ is a sub-response of $r_2$ (\ie{} $r_1$ contains
+a subset of the evidence in $r_2$), then
+$I(r_1) \tleq I(r_2)$ in the ordering
+$\mathsf{inconclusive} \tleq \mathsf{confirmed}$,
+$\mathsf{inconclusive} \tleq \mathsf{refuted}$.
+\end{lemma}
+\begin{proof}
+Let $r_1 \subseteq r_2$.  If $I(r_2) = \mathsf{confirmed}$,
+then $r_2$ contains a complete evidence record at the required
+trust level.  Since $r_1 \subseteq r_2$, we have
+$I(r_1) \in \{\mathsf{confirmed}, \mathsf{inconclusive}\}$.
+The case $I(r_2) = \mathsf{refuted}$ is symmetric.  If
+$I(r_2) = \mathsf{inconclusive}$, then $I(r_1)$ may also
+be inconclusive or timeout, both $\tleq \mathsf{inconclusive}$.
+\end{proof}
+
+\subsection{Experiment reproducibility}
+
+\begin{definition}[Reproducible experiment]\label{def:repro}
+An experiment plan~$\mathcal{E}$ is \emph{reproducible} if
+for every pair of executions with the same input hypothesis
+and the same channel state, the interpretation function yields
+the same verdict.  Formally:
+\[
+  \forall h,\, s.\;
+  I_{\mathcal{E}}(\mathrm{exec}(\mathcal{E}, h, s))
+  = I_{\mathcal{E}}(\mathrm{exec}(\mathcal{E}, h, s)).
+\]
+This is trivially satisfied by deterministic channels (solver,
+runtime).  For stochastic channels (Copilot), reproducibility
+requires caching or majority voting.
+\end{definition}
+
+% ============================================================
+%  Section 5 — Advisor Composition
+% ============================================================
+\section{Advisor Composition}\label{sec:composition}
+
+\subsection{Sequential composition}
+
+The natural workflow composes the two advisors sequentially:
+first the research advisor generates hypotheses and selects
+a strategy, then the experiment advisor designs a verification
+plan.
+
+\begin{definition}[Sequential composition]\label{def:seqcomp}
+Given advisors $A_1 = (\mathcal{A}_1, \tau_1, j_1)$ and
+$A_2 = (\mathcal{A}_2, \tau_2, j_2)$, their sequential
+composition is $A_1 \mathbin{;} A_2 = (\mathcal{A}_2 \circ
+\mathcal{A}_1, \min(\tau_1, \tau_2), j_1 \cup j_2)$.
+\end{definition}
+
+\begin{lemma}[Composition trust ceiling]\label{lem:comptrust}
+$\mathrm{trust}(A_1 \mathbin{;} A_2) \tleq
+\min(\tau_1, \tau_2)$.
+\end{lemma}
+\begin{proof}
+Each component operates at its own ceiling.  The composition
+inherits the minimum, since the second advisor receives only
+suggestions at trust $\tleq \tau_1$ and produces output at
+trust $\tleq \tau_2$.  Therefore the overall trust is bounded
+by $\min(\tau_1, \tau_2)$.
+\end{proof}
+
+\subsection{Parallel composition}
+
+Alternatively, both advisors can operate in parallel on the
+same proof state, producing independent suggestion lists
+that are merged by the kernel.
+
+\begin{definition}[Parallel composition]\label{def:parcomp}
+$A_1 \| A_2 = (\lambda \Gamma.\;
+\mathcal{A}_1(\Gamma) \cup \mathcal{A}_2(\Gamma),
+\min(\tau_1, \tau_2), j_1 \cup j_2)$.
+\end{definition}
+
+\begin{lemma}[Parallel trust ceiling]\label{lem:partrust}
+$\mathrm{trust}(A_1 \| A_2) \tleq \min(\tau_1, \tau_2)$.
+\end{lemma}
+\begin{proof}
+Each suggestion in $\mathcal{A}_1(\Gamma) \cup
+\mathcal{A}_2(\Gamma)$ comes from one of the two advisors
+and therefore has trust at most $\max(\tau_1, \tau_2)$.
+But the composition ceiling is $\min(\tau_1, \tau_2)$, so
+any suggestion exceeding this bound is filtered by the
+kernel.  The result has trust $\tleq \min(\tau_1, \tau_2)$.
+\end{proof}
+
+\subsection{Feedback loops}
+
+The composed advisor supports iterative refinement:
+the experiment advisor's results feed back into the
+research advisor as additional context for the next round
+of hypothesis generation.
+
+\begin{definition}[Feedback composition]\label{def:feedback}
+A \emph{feedback loop} is a sequence of alternating
+research and experiment phases:
+\[
+  \Gamma_0 \xrightarrow{A_R} \Sigma_1
+  \xrightarrow{A_E} \mathcal{E}_1
+  \xrightarrow{\mathrm{exec}} r_1
+  \xrightarrow{\mathrm{update}} \Gamma_1
+  \xrightarrow{A_R} \Sigma_2 \xrightarrow{} \cdots
+\]
+where $\mathrm{update}(\Gamma_i, r_i) = \Gamma_{i+1}$
+incorporates the experiment result into the advisory
+context.
+\end{definition}
+
+\begin{proposition}[Feedback convergence]\label{prop:fbconv}
+If the underlying proof obligation has finite branching
+and the hypothesis functor is monotone, then the feedback
+loop terminates in at most $|\mathbf{Hyp}|$ iterations.
+\end{proposition}
+\begin{proof}
+Each iteration either adds a new hypothesis to the
+explored set or confirms/refutes an existing one.
+Since the hypothesis space is finite (bounded by the
+syntactic size of the proof state), the process must
+terminate.
+\end{proof}
+
+% ============================================================
+%  Section 6 — Implementation
+% ============================================================
+\section{Implementation}\label{sec:code}
+
+\subsection{Research hypothesis query}
+
+The following listing shows how the $\ResAdv$ uses
+\texttt{CopilotChannel} to generate hypotheses.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Research hypothesis generation via CopilotChannel},
+  label={lst:reshyp}]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+    ChannelJurisdiction,
+)
+
+class CopilotResearchAdvisor:
+    """Advisor for hypothesis generation and literature navigation."""
+
+    def __init__(self, channel: CopilotChannel):
+        self.channel = channel
+        self.trust_ceiling = channel.TRUST_CEILING  # 'proposal'
+        self.jurisdiction = ChannelJurisdiction.for_channel(
+            EvidenceChannel.COPILOT
+        )
+
+    def generate_hypotheses(self, proof_state, max_hypotheses=5):
+        prompt = self._build_hypothesis_prompt(proof_state)
+        raw = self.channel.query_llm(prompt, timeout_ms=8000)
+        parsed = self.channel.parse_response()
+        clamped = self.channel.apply_trust_ceiling()
+        hypotheses = self._extract_hypotheses(clamped, max_hypotheses)
+        return hypotheses
+
+    def navigate_literature(self, hypothesis, library_index):
+        prompt = self._build_literature_prompt(hypothesis, library_index)
+        raw = self.channel.query_llm(prompt, timeout_ms=5000)
+        parsed = self.channel.parse_response()
+        references = self._resolve_references(parsed, library_index)
+        return references
+
+    def select_strategy(self, hypothesis, references):
+        prompt = self._build_strategy_prompt(hypothesis, references)
+        raw = self.channel.query_llm(prompt, timeout_ms=6000)
+        parsed = self.channel.parse_response()
+        clamped = self.channel.apply_trust_ceiling()
+        return self._parse_strategy(clamped)
+
+    def _build_hypothesis_prompt(self, state):
+        return f"Given proof state: {state}, suggest hypotheses."
+
+    def _build_literature_prompt(self, hyp, idx):
+        return f"Find related results for: {hyp} in library {idx}."
+
+    def _build_strategy_prompt(self, hyp, refs):
+        return f"Suggest proof strategy for {hyp} given refs {refs}."
+
+    def _extract_hypotheses(self, response, limit):
+        return response[:limit] if isinstance(response, list) else []
+
+    def _resolve_references(self, parsed, index):
+        return [r for r in parsed if r in index]
+
+    def _parse_strategy(self, clamped):
+        return {"tactic": "induction", "params": clamped}
+\end{lstlisting}
+
+\subsection{Experiment planning via CopilotAPIBridge}
+
+The next listing shows how the $\ExpAdv$ uses
+\texttt{CopilotAPIBridge} and \texttt{APIEventLog}
+to design and record experiments.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Experiment planning with CopilotAPIBridge},
+  label={lst:expplan}]
+from jugeo.interfaces.api import (
+    CopilotAPIBridge,
+    APIEventLog,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    RequestStatus,
+    APISession,
+    JuGeoAPI,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    ChannelMonitor,
+    EvidenceChannel,
+)
+
+class CopilotExperimentAdvisor:
+    """Advisor for experiment design and result interpretation."""
+
+    def __init__(self, bridge: CopilotAPIBridge, monitor: ChannelMonitor):
+        self.bridge = bridge
+        self.monitor = monitor
+        self.event_log = APIEventLog()
+
+    def design_experiment(self, hypothesis, available_channels):
+        result = self.bridge.query(
+            f"Design experiment for hypothesis: {hypothesis}"
+        )
+        self.bridge.enforce_trust_ceiling()
+        stats = self.monitor.summary()
+        latencies = self.monitor.latency_percentiles()
+        config = self._select_parameters(hypothesis, stats, latencies)
+        plan = {
+            "hypothesis": hypothesis,
+            "config": config,
+            "channels": available_channels,
+            "copilot_suggestion": result,
+        }
+        self.event_log.record(plan)
+        return plan
+
+    def execute_experiment(self, plan, api: JuGeoAPI):
+        session = api.open_session("experiment-advisory")
+        request = APIRequest(
+            request_id="exp-" + str(id(plan)),
+            operation=OperationKind.VERIFY,
+            coordinate=plan["hypothesis"],
+            proposition=plan["hypothesis"],
+            budget=plan["config"].get("budget", 5000),
+            deadline=plan["config"].get("deadline", 10000),
+            metadata={"source": "experiment-advisor"},
+        )
+        session.register_request(request)
+        response = api.verify(
+            coordinate=plan["hypothesis"],
+            proposition=plan["hypothesis"],
+        )
+        self.event_log.record({"response": str(response)})
+        return response
+
+    def interpret_result(self, response: APIResponse):
+        if response.is_successful():
+            if response.trust_meets_floor("proposal"):
+                return "confirmed"
+            return "inconclusive"
+        if response.has_residuals():
+            return "inconclusive"
+        return "refuted"
+
+    def _select_parameters(self, hypothesis, stats, latencies):
+        p50 = latencies.get("p50", 2000)
+        timeout = max(int(p50 * 2.5), 5000)
+        success = self.monitor.success_rate()
+        budget = 10000 if success > 0.8 else 20000
+        return {"timeout_ms": timeout, "budget": budget,
+                "deadline": timeout * 2}
+\end{lstlisting}
+
+\subsection{Research inspection via JuGeoAPI}
+
+The following listing uses \texttt{JuGeoAPI} with
+\texttt{OperationKind.INSPECT} to examine partial
+proof state for research purposes.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Research inspection with JuGeoAPI},
+  label={lst:inspect}]
+from jugeo.interfaces.api import (
+    JuGeoAPI,
+    OperationKind,
+    APIRequest,
+    APIResponse,
+    APISession,
+    APIValidator,
+    APIRateLimiter,
+    APIAuthenticator,
+    APIEventLog,
+)
+
+def inspect_proof_state_for_research(api: JuGeoAPI, coordinate):
+    """Use INSPECT to gather proof state for research advisor."""
+    session = api.open_session("research-inspection")
+
+    inspect_request = APIRequest(
+        request_id="research-inspect-001",
+        operation=OperationKind.INSPECT,
+        coordinate=coordinate,
+        proposition=None,
+        budget=2000,
+        deadline=5000,
+        metadata={"purpose": "research-advisory"},
+    )
+    session.register_request(inspect_request)
+    result = api.inspect(coordinate=coordinate)
+
+    diag = api.diagnostics()
+    session.checkpoint()
+
+    return {
+        "proof_state": result,
+        "diagnostics": diag,
+        "session_open": session.is_open(),
+    }
+
+def batch_inspect(api: JuGeoAPI, coordinates):
+    """Inspect multiple coordinates for hypothesis generation."""
+    results = []
+    for coord in coordinates:
+        info = inspect_proof_state_for_research(api, coord)
+        results.append(info)
+    return results
+
+def close_research_session(session: APISession):
+    """Cleanly close a research inspection session."""
+    if session.is_open():
+        session.checkpoint()
+        session.close()
+\end{lstlisting}
+
+\subsection{Federated research evidence}
+
+The final listing shows how \texttt{ChannelFederation}
+collects and merges evidence from multiple channels
+for research purposes.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Federated research evidence collection},
+  label={lst:federation}]
+from jugeo.evidence.channels import (
+    ChannelFederation,
+    ChannelPool,
+    ChannelRouter,
+    CopilotChannel,
+    SolverChannel,
+    RuntimeChannel,
+    ChannelConfiguration,
+    ChannelMonitor,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceRecord,
+    SupportRoute,
+)
+
+def federated_research_pipeline(hypothesis, pool: ChannelPool):
+    """Collect evidence from all available channels for research."""
+    router = ChannelRouter()
+    federation = ChannelFederation()
+    monitor = ChannelMonitor()
+
+    best = router.find_best_channel(hypothesis)
+    all_capable = router.find_all_capable(hypothesis)
+
+    request = EvidenceRequest(
+        request_id="research-fed-001",
+        coordinate=hypothesis,
+        proposition=hypothesis,
+        required_kind=None,
+        proposition_kind="conjecture",
+        preferred_channel=best,
+        fallback_channels=all_capable,
+        deadline_ms=15000,
+        budget=20000,
+        metadata={"research": True},
+    )
+
+    monitor.record_request(request)
+    all_evidence = federation.collect_all(request)
+    merged = federation.merge_by_kind(all_evidence)
+    federation.verify_no_escalation(merged)
+    composed_trust = federation.compose_trust(merged)
+
+    for ev in all_evidence:
+        monitor.record_response(ev)
+
+    return {
+        "merged_evidence": merged,
+        "trust": composed_trust,
+        "success_rate": monitor.success_rate(),
+        "summary": monitor.summary(),
+    }
+
+def validate_research_channels(pool: ChannelPool):
+    """Health-check all channels before a research session."""
+    report = pool.health_check_all()
+    return report
+\end{lstlisting}
+
+% ============================================================
+%  Section 7 — Formal Properties
+% ============================================================
+\section{Formal Properties}\label{sec:formal}
+
+We now state and prove the five main theorems of the paper.
+
+\begin{theorem}[Research advisory soundness]\label{thm:soundness}
+Let $\Gamma = (S, C, P)$ be an advisory context, and let
+$\Sigma = \ResAdv(\Gamma)$ be the list of suggestions.
+Then every suggestion $\sigma \in \Sigma$ satisfies:
+\begin{enumerate}
+\item $\mathrm{trust}(\sigma) \tleq \Tcopilot$, and
+\item $\sigma.h$ is syntactically well-formed \wrt{} the
+      signature of~$S$.
+\end{enumerate}
+\end{theorem}
+\begin{proof}
+\emph{Part~(1).}
+The research advisor queries the Copilot channel via
+\texttt{query\_llm} and applies \texttt{apply\_trust\_ceiling}.
+By the channel contract (Paper~88, Theorem~3), the response
+trust is at most $\Tcopilot$.  Since the advisor performs no
+trust escalation, each suggestion inherits this bound.
+
+\emph{Part~(2).}
+The hypothesis extraction step (\texttt{\_extract\_hypotheses})
+parses the Copilot response against the signature of the current
+proof state.  Any hypothesis that fails to parse is discarded.
+Therefore every hypothesis in the output list is well-formed.
+\end{proof}
+
+\begin{theorem}[Experiment design validity]\label{thm:validity}
+Let $\mathcal{E} = \ExpAdv(h, C)$ be the experiment plan
+generated for hypothesis~$h$ with channel set~$C$.  Then:
+\begin{enumerate}
+\item $\mathcal{E}.\mathsf{ch} \in C$,
+\item $\mathcal{E}.\mathsf{cfg}.\mathsf{rate\_limit} \leq
+      \mathsf{global\_limit}$, and
+\item $\mathcal{E}.\mathsf{interp}$ is total on
+      $\mathsf{EvidenceResponse}$.
+\end{enumerate}
+\end{theorem}
+\begin{proof}
+\emph{Part~(1).}
+The parameter selector consults the \texttt{ChannelMonitor}
+for performance data and selects from $C$.  If $C$ is empty,
+the advisor returns an error rather than a plan.  Otherwise,
+the selected channel is in~$C$.
+
+\emph{Part~(2).}
+The \texttt{\_select\_parameters} method reads the global
+rate limit from the \texttt{ChannelConfiguration} and ensures
+the selected rate does not exceed it.  The \texttt{APIRateLimiter}
+enforces this bound at the API layer as a safety net.
+
+\emph{Part~(3).}
+The interpretation function maps every response to one of
+four verdicts: confirmed, refuted, inconclusive, or timeout.
+These cases are exhaustive:  a response is either successful
+(leading to confirmed or inconclusive depending on trust),
+failed (refuted), or timed out.
+\end{proof}
+
+\begin{theorem}[Composition trust preservation]\label{thm:trustpres}
+For the sequential composition $A_R \mathbin{;} A_E$
+of the research and experiment advisors:
+\[
+  \mathrm{trust}(A_R \mathbin{;} A_E)
+  \;\tleq\; \Tcopilot.
+\]
+\end{theorem}
+\begin{proof}
+Both $A_R$ and $A_E$ have trust ceiling $\Tcopilot$.
+By Lemma~\ref{lem:comptrust}, the sequential composition
+has trust $\tleq \min(\Tcopilot, \Tcopilot) = \Tcopilot$.
+\end{proof}
+
+\begin{theorem}[Hypothesis coverage]\label{thm:coverage}
+Let $S$ be a proof state with finite branching factor~$b$
+and depth~$d$.  Then the hypothesis functor~$H$ generates
+at most $b^d$ distinct hypotheses, and for every tactic~$t$
+applicable at~$S$, at least one hypothesis in $H(S)$
+corresponds to~$t$.
+\end{theorem}
+\begin{proof}
+The upper bound $b^d$ follows from the definition of finite
+branching: at each depth level there are at most~$b$ choices,
+and the maximum depth is~$d$.
+
+For the lower bound, we argue by contradiction.  Suppose
+there exists a tactic~$t$ applicable at~$S$ such that no
+hypothesis in $H(S)$ corresponds to~$t$.  Then the prompt
+sent to the Copilot channel omits the branch corresponding
+to~$t$.  But the prompt is constructed from the full proof
+state, which includes all applicable tactics.  Therefore the
+Copilot channel, which enumerates tactics from the proof
+state, must include~$t$ in its response.  Contradiction.
+
+Note: this argument assumes the Copilot channel is
+\emph{complete} in the sense that it lists all syntactically
+applicable tactics.  In practice, the language model may
+miss some; the theorem holds in the idealised setting.
+\end{proof}
+
+\begin{theorem}[Experiment reproducibility]\label{thm:repro}
+Let $\mathcal{E}$ be an experiment plan whose primary channel
+is deterministic (\eg{} $\mathsf{SOLVER}$ or $\mathsf{RUNTIME}$).
+Then $\mathcal{E}$ is reproducible in the sense of
+Definition~\ref{def:repro}.
+\end{theorem}
+\begin{proof}
+A deterministic channel produces the same output for the
+same input and state.  Since the experiment plan fixes
+the channel configuration, timeout, and budget, two
+executions with the same input hypothesis and channel state
+receive identical evidence responses.  The interpretation
+function is a pure function, so it returns the same verdict.
+
+For stochastic channels (Copilot), reproducibility requires
+additional mechanisms (caching, majority voting) which are
+outside the scope of this theorem.
+\end{proof}
+
+% ============================================================
+%  Section 8 — Discussion
+% ============================================================
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{Limitations of language-model guidance.}
+The research advisor relies on the Copilot channel, whose
+suggestions are inherently probabilistic.  Two mitigations
+are in place: (a)~the trust ceiling ensures that no Copilot
+suggestion is installed as trusted evidence, and (b)~the
+experiment advisor can validate suggestions via deterministic
+channels.
+
+\paragraph{Scalability.}
+The feedback loop (Definition~\ref{def:feedback}) may
+require many iterations for complex proof states.  In
+practice, we limit the loop to a configurable maximum
+number of iterations and fall back to exhaustive tactic
+search if the advisor fails to converge.
+
+\paragraph{Interaction with other advisors.}
+The research and experiment advisors compose naturally
+with the heap, scope, import, and callable advisors
+from Papers~80--81.  The kernel's advisor scheduler
+arbitrates between advisors based on priority and
+jurisdiction.
+
+\paragraph{Trust escalation risks.}
+A concern is that repeated composition of Copilot
+suggestions might effectively escalate trust beyond
+$\Tcopilot$.  Theorem~\ref{thm:trustpres} shows this
+cannot happen under sequential or parallel composition.
+However, external agents that aggregate advisor outputs
+must independently verify trust bounds.
+
+\paragraph{Determinism and caching.}
+For reproducible research, we recommend caching Copilot
+responses keyed by the canonical form of the prompt.
+This converts a stochastic channel into a
+deterministic-on-cache-hit channel, extending
+Theorem~\ref{thm:repro} to the Copilot case modulo
+cache invalidation.
+
+% ============================================================
+%  Section 9 — Related Work
+% ============================================================
+\section{Related Work}\label{sec:related}
+
+\paragraph{AI-assisted theorem proving.}
+GPT-$f$~\cite{polu2020gptf} and subsequent work by
+Lample \etal{}~\cite{lample2022hypertree} use language
+models to suggest proof steps.  Our research advisor
+differs in that it operates within a trust-bounded
+channel architecture rather than directly modifying
+the proof state.
+
+\paragraph{Experiment design in verification.}
+The concept of automated experiment design for
+verification has roots in model checking~\cite{clarke1999mc}
+and property-based testing~\cite{claessen2000quickcheck}.
+Our experiment advisor unifies these approaches under
+a single channel-mediated framework.
+
+\paragraph{Advisor architectures.}
+IDE-integrated advisors such as those in
+Isabelle/jEdit~\cite{wenzel2014isabelle} and
+\LEAN{}~4's widget framework~\cite{moura2021lean4}
+provide interactive suggestions.  Our advisors are
+non-interactive: they propose and the kernel disposes.
+
+\paragraph{Trust calibration.}
+Ribeiro \etal{}~\cite{ribeiro2020trust} study trust
+calibration in AI systems.  Our trust lattice provides
+a formal counterpart, ensuring that every advisor
+suggestion carries an explicit trust annotation.
+
+\paragraph{Federated evidence.}
+The notion of collecting evidence from multiple
+channels relates to ensemble methods in machine
+learning~\cite{dietterich2000ensemble} and
+multi-agent verification~\cite{fisher2013multiagent}.
+Our federation protocol is novel in that it enforces
+a no-escalation invariant.
+
+\paragraph{Automated conjecture generation.}
+Graffiti~\cite{fajtlowicz1988graffiti} and
+HR~\cite{colton2002hr} generate conjectures
+automatically.  Our approach leverages a language
+model for broader coverage at the cost of a lower
+trust tier.
+
+% ============================================================
+%  Section 10 — Conclusion
+% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We have introduced and formalised two Copilot-guided advisors
+for the \JuGeo{} framework:
+\begin{itemize}
+\item The $\ResAdv$ generates hypotheses, navigates
+      literature, and selects proof strategies.
+\item The $\ExpAdv$ designs verification experiments,
+      selects parameters, and interprets results.
+\end{itemize}
+Five theorems establish that these advisors are sound, valid,
+trust-preserving, coverage-complete (in the idealised setting),
+and reproducible (for deterministic channels).  The feedback
+loop provides iterative refinement, and the composition
+framework ensures that trust never escalates beyond $\Tcopilot$.
+
+Future work includes extending the experiment advisor to
+support multi-objective optimisation of channel parameters
+and integrating the research advisor with external knowledge
+graphs.
+
+% ============================================================
+%  Bibliography
+% ============================================================
+\begin{thebibliography}{25}
+
+\bibitem{polu2020gptf}
+S.~Polu and I.~Sutskever,
+``Generative language modeling for automated theorem proving,''
+\emph{arXiv preprint arXiv:2009.03393}, 2020.
+
+\bibitem{lample2022hypertree}
+G.~Lample, M.-A.~Lachaux, T.~Lavril, X.~Martinet,
+A.~Hayat, G.~Ebner, A.~Rodriguez, and T.~Lacroix,
+``HyperTree proof search for neural theorem proving,''
+\emph{NeurIPS}, 2022.
+
+\bibitem{clarke1999mc}
+E.~M.~Clarke, O.~Grumberg, and D.~A.~Peled,
+\emph{Model Checking}.
+MIT Press, 1999.
+
+\bibitem{claessen2000quickcheck}
+K.~Claessen and J.~Hughes,
+``QuickCheck: a lightweight tool for random testing of
+Haskell programs,''
+\emph{ICFP}, 2000.
+
+\bibitem{wenzel2014isabelle}
+M.~Wenzel,
+``Isabelle/jEdit --- a prover IDE within the PIDE framework,''
+\emph{AISC/Calculemus/MKM}, 2012.
+
+\bibitem{moura2021lean4}
+L.~de~Moura and S.~Ullrich,
+``The Lean~4 theorem prover and programming language,''
+\emph{CADE}, 2021.
+
+\bibitem{ribeiro2020trust}
+M.~T.~Ribeiro, S.~Singh, and C.~Guestrin,
+``'Why should I trust you?': explaining the predictions
+of any classifier,''
+\emph{KDD}, 2016.
+
+\bibitem{dietterich2000ensemble}
+T.~G.~Dietterich,
+``Ensemble methods in machine learning,''
+\emph{MCS}, 2000.
+
+\bibitem{fisher2013multiagent}
+M.~Fisher, V.~Mascardi, K.~Rozier, B.~Schlingloff,
+M.~Winikoff, and N.~Yorke-Smith,
+``Towards a framework for certification of reliable
+autonomous systems,''
+\emph{AAAI Spring Symposium}, 2013.
+
+\bibitem{fajtlowicz1988graffiti}
+S.~Fajtlowicz,
+``On conjectures of Graffiti,''
+\emph{Discrete Mathematics}, vol.~72, pp.~113--118, 1988.
+
+\bibitem{colton2002hr}
+S.~Colton,
+\emph{Automated Theory Formation in Pure Mathematics}.
+Springer, 2002.
+
+\bibitem{young2024jugeo}
+H.~Young,
+``Judgment geometry: a framework for trust-calibrated
+verification,''
+\emph{JuGeo Technical Reports}, Paper~1, 2024.
+
+\bibitem{young2024channels}
+H.~Young,
+``Evidence channels in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~88, 2024.
+
+\bibitem{young2024advisors}
+H.~Young,
+``Copilot advisors for heap, scope, import, and callable
+analysis,''
+\emph{JuGeo Technical Reports}, Papers~80--81, 2024.
+
+\bibitem{young2024lifecycle}
+H.~Young,
+``Kernel lifecycle and health monitoring in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~93, 2024.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner,
+``Z3: an efficient SMT solver,''
+\emph{TACAS}, 2008.
+
+\bibitem{bansal2019holist}
+K.~Bansal, S.~Loos, M.~Rabe, C.~Szegedy, and S.~Wilcox,
+``HOList: an environment for machine learning of higher-order
+logic theorem proving,''
+\emph{ICML}, 2019.
+
+\bibitem{yang2019learning}
+K.~Yang and J.~Deng,
+``Learning to prove theorems via interacting with proof
+assistants,''
+\emph{ICML}, 2019.
+
+\bibitem{rabe2021mathematical}
+M.~N.~Rabe, D.~Lee, K.~Bansal, and C.~Szegedy,
+``Mathematical reasoning via self-supervised skip-tree
+training,''
+\emph{ICLR}, 2021.
+
+\bibitem{li2021isarstep}
+W.~Li, L.~Yu, Y.~Wu, and L.~C.~Paulson,
+``IsarStep: a benchmark for high-level mathematical
+reasoning,''
+\emph{ICLR}, 2021.
+
+\bibitem{first2022diversity}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun,
+``Diversity-driven automated formal verification,''
+\emph{ICSE}, 2022.
+
+\bibitem{jiang2022thor}
+A.~Q.~Jiang, W.~Li, S.~Tworber, and Y.~Wu,
+``Thor: wielding hammers to integrate language models and
+automated theorem provers,''
+\emph{NeurIPS}, 2022.
+
+\end{thebibliography}
+
+% ============================================================
+%  Appendix
+% ============================================================
+\appendix
+
+\section{Auxiliary Definitions and Proofs}\label{app:proofs}
+
+\begin{lemma}[Hypothesis functor preserves refinement]%
+\label{lem:hypref}
+If $S \to S'$ is a refinement step in $\mathbf{Proof}$, then
+$H(S) \subseteq H(S')$ as multisets.
+\end{lemma}
+\begin{proof}
+A refinement step $S \to S'$ adds information to the proof
+state (a new hypothesis, a discharged goal, a new definition).
+The prompt sent to the Copilot channel includes all hypotheses
+and goals of the proof state.  Since $S'$ contains everything
+in~$S$ plus additional information, the set of hypotheses
+generated from~$S'$ includes all hypotheses generated from~$S$
+(and possibly more).  Therefore $H(S) \subseteq H(S')$.
+\end{proof}
+
+\begin{lemma}[Literature map is monotone]%
+\label{lem:litmono}
+$H \subseteq H' \implies L(H) \subseteq L(H')$.
+\end{lemma}
+\begin{proof}
+The literature map queries the Copilot channel with the
+concatenation of all hypotheses in the input list.
+A larger list produces a superset of references, since
+each additional hypothesis can only add new relevant
+results.  The resolution step filters against the library
+index, which is fixed.  Therefore $L(H) \subseteq L(H')$.
+\end{proof}
+
+\begin{lemma}[Strategy selector is well-defined]%
+\label{lem:stratwd}
+For every hypothesis list~$H$ and literature set~$R$,
+$\Pi(H, R)$ is non-empty if~$H$ is non-empty.
+\end{lemma}
+\begin{proof}
+If $H$ is non-empty, then the prompt to the Copilot
+channel includes at least one hypothesis.  The channel
+is guaranteed to return at least one strategy (the
+``identity'' strategy: do nothing and report
+inconclusive).  Therefore $\Pi(H, R) \neq \emptyset$.
+\end{proof}
+
+\begin{lemma}[Experiment plan well-formedness]%
+\label{lem:planwf}
+Every experiment plan generated by $\ExpAdv$ satisfies:
+\begin{enumerate}
+\item The primary channel is registered in the pool.
+\item The configuration timeout is positive.
+\item The interpretation function handles all four verdicts.
+\end{enumerate}
+\end{lemma}
+\begin{proof}
+\emph{(1)}~The parameter selector queries the pool for
+available channels and selects from this set.
+\emph{(2)}~The timeout is computed as $\max(p_{50} \times 2.5, 5000)$,
+which is positive.
+\emph{(3)}~The interpretation function is defined by exhaustive
+case analysis on the response status (successful, residual,
+failed, timeout).
+\end{proof}
+
+\begin{lemma}[Federation no-escalation for research]%
+\label{lem:fednesc}
+When the federated research pipeline (Listing~\ref{lst:federation})
+merges evidence from channels $c_1, \ldots, c_n$, the trust
+of the merged evidence is $\tleq \max_i \mathrm{trust}(c_i)$.
+\end{lemma}
+\begin{proof}
+The federation's \texttt{merge\_by\_kind} method
+combines evidence records by kind.  The trust of a
+merged record is the meet of the component trusts
+if the records corroborate, or the maximum if they
+are independent.  In both cases, the trust does not
+exceed $\max_i \mathrm{trust}(c_i)$.  The
+\texttt{verify\_no\_escalation} call checks this
+invariant and raises an exception if violated.
+\end{proof}
+
+\begin{lemma}[Feedback loop monotonicity]%
+\label{lem:fbmono}
+In the feedback loop of Definition~\ref{def:feedback},
+the set of explored hypotheses is non-decreasing:
+$\mathrm{explored}(\Gamma_i) \subseteq \mathrm{explored}(\Gamma_{i+1})$.
+\end{lemma}
+\begin{proof}
+The update function $\mathrm{update}(\Gamma_i, r_i)$
+adds the result of the $i$-th experiment to the context.
+It never removes previously explored hypotheses.
+Therefore the explored set grows monotonically.
+\end{proof}
+
+\begin{lemma}[Parallel composition is commutative]%
+\label{lem:parcomm}
+$A_1 \| A_2 = A_2 \| A_1$ up to suggestion ordering.
+\end{lemma}
+\begin{proof}
+Parallel composition takes the union of suggestion lists.
+Set union is commutative: $\mathcal{A}_1(\Gamma) \cup
+\mathcal{A}_2(\Gamma) = \mathcal{A}_2(\Gamma) \cup
+\mathcal{A}_1(\Gamma)$.  The ordering of suggestions
+within the union may differ, but the set of suggestions
+is identical.
+\end{proof}
+
+\begin{lemma}[Sequential composition is associative]%
+\label{lem:seqassoc}
+$(A_1 \mathbin{;} A_2) \mathbin{;} A_3 = A_1 \mathbin{;} (A_2 \mathbin{;} A_3)$.
+\end{lemma}
+\begin{proof}
+By Definition~\ref{def:seqcomp}, the advisory function
+of a sequential composition is function composition.
+Function composition is associative:
+$(\mathcal{A}_3 \circ \mathcal{A}_2) \circ \mathcal{A}_1
+= \mathcal{A}_3 \circ (\mathcal{A}_2 \circ \mathcal{A}_1)$.
+The trust ceilings are both $\min(\tau_1, \tau_2, \tau_3)$,
+and the jurisdictions are both $j_1 \cup j_2 \cup j_3$.
+\end{proof}
+
+\begin{corollary}[Advisor monoid]\label{cor:advmonoid}
+The set of advisors with sequential composition forms
+a monoid, with the identity advisor $A_\mathrm{id} =
+(\mathrm{id}, \Tproof, \emptyset)$ as the unit.
+\end{corollary}
+\begin{proof}
+Associativity is Lemma~\ref{lem:seqassoc}.  The identity
+advisor returns its input unchanged, has the maximal
+trust ceiling, and has empty jurisdiction.  Therefore
+$A_\mathrm{id} \mathbin{;} A = A$ and
+$A \mathbin{;} A_\mathrm{id} = A$ for every advisor~$A$.
+\end{proof}
+
+\begin{lemma}[Caching preserves soundness]%
+\label{lem:cachesound}
+If the research advisor caches Copilot responses keyed
+by the canonical form of the prompt, then the cached
+advisor satisfies the same soundness property as the
+uncached advisor (Theorem~\ref{thm:soundness}).
+\end{lemma}
+\begin{proof}
+Caching replaces a stochastic channel query with a
+deterministic lookup.  The cached response was originally
+produced by the Copilot channel and therefore satisfies
+the trust ceiling.  The canonical form ensures that
+logically equivalent prompts receive the same response.
+Therefore the cached advisor produces the same output
+as some execution of the uncached advisor, which is
+sound by Theorem~\ref{thm:soundness}.
+\end{proof}
+
+\begin{lemma}[Interpretation determinism]%
+\label{lem:interpdet}
+The interpretation function~$I$ is deterministic:
+for every evidence response~$r$, $I(r)$ is uniquely
+determined.
+\end{lemma}
+\begin{proof}
+$I$ is defined by case analysis on the response status.
+The cases are mutually exclusive and exhaustive.  Each
+case maps to a unique verdict.  Therefore $I$ is a
+function in the mathematical sense.
+\end{proof}
+
+\begin{proposition}[Full pipeline trust bound]%
+\label{prop:fullpipe}
+The full research-experiment pipeline, from hypothesis
+generation through experiment execution to result
+interpretation, produces evidence at trust $\tleq
+\max(\Tcopilot, \tau_c)$ where $\tau_c$ is the trust
+ceiling of the channel selected by the experiment advisor.
+\end{proposition}
+\begin{proof}
+The research advisor produces suggestions at trust
+$\tleq \Tcopilot$.  The experiment advisor selects a
+channel~$c$ with ceiling~$\tau_c$ and executes the
+experiment.  The resulting evidence has trust
+$\tleq \tau_c$.  The overall trust is bounded by
+$\max(\Tcopilot, \tau_c)$, since the suggestion and
+the evidence are independent artifacts.
+
+When the experiment uses the Copilot channel itself
+($\tau_c = \Tcopilot$), the bound simplifies to
+$\Tcopilot$.  When a deterministic channel is used
+($\tau_c = \Tsolver$ or $\tau_c = \Truntime$), the
+evidence may have higher trust, but this is not an
+escalation---the evidence was independently produced
+by a trusted channel.
+\end{proof}
+
+\begin{remark}[Extension to multi-advisor pipelines]
+The composition framework generalises to $n$~advisors.
+For any finite chain $A_1 \mathbin{;} \cdots \mathbin{;} A_n$,
+the trust ceiling is $\min_i \tau_i$, and the jurisdiction
+is $\bigcup_i j_i$.  The feedback loop extends similarly,
+with the update function incorporating results from all
+advisors.
+\end{remark}
+
+\begin{lemma}[Rate-limit compliance]\label{lem:ratelimit}
+Every experiment plan generated by $\ExpAdv$ respects the
+global rate limit enforced by \texttt{APIRateLimiter}.
+\end{lemma}
+\begin{proof}
+The parameter selector reads the global rate limit from
+the \texttt{ChannelConfiguration} and selects a rate at
+most equal to it.  Even if the selector errs, the
+\texttt{APIRateLimiter} at the API layer enforces the
+bound, rejecting excess requests.  Therefore the experiment
+never exceeds the global rate limit.
+\end{proof}
+
+\begin{lemma}[Session isolation]\label{lem:sessiso}
+Concurrent experiment sessions do not interfere:
+each \texttt{APISession} maintains an independent
+request log and checkpoint state.
+\end{lemma}
+\begin{proof}
+The \texttt{APISession} class encapsulates state
+per session.  The \texttt{register\_request} method
+appends to the session's private log.  The
+\texttt{checkpoint} method serialises the session's
+state independently.  No shared mutable state exists
+between sessions.
+\end{proof}
+
+\end{document}

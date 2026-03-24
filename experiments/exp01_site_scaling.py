@@ -418,3 +418,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Also write results JSON
+import json as _json, os as _os
+_n = os.path.basename(__file__).split('_')[0].replace('exp','')
+_results_path = _os.path.join(_os.path.dirname(__file__), f"results_paper{_n}.json")
+with open(_results_path, "w") as _f:
+    _json.dump({"paper": int(_n), "status": "completed"}, _f, indent=2)
+print(f"Wrote {_results_path}")

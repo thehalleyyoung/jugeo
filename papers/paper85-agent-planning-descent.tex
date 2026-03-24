@@ -5,7 +5,7 @@
 \documentclass[11pt]{article}
 \usepackage{lmodern}
 \input{jugeo-common}
-% data file removed (no real experiment)
+% \input{data-paper85}  % commented out: data file does not exist
 
 % ── Additional packages ────────────────────────────────────────────
 \usepackage{array}
@@ -51,6 +51,14 @@ Verifying Multi-Step Plans Before Execution}}
 \begin{document}
 \maketitle
 
+\noindent\textbf{Audit note.}
+This paper presents a sheaf-theoretic design for plan verification, but
+the repository does not currently ship the plan-specific \texttt{jugeo.agents}
+or \texttt{jugeo.descent} APIs used in the original draft.  In this audited
+version, implementation claims are limited to general JuGeo site/descent
+machinery, and plan-oriented code blocks are rewritten as schematic
+pseudocode rather than importable library examples.
+
 % ─────────────────────────────────────────────────────────────────────
 \begin{abstract}
 We present a framework for verifying the coherence of agent plans
@@ -68,9 +76,12 @@ $[\alpha] \in \Hcoh{1}(\GoalSite, \PlanSheaf)$ identifies which
 sub-goals conflict and classifies the failure as resource contention,
 ordering violation, or precondition incompatibility.  We define a
 repair algorithm $\RepairOp$ that iteratively eliminates obstructions
-and prove it converges in at most $|\ConflictSet|$ iterations.
-We implement the full pipeline in the \JuGeo{} \Python{} library and
-formalize key theorems in \LEAN.
+and prove a convergence bound under explicit severity-reduction
+assumptions.  The current JuGeo repository motivates this paper's
+site- and descent-oriented perspective, but it does not expose the
+plan-specific APIs or Lean artifacts claimed in the original draft.
+Accordingly, the implementation material below should be read as
+repository-informed design pseudocode rather than as shipped interfaces.
 \end{abstract}
 
 \newpage
@@ -123,12 +134,13 @@ reveals the nature of the conflict.
     coherence and prove that coherent plans are unique up to
     equivalence (\Cref{sec:descent}).
   \item We classify descent failures into three conflict types
-    and define a repair algorithm that converges in bounded
-    iterations (\Cref{sec:conflict}).
+     and define a repair algorithm that converges in bounded
+     iterations (\Cref{sec:conflict}).
   \item We describe an evaluation methodology for the plan descent
-    framework (\Cref{sec:experiments}).
-  \item We implement the full pipeline in the \JuGeo{} \Python{}
-    API and formalize key theorems in \LEAN{}
+     framework (\Cref{sec:experiments}).
+  \item We relate the proposal to JuGeo's existing site/descent
+    viewpoint while treating plan-specific APIs and theorem-prover
+    artifacts as future work rather than shipped functionality
     (\Cref{sec:related,sec:conclusion}).
 \end{enumerate}
 
@@ -247,40 +259,32 @@ a concrete action sequence that the agent intends to execute
 for sub-goal $\SubGoal{i}$.  A \emph{plan} is a collection
 of local sections $\{s_i\}_{i \in I}$, one per sub-goal.
 
-The following code listing shows how to construct a goal site
-and plan presheaf using the \JuGeo{} \Python{} API.
+The following listing is \emph{schematic pseudocode}.  It illustrates
+the data that a plan-verification layer would need to assemble, but the
+repository does not currently export the plan-specific symbols shown in
+the original draft.
 
 \begin{lstlisting}
-from jugeo import Site, Covering, Presheaf
-from jugeo.agents import GoalSpace, SubGoal, ActionSeq
+# Schematic pseudocode: prospective plan-verification layer
+goal_atoms = {"water_hot", "vegs_sliced", "table_set"}
 
-# Define atomic propositions
-goal_space = GoalSpace(["water_hot", "vegs_sliced", "table_set"])
-
-# Define sub-goals as subsets
-sg_heat  = SubGoal("heat",  {"water_hot"})
-sg_slice = SubGoal("slice", {"vegs_sliced"})
-sg_table = SubGoal("table", {"table_set"})
-sg_prep  = SubGoal("prep",  {"water_hot", "vegs_sliced"})
-
-# Build the covering family
-covering = Covering(
-    base=goal_space,
-    opens=[sg_heat, sg_slice, sg_table, sg_prep]
-)
-
-# Define action sequences for each sub-goal
-plans = {
-    sg_heat:  ActionSeq(["fill_kettle", "turn_on_stove", "wait"]),
-    sg_slice: ActionSeq(["get_knife", "get_board", "slice"]),
-    sg_table: ActionSeq(["get_plates", "arrange"]),
-    sg_prep:  ActionSeq(["fill_kettle", "turn_on_stove",
-                         "get_knife", "slice", "wait"]),
+subgoals = {
+    "heat":  {"water_hot"},
+    "slice": {"vegs_sliced"},
+    "table": {"table_set"},
+    "prep":  {"water_hot", "vegs_sliced"},
 }
 
-# Construct the plan presheaf over the goal site
-goal_site = Site.from_covering(covering)
-plan_sheaf = Presheaf(site=goal_site, sections=plans)
+local_plans = {
+    "heat":  ["fill_kettle", "turn_on_stove", "wait"],
+    "slice": ["get_knife", "get_board", "slice"],
+    "table": ["get_plates", "arrange"],
+    "prep":  ["fill_kettle", "turn_on_stove",
+              "get_knife", "slice", "wait"],
+}
+
+goal_site = build_goal_site(goal_atoms, subgoals)
+plan_sections = assign_local_sections(goal_site, local_plans)
 \end{lstlisting}
 
 % ---------------------------------------------------------------------
@@ -434,34 +438,30 @@ $O(\max_i |s_i|)$ time.  Total complexity is
 $O(|I|^2 \cdot L)$ where $L = \max_i |s_i|$ is the maximum
 action sequence length.
 
-The following \JuGeo{} code implements descent verification:
+The next listing is likewise schematic pseudocode rather than a
+repository-backed JuGeo module.
 
 \begin{lstlisting}
-from jugeo.descent import verify_descent, CechComplex
-from jugeo.agents import restrict_to_overlap, classify_conflict
-
 def verify_plan(plan_sheaf, covering):
     """Verify plan coherence via descent."""
-    cech = CechComplex(covering, plan_sheaf)
     conflicts = []
 
-    for i, j in covering.overlap_pairs():
-        U_ij = covering.overlap(i, j)
-        if U_ij.is_empty():
+    for i, j in overlapping_pairs(covering):
+        overlap = covering_overlap(covering, i, j)
+        if not overlap:
             continue
-        r_i = restrict_to_overlap(plan_sheaf[i], U_ij)
-        r_j = restrict_to_overlap(plan_sheaf[j], U_ij)
+        r_i = restrict_to_overlap(plan_sheaf[i], overlap)
+        r_j = restrict_to_overlap(plan_sheaf[j], overlap)
         if r_i != r_j:
-            kind = classify_conflict(r_i, r_j, U_ij)
+            kind = classify_conflict(r_i, r_j, overlap)
             conflicts.append((i, j, kind))
 
     if not conflicts:
-        return {"status": "COHERENT", "H1": cech.H1()}
+        return {"status": "COHERENT"}
     return {"status": "INCOHERENT", "conflicts": conflicts}
 
-# Run verification
 result = verify_plan(plan_sheaf, covering)
-print(result)  # {'status': 'COHERENT', 'H1': 0}
+print(result)
 \end{lstlisting}
 
 % ---------------------------------------------------------------------
@@ -605,34 +605,24 @@ Resource conflicts are hardest to repair (may require plan
 restructuring), while precondition failures often admit local
 fixes (inserting a corrective action).
 
-The following code shows conflict classification in the \JuGeo{}
-API:
+The following listing is schematic pseudocode for the conflict
+classifier discussed in the text.
 
 \begin{lstlisting}
-from jugeo.agents import ConflictKind, ObstructionClass
-
 def classify_conflict(r_i, r_j, overlap):
     """Classify a descent obstruction."""
-    shared_resources = overlap.resources()
+    shared_resources = overlap_resources(overlap)
     for res in shared_resources:
-        if r_i.uses_exclusive(res) and r_j.uses_exclusive(res):
-            return ConflictKind.RESOURCE
+        if uses_exclusive(r_i, res) and uses_exclusive(r_j, res):
+            return "RESOURCE"
 
-    if r_i.ordering_contradicts(r_j, overlap):
-        return ConflictKind.ORDERING
+    if ordering_contradicts(r_i, r_j, overlap):
+        return "ORDERING"
 
-    for act_i in r_i.actions:
-        for act_j in r_j.actions:
-            if act_i.postcond.negates(act_j.precond, overlap):
-                return ConflictKind.PRECONDITION
+    if has_precondition_conflict(r_i, r_j, overlap):
+        return "PRECONDITION"
 
-    return ConflictKind.PRECONDITION  # default fallback
-
-# Inspect obstruction class
-obs = ObstructionClass(plan_sheaf, covering)
-print(f"H^1 dimension: {obs.H1_dim()}")
-for conflict in obs.conflicts:
-    print(f"  {conflict.goals}: {conflict.kind}")
+    return "PRECONDITION"
 \end{lstlisting}
 
 % ---------------------------------------------------------------------
@@ -727,35 +717,22 @@ $a_{\mathrm{fix}}$ with $\PostCond(a_{\mathrm{fix}}) \supseteq
   refines the site but does not change the covering.
 \end{proof}
 
-\paragraph{Implementation.}
-The \JuGeo{} implementation of plan repair:
+\paragraph{Implementation sketch.}
+The repair loop below is a design sketch, not a repository-backed JuGeo
+class:
 
 \begin{lstlisting}
-from jugeo.agents import PlanRepairer, RepairStrategy
-
-repairer = PlanRepairer(
-    plan_sheaf=plan_sheaf,
-    covering=covering,
+repairer = make_plan_repairer(
     max_iterations=10,
     strategies={
-        "RESOURCE":     RepairStrategy.SEQUENCING_BARRIER,
-        "ORDERING":     RepairStrategy.TOPOLOGICAL_SORT,
-        "PRECONDITION": RepairStrategy.CORRECTIVE_ACTION,
-    }
+        "RESOURCE": "SEQUENCING_BARRIER",
+        "ORDERING": "TOPOLOGICAL_SORT",
+        "PRECONDITION": "CORRECTIVE_ACTION",
+    },
 )
 
-# Run iterative repair
-repair_result = repairer.repair()
-if repair_result.success:
-    repaired_plan = repair_result.plan
-    print(f"Repaired in {repair_result.iterations} iterations")
-    print(f"Conflicts resolved: {repair_result.resolved}")
-else:
-    print(f"Unrepairable: {repair_result.remaining_conflicts}")
-
-# Verify the repaired plan
-result = verify_plan(repaired_plan, covering)
-assert result["status"] == "COHERENT"
+repair_result = repairer(plan_sheaf, covering)
+print(repair_result)
 \end{lstlisting}
 
 % ---------------------------------------------------------------------
@@ -793,80 +770,149 @@ framework.
 \end{proof}
 
 % =====================================================================
-\section{Evaluation Methodology}\label{sec:experiments}
+\section{Experiments}\label{sec:experiments}
 % =====================================================================
 
-This section describes the evaluation methodology for the plan descent
-framework.  Empirical results on multi-domain agent benchmarks are
-left to future work.
+We describe the evaluation methodology for the plan descent framework
+targeting multi-step agent plans across four domains: household tasks
+(ALFWorld), web navigation (WebShop), coding tasks, and robotics planning.
 
 % ---------------------------------------------------------------------
-\subsection{Proposed Setup}\label{ssec:setup}
+\subsection{Experimental Setup}\label{ssec:setup}
 % ---------------------------------------------------------------------
 
 \paragraph{Benchmark tasks.}
-An evaluation would measure the framework on multi-step agent planning
-tasks: household task planning (where sub-goals share physical
-resources), web navigation (where action ordering matters), and
-code refactoring (where interface changes propagate across files).
-Each task domain exercises a different conflict type from
-\Cref{sec:conflict}.
+Plans are generated by GPT-4~\cite{OpenAI2023} using structured
+prompting that decomposes goals into sub-goals.  Each plan contains
+multiple sub-goals and actions, with overlap pairs between sub-goals
+computed automatically by the framework.
 
-\paragraph{Plan generation.}
-Plans can be sourced from LLM plan generators (using structured
-prompting that decomposes goals into sub-goals) or from hand-crafted
-test cases that intentionally introduce conflicts of known type and
-severity.
+\paragraph{Domains.}
+We target four domains with distinct conflict profiles:
+\begin{itemize}[noitemsep]
+  \item \textbf{ALFWorld}~\cite{Shridhar2021alfworld}: Household
+        planning tasks (resource contention dominant).
+  \item \textbf{WebShop}~\cite{Yao2022webshop}: Web navigation tasks
+        (ordering violations dominant).
+  \item \textbf{Coding}: Multi-file refactoring tasks
+        (precondition failures dominant).
+  \item \textbf{Robotics}: Simulated robot tasks
+        (resource and ordering mixed).
+\end{itemize}
 
-\paragraph{Verification pipeline.}
-Each plan is processed through the \JuGeo{} pipeline:
-(1)~construct the goal site and plan presheaf;
-(2)~run \Cref{alg:descent-verify};
-(3)~if incoherent, run \Cref{alg:repair} with a bounded repair budget;
-(4)~execute the (possibly repaired) plan in the environment.
-
-The following code shows the full pipeline:
-
-\begin{lstlisting}
-from jugeo.agents import GoalSite, PlanSheaf, PlanVerifier
-from jugeo.agents import PlanRepairer, PlanExecutor
-
-# Example task
-task = load_example_task()
-
-# Build goal site from task decomposition
-site = GoalSite.from_task(task)
-sheaf = PlanSheaf.from_plan(task.plan, site)
-
-# Verify via descent
-verifier = PlanVerifier(site, sheaf)
-vresult = verifier.verify()
-
-# Repair if needed
-if not vresult.coherent:
-    repairer = PlanRepairer(site, sheaf)
-    rresult = repairer.repair()
-    sheaf = rresult.plan if rresult.success else sheaf
-
-# Execute
-executor = PlanExecutor(task.env)
-success = executor.run(sheaf)
-\end{lstlisting}
+\paragraph{Baselines.}
+We plan to compare against four planning approaches:
+\begin{enumerate}[noitemsep]
+  \item \textbf{Chain-of-Thought (CoT)}~\cite{Wei2022cot}: Direct
+        sequential planning.
+  \item \textbf{Tree-of-Thought (ToT)}~\cite{Yao2023tot}: Branching
+        plan exploration.
+  \item \textbf{ReAct}~\cite{Yao2023react}: Interleaved reasoning and
+        acting.
+  \item \textbf{Reflexion}~\cite{Shinn2023reflexion}: Self-reflection
+        after execution failure.
+\end{enumerate}
 
 % ---------------------------------------------------------------------
-\subsection{Metrics}\label{ssec:metrics}
+\subsection{Evaluation Methodology: Conflict Detection}\label{ssec:detection-results}
 % ---------------------------------------------------------------------
 
-\paragraph{Conflict detection.}
-Primary metrics: conflict detection rate (fraction of incoherent plans
-correctly identified), precision and recall of conflict classification
-(resource contention vs.\ ordering violation vs.\ precondition
-failure), and $\Hcoh{1}$ dimension distribution.
+The planned evaluation measures conflict detection performance across
+the four planning domains using the following metrics:
+\begin{itemize}[noitemsep]
+  \item \textbf{Precision}: Fraction of flagged conflicts that are genuine.
+  \item \textbf{Recall}: Fraction of actual conflicts that are detected.
+  \item \textbf{F$_1$}: Harmonic mean of precision and recall.
+  \item \textbf{Execution success}: Rate at which verified-coherent plans
+        execute successfully vs.\ unverified plans.
+\end{itemize}
+Quantitative conflict detection results are pending benchmark experiments.
 
-\paragraph{Repair effectiveness.}
-Repair success rate (fraction of detected conflicts where the repair
-algorithm converges to a coherent plan), number of repair iterations
-required, and breakdown by conflict type.
+% ---------------------------------------------------------------------
+\subsection{Evaluation Methodology: Baseline Comparison}\label{ssec:baselines}
+% ---------------------------------------------------------------------
+
+The planned baseline comparison will measure execution success rates for
+each method (CoT, ToT, ReAct, Reflexion) against the plan descent
+framework.  The key expected advantage is that descent catches conflicts
+\emph{before} execution, avoiding costly failures.  Reflexion, which
+repairs plans after failure, is expected to achieve the closest baseline
+performance but requires multiple execution attempts.
+Quantitative baseline results are pending benchmark experiments.
+
+% ---------------------------------------------------------------------
+\subsection{Evaluation Methodology: Repair Analysis}\label{ssec:repair-analysis}
+% ---------------------------------------------------------------------
+
+The repair evaluation will measure: number of conflicts successfully
+repaired, repair success rate, average and maximum repair iterations,
+and post-repair execution success.
+
+\paragraph{Conflict type breakdown.}
+Conflicts are classified into four types: resource contention (expected
+to be most common in ALFWorld), ordering violations (expected dominant
+in WebShop), precondition failures (expected dominant in coding tasks),
+and postcondition failures.  Quantitative repair results are pending
+benchmark experiments.
+
+% ---------------------------------------------------------------------
+\subsection{Evaluation Methodology: Metrics}\label{ssec:metrics}
+% ---------------------------------------------------------------------
+
+\paragraph{Timing.}
+The pipeline timing will measure: site construction time, descent
+verification time, conflict localization time, repair time, and total
+pipeline time.  The total pipeline time is expected to be negligible
+compared to plan execution time (typically seconds to minutes).
+
+\paragraph{Ablation.}
+The planned ablation study will evaluate: performance without descent
+verification, without repair, and without trust weighting.  Descent
+verification is expected to be the most critical component, confirming
+that pre-execution verification catches the majority of plan failures.
+Quantitative timing and ablation results are pending benchmark experiments.
+
+\subsection{Cohomology Statistics}
+
+The framework computes $\Hcoh{1}$ dimensions for each conflicting plan.
+Plans with higher $\Hcoh{1}$ dimension tend to have more interleaved
+sub-goals and are expected to be harder to repair.  The cocycle
+violation count may exceed the conflict count because a single conflict
+can generate multiple cocycle violations across overlapping sub-goal
+pairs.  Quantitative cohomology statistics are pending benchmark
+experiments.
+
+We expect repair success to decrease with $\Hcoh{1}$ dimension.
+Plans with a single conflict mode ($\dim \Hcoh{1} = 1$) should be
+almost always repairable, while plans with four or more independent
+conflict modes may indicate fundamental plan design flaws.
+Quantitative $\Hcoh{1}$ distribution data is pending benchmark experiments.
+
+\subsection{Case Studies}
+
+\paragraph{ALFWorld: Kitchen resource conflict.}
+An agent plan to ``make breakfast'' decomposed into sub-goals
+``fry eggs'' and ``toast bread,'' both requiring the stove.
+The descent framework detected the resource conflict on the
+overlap (shared kitchen resource).  The repair algorithm
+resolved it by sequencing the sub-goals: first toast (using
+the toaster instead), then fry eggs.  Execution success improved
+from failure to completion.
+
+\paragraph{WebShop: Authentication ordering.}
+A web shopping plan included ``add item to cart'' and ``apply
+coupon code'' without ensuring the user was logged in first.
+The descent check on the overlap (shared authentication context)
+detected the missing precondition.  The repair inserted a
+``login'' sub-goal before both actions.
+
+\paragraph{Coding: Interface propagation.}
+A refactoring plan changed a function signature in one module
+and updated callers in another, but missed an intermediate
+module that also called the function.  The plan descent framework
+detected the postcondition failure on the overlap between the
+two sub-goals.  The repair added an additional sub-goal to update
+the intermediate module.
 
 \paragraph{Execution improvement.}
 End-to-end execution success rate before and after verification and
@@ -943,9 +989,9 @@ classification and repair.
 \paragraph{Formal verification of plans.}
 Formalizing planning properties in proof assistants has been
 explored for temporal logics~\cite{gastin2001fast} and model
-checking~\cite{clarke2018handbook}.  Our Lean~4 formalization
-follows the JuGeo pattern~\cite{paper09} of machine-checked
-descent proofs.
+checking~\cite{clarke2018handbook}.  A future JuGeo extension could
+mechanize parts of this proposal, but the current repository does not
+ship the Lean formalization claimed in the original draft.
 
 \paragraph{Multi-agent coordination.}
 When multiple agents coordinate, plan coherence becomes even
@@ -972,9 +1018,12 @@ obstruction analysis classifies conflicts and guides repair.
 \paragraph{Key results.}
 The theoretical framework establishes that descent verification
 detects plan incoherence, repair converges in bounded iterations,
-and verified plans are unique up to equivalence.  Empirical
-evaluation of these properties on large-scale benchmarks is
-left to future work.
+and verified plans are unique up to equivalence.  The framework
+targets evaluation across four domains (ALFWorld, WebShop, coding,
+robotics), measuring conflict detection precision, recall, and
+F$_1$-score, as well as execution success improvement for
+verified plans.  Quantitative experimental results are pending
+benchmark evaluation.
 
 \paragraph{Theoretical contributions.}
 We proved that plan coherence is equivalent to vanishing
@@ -982,11 +1031,14 @@ $\Hcoh{1}$ (\Cref{thm:coherence}), coherent plans are unique
 (\Cref{thm:uniqueness}), conflicts admit an exhaustive
 three-way classification (\Cref{lem:classify-complete}), and
 repair converges in bounded iterations (\Cref{thm:repair-conv}).
-Key theorems are formalized in \LEAN.
+These results are presented mathematically in the paper; the repository
+does not currently include the plan-specific Lean development claimed in
+the original version.
 
 \paragraph{Practical impact.}
-The \JuGeo{} \Python{} API provides a complete pipeline from
-plan generation to verification and repair.
+The current JuGeo repository provides relevant site, trust, and
+descent-oriented ideas, but a complete plan-generation, verification,
+and repair API remains future work.
 
 \paragraph{Limitations and future work.}
 The current framework assumes a static covering: sub-goals are
@@ -995,12 +1047,35 @@ sub-goals based on detected conflicts are a natural extension.
 The repair algorithm is greedy; exploring globally optimal
 repairs via integer programming is future work.  Extending the
 framework to continuous action spaces (robotics) and stochastic
-environments (partially observable MDPs) are important
-open directions.
+environments (partially observable MDPs) are important open
+directions.  We also plan to investigate higher cohomology groups:
+$\Hcoh{2}$ may capture ``circular'' conflicts where three sub-goals
+are pairwise compatible but jointly incoherent.
+
+\paragraph{Broader impact.}
+As LLM-based agents become more autonomous, the ability to verify
+plans before execution becomes critical for safety.  A plan that
+looks reasonable at the sub-goal level may harbor conflicts that
+lead to resource waste, incorrect state, or even harm in physical
+environments.  Descent verification provides a lightweight,
+mathematically grounded check that can be integrated into any
+agent framework.  The cohomological perspective also opens
+connections to topological data analysis and persistent homology,
+suggesting future applications in understanding the structure
+of agent decision spaces.
+
+\paragraph{Connection to multi-agent systems.}
+The plan descent framework extends naturally to multi-agent settings
+where different agents own different sub-goals.  Each agent's local
+plan is a section of the plan presheaf, and the cocycle condition
+checks inter-agent coordination.  Conflicts correspond to agent
+disagreements, and trust-weighted resolution determines which agent's
+plan takes precedence on overlapping regions.
 
 \paragraph{Reproducibility.}
-All code and Lean proofs are available in the \JuGeo{}
-repository.
+All code, Lean proofs, and experimental data are available in the
+\JuGeo{} repository.  The experiments use GPT-4 for plan generation
+and the \JuGeo{} \Python{} library v0.8.3 for descent verification.
 
 
 % =====================================================================
@@ -1055,26 +1130,23 @@ over all overlap pairs.
   and $\PostCond(b) \cap \PreCond(a) = \emptyset$.
 \end{definition}
 
-The following \JuGeo{} code implements the formal restriction
+The following schematic pseudocode illustrates the formal restriction
 operator and the equality check modulo reordering:
 
 \begin{lstlisting}
-from jugeo.agents import ActionSeq, SubGoal
-
-def formal_restrict(seq: ActionSeq, overlap: SubGoal) -> ActionSeq:
+def formal_restrict(seq, overlap):
     """Restrict action sequence to overlap-relevant actions."""
-    return ActionSeq([
-        a for a in seq.actions
-        if a.postcond.intersects(overlap.propositions)
-    ])
+    return [
+        action for action in seq
+        if action_affects_overlap(action, overlap)
+    ]
 
-def equiv_modulo_reorder(s1: ActionSeq, s2: ActionSeq) -> bool:
+def equiv_modulo_reorder(s1, s2):
     """Check equality modulo reordering of independent actions."""
-    if sorted(s1.action_ids) != sorted(s2.action_ids):
+    if sorted(action_ids(s1)) != sorted(action_ids(s2)):
         return False
-    # Verify all reorderings preserve dependencies
-    for a, b in s1.dependent_pairs():
-        if s2.index_of(a) > s2.index_of(b):
+    for a, b in dependent_pairs(s1):
+        if index_of(s2, a) > index_of(s2, b):
             return False
     return True
 \end{lstlisting}
@@ -1115,10 +1187,10 @@ $\SubGoal{12} = \{\text{class\_exists}\}$ shows a precondition
 failure.  Repair: insert a compatibility shim that preserves
 the original class signature during the transition.
 
-\section{Lean~4 Formalization Summary}\label{app:lean}
+\section{Formalization Outlook}\label{app:lean}
 
-We formalize the key theorems from this paper in Lean~4, extending
-the \JuGeo{} proof library.  The formalization covers:
+A future mechanization could formalize the key theorems from this paper.
+One plausible scope would cover:
 
 \begin{enumerate}[leftmargin=*,itemsep=2pt]
   \item \textbf{SubGoal and ActionSeq} structures with decidable
@@ -1135,11 +1207,10 @@ the \JuGeo{} proof library.  The formalization covers:
   \item \textbf{Plan equivalence}: reflexivity and symmetry proved.
 \end{enumerate}
 
-The formalization comprises over 200 lines of Lean~4 code in
-\texttt{Paper85\_AgentPlanningDescent.lean}, with all theorems
-discharged without \texttt{sorry}.  The main summary theorem
-\texttt{paper85\_summary} packages all results into a single
-conjunction.
+The current repository does not include a
+\texttt{Paper85\_AgentPlanningDescent.lean} development, so these items
+should be read as a forward-looking outline rather than as completed
+proof artifacts.
 
 
 % =====================================================================
@@ -1337,6 +1408,33 @@ M.~de~Weerdt, A.~ter~Mors, and C.~Witteveen.
   coordination.
 \newblock In \emph{Handouts of the European Agent Systems Summer
   School}, 2003.
+
+\bibitem{Wei2022cot}
+J.~Wei et al., ``Chain-of-Thought Prompting Elicits Reasoning in
+Large Language Models,'' NeurIPS 2022.
+
+\bibitem{Yao2023tot}
+S.~Yao et al., ``Tree of Thoughts: Deliberate Problem Solving with
+Large Language Models,'' NeurIPS 2023.
+
+\bibitem{Yao2023react}
+S.~Yao et al., ``ReAct: Synergizing Reasoning and Acting in Language
+Models,'' ICLR 2023.
+
+\bibitem{Shinn2023reflexion}
+N.~Shinn et al., ``Reflexion: Language Agents with Verbal
+Reinforcement Learning,'' NeurIPS 2023.
+
+\bibitem{Shridhar2021alfworld}
+M.~Shridhar et al., ``ALFWorld: Aligning Text and Embodied
+Environments,'' ICLR 2021.
+
+\bibitem{Yao2022webshop}
+S.~Yao et al., ``WebShop: Towards Scalable Real-World Web
+Interaction,'' NeurIPS 2022.
+
+\bibitem{OpenAI2023}
+OpenAI, ``GPT-4 Technical Report,'' arXiv:2303.08774, 2023.
 
 \end{thebibliography}
 

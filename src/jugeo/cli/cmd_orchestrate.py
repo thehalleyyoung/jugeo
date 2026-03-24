@@ -62,6 +62,53 @@ try:
 except ImportError:
     _GEOMETRY_AVAILABLE = False
 
+# ---------------------------------------------------------------------------
+# Optional jugeo orchestration controller imports
+# ---------------------------------------------------------------------------
+try:
+    from jugeo.orchestration.controller import (
+        Orchestrator as SemanticOrchestrator,
+        OrchestratorState,
+        OrchestratorConfiguration,
+        OrchestratorEventBus,
+        OrchestratorEventKind,
+        OrchestratorEvent,
+        SemanticMove,
+        MoveKind,
+        ResourceBudget,
+        MoveHistory,
+        OrchestratorDiagnostics,
+    )
+    _CONTROLLER_AVAILABLE = True
+except ImportError:
+    _CONTROLLER_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Optional jugeo generation subsystem imports
+# ---------------------------------------------------------------------------
+try:
+    from jugeo.generation.goals import (
+        GenerationGoal,
+        GoalDecomposer,
+        GoalScheduler,
+        GoalTracker,
+    )
+    _GENERATION_GOALS_AVAILABLE = True
+except ImportError:
+    _GENERATION_GOALS_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Optional jugeo ideation bridge (for feeding back synthesis results)
+# ---------------------------------------------------------------------------
+try:
+    from jugeo.ideation.discovery_engine.integration import (
+        DiscoveryEngineIntegration,
+        OrchestrationAdapter,
+    )
+    _IDEATION_BRIDGE_AVAILABLE = True
+except ImportError:
+    _IDEATION_BRIDGE_AVAILABLE = False
+
 
 # ===================================================================== data
 # =====================================================================
@@ -143,12 +190,27 @@ class TestRunResult:
 # ================================================================
 
 def _clean_copilot_output(text: str) -> str:
-    """Strip Copilot CLI tool narration from stdout, keeping only content."""
+    """Strip Copilot CLI tool narration and usage stats from stdout.
+
+    Copilot CLI v1.x emits several kinds of noise around the actual content:
+    - Tool-use narration blocks (● / ✗ / │ / └ prefixed lines)
+    - Session usage stats (Total usage est, API time spent, etc.)
+    - Breakdown lines (Breakdown by AI model, model lines with in/out counts)
+    """
     lines = text.split("\n")
     cleaned: list[str] = []
     skip_block = False
+    # Patterns that indicate copilot session metadata, not content
+    _STATS_PREFIXES = (
+        "Total usage est:",
+        "API time spent:",
+        "Total session time:",
+        "Total code changes:",
+        "Breakdown by AI model:",
+    )
     for line in lines:
         stripped = line.strip()
+        # Tool-use narration blocks
         if stripped.startswith("●") or stripped.startswith("✗"):
             skip_block = True
             continue
@@ -157,9 +219,21 @@ def _clean_copilot_output(text: str) -> str:
         if skip_block and stripped == "":
             continue
         skip_block = False
+        # Session stats lines
+        if stripped.startswith(_STATS_PREFIXES):
+            continue
+        # Model breakdown lines like " gpt-5.4  17.4k in, 48 out, 0 cached (...)"
+        if stripped and stripped[0] == " " and ("in," in stripped and "out," in stripped):
+            continue
+        # Also skip lines that are purely model stats (e.g. "gpt-5.4   ...")
+        if re.match(r"^\s*(gpt|claude|o[1-9]|gemini)\S*\s+\d+", stripped):
+            continue
         cleaned.append(line)
+    # Strip leading/trailing blank lines
     while cleaned and not cleaned[0].strip():
         cleaned.pop(0)
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
     return "\n".join(cleaned).strip()
 
 
@@ -211,26 +285,38 @@ def _safe_name(idea: str) -> str:
 
 def _call_llm(prompt: str, model: str = "claude-sonnet-4.6",
               max_tokens: int = 4096, verbose: bool = False) -> str:
-    """Call LLM via Copilot CLI → Anthropic → OpenAI fallback chain."""
+    """Call LLM via Copilot CLI → Anthropic → OpenAI fallback chain.
 
-    # 1. Copilot CLI
+    The copilot path uses GitHub Copilot CLI as a first-class LLM provider,
+    matching the jugeo evidence model where copilot is a controlled oracle
+    (theory2.tex §252).
+    """
+
+    # 1. Copilot CLI — first-class provider for LLM-generated code
     if shutil.which("copilot"):
         try:
             tmpdir = tempfile.mkdtemp(prefix="jugeo_orch_")
+            # Use the model flag if copilot supports it; fall back gracefully
+            copilot_cmd = ["copilot", "-p", prompt]
+            # Try with --available-tools "" to suppress tool use
+            copilot_cmd.extend(["--available-tools", ""])
             try:
                 result = subprocess.run(
-                    ["copilot", "-p", prompt, "--model", "gpt-5.4",
-                     "--available-tools", ""],
+                    copilot_cmd,
                     capture_output=True, text=True, timeout=300,
                     cwd=tmpdir,
                 )
             finally:
                 try:
-                    os.rmdir(tmpdir)
+                    shutil.rmtree(tmpdir, ignore_errors=True)
                 except OSError:
                     pass
             if result.returncode == 0 and result.stdout.strip():
-                return _clean_copilot_output(result.stdout)
+                output = _clean_copilot_output(result.stdout)
+                if output:
+                    if verbose:
+                        _log.debug("Copilot CLI succeeded (%d chars)", len(output))
+                    return output
             if verbose:
                 _log.debug("Copilot CLI rc=%d: %s",
                            result.returncode, result.stderr[:200])
@@ -238,32 +324,54 @@ def _call_llm(prompt: str, model: str = "claude-sonnet-4.6",
             if verbose:
                 _log.debug("Copilot CLI error: %s", exc)
 
-    # 2. Anthropic
+    # 2. Anthropic SDK
     try:
         import anthropic  # type: ignore[import-untyped]
         client = anthropic.Anthropic()
+        # Map model names to Anthropic model IDs
+        anthropic_model = model
+        if model.startswith("claude-"):
+            anthropic_model = model
         msg = client.messages.create(
-            model=model, max_tokens=max_tokens, temperature=0.7,
+            model=anthropic_model, max_tokens=max_tokens, temperature=0.7,
             messages=[{"role": "user", "content": prompt}],
         )
         return msg.content[0].text
-    except (ImportError, Exception):
-        pass
+    except ImportError:
+        if verbose:
+            _log.debug("anthropic SDK not installed")
+    except Exception as exc:
+        if verbose:
+            _log.debug("Anthropic API error: %s", exc)
 
-    # 3. OpenAI
+    # 3. OpenAI SDK (also works with Azure OpenAI, etc.)
     try:
         import openai  # type: ignore[import-untyped]
         client = openai.OpenAI()
+        # Map to OpenAI-compatible model names
+        openai_model = model
+        if model.startswith("claude-"):
+            openai_model = "gpt-4o"  # fallback for OpenAI
         resp = client.chat.completions.create(
-            model=model, max_tokens=max_tokens, temperature=0.7,
+            model=openai_model, max_tokens=max_tokens, temperature=0.7,
             messages=[{"role": "user", "content": prompt}],
             timeout=120,
         )
         return resp.choices[0].message.content or ""
-    except (ImportError, Exception):
-        pass
+    except ImportError:
+        if verbose:
+            _log.debug("openai SDK not installed")
+    except Exception as exc:
+        if verbose:
+            _log.debug("OpenAI API error: %s", exc)
 
-    raise RuntimeError("No LLM provider available (copilot / anthropic / openai)")
+    raise RuntimeError(
+        "No LLM provider available. Install one of:\n"
+        "  - GitHub Copilot CLI (copilot)\n"
+        "  - anthropic Python SDK (pip install anthropic)\n"
+        "  - openai Python SDK (pip install openai)\n"
+        "Or use --no-llm for template-only mode."
+    )
 
 
 # ============================================================== template
@@ -731,6 +839,115 @@ class Orchestrator:
         self.plan: SoftwarePlan | None = None
         self.refinements: list[RefinementResult] = []
 
+        # --- Semantic orchestration state (integrated with jugeo API) ---
+        self._semantic_controller: Any = None
+        self._semantic_state: Any = None
+        self._event_bus: Any = None
+        self._goal_tracker: Any = None
+        self._diagnostics: Any = None
+        self._init_semantic_orchestration()
+
+    # ---- Semantic orchestration integration ----------------------------
+
+    def _init_semantic_orchestration(self) -> None:
+        """Set up the jugeo orchestration controller, event bus, and goal tracker."""
+        if not _CONTROLLER_AVAILABLE:
+            _log.info("Orchestration controller unavailable; running standalone")
+            return
+
+        copilot_budget = 0 if self._no_llm else 100
+        config = OrchestratorConfiguration(
+            max_steps=self.max_iterations * 20,
+            convergence_threshold=0.95,
+            budget_limits={
+                "solver": 200,
+                "runtime": 150,
+                "copilot": copilot_budget,
+                "formal": 50,
+            },
+            copilot_enabled=not self._no_llm,
+            strategy="balanced",
+        )
+        self._event_bus = OrchestratorEventBus()
+        self._semantic_state = OrchestratorState()
+        self._semantic_controller = SemanticOrchestrator(
+            config=config,
+            state=self._semantic_state,
+            event_bus=self._event_bus,
+        )
+        self._diagnostics = OrchestratorDiagnostics(
+            state=self._semantic_state,
+            history=self._semantic_controller._history,
+            monitor=self._semantic_controller._monitor,
+            config=config,
+        )
+
+        if _GENERATION_GOALS_AVAILABLE:
+            self._goal_tracker = GoalTracker()
+
+    def _record_semantic_move(
+        self, kind_name: str, target: str, success: bool, gain: float = 0.0
+    ) -> None:
+        """Record a semantic move through the jugeo orchestration controller."""
+        if not _CONTROLLER_AVAILABLE or self._semantic_state is None:
+            return
+
+        kind_map = {
+            "elaborate": MoveKind.CONSTRUCT,
+            "test_gen": MoveKind.CONSTRUCT,
+            "scaffold": MoveKind.CONSTRUCT,
+            "implement": MoveKind.CONSTRUCT,
+            "verify": MoveKind.VERIFY,
+            "refine": MoveKind.REPAIR,
+            "llm_generate": MoveKind.CONSULT_ORACLE,
+        }
+        kind = kind_map.get(kind_name, MoveKind.CONSTRUCT)
+
+        move = SemanticMove(
+            kind=kind,
+            target_coordinate=target,
+            expected_gain=gain,
+            estimated_cost=1,
+        )
+
+        self._event_bus.publish(OrchestratorEvent(
+            kind=OrchestratorEventKind.MOVE_EXECUTED if success
+            else OrchestratorEventKind.MOVE_FAILED,
+            payload={
+                "move_id": move.move_id,
+                "kind": kind_name,
+                "target": target,
+                "success": success,
+                "gain": gain,
+            },
+        ))
+
+        if success and target not in self._semantic_state.current_sections:
+            self._semantic_state.current_sections[target] = {
+                "phase": kind_name,
+                "trust": "COPILOT_SUGGESTED" if "llm" in kind_name else "HEURISTIC",
+            }
+            if target in self._semantic_state.frontier_nodes:
+                self._semantic_state.frontier_nodes.remove(target)
+        elif not success:
+            if target not in self._semantic_state.frontier_nodes:
+                self._semantic_state.frontier_nodes.append(target)
+
+        self._semantic_state.epoch += 1
+
+    def _populate_frontier_from_plan(self, plan: SoftwarePlan) -> None:
+        """Seed the semantic state frontier from the elaborated plan."""
+        if not _CONTROLLER_AVAILABLE or self._semantic_state is None:
+            return
+        for mod in plan.modules:
+            if mod.name not in self._semantic_state.current_sections:
+                if mod.name not in self._semantic_state.frontier_nodes:
+                    self._semantic_state.frontier_nodes.append(mod.name)
+        for cmd in plan.cli_commands:
+            obligation = f"test:{cmd.name}"
+            if obligation not in self._semantic_state.pending_obligations:
+                self._semantic_state.pending_obligations.append(obligation)
+
     # ---- LLM helper ------------------------------------------------
 
     def _llm(self, prompt: str, max_tokens: int = 4096) -> str:
@@ -990,6 +1207,58 @@ class Orchestrator:
             written.append(p)
         return written
 
+    @staticmethod
+    def _extract_python_source(raw: str) -> str:
+        """Extract Python source code from potentially noisy LLM output.
+
+        Copilot CLI (and other LLMs) may prepend narration text before the
+        actual code.  This function tries several strategies:
+        1. If there's a fenced ```python block, extract it.
+        2. If the first Python-looking line (import, from, def, class, #!,
+           triple-quote) is not at the top, strip everything before it.
+        3. Also strip trailing copilot stats and markdown fences.
+        """
+        text = raw.strip()
+
+        # Strategy 1: fenced code block
+        fenced = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
+        if fenced:
+            return fenced.group(1).strip()
+
+        # Also try generic fenced block
+        fenced = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
+        if fenced:
+            candidate = fenced.group(1).strip()
+            # Only use it if it looks like Python
+            if any(candidate.startswith(p) for p in
+                   ('"""', "'''", "import ", "from ", "def ", "class ",
+                    "#!", "# ", "__")):
+                return candidate
+
+        # Strategy 2: find the first line that looks like Python source
+        lines = text.split("\n")
+        _PY_STARTS = (
+            '"""', "'''", "import ", "from ", "def ", "class ",
+            "#!", "# ", "__", "try:", "if ", "async ",
+        )
+        start_idx = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if any(stripped.startswith(p) for p in _PY_STARTS):
+                start_idx = i
+                break
+
+        # Strip from that point
+        code_lines = lines[start_idx:]
+
+        # Strategy 3: strip trailing stats/fences
+        while code_lines and code_lines[-1].strip().startswith(("```", "Total usage", "API time", "Breakdown")):
+            code_lines.pop()
+        while code_lines and not code_lines[-1].strip():
+            code_lines.pop()
+
+        return "\n".join(code_lines).strip()
+
     def _implement_llm(
         self, plan: SoftwarePlan, src_dir: pathlib.Path
     ) -> None:
@@ -1038,14 +1307,16 @@ class Orchestrator:
                   (where X is the module name without .py).
                 - The code must be production-quality and handle errors.
                 - Include docstrings for all public functions / classes.
-                - Return ONLY the Python source code, no markdown fences.
+                - Return ONLY the Python source code, no markdown fences,
+                  no explanatory text before or after the code.
             """)
 
             try:
-                code = self._llm(prompt, max_tokens=4096)
-                # Strip markdown fences if present
-                code = re.sub(r"^```python\s*\n", "", code)
-                code = re.sub(r"\n```\s*$", "", code)
+                raw = self._llm(prompt, max_tokens=4096)
+                code = self._extract_python_source(raw)
+                if not code or len(code) < 20:
+                    _log.warning("LLM returned no usable code for %s", mod.name)
+                    code = f'"""{mod.name} — {mod.purpose} (LLM returned empty)."""\n'
             except Exception as exc:
                 _log.warning("LLM failed for %s: %s", mod.name, exc)
                 code = f'"""{mod.name} — {mod.purpose} (LLM unavailable)."""\n'
@@ -1671,18 +1942,30 @@ class Orchestrator:
         if probe.returncode == 0:
             install_cmd.append("--break-system-packages")
 
-        install_proc = subprocess.run(
-            install_cmd,
-            capture_output=True, text=True, timeout=120,
-        )
+        try:
+            install_proc = subprocess.run(
+                install_cmd,
+                capture_output=True, text=True, timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            _log.warning("pip install timed out; proceeding with direct PYTHONPATH")
+            install_proc = type("Result", (), {"returncode": 1, "stderr": "timeout"})()  # type: ignore[assignment]
         if install_proc.returncode != 0:
-            _log.warning("pip install failed: %s", install_proc.stderr[:300])
+            _log.warning("pip install failed: %s", getattr(install_proc, 'stderr', 'timeout')[:300])
 
-        # Run tests
+        # Run tests — augment PYTHONPATH so the generated tool is importable
+        # even if pip install failed
+        pkg = plan.name.replace("-", "_")
+        src_path = str(proj_dir / "src")
+        test_env = {
+            **os.environ,
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": src_path + ":" + os.environ.get("PYTHONPATH", ""),
+        }
         test_proc = subprocess.run(
             ["bash", str(test_script)],
             capture_output=True, text=True, timeout=120,
-            env={**os.environ, "PATH": os.environ.get("PATH", "")},
+            env=test_env,
         )
         raw = test_proc.stdout + "\n" + test_proc.stderr
         result.raw_output = raw
@@ -1765,14 +2048,14 @@ class Orchestrator:
                 {test_results.raw_output[-2000:]}
 
                 Fix the module so all tests pass.  Return ONLY the complete
-                Python source, no markdown fences.
+                Python source, no markdown fences, no explanatory text.
             """)
 
             try:
-                code = self._llm(prompt, max_tokens=4096)
-                code = re.sub(r"^```python\s*\n", "", code)
-                code = re.sub(r"\n```\s*$", "", code)
-                path.write_text(code + "\n")
+                raw = self._llm(prompt, max_tokens=4096)
+                code = self._extract_python_source(raw)
+                if code and len(code) > 20:
+                    path.write_text(code + "\n")
             except Exception as exc:
                 _log.warning("LLM repair failed for %s: %s", mod_name, exc)
 
@@ -1797,6 +2080,29 @@ class Orchestrator:
             print(f"  Site coords: {len(plan.site_coordinates)}")
             print(f"  Morphisms  : {len(plan.site_morphisms)}")
             print(f"  Cover score: {plan.cover_score:.2f}")
+
+        # Semantic orchestration diagnostics
+        if _CONTROLLER_AVAILABLE and self._semantic_state:
+            cov = self._semantic_state.coverage_ratio
+            cov_val = cov() if callable(cov) else cov
+            n_oblig = len(self._semantic_state.pending_obligations)
+            n_obstructions = len(self._semantic_state.obstruction_archive)
+            n_sections = len(self._semantic_state.current_sections)
+            epochs = self._semantic_state.epoch
+            print(f"  --- Semantic orchestration ---")
+            print(f"  Coverage   : {cov_val:.1%}")
+            print(f"  Sections   : {n_sections}")
+            print(f"  Obligations: {n_oblig} remaining")
+            print(f"  Obstructions: {n_obstructions}")
+            print(f"  Epochs     : {epochs}")
+            if self._semantic_state.resource_budget:
+                budget = self._semantic_state.resource_budget
+                for ch, info in budget.budget_per_channel().items():
+                    print(f"    {ch}: {info['spent']}/{info['allocated']} spent")
+
+        # LLM provider info
+        llm_provider = "none (--no-llm)" if self._no_llm else self._model
+        print(f"  LLM        : {llm_provider}")
         print(f"  Duration   : {duration:.1f}s")
         print(f"  Project    : {proj_dir}")
         print(f"  Install    : pip install -e {proj_dir}")
@@ -1823,7 +2129,23 @@ class Orchestrator:
             "tests_total": final_results.total,
             "duration_seconds": round(duration, 2),
             "refinement_iterations": len(self.refinements),
+            "llm_provider": "none" if self._no_llm else self._model,
         }
+        # Add semantic orchestration state to the output
+        if _CONTROLLER_AVAILABLE and self._semantic_state:
+            cov = self._semantic_state.coverage_ratio
+            plan_dict["semantic_orchestration"] = {
+                "coverage_ratio": round(cov() if callable(cov) else cov, 4),
+                "sections": len(self._semantic_state.current_sections),
+                "frontier_remaining": len(self._semantic_state.frontier_nodes),
+                "obligations_remaining": len(self._semantic_state.pending_obligations),
+                "obstructions": len(self._semantic_state.obstruction_archive),
+                "epochs": self._semantic_state.epoch,
+                "budget": (
+                    self._semantic_state.resource_budget.budget_per_channel()
+                    if self._semantic_state.resource_budget else {}
+                ),
+            }
         plan_path.write_text(json.dumps(plan_dict, indent=2) + "\n")
 
     # ---- Main run loop -----------------------------------------------
@@ -1850,6 +2172,7 @@ class Orchestrator:
         print("  Phase 1: Elaborating idea into sheaf model...")
         self.plan = self._phase1_elaborate()
         plan = self.plan
+        self._record_semantic_move("elaborate", plan.name, True, 0.3)
         print(
             f"    ✓ {plan.name}: {len(plan.modules)} modules, "
             f"{len(plan.cli_commands)} commands, "
@@ -1861,20 +2184,39 @@ class Orchestrator:
                 f"{len(plan.site_morphisms)} morphisms"
             )
 
+        # Seed the semantic frontier from the plan
+        self._populate_frontier_from_plan(plan)
+        if _CONTROLLER_AVAILABLE and self._semantic_state:
+            n_frontier = len(self._semantic_state.frontier_nodes)
+            n_oblig = len(self._semantic_state.pending_obligations)
+            if self._verbose:
+                print(f"    Semantic state: {n_frontier} frontier nodes, {n_oblig} obligations")
+
         # Phase 2
         print("\n  Phase 2: Generating behavioral tests...")
         test_script = self._phase2_generate_tests(plan)
+        self._record_semantic_move("test_gen", "test_behavior.sh", True, 0.1)
         print(f"    ✓ {len(plan.behavioral_tests)} tests → {test_script}")
 
         # Phase 3
         print("\n  Phase 3: Scaffolding project...")
         proj_dir = self._phase3_scaffold(plan)
+        self._record_semantic_move("scaffold", plan.name, True, 0.1)
         print(f"    ✓ Project at {proj_dir}")
 
         # Phase 4
         print("\n  Phase 4: Implementing modules...")
         files = self._phase4_implement(plan, proj_dir)
+        for mod in plan.modules:
+            channel = "llm_generate" if not self._no_llm else "implement"
+            self._record_semantic_move(channel, mod.name, True, 0.15)
         print(f"    ✓ {len(files)} files generated")
+
+        if _CONTROLLER_AVAILABLE and self._semantic_state:
+            cov = self._semantic_state.coverage_ratio
+            cov_val = cov() if callable(cov) else cov
+            if self._verbose:
+                print(f"    Semantic coverage: {cov_val:.1%}")
 
         # Phase 5-6: Verify & refine loop
         final_results = TestRunResult()
@@ -1891,6 +2233,22 @@ class Orchestrator:
             failed = final_results.failed
             iter_dur = time.perf_counter() - iter_t0
 
+            # Record verification results as semantic moves
+            verify_gain = passed / max(total, 1)
+            self._record_semantic_move("verify", plan.name, passed > 0, verify_gain)
+
+            # Discharge satisfied test obligations
+            if _CONTROLLER_AVAILABLE and self._semantic_state:
+                for test in plan.behavioral_tests:
+                    obligation = f"test:{test.name}"
+                    if obligation in self._semantic_state.pending_obligations:
+                        # If test passed, discharge the obligation
+                        if not any(
+                            test.name in f.get("line", "")
+                            for f in final_results.failures
+                        ):
+                            self._semantic_state.pending_obligations.remove(obligation)
+
             self.refinements.append(
                 RefinementResult(
                     iteration=iteration,
@@ -1902,6 +2260,11 @@ class Orchestrator:
             )
 
             print(f"    Tests: {passed}/{total} passed")
+            if _CONTROLLER_AVAILABLE and self._semantic_state:
+                cov = self._semantic_state.coverage_ratio
+                cov_val = cov() if callable(cov) else cov
+                n_oblig = len(self._semantic_state.pending_obligations)
+                print(f"    Semantic: coverage={cov_val:.1%}, obligations={n_oblig}")
 
             if passed == total and total > 0:
                 print(
@@ -1913,6 +2276,7 @@ class Orchestrator:
             if iteration < self.max_iterations:
                 print(f"    ↻ Refining ({failed} failures)...")
                 self._phase6_refine(plan, proj_dir, final_results)
+                self._record_semantic_move("refine", plan.name, True, 0.1)
 
         # Phase 7
         duration = time.perf_counter() - t0

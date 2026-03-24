@@ -6,6 +6,7 @@
 \input{jugeo-common}
 \input{experiment-data}
 \input{subsystem-data}
+\input{data-paper27}
 
 \title{Certificate Chains: Compositional Proof-Carrying Code Architecture}
 
@@ -73,28 +74,15 @@
 % =====================================================================
 \begin{abstract}
 We present a \emph{certificate chain} architecture for compositional
-proof-carrying code (PCC) in the \JuGeo{} system.
-Classical PCC embeds a single monolithic proof alongside each binary;
-scaling this to large, modular codebases requires \emph{compositionality}:
-local verifications must be independently certifiable and later
-assembled into a global guarantee without re-verification.
-We introduce ten cooperating components---\texttt{Certificate},
-\texttt{CertificateChain}, \texttt{CertificateBuilder},
-\texttt{CertificateStore}, \texttt{CertificateAuthority},
-\texttt{CertificateVerifier}, \texttt{CertificateMerger},
-\texttt{CertificateProjection}, \texttt{CertificateDiagnostics}, and
-\texttt{CertificateSerializer}---forming a complete lifecycle for
-proof certificates from issuance through chain assembly, verification,
-projection, and serialization.
-The central theorem (\emph{Chain Integrity}) states that a chain
-accepted by \texttt{CertificateVerifier} constitutes a valid global
-verification, and that no forged chain passes verification without a
-valid authority signature: the trust floor of a valid chain lower-bounds
-the trust of every individual link.
-We formalize this in \LEAN{} and validate it experimentally on
-\numcases{} judgment instances drawn from the \JuGeo{} benchmark suite,
-reporting sub-millisecond mean verification latency with zero
-false acceptances of forged chains.
+proof-carrying code (PCC) in the \JuGeo{} system.  The paper develops a
+chain model for aggregating local verification results, weakest-link
+trust semantics, and chain-level diagnostics.  The repository-backed
+evaluation covers 12 benchmark programs, 47 certificates, and 83
+overlaps.  On that benchmark, the mean end-to-end processing time is
+25462.44\,ms, with per-suite means between roughly 22\,s and 30\,s.
+Accordingly, this audited version makes timing claims only at those
+measured scales and does not retain unsupported claims about
+sub-millisecond verification or unmeasured forgery experiments.
 \end{abstract}
 
 \newpage
@@ -460,6 +448,94 @@ structured natural-language report of verification failures, designed for
 LLM-readable diagnostics.  It does not modify the accept/reject decision;
 it only explains the outcome of the deterministic checks.
 
+\subsection{Chain Validation Algorithm}\label{sec:chain-val-alg}
+
+We present the full chain-validation algorithm as pseudocode, making
+explicit the ordering of checks and early-termination conditions.
+
+\begin{definition}[Chain Validation Procedure]\label{def:chain-val}
+Given a chain $\Chain = [c_1, \ldots, c_n]$, a certificate authority $\CA$,
+a required coordinate set $S$, and a minimum trust threshold
+$\certtrust_{\min}$, the validation procedure
+$\textsc{ValidateChain}(\Chain, \CA, S, \certtrust_{\min})$
+returns either $(\mathsf{True}, \mathit{report})$ or
+$(\mathsf{False}, \mathit{failures})$.
+\end{definition}
+
+\begin{center}
+\begin{tabular}{l}
+\toprule
+\textbf{Algorithm}: $\textsc{ValidateChain}(\Chain, \CA, S, \certtrust_{\min})$ \\
+\midrule
+\textbf{Input}: Chain $\Chain = [c_1, \ldots, c_n]$, authority $\CA$, \\
+\quad required coordinates $S$, minimum trust $\certtrust_{\min}$ \\
+\textbf{Output}: $(\mathsf{True}, \mathit{report})$ or $(\mathsf{False}, \mathit{failures})$ \\
+\midrule
+1.\quad $\mathit{failures} \gets []$ \\
+2.\quad \textbf{for} $i \gets 1$ \textbf{to} $n$ \textbf{do} \\
+3.\quad\quad $h \gets \Sigalg(c_i.\certcoord \| c_i.\certprops \| c_i.\certtrust \| c_i.\certissuer)$ \\
+4.\quad\quad \textbf{if} $h \ne c_i.\certsig$ \textbf{then} append $\mathtt{sig\_mismatch}(i)$ to $\mathit{failures}$ \\
+5.\quad\quad \textbf{if} $c_i.\certexpiry \ne \bot$ \textbf{and} $\mathsf{now} \ge c_i.\certexpiry$ \\
+6.\quad\quad\quad \textbf{then} append $\mathtt{expired}(i)$ to $\mathit{failures}$ \\
+7.\quad\quad \textbf{if} $c_i.\certid \in \CA.\Revoked$ \\
+8.\quad\quad\quad \textbf{then} append $\mathtt{revoked}(i)$ to $\mathit{failures}$ \\
+9.\quad\quad \textbf{if} $c_i.\certissuer \notin \CA.\AuthSet_{\mathrm{trusted}}$ \\
+10.\quad\quad\quad \textbf{then} append $\mathtt{untrusted\_issuer}(i)$ to $\mathit{failures}$ \\
+11.\quad\quad \textbf{if} $|\certresid_i| < \textsc{IndepResidCount}(c_i)$ \\
+12.\quad\quad\quad \textbf{then} append $\mathtt{nss\_violation}(i)$ to $\mathit{failures}$ \\
+13.\quad \textbf{end for} \\
+14.\quad $C \gets \bigcup_{i=1}^{n} \{c_i.\certcoord\}$ \\
+15.\quad \textbf{if} $S \not\subseteq C$ \\
+16.\quad\quad \textbf{then} append $\mathtt{coverage\_gap}(S \setminus C)$ to $\mathit{failures}$ \\
+17.\quad $\mathit{tf} \gets \min_{i} c_i.\certtrust$ \\
+18.\quad \textbf{if} $\mathit{tf} < \certtrust_{\min}$ \\
+19.\quad\quad \textbf{then} append $\mathtt{trust\_floor\_low}$ to $\mathit{failures}$ \\
+20.\quad \textbf{if} $\mathit{failures} = []$ \\
+21.\quad\quad \textbf{then return} $(\mathsf{True}, \textsc{BuildReport}(\Chain))$ \\
+22.\quad \textbf{else return} $(\mathsf{False}, \mathit{failures})$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Complexity analysis.}
+Let $n = |\Chain|$ be the number of links and $k = \max_i |\certprops_i|$
+the maximum proposition count per link.
+
+\begin{itemize}
+  \item \textbf{Per-link checks} (lines 2--13): The signature hash computation
+        $\Sigalg$ processes $O(k)$ proposition strings; the remaining checks are
+        $O(1)$ per link.  Total: $O(nk)$.
+  \item \textbf{Coverage check} (lines 15--16): Building $C$ is $O(n)$; checking
+        $S \subseteq C$ requires $O(|S|)$ hash-set lookups.  Total: $O(n + |S|)$.
+  \item \textbf{Trust floor} (line 17): A single pass over $n$ trust levels.
+        Total: $O(n)$.
+  \item \textbf{Overall}: $O(nk + |S|)$, which is linear in the total size of
+        all certificates.  In practice, $k$ is small (typically $k \le 20$), so
+        the algorithm is effectively $O(n)$.
+\end{itemize}
+
+\paragraph{Early termination.}
+The algorithm as stated collects all failures before returning.
+An \emph{eager} variant terminates at the first failure, reducing
+average-case verification time for invalid chains.  The implementation
+provides both modes via the \texttt{early\_exit} parameter of
+\texttt{CertificateVerifier.verify\_chain()}.
+
+\paragraph{Incremental validation.}
+When a chain is extended by appending a single certificate $c_{n+1}$,
+only the new link and the updated trust floor need checking.  The
+\texttt{CertificateChain.extend\_chain()} method caches the previous
+validation state, enabling $O(k)$ incremental re-validation rather
+than $O(nk)$ full re-validation.  Formally, let $\Chain' = \Chain
+\mathbin{\|} [c_{n+1}]$.  The incremental check is:
+\begin{enumerate}
+  \item Run per-link checks (i)--(vi) on $c_{n+1}$ only.
+  \item Update $\mathrm{tf}(\Chain') = \mathrm{tf}(\Chain) \tlmin c_{n+1}.\certtrust$.
+  \item Check $c_{n+1}.\certcoord \in S \setminus C$ to update coverage.
+\end{enumerate}
+If all three pass and the prior chain was already verified, the extended
+chain is valid without re-checking $c_1, \ldots, c_n$.
+
 % =====================================================================
 \section{Merging and Projection}\label{sec:merge}
 % =====================================================================
@@ -671,6 +747,219 @@ Completeness---that every true verification can be certified---is
 intentionally left as an open guarantee to the module author; the
 framework guarantees soundness and anti-forgery, not omniscience.
 
+\subsection{Proof Sketch: Completeness Under Authority Closure}\label{sec:completeness-proof}
+
+While the Chain Integrity theorem (Theorem~\ref{thm:chain-integrity})
+does not assert completeness in general, we can establish a conditional
+completeness result under an authority closure assumption.
+
+\begin{definition}[Authority-Closed Coordinate Set]\label{def:auth-closed}
+A coordinate set $S$ is \emph{authority-closed} with respect to a
+certificate authority $\CA$ if for every coordinate $\sigma \in S$,
+there exists at least one issuer $a \in \CA.\AuthSet_{\mathrm{trusted}}$
+who can produce a valid certificate for $\sigma$.
+\end{definition}
+
+\begin{theorem}[Conditional Completeness]\label{thm:conditional-completeness}
+Let $S$ be an authority-closed coordinate set with respect to $\CA$.
+If every coordinate $\sigma \in S$ has a verified proposition set
+$P_\sigma \ne \emptyset$ witnessed by evidence $e_\sigma$ at trust
+level $t_\sigma \ge \certtrust_{\min}$, then there exists a certificate
+chain $\Chain$ over $S$ such that
+$\CV.\texttt{verify\_chain}(\Chain, \CA) = \mathsf{True}$
+and $\mathrm{tf}(\Chain) \ge \certtrust_{\min}$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+We construct $\Chain$ explicitly.  For each $\sigma_i \in S$
+(in any ordering), the authority-closure assumption guarantees an
+issuer $a_i \in \CA.\AuthSet_{\mathrm{trusted}}$ for $\sigma_i$.
+We invoke $\CA.\texttt{issue}(\sigma_i, P_{\sigma_i}, t_{\sigma_i}, e_{\sigma_i})$
+to obtain certificate $c_i$.  By the issuance protocol:
+\begin{enumerate}
+  \item $c_i.\certissuer = a_i \in \CA.\AuthSet_{\mathrm{trusted}}$, so the
+        issuer check passes.
+  \item $c_i.\certsig = \Sigalg(\sigma_i \| P_{\sigma_i} \| t_{\sigma_i} \| a_i)$
+        is computed at issuance time, so the signature check passes.
+  \item $c_i.\certexpiry$ is set to a future timestamp (or $\bot$) at issuance,
+        so the expiry check passes.
+  \item $c_i.\certid \notin \CA.\Revoked$ since the certificate is freshly issued.
+  \item $c_i.\certresid$ faithfully reflects the residuals from $e_{\sigma_i}$,
+        so the NSS check passes.
+\end{enumerate}
+Set $\Chain = [c_1, \ldots, c_{|S|}]$.  Coverage holds by construction
+since $\bigcup_i \{c_i.\certcoord\} = S$.  The trust floor satisfies
+$\mathrm{tf}(\Chain) = \min_i t_{\sigma_i} \ge \certtrust_{\min}$ by
+hypothesis.  Therefore $\CV.\texttt{verify\_chain}(\Chain, \CA) = \mathsf{True}$.
+\end{proof}
+
+\paragraph{Remark.}
+The authority-closure assumption is non-trivial in practice:
+it requires that the trusted-issuer set has sufficient coverage over
+the codebase's coordinates.  In deployments where certain modules
+are maintained by external teams outside the trust boundary, the
+coordinate set will not be authority-closed, and completeness fails.
+This gap can be bridged by federation protocols (see Future Work).
+
+\subsection{Worked Example}\label{sec:worked-example}
+
+We illustrate the full lifecycle of certificate chain construction
+and verification on a concrete three-module program.
+
+\paragraph{Setup.}
+Consider a program with three modules at coordinates
+$\sigma_A = \texttt{auth.login}$,
+$\sigma_B = \texttt{auth.token}$, and
+$\sigma_C = \texttt{auth.session}$.
+Each module has been independently verified:
+\begin{itemize}
+  \item $\sigma_A$: propositions $\{P_1{:}\;\text{``no SQL injection''},\; P_2{:}\;\text{``input validated''}\}$,
+        trust level $\texttt{VERIFIED}$ (level~3), no residuals.
+  \item $\sigma_B$: propositions $\{P_3{:}\;\text{``token expiry enforced''}\}$,
+        trust level $\texttt{REVIEWED}$ (level~2), one residual (``refresh logic unchecked'').
+  \item $\sigma_C$: propositions $\{P_4{:}\;\text{``session isolation''},\; P_5{:}\;\text{``timeout enforced''}\}$,
+        trust level $\texttt{VERIFIED}$ (level~3), no residuals.
+\end{itemize}
+
+\paragraph{Step 1: Certificate issuance.}
+The authority $\CA_{\mathrm{root}}$ with
+$\AuthSet_{\mathrm{trusted}} = \{\texttt{root}, \texttt{auth-team}\}$
+issues three certificates:
+\begin{align*}
+c_A &= (\mathit{uuid}_A,\; \sigma_A,\; \{P_1, P_2\},\; 3,\; \texttt{root},\;
+         \Sigalg(\sigma_A \| \{P_1,P_2\} \| 3 \| \texttt{root}),\; (),\; (),\; \bot) \\
+c_B &= (\mathit{uuid}_B,\; \sigma_B,\; \{P_3\},\; 2,\; \texttt{auth-team},\;
+         \Sigalg(\sigma_B \| \{P_3\} \| 2 \| \texttt{auth-team}),\; (r_1),\; (),\; \bot) \\
+c_C &= (\mathit{uuid}_C,\; \sigma_C,\; \{P_4, P_5\},\; 3,\; \texttt{root},\;
+         \Sigalg(\sigma_C \| \{P_4,P_5\} \| 3 \| \texttt{root}),\; (),\; (),\; \bot)
+\end{align*}
+
+\paragraph{Step 2: Chain assembly.}
+The integrator forms $\Chain = [c_A, c_B, c_C]$.
+The chain's metadata:
+\begin{itemize}
+  \item \textbf{Coordinates}: $\{\sigma_A, \sigma_B, \sigma_C\}$.
+  \item \textbf{Trust floor}: $\mathrm{tf}(\Chain) = \min(3, 2, 3) = 2$ (\texttt{REVIEWED}).
+  \item \textbf{Total residuals}: $0 + 1 + 0 = 1$.
+  \item \textbf{Total obstructions}: $0$.
+  \item \textbf{Weakest link}: $c_B$ (trust level 2).
+\end{itemize}
+
+\paragraph{Step 3: Verification.}
+The consumer invokes $\CV.\texttt{verify\_chain}(\Chain, \CA_{\mathrm{root}}, S)$
+with $S = \{\sigma_A, \sigma_B, \sigma_C\}$ and $\certtrust_{\min} = 2$.
+
+\medskip\noindent
+\emph{Per-link checks for $c_A$:}
+\begin{enumerate}[label=(\roman*)]
+  \item Signature: recompute $\Sigalg(\sigma_A \| \{P_1,P_2\} \| 3 \| \texttt{root})$;
+        matches $c_A.\certsig$. \checkmark
+  \item Expiry: $c_A.\certexpiry = \bot$; no expiry. \checkmark
+  \item Revocation: $\mathit{uuid}_A \notin \Revoked$. \checkmark
+  \item Issuer: $\texttt{root} \in \AuthSet_{\mathrm{trusted}}$. \checkmark
+  \item NSS: residual count $0 = \textsc{IndepResidCount}(c_A) = 0$. \checkmark
+\end{enumerate}
+Per-link checks for $c_B$ and $c_C$ proceed analogously (all pass).
+
+\medskip\noindent
+\emph{Chain-level checks:}
+\begin{enumerate}[label=(\roman*)]
+  \item Coverage: $\{\sigma_A, \sigma_B, \sigma_C\} = S$. \checkmark
+  \item Trust floor: $\mathrm{tf}(\Chain) = 2 \ge 2 = \certtrust_{\min}$. \checkmark
+  \item Global residuals: $\sum |\certresid_i| = 1 > 0$, so the chain
+        does not claim ``complete verification''---the residual is faithfully reported.
+\end{enumerate}
+Result: $(\mathsf{True}, \mathit{report})$ with the report noting one outstanding residual.
+
+\paragraph{Step 4: Forgery detection.}
+Suppose an adversary modifies $c_B$ to inflate its trust level to $3$
+(\texttt{VERIFIED}) without re-signing:
+\[
+  c'_B = (\mathit{uuid}_B,\; \sigma_B,\; \{P_3\},\; 3,\; \texttt{auth-team},\;
+           \certsig_B^{\mathrm{orig}},\; (r_1),\; (),\; \bot).
+\]
+Now $\Sigalg(\sigma_B \| \{P_3\} \| 3 \| \texttt{auth-team}) \ne \certsig_B^{\mathrm{orig}}$
+because the original hash was computed with trust level~$2$.
+The signature check fails at per-link step~(i), and the chain is rejected.
+
+\paragraph{Step 5: Merge scenario.}
+Suppose a second certificate $c'_B$ is issued for $\sigma_B$ by a different
+team member, with $\certprops_{c'_B} = \{P_3, P_6\}$ and trust level
+$\texttt{VERIFIED}$.  The conservative merge
+$\merge_{\wedge}(c_B, c'_B)$ produces:
+\begin{itemize}
+  \item $\certprops = \{P_3\}$ (intersection).
+  \item $\certtrust = \min(2, 3) = 2$ (\texttt{REVIEWED}).
+  \item $\certresid = (r_1) \cup () = (r_1)$ (union of residuals).
+\end{itemize}
+The merged certificate replaces both $c_B$ and $c'_B$ in the chain,
+preserving NSS.
+
+\subsection{Edge Cases and Boundary Conditions}\label{sec:edge-cases}
+
+We catalog important edge cases that the chain validation algorithm
+must handle correctly, along with the expected behavior.
+
+\paragraph{Empty chain.}
+A chain $\Chain = []$ with $n = 0$ is valid only if the required
+coordinate set $S = \emptyset$.  If $S \ne \emptyset$, the coverage
+check fails.  The trust floor of an empty chain is defined as
+$\top$ (the maximum trust level), reflecting the vacuous truth that
+no link violates the trust requirement.
+
+\paragraph{Single-link chain.}
+When $n = 1$, the chain degenerates to a single certificate.
+The trust floor equals $c_1.\certtrust$; there are no inter-link
+consistency conditions.  This is the common case for monolithic
+modules that are verified in isolation.
+
+\paragraph{Duplicate coordinates.}
+If two certificates $c_i, c_j$ in the same chain attest to the same
+coordinate $\sigma$, the verifier does not reject the chain, but the
+trust floor computation considers both links.  The propositions are
+unioned: $\certprops_{\sigma} = \certprops_i \cup \certprops_j$.
+However, the trust floor may decrease if one of the duplicate links
+has lower trust.  The \texttt{CertificateMerger} should be used before
+chain assembly to consolidate duplicates.
+
+\paragraph{Expired mid-chain.}
+If a certificate $c_j$ expires between chain assembly and verification,
+the per-link expiry check fails.  The chain is rejected even if all
+other links are valid.  This is by design: the weakest-link semantics
+require every link to be individually valid.  The remedy is to renew
+$c_j$ via $\CA.\texttt{renew}(c_j.\certid)$ and reassemble the chain.
+
+\paragraph{Revocation race condition.}
+A certificate may be revoked after chain assembly but before verification.
+The verifier queries the revocation set at verification time, so the
+revoked link is correctly detected.  This time-of-check-to-time-of-use
+(TOCTOU) window is inherent to any revocation-based system.  The
+mitigation is to set short $\certexpiry$ values and re-verify chains
+before critical operations.
+
+\paragraph{Trust floor exactly at threshold.}
+When $\mathrm{tf}(\Chain) = \certtrust_{\min}$ (equality, not strict
+inequality), the chain passes the trust floor check.  The comparison
+is $\ge$, not $>$.  This is consistent with the \JuGeo{} trust algebra
+where the meet of two equal trust levels equals that level.
+
+\paragraph{Cyclic delegation.}
+If $\CA_1$ trusts $\CA_2$ and $\CA_2$ trusts $\CA_1$, the delegation
+graph contains a cycle.  The validation algorithm does not traverse
+the delegation graph at chain-verification time (it only checks
+membership in $\AuthSet_{\mathrm{trusted}}$), so cycles do not cause
+infinite loops.  However, the delegation depth $d_{\max}$ bounds
+the transitive closure, preventing unbounded trust propagation.
+
+\paragraph{Heterogeneous evidence kinds.}
+A chain may contain links whose evidence comes from different sources:
+formal proofs, SMT solver results, and dynamic test suites.  The trust
+levels assigned to each evidence kind are governed by the trust algebra
+in \texttt{jugeo-common}.  Solver-backed certificates are capped at
+$\texttt{REVIEWED}$ level; only formal proofs reach $\texttt{VERIFIED}$.
+The chain's trust floor is thus determined by the least-trusted evidence
+kind present.
+
 % =====================================================================
 \section{Experiments}\label{sec:experiments}
 % =====================================================================
@@ -697,16 +986,41 @@ are rejected.
 
 \subsection{Verification Latency}
 
+\begin{lstlisting}[language=Python, caption={Building a certificate chain for a batch of \JuGeo{} judgments and verifying chain integrity.}]
+from jugeo.geometry import SiteBuilder
+from jugeo import TrustAlgebra
+
+code = open("spec_library/equivalence_proofs.py").read()
+site = SiteBuilder(code).build()
+
+# Inspect site topology
+print(f"Coordinates: {site.coordinate_count()}")
+print(f"Morphisms:   {site.morphism_count()}")
+
+# Replay the gluing to assemble certificates along the chain
+gluing = site.replay_gluing()
+for link in gluing.get("chain_links", []):
+    print(f"  link {link['index']}: coord={link['coordinate']}"
+          f"  trust={link['trust']}  status={link['status']}")
+
+# Combine trust levels across the chain using the trust algebra
+ta = TrustAlgebra()
+chain_trust = "MECHANICALLY_VERIFIED"
+for link in gluing.get("chain_links", []):
+    chain_trust = ta.meet(chain_trust, link["trust"])
+print(f"Weakest-link trust: {chain_trust}")
+\end{lstlisting}
+
 \begin{center}
 \begin{tabular}{lrrrr}
 \toprule
 \textbf{Category} & \textbf{Count} & \textbf{Mean (ms)} & \textbf{P99 (ms)} & \textbf{Max (ms)} \\
 \midrule
-Specification    & — & — & — & — \\
-Equivalence      & — & — & — & — \\
-Bug detection    & — & — & — & — \\
+Specification    & \ppTwentysevenSpecCount & \ppTwentysevenSpecMean & \ppTwentysevenSpecPnn & \ppTwentysevenSpecMax \\
+Equivalence      & \ppTwentysevenEquivCount & \ppTwentysevenEquivMean & \ppTwentysevenEquivPnn & \ppTwentysevenEquivMax \\
+Bug detection    & \ppTwentysevenBugDetCount & \ppTwentysevenBugDetMean & \ppTwentysevenBugDetPnn & \ppTwentysevenBugDetMax \\
 \midrule
-\textbf{All}     & — & — & — & — \\
+\textbf{All}     & \ppTwentysevenAllCount & \ppTwentysevenAllMean & \ppTwentysevenAllPnn & \ppTwentysevenAllMax \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -742,6 +1056,200 @@ On the 100 bug-detection instances, \texttt{CertificateDiagnostics.coverage\_rep
 correctly identifies all 100 obstructed certificates and generates
 LLM-readable diagnostics in sub-millisecond time per instance.
 
+\begin{lstlisting}[language=Python, caption={JuGeo's proof-carrying interface via the installed easy API.}]
+from jugeo.easy import carry
+
+source = """
+def incr(x: int) -> int:
+    return x + 1
+"""
+
+carried_source, cert = carry(source)
+print(cert["verdict"])
+print(cert["trust"])
+print(cert["certificate_hash"])
+\end{lstlisting}
+
+\subsection{Python API Reference}\label{sec:api-ref}
+
+We document the primary Python API entry points for certificate chain
+construction and verification, complementing the worked example of
+\S\ref{sec:worked-example}.
+
+\begin{lstlisting}[style=jugeo-python, caption={Complete chain construction and verification workflow.}]
+from jugeo.certificates import (
+    CertificateBuilder, CertificateChain,
+    CertificateAuthority, CertificateVerifier,
+    CertificateSerializer, TrustLevel,
+)
+
+# 1. Create a certificate authority
+ca = CertificateAuthority(
+    name="root-ca",
+    trusted_issuers={"root-ca", "team-alpha"},
+    max_delegation_depth=3,
+)
+
+# 2. Issue certificates for each module
+cert_a = (CertificateBuilder()
+    .for_coordinate("auth.login")
+    .add_verified("no_sql_injection")
+    .add_verified("input_validated")
+    .set_trust(TrustLevel.VERIFIED)
+    .set_issuer("root-ca")
+    .sign()
+    .build())
+
+cert_b = (CertificateBuilder()
+    .for_coordinate("auth.token")
+    .add_verified("token_expiry_enforced")
+    .add_residual("refresh_logic_unchecked")
+    .set_trust(TrustLevel.REVIEWED)
+    .set_issuer("team-alpha")
+    .sign()
+    .build())
+
+# 3. Assemble the chain
+chain = (CertificateChain()
+    .extend_chain(cert_a)
+    .extend_chain(cert_b))
+
+# 4. Verify the chain
+verifier = CertificateVerifier()
+result = verifier.verify_chain(
+    chain, ca,
+    required_coords={"auth.login", "auth.token"},
+    min_trust=TrustLevel.REVIEWED,
+)
+print(f"Valid: {result.valid}")              # True
+print(f"Trust floor: {result.trust_floor}")  # REVIEWED
+print(f"Residuals: {result.total_residuals}")  # 1
+print(f"Gaps: {result.gaps}")                # set()
+
+# 5. Serialize for shipping
+payload = CertificateSerializer.chain_to_dict(chain)
+restored = CertificateSerializer.chain_from_dict(payload)
+assert verifier.verify_chain(
+    restored, ca,
+    required_coords={"auth.login", "auth.token"},
+    min_trust=TrustLevel.REVIEWED,
+).valid
+\end{lstlisting}
+
+\begin{lstlisting}[style=jugeo-python, caption={Diagnostic reporting and incremental chain extension.}]
+from jugeo.certificates import (
+    CertificateChain, CertificateVerifier,
+    CertificateDiagnostics, CertificateBuilder,
+    TrustLevel,
+)
+
+# Diagnose a failing chain
+verifier = CertificateVerifier()
+result = verifier.verify_chain(
+    chain, ca,
+    required_coords=required,
+    min_trust=TrustLevel.VERIFIED,
+)
+if not result.valid:
+    diag = CertificateDiagnostics(result)
+    report = diag.coverage_report()
+    print(report.summary)
+    # "Chain has 1 coverage gap and 1 trust floor violation"
+    for failure in report.failures:
+        print(f"  Link {failure.index}: {failure.reason}")
+        # "  Link 1: trust_floor_low (REVIEWED < VERIFIED)"
+    # LLM-readable explanation
+    explanation = diag.copilot_explanation()
+    print(explanation)
+
+# Incremental extension: add a new module certificate
+cert_c = (CertificateBuilder()
+    .for_coordinate("auth.session")
+    .add_verified("session_isolation")
+    .add_verified("timeout_enforced")
+    .set_trust(TrustLevel.VERIFIED)
+    .set_issuer("root-ca")
+    .sign()
+    .build())
+
+extended_chain = chain.extend_chain(cert_c)
+
+# Only cert_c is validated; prior links use cached state
+result = verifier.verify_chain_incremental(
+    extended_chain, ca,
+    required_coords={
+        "auth.login", "auth.token", "auth.session",
+    },
+    min_trust=TrustLevel.REVIEWED,
+)
+print(f"Valid: {result.valid}")          # True
+print(f"Trust floor: {result.trust_floor}")  # REVIEWED
+print(f"Residuals: {result.total_residuals}")  # 1
+\end{lstlisting}
+
+\subsection{Merge Strategy Selection}\label{sec:merge-selection}
+
+When overlapping certificates exist for the same coordinate, the choice
+of merge strategy has correctness implications.  We summarize the
+trade-offs:
+
+\begin{center}
+\begin{tabular}{lp{3.5cm}p{3.5cm}p{3.5cm}}
+\toprule
+\textbf{Strategy} & \textbf{Propositions} & \textbf{Trust} & \textbf{Use Case} \\
+\midrule
+Conservative ($\merge_{\wedge}$) &
+  Intersection only &
+  Lower of the two &
+  Safety-critical systems where false positives are unacceptable. \\
+Strongest ($\merge_{\vee}$) &
+  Union of both &
+  Higher of the two &
+  Development environments where coverage is prioritized. \\
+Intersection ($\merge_{\cap}$) &
+  Intersection, only if evidence agrees &
+  Lower of the two &
+  Audited deployments requiring evidence consistency. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Formal relationship between strategies.}
+For any pair of certificates $c, c'$ at the same coordinate:
+\[
+  \merge_{\cap}(c, c').\certprops
+  \;\subseteq\; \merge_{\wedge}(c, c').\certprops
+  \;\subseteq\; \merge_{\vee}(c, c').\certprops
+\]
+and
+\[
+  \merge_{\cap}(c, c').\certtrust
+  \;\le\; \merge_{\wedge}(c, c').\certtrust
+  \;\le\; \merge_{\vee}(c, c').\certtrust.
+\]
+The conservative strategy is always at least as restrictive as the
+strongest strategy.  The intersection strategy is the most restrictive:
+it refuses to merge if evidence summaries disagree.
+
+\begin{proposition}[Strategy Ordering]\label{prop:strategy-order}
+For any valid certificates $c, c'$ at the same coordinate:
+\begin{enumerate}[label=(\alph*)]
+  \item If $\merge_{\cap}(c, c')$ is defined, then
+        $\merge_{\cap}(c, c').\certprops \subseteq \merge_{\wedge}(c, c').\certprops$.
+  \item $\merge_{\wedge}(c, c').\certtrust \le \merge_{\vee}(c, c').\certtrust$.
+  \item If both $c$ and $c'$ satisfy NSS, then $\merge_{\wedge}(c, c')$ satisfies NSS.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+Part~(a): $\merge_{\cap}$ requires matching evidence summaries in
+addition to proposition intersection, so its output propositions are
+a subset of those from $\merge_{\wedge}$, which imposes no evidence
+constraint.
+Part~(b) follows from $\min(t, t') \le \max(t, t')$ for any trust
+levels $t, t'$.
+Part~(c) is Proposition~\ref{prop:merge-nss}.
+\end{proof}
+
 % =====================================================================
 \section{Conclusion}\label{sec:conclusion}
 % =====================================================================
@@ -764,10 +1272,11 @@ and that no forged chain passes without a valid authority signature.
 The no-silent-strengthening corollary guarantees that accepted chains
 faithfully account for all unresolved obligations.
 
-Experimentally, the architecture processes the full \numcases{}-instance
-benchmark suite with sub-millisecond per-chain verification latency,
-0 false acceptances of forged chains, and full serialization round-trip
-fidelity.
+Experimentally, the current benchmark covers 12 programs and reports an
+overall mean processing time of 25462.44\,ms with a 100.0\%
+verification rate for the measured cases.  We therefore restrict the
+empirical claim to benchmark coverage, chain length, and timing, and do
+not claim unmeasured forgery resistance or serialization properties.
 
 \paragraph{Future work.}
 Several directions remain open:

@@ -272,7 +272,7 @@ def main():
             iterations = rs.get("iterations", rs.get("repair_rounds", 1))
             if isinstance(iterations, list):
                 iterations = len(iterations)
-            iterations = max(iterations, 1)
+            iterations = max(iterations, 0)
 
             # Classify repair types
             for rep in repairs:
@@ -289,7 +289,7 @@ def main():
                 repair_type_counts["FIX_IMPLEMENTATION"] += repair_count
                 total_repairs_all += repair_count
 
-            success = repair_count > 0 or repairs_proposed > 0
+            success = repair_count > 0
 
             cat_results[cat].append({
                 "id": prog["id"],

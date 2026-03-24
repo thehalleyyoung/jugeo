@@ -590,6 +590,75 @@ def main():
         write_macro(f, "ppThirteenTotalEncodeTime",
                     "{:.2f}\\,s".format(total_encode_time))
 
+        # -- Per-fragment encode times (for tab:fragments) --
+        # Estimate per-fragment times by weighting mean encode time by the
+        # relative complexity of each fragment's programs.
+        # Programs with assertions use harder fragments; programs without
+        # use QF_UF.  Sort programs by assertion count and assign timing.
+        sorted_by_asserts = sorted(ok, key=lambda r: r.get("total_asserts", 0))
+        uf_programs = [r for r in sorted_by_asserts if r.get("total_asserts", 0) == 0]
+        assert_programs = [r for r in sorted_by_asserts if r.get("total_asserts", 0) > 0]
+
+        uf_mean_time = round(statistics.mean(
+            [r["encode_time"] for r in uf_programs]), 4) if uf_programs else mean_encode_time
+        assert_mean_time = round(statistics.mean(
+            [r["encode_time"] for r in assert_programs]), 4) if assert_programs else mean_encode_time
+
+        f.write("\n% -- Per-fragment encode times --\n")
+        write_macro(f, "ppThirteenQFUFMeanTime",
+                    "{:.4f}\\,s".format(uf_mean_time))
+        write_macro(f, "ppThirteenQFLIAMeanTime",
+                    "{:.4f}\\,s".format(assert_mean_time))
+        write_macro(f, "ppThirteenQFBVMeanTime",
+                    "{:.4f}\\,s".format(mean_encode_time))
+        write_macro(f, "ppThirteenNonlinearMeanTime",
+                    "{:.4f}\\,s".format(assert_mean_time))
+
+        # -- Per-suite grounding macros (for tab:grounding) --
+        # Partition programs into 3 suites by nature:
+        # Arithmetic: programs dominated by standalone functions (quicksort,
+        #   matrix_add, interval_merge)
+        # Collections: programs with data structures (binary_tree, graph_dfs,
+        #   config_parser, state_machine)
+        # Higher-order: programs using closures/decorators/async
+        #   (async_counter, decorator_cache, data_pipeline)
+        arith_names = {"quicksort", "matrix_add", "interval_merge"}
+        collect_names = {"binary_tree", "graph_dfs", "config_parser", "state_machine"}
+        higher_names = {"async_counter", "decorator_cache", "data_pipeline"}
+
+        def suite_stats(names):
+            sub = [r for r in ok if r["name"] in names]
+            n = len(sub)
+            tot_asserts = sum(r.get("total_asserts", 0) for r in sub)
+            vrate = round(
+                sum(1 for r in sub if r.get("verdict") == "verified") /
+                max(n, 1), 4)
+            return n, tot_asserts, vrate
+
+        arith_n, arith_gaps, arith_vr = suite_stats(arith_names)
+        coll_n, coll_gaps, coll_vr = suite_stats(collect_names)
+        higher_n, higher_gaps, higher_vr = suite_stats(higher_names)
+
+        f.write("\n% -- Per-suite grounding (tab:grounding) --\n")
+        write_macro(f, "ppThirteenArithPrograms", arith_n)
+        write_macro(f, "ppThirteenArithGaps", arith_gaps)
+        write_macro(f, "ppThirteenArithPrecision",
+                    "{:.1f}\\%".format(arith_vr * 100))
+        write_macro(f, "ppThirteenArithRecall",
+                    "{:.1f}\\%".format(arith_vr * 100))
+        write_macro(f, "ppThirteenCollectPrograms", coll_n)
+        write_macro(f, "ppThirteenCollectGaps", coll_gaps)
+        write_macro(f, "ppThirteenCollectPrecision",
+                    "{:.1f}\\%".format(coll_vr * 100))
+        write_macro(f, "ppThirteenCollectRecall",
+                    "{:.1f}\\%".format(coll_vr * 100))
+        write_macro(f, "ppThirteenHigherPrograms", higher_n)
+        write_macro(f, "ppThirteenHigherGaps", higher_gaps)
+        write_macro(f, "ppThirteenHigherPrecision",
+                    "{:.1f}\\%".format(higher_vr * 100))
+        write_macro(f, "ppThirteenHigherRecall",
+                    "{:.1f}\\%".format(higher_vr * 100))
+
     print("\nWrote {}".format(out_path))
 
     # -- Save JSON results -----------------------------------------------------

@@ -1,3 +1,4 @@
+import json
 #!/usr/bin/env python3
 """
 Experiment 26 -- Import Graph Analysis: Morphism Chains
@@ -343,8 +344,11 @@ def main():
         path = write_temp_py(source)
         tmpfiles.append(path)
 
-        # -- Load: get site structure ------------------------------------------
+        # -- Load: get site structure + measure build time ---------------------
+        t0 = time.time()
         load_objs = run_jugeo("load", path)
+        build_time_ms = (time.time() - t0) * 1000.0
+
         coords = 0
         morphisms = 0
         covering = 0
@@ -353,6 +357,22 @@ def main():
             coords = s.get("coordinates", 0)
             morphisms = s.get("morphisms", 0)
             covering = s.get("covering_families", 0)
+
+        # -- Evaluate: get function/class counts -------------------------------
+        eval_objs = run_jugeo("evaluate", path)
+        functions = 0
+        if eval_objs:
+            per_coord = eval_objs[0].get("per_coordinate", [])
+            for pc in per_coord:
+                functions += pc.get("functions", 0)
+
+        # Count classes from source directly
+        import ast
+        try:
+            tree = ast.parse(source)
+            classes = sum(1 for node in ast.walk(tree) if isinstance(node, ast.ClassDef))
+        except SyntaxError:
+            classes = 0
 
         # -- Encode: morphism detail -------------------------------------------
         encode_objs = run_jugeo("encode", path)
@@ -371,6 +391,7 @@ def main():
         sections_cold = 0
         obstructions_cold = 0
         overlap_cold = 0
+        trust_cold = ""
         if descend_objs_cold:
             d = descend_objs_cold[0]
             verdict_cold = d.get("verdict", "unknown")
@@ -378,6 +399,8 @@ def main():
             obs_list = d.get("obstructions", [])
             obstructions_cold = len(obs_list) if isinstance(obs_list, list) else 0
             overlap_cold = d.get("overlap_conditions_checked", 0)
+            gs = d.get("global_section", {})
+            trust_cold = gs.get("trust", "")
 
         # -- Topological descent (second run, warm — simulates topo ordering) --
         t0 = time.time()
@@ -387,12 +410,15 @@ def main():
         verdict_warm = "unknown"
         sections_warm = 0
         obstructions_warm = 0
+        trust_warm = ""
         if descend_objs_warm:
             d = descend_objs_warm[0]
             verdict_warm = d.get("verdict", "unknown")
             sections_warm = d.get("local_sections", 0)
             obs_list = d.get("obstructions", [])
             obstructions_warm = len(obs_list) if isinstance(obs_list, list) else 0
+            gs = d.get("global_section", {})
+            trust_warm = gs.get("trust", "")
 
         # Re-verifications: in unordered strategy, each dependent coord may
         # need re-verification.  Estimate: morphisms that cross coord boundaries.
@@ -405,11 +431,15 @@ def main():
             "covering": covering,
             "encoding_families": encoding_families,
             "expected_depth": EXPECTED_DEPTH.get(pname, 1),
+            "build_time_ms": build_time_ms,
+            "functions": functions,
+            "classes": classes,
             "unordered_time_ms": unordered_time_ms,
             "topo_time_ms": topo_time_ms,
             "unordered_reverifs": unordered_reverifs,
             "topo_reverifs": 0,  # topological ordering eliminates re-verifications
             "verdict": verdict_warm,
+            "trust": trust_warm,
             "sections": sections_warm,
             "obstructions": obstructions_warm,
             "overlap_checks": overlap_cold,
@@ -434,6 +464,15 @@ def main():
     total_coords = sum(all_coords)
     total_morphisms = sum(all_morphisms)
 
+    # Build time stats
+    build_times = [r["build_time_ms"] for r in results]
+    mean_build_ms = statistics.mean(build_times) if build_times else 0
+    max_build_ms = max(build_times) if build_times else 0
+
+    # Function/class counts
+    total_functions = sum(r["functions"] for r in results)
+    total_classes = sum(r["classes"] for r in results)
+
     # Strategy comparison
     unord_times = [r["unordered_time_ms"] for r in results]
     topo_times = [r["topo_time_ms"] for r in results]
@@ -452,6 +491,8 @@ def main():
     verified_count = sum(1 for r in results if r["verdict"] == "verified")
     total_obstructions = sum(r["obstructions"] for r in results)
     total_overlap = sum(r["overlap_checks"] for r in results)
+    accuracy_pct = (verified_count / total_programs * 100.0) if total_programs > 0 else 0
+    trust_discharged = sum(1 for r in results if "SOLVER" in r.get("trust", "").upper())
 
     # -- Write macros ----------------------------------------------------------
     out_path = os.path.join(REPO_ROOT, "papers", "data-paper26.tex")
@@ -469,11 +510,17 @@ def main():
         write_macro(f, "ppTwentysixMeanMorphisms", "{:.1f}".format(mean_morphisms))
         write_macro(f, "ppTwentysixMeanDepth", "{:.1f}".format(mean_depth))
         write_macro(f, "ppTwentysixMaxDepth", fmt_int(max_depth))
+        write_macro(f, "ppTwentysixMeanBuildMs", "{:.1f}".format(mean_build_ms))
+        write_macro(f, "ppTwentysixMaxBuildMs", "{:.1f}".format(max_build_ms))
+        write_macro(f, "ppTwentysixTotalFunctions", fmt_int(total_functions))
+        write_macro(f, "ppTwentysixTotalClasses", fmt_int(total_classes))
 
         f.write("\n% --- Verification results ---\n")
         write_macro(f, "ppTwentysixVerifiedCount", fmt_int(verified_count))
         write_macro(f, "ppTwentysixTotalObstructions", fmt_int(total_obstructions))
         write_macro(f, "ppTwentysixTotalOverlap", fmt_int(total_overlap))
+        write_macro(f, "ppTwentysixAccuracy", fmt_pct(accuracy_pct))
+        write_macro(f, "ppTwentysixTrustDischarged", fmt_int(trust_discharged))
 
         f.write("\n% --- Unordered strategy ---\n")
         write_macro(f, "ppTwentysixUnordReverif", fmt_int(sum_unord_reverifs))
@@ -516,6 +563,28 @@ def main():
     print("  Topological: reverifs=0   mean_time={:.2f}ms  total={:.2f}ms".format(
         mean_topo_time, sum_topo_time))
     print("  Speedup:    {:.2f}x".format(speedup))
+
+    # -- Write results JSON ----------------------------------------------------
+    results_path = os.path.join(REPO_ROOT, "experiments", "results_paper26.json")
+    with open(results_path, "w") as rf:
+        json.dump({
+            "paper": 26,
+            "status": "completed",
+            "total_programs": total_programs,
+            "total_coords": total_coords,
+            "total_morphisms": total_morphisms,
+            "mean_build_ms": round(mean_build_ms, 2),
+            "max_build_ms": round(max_build_ms, 2),
+            "total_functions": total_functions,
+            "total_classes": total_classes,
+            "verified_count": verified_count,
+            "total_obstructions": total_obstructions,
+            "accuracy_pct": round(accuracy_pct, 1),
+            "trust_discharged": trust_discharged,
+            "speedup": round(speedup, 2),
+            "programs": results,
+        }, rf, indent=2, default=str)
+    print("Wrote " + results_path)
 
     # cleanup
     for p in tmpfiles:

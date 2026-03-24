@@ -123,6 +123,32 @@ def _parse_spec_clauses(
     return clauses
 
 
+def _runtime_spec_payload(
+    spec_text: str, spec_path: pathlib.Path,
+) -> dict[str, Any] | None:
+    """Return executable runtime-spec metadata from a JSON spec, if present."""
+    if spec_path.suffix != ".json":
+        return None
+    try:
+        raw = json.loads(spec_text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    spec_program = raw.get("spec_program")
+    input_cover = raw.get("input_cover")
+    if not isinstance(spec_program, str) or not isinstance(input_cover, list):
+        return None
+    return {
+        "description": raw.get("description", spec_path.stem),
+        "entrypoint": str(raw.get("entrypoint", "solve")),
+        "spec_function": str(raw.get("spec_function", "spec")),
+        "spec_program": spec_program,
+        "input_cover": input_cover,
+        "constraints": raw.get("constraints", raw.get("clauses", [])),
+    }
+
+
 # ---------------------------------------------------------------------------
 # AST collection helpers
 # ---------------------------------------------------------------------------
@@ -979,6 +1005,221 @@ def _run_ast_fallback(
     }
 
 
+def _run_runtime_cover_pipeline(
+    spec_path: pathlib.Path,
+    program_path: pathlib.Path,
+    strict: bool,
+    verbose: bool,
+) -> dict[str, Any] | None:
+    """Run executable spec checking over a declared finite cover."""
+    spec_text = spec_path.read_text(encoding="utf-8")
+    payload = _runtime_spec_payload(spec_text, spec_path)
+    if payload is None:
+        return None
+
+    program_text = program_path.read_text(encoding="utf-8")
+
+    try:
+        from jugeo.benchmarks.models import InputPoint
+        from jugeo.benchmarks.semantics import (
+            call_fresh,
+            format_outcome,
+            load_function,
+            require_declared_cover,
+            semantic_coordinate,
+        )
+    except Exception as exc:
+        if verbose:
+            _log.warning("runtime declared-cover pipeline unavailable: %s", exc)
+        return None
+
+    try:
+        points = tuple(
+            InputPoint.from_dict(item)
+            for item in payload["input_cover"]
+        )
+        points = require_declared_cover(
+            points,
+            case_id=program_path.stem,
+            category="spec",
+        )
+        spec_fn = load_function(payload["spec_program"], payload["spec_function"])
+    except Exception as exc:
+        detail = f"Invalid runtime specification: {type(exc).__name__}: {exc}"
+        return {
+            "spec_file": str(spec_path),
+            "program": str(program_path),
+            "satisfied": False,
+            "trust_level": 0.0,
+            "clauses": [{
+                "text": "runtime specification setup",
+                "pass": False,
+                "status": "FAIL",
+                "detail": detail,
+            }],
+            "residual_obligations": [detail],
+            "obstructions": [detail],
+            "trust_info": {
+                "settled_ratio": 0.0,
+                "settled_count": 0,
+                "total_count": 1,
+                "aggregate_label": "CONTRADICTED",
+                "per_clause_trust": ["CONTRADICTED"],
+            },
+            "certificates": [],
+            "descent_summary": "runtime setup failed",
+            "mode": "runtime-declared-cover",
+        }
+
+    base_coordinate = None
+    try:
+        base_coordinate = semantic_coordinate(program_text)
+    except Exception:
+        base_coordinate = None
+    if not base_coordinate:
+        base_coordinate = f"{program_path.stem}.{payload['entrypoint']}"
+
+    clauses_out: list[dict[str, Any]] = []
+    residuals: list[str] = []
+    obstructions: list[str] = []
+    witnesses: list[dict[str, Any]] = []
+    per_clause_trust: list[str] = []
+    satisfied_count = 0
+
+    for index, point in enumerate(points):
+        coordinate = f"{base_coordinate}#cover[{index}]"
+        text = (
+            f"{payload['entrypoint']} respects {payload['spec_function']} "
+            f"on cover[{index}]"
+        )
+        outcome = call_fresh(program_text, payload["entrypoint"], point)
+        passed = False
+        detail = ""
+        witness_payload: dict[str, Any] | None = None
+
+        if outcome.tag != "return":
+            detail = (
+                f"{payload['entrypoint']} produced {format_outcome(outcome)} "
+                f"for declared cover[{index}]"
+            )
+            witness_payload = {
+                "coordinate": coordinate,
+                "cover_index": index,
+                "input_point": point.to_dict(),
+                "outcome": {
+                    "tag": outcome.tag,
+                    "value": outcome.value,
+                },
+                "message": detail,
+            }
+        else:
+            try:
+                spec_result = spec_fn(outcome.value, *point.args, **point.kwargs)
+                if isinstance(spec_result, bool):
+                    passed = spec_result
+                    if passed:
+                        detail = (
+                            f"runtime witness accepted result={outcome.value!r} "
+                            f"on declared cover[{index}]"
+                        )
+                    else:
+                        detail = (
+                            f"{payload['spec_function']} returned False for "
+                            f"result={outcome.value!r} on declared cover[{index}]"
+                        )
+                else:
+                    detail = (
+                        f"{payload['spec_function']} returned {type(spec_result).__name__}, "
+                        "not bool"
+                    )
+                if not passed:
+                    witness_payload = {
+                        "coordinate": coordinate,
+                        "cover_index": index,
+                        "input_point": point.to_dict(),
+                        "outcome": {
+                            "tag": outcome.tag,
+                            "value": outcome.value,
+                        },
+                        "message": detail,
+                    }
+            except Exception as exc:
+                detail = (
+                    f"{payload['spec_function']} raised {type(exc).__name__}: {exc}"
+                )
+                witness_payload = {
+                    "coordinate": coordinate,
+                    "cover_index": index,
+                    "input_point": point.to_dict(),
+                    "outcome": {
+                        "tag": outcome.tag,
+                        "value": outcome.value,
+                    },
+                    "message": detail,
+                }
+
+        if passed:
+            satisfied_count += 1
+            per_clause_trust.append("RUNTIME_WITNESSED")
+        else:
+            residual = (
+                f"runtime obligation remains open at {coordinate}: {detail}"
+            )
+            obstruction = f"[{coordinate}] {detail}"
+            residuals.append(residual)
+            obstructions.append(obstruction)
+            per_clause_trust.append("CONTRADICTED")
+            if witness_payload is not None:
+                witnesses.append(witness_payload)
+
+        clauses_out.append({
+            "text": text,
+            "pass": passed,
+            "status": "SETTLED" if passed else "FAIL",
+            "detail": detail,
+            "coordinate": coordinate,
+            "cohomology_class": (
+                ""
+                if passed else
+                f"H1/specification-obstruction/{payload['entrypoint']}/cover[{index}]"
+            ),
+            "input_point": point.to_dict(),
+        })
+
+    total = len(points) or 1
+    satisfied = satisfied_count == len(points)
+    if strict and residuals:
+        satisfied = False
+
+    return {
+        "spec_file": str(spec_path),
+        "program": str(program_path),
+        "satisfied": satisfied,
+        "trust_level": round(satisfied_count / total, 4),
+        "clauses": clauses_out,
+        "residual_obligations": residuals,
+        "obstructions": obstructions,
+        "trust_info": {
+            "settled_ratio": round(satisfied_count / total, 4),
+            "settled_count": satisfied_count,
+            "total_count": len(points),
+            "aggregate_label": (
+                "RUNTIME_WITNESSED" if satisfied else "CONTRADICTED"
+            ),
+            "per_clause_trust": per_clause_trust,
+        },
+        "certificates": [],
+        "descent_summary": (
+            f"declared cover satisfied on {satisfied_count}/{len(points)} "
+            "points"
+        ),
+        "witnesses": witnesses,
+        "mode": "runtime-declared-cover",
+        "entrypoint": payload["entrypoint"],
+        "spec_function": payload["spec_function"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -1502,6 +1743,16 @@ def run_spec(args: argparse.Namespace) -> int:
     )
 
     report: dict[str, Any] | None = None
+
+    runtime_report = _run_runtime_cover_pipeline(
+        spec_path,
+        program_path,
+        strict,
+        verbose,
+    )
+    if runtime_report is not None:
+        _emit(runtime_report, fmt)
+        return 0 if runtime_report["satisfied"] else 1
 
     # ── Try rich problem_modes spec check first ──────────────────────
     try:

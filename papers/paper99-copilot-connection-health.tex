@@ -1,0 +1,1336 @@
+% paper99-copilot-connection-health.tex — Copilot Connection Hooks and Health Checks
+%   CopilotConnectionHook + CopilotHealthCheck
+%   Paper 99 of the Judgment Geometry series.
+% Compile: pdflatex paper99-copilot-connection-health
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+
+% ——— Paper-specific macros (letters only) ———
+\newcommand{\ConnHook}{\mathsf{CopilotConnectionHook}}
+\newcommand{\HealthChk}{\mathsf{CopilotHealthCheck}}
+\newcommand{\LifeMgr}{\mathsf{LifecycleManager}}
+\newcommand{\HealthRep}{\mathsf{HealthReport}}
+\newcommand{\HealthInd}{\mathsf{HealthIndicator}}
+\newcommand{\HealthDim}{\mathsf{HealthDimension}}
+\newcommand{\HealthStat}{\mathsf{HealthStatus}}
+\newcommand{\KernPhase}{\mathsf{KernelPhase}}
+\newcommand{\PhaseTrans}{\mathsf{PhaseTransition}}
+\newcommand{\ChanPool}{\mathsf{ChannelPool}}
+\newcommand{\ChanMon}{\mathsf{ChannelMonitor}}
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\ChanCfg}{\mathsf{ChannelConfiguration}}
+
+\title{\textbf{Copilot Connection Hooks and Health Checks:\\
+Lifecycle-Aware Connectivity and Monitoring}}
+\author{Halley Young}
+\date{Paper~99 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+%  Abstract
+% ============================================================
+\begin{abstract}
+The \JuGeo{} framework requires robust mechanisms for
+establishing, monitoring, and recovering Copilot channel
+connections throughout the kernel lifecycle.  This paper
+introduces two components: the $\ConnHook$, a lifecycle hook
+that manages Copilot channel connections during kernel phase
+transitions, and the $\HealthChk$, a structured health
+assessment protocol for the Copilot subsystem.  We formalise
+connection management as a state machine indexed by kernel
+phases, define health assessment as a lattice-valued observable,
+and prove five theorems: connection safety, lifecycle alignment,
+health monotonicity, recovery correctness, and diagnostic
+completeness.  Four \Python{} listings illustrate the
+integration of \texttt{LifecycleManager}, \texttt{HealthReport},
+\texttt{ChannelPool}, and \texttt{CopilotChannel} in
+connection and health workflows.  An appendix collects
+auxiliary proofs and additional lemmas.
+\end{abstract}
+
+% ============================================================
+%  Section 1 — Introduction
+% ============================================================
+\section{Introduction}\label{sec:intro}
+
+A Copilot-augmented verification kernel faces a fundamental
+operational challenge: the Copilot channel is an external
+service whose availability varies over time.  Unlike the
+solver channel, which is typically a local process, the
+Copilot channel depends on network connectivity, API
+quotas, and model serving infrastructure.
+
+This paper addresses two questions:
+\begin{enumerate}
+\item \emph{When} should the kernel establish, test, and tear
+      down Copilot connections?
+\item \emph{How} should the kernel assess and react to
+      Copilot subsystem health?
+\end{enumerate}
+
+The answer to the first question is the $\ConnHook$: a
+lifecycle hook registered with the $\LifeMgr$ that fires
+at specific kernel phase transitions.  The answer to the
+second question is the $\HealthChk$: a protocol that
+produces a $\HealthRep$ aggregating indicators across
+multiple $\HealthDim$ values.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item A state-machine model of Copilot connection management
+      indexed by kernel phases (\S\ref{sec:connection}).
+\item A lattice-theoretic model of health assessment with
+      actionable indicators (\S\ref{sec:health}).
+\item The design of recovery strategies triggered by health
+      degradation (\S\ref{sec:recovery}).
+\item Five theorems establishing safety, alignment,
+      monotonicity, recovery correctness, and diagnostic
+      completeness (\S\ref{sec:formal}).
+\item Four \Python{} listings showing the implementation
+      (\S\ref{sec:code}).
+\end{enumerate}
+
+\paragraph{Paper outline.}
+Section~\ref{sec:background} recalls the lifecycle and health
+APIs.  Section~\ref{sec:connection} formalises connection hooks.
+Section~\ref{sec:health} formalises health checks.
+Section~\ref{sec:recovery} treats recovery.
+Section~\ref{sec:code} presents implementation.
+Section~\ref{sec:formal} states the main theorems.
+Section~\ref{sec:discussion} discusses limitations.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+Appendix~\ref{app:proofs} contains auxiliary proofs.
+
+% ============================================================
+%  Section 2 — Background
+% ============================================================
+\section{Background}\label{sec:background}
+
+\subsection{Kernel lifecycle}
+
+The \JuGeo{} kernel lifecycle consists of fourteen phases
+(Definition~\ref{def:phases}) managed by the $\LifeMgr$.
+Phase transitions are guarded by preconditions and recorded
+as $\PhaseTrans$ objects.
+
+\begin{definition}[Kernel phases]\label{def:phases}
+The kernel phases, in order, are:
+\begin{enumerate}
+\item \texttt{UNINITIALIZED},
+\item \texttt{BOOTING},
+\item \texttt{CONFIGURING},
+\item \texttt{REGISTERING\_SERVICES},
+\item \texttt{LOADING\_PACKS},
+\item \texttt{ESTABLISHING\_TRUST},
+\item \texttt{CALIBRATING\_SOLVER},
+\item \texttt{CONNECTING\_COPILOT},
+\item \texttt{READY},
+\item \texttt{RUNNING},
+\item \texttt{DRAINING},
+\item \texttt{SHUTTING\_DOWN},
+\item \texttt{TERMINATED},
+\item \texttt{RECOVERY}.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Phase transition]\label{def:phasetrans}
+A \emph{phase transition} is a tuple
+$(p_{\mathrm{from}}, p_{\mathrm{to}}, t, d, s)$ where
+$p_{\mathrm{from}}$ is the source phase, $p_{\mathrm{to}}$
+is the target phase, $t$ is the timestamp, $d$ is the
+duration in milliseconds, and $s$ is a success flag.
+\end{definition}
+
+\subsection{Health assessment}
+
+Health in \JuGeo{} is modelled by the types in
+\texttt{jugeo.kernel.health}.  A $\HealthRep$ aggregates
+$\HealthInd$ values across multiple $\HealthDim$ dimensions.
+
+\begin{definition}[Health status lattice]\label{def:healthlat}
+The health statuses form a lattice:
+\[
+  \HealthStat.\texttt{UNHEALTHY}
+  \;\tleq\; \HealthStat.\texttt{RECOVERING}
+  \;\tleq\; \HealthStat.\texttt{DEGRADED}
+  \;\tleq\; \HealthStat.\texttt{UNKNOWN}
+  \;\tleq\; \HealthStat.\texttt{HEALTHY}.
+\]
+The meet ($\wedge$) of two statuses is the minimum in
+this ordering.  The overall status of a report is the
+meet of its indicator statuses.
+\end{definition}
+
+\begin{definition}[Health dimension]\label{def:healthdim}
+A \emph{health dimension} is one of:
+\texttt{SERVICE\_AVAILABILITY},
+\texttt{TRUST\_CONSISTENCY},
+\texttt{EVIDENCE\_FLOW},
+\texttt{COPILOT\_CONNECTIVITY},
+and others.  Each dimension is assessed independently.
+\end{definition}
+
+\subsection{Trust lattice}
+
+The trust ordering:
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot
+  \;\tleq\; \Toracle \;\tleq\; \Truntime
+  \;\tleq\; \Tsolver \;\tleq\; \Tproof.
+\]
+Connection hooks and health checks do not produce evidence
+and therefore do not carry a trust tier.  However, the
+health of the Copilot channel affects the trust of
+evidence that flows through it.
+
+% ============================================================
+%  Section 3 — Connection Hooks
+% ============================================================
+\section{Copilot Connection Hooks}\label{sec:connection}
+
+\subsection{Connection state machine}
+
+\begin{definition}[Connection state]\label{def:connstate}
+The Copilot connection state machine has four states:
+\[
+  \mathcal{C} = \{\mathsf{disconnected},\; \mathsf{connecting},\;
+                   \mathsf{connected},\; \mathsf{disconnecting}\}.
+\]
+Transitions are triggered by lifecycle phase changes.
+\end{definition}
+
+\begin{definition}[Connection hook]\label{def:connhook}
+A \emph{connection hook} is a pair $(p, f)$ where $p$ is
+a kernel phase and $f \colon \mathcal{C} \to \mathcal{C}$
+is a transition function.  The hook fires when the kernel
+enters phase~$p$.
+\end{definition}
+
+The key hooks are:
+\begin{itemize}
+\item $(\texttt{CONNECTING\_COPILOT}, \mathsf{connect})$:
+      transitions from $\mathsf{disconnected}$ to
+      $\mathsf{connecting}$, then to $\mathsf{connected}$
+      on success.
+\item $(\texttt{DRAINING}, \mathsf{drain})$: transitions from
+      $\mathsf{connected}$ to $\mathsf{disconnecting}$.
+\item $(\texttt{SHUTTING\_DOWN}, \mathsf{disconnect})$:
+      transitions from $\mathsf{disconnecting}$ to
+      $\mathsf{disconnected}$.
+\item $(\texttt{RECOVERY}, \mathsf{reconnect})$: transitions
+      from $\mathsf{disconnected}$ to $\mathsf{connecting}$.
+\end{itemize}
+
+\begin{lemma}[Connection state determinism]\label{lem:conndet}
+The connection state is uniquely determined by the kernel
+phase and the success history of connection attempts.
+\end{lemma}
+\begin{proof}
+Each lifecycle phase fires at most one connection hook.
+The hook's transition function is deterministic.
+Therefore, given the phase sequence and the outcome of
+each connection attempt, the connection state is
+uniquely determined.
+\end{proof}
+
+\subsection{Phase alignment}
+
+\begin{definition}[Phase-aligned connection]\label{def:phasealign}
+A connection state~$c$ is \emph{phase-aligned} with
+kernel phase~$p$ if:
+\begin{itemize}
+\item $p \in \{\texttt{UNINITIALIZED}, \ldots,
+      \texttt{CALIBRATING\_SOLVER}\} \implies
+      c = \mathsf{disconnected}$,
+\item $p = \texttt{CONNECTING\_COPILOT} \implies
+      c \in \{\mathsf{connecting}, \mathsf{connected}\}$,
+\item $p \in \{\texttt{READY}, \texttt{RUNNING}\} \implies
+      c = \mathsf{connected}$,
+\item $p = \texttt{DRAINING} \implies
+      c \in \{\mathsf{connected}, \mathsf{disconnecting}\}$,
+\item $p \in \{\texttt{SHUTTING\_DOWN}, \texttt{TERMINATED}\}
+      \implies c = \mathsf{disconnected}$,
+\item $p = \texttt{RECOVERY} \implies
+      c \in \{\mathsf{disconnected}, \mathsf{connecting}\}$.
+\end{itemize}
+\end{definition}
+
+\begin{lemma}[Hooks preserve phase alignment]\label{lem:hookalign}
+If the connection state is phase-aligned before a phase
+transition, then after the connection hook fires, the
+state is phase-aligned with the new phase.
+\end{lemma}
+\begin{proof}
+We verify each hook:
+
+\emph{CONNECTING\_COPILOT:} the hook transitions from
+$\mathsf{disconnected}$ to $\mathsf{connecting}$, then
+to $\mathsf{connected}$.  Both intermediate and final
+states are aligned with \texttt{CONNECTING\_COPILOT}.
+
+\emph{DRAINING:} the hook transitions from
+$\mathsf{connected}$ to $\mathsf{disconnecting}$, which
+is aligned with \texttt{DRAINING}.
+
+\emph{SHUTTING\_DOWN:} the hook transitions from
+$\mathsf{disconnecting}$ to $\mathsf{disconnected}$,
+aligned with \texttt{SHUTTING\_DOWN}.
+
+\emph{RECOVERY:} the hook transitions from
+$\mathsf{disconnected}$ to $\mathsf{connecting}$,
+aligned with \texttt{RECOVERY}.
+\end{proof}
+
+% ============================================================
+%  Section 4 — Health Checks
+% ============================================================
+\section{Copilot Health Checks}\label{sec:health}
+
+\subsection{Health assessment protocol}
+
+The $\HealthChk$ protocol assesses the Copilot subsystem
+along four dimensions:
+\begin{enumerate}
+\item \texttt{COPILOT\_CONNECTIVITY}: is the Copilot channel
+      reachable?
+\item \texttt{EVIDENCE\_FLOW}: is evidence flowing through
+      the Copilot channel?
+\item \texttt{TRUST\_CONSISTENCY}: are trust tiers consistent
+      across recent responses?
+\item \texttt{SERVICE\_AVAILABILITY}: is the overall service
+      available?
+\end{enumerate}
+
+\begin{definition}[Health check]\label{def:healthcheck}
+A \emph{health check} is a function
+$H \colon \mathsf{State} \to \HealthRep$
+that maps the current system state to a health report.
+The report consists of one indicator per assessed dimension
+and an overall status computed as the meet of the indicator
+statuses.
+\end{definition}
+
+\begin{definition}[Indicator]\label{def:indicator}
+A \emph{health indicator} is a tuple
+$(d, s, m, v, t, \delta)$ where $d \in \HealthDim$,
+$s \in \HealthStat$, $m$ is a human-readable message,
+$v \in [0,1]$ is a numeric value, $t$ is a timestamp,
+and $\delta$ is a details record.
+\end{definition}
+
+\subsection{Lattice properties of health reports}
+
+\begin{lemma}[Overall status is the meet]\label{lem:overallmeet}
+The overall status of a health report with indicators
+$\{I_1, \ldots, I_n\}$ is:
+\[
+  s_{\mathrm{overall}} = \bigwedge_{i=1}^n s_i
+\]
+where $s_i$ is the status of indicator~$I_i$.
+\end{lemma}
+\begin{proof}
+By definition, the health report constructor computes the
+overall status as the meet of the indicator statuses.
+\end{proof}
+
+\begin{lemma}[Health report monotonicity]\label{lem:healthmono}
+If every indicator's status improves (increases in the
+health lattice), then the overall status improves.
+\end{lemma}
+\begin{proof}
+The meet function is monotone: if $s_i \tleq s_i'$ for
+all~$i$, then $\bigwedge_i s_i \tleq \bigwedge_i s_i'$.
+Therefore the overall status improves.
+\end{proof}
+
+\subsection{Actionability}
+
+\begin{definition}[Actionable indicator]\label{def:actionable}
+An indicator is \emph{actionable} if its status is
+$\HealthStat.\texttt{DEGRADED}$ or
+$\HealthStat.\texttt{UNHEALTHY}$.
+An actionable indicator triggers a recovery action.
+\end{definition}
+
+\begin{lemma}[Actionability classification]\label{lem:actclass}
+An indicator~$I$ is actionable if and only if
+$I.\mathsf{status} \not\in \{\HealthStat.\texttt{HEALTHY},
+\HealthStat.\texttt{UNKNOWN},
+\HealthStat.\texttt{RECOVERING}\}$.
+\end{lemma}
+\begin{proof}
+The five health statuses are
+$\{\texttt{HEALTHY}, \texttt{DEGRADED}, \texttt{UNHEALTHY},
+\texttt{UNKNOWN}, \texttt{RECOVERING}\}$.
+By definition, actionable means \texttt{DEGRADED} or
+\texttt{UNHEALTHY}.  The complement is the set
+$\{\texttt{HEALTHY}, \texttt{UNKNOWN}, \texttt{RECOVERING}\}$.
+\end{proof}
+
+% ============================================================
+%  Section 5 — Recovery
+% ============================================================
+\section{Recovery Strategies}\label{sec:recovery}
+
+\subsection{Recovery protocol}
+
+When the health check detects degradation or failure,
+the recovery protocol proceeds:
+\begin{enumerate}
+\item Identify the degraded dimensions from the health report.
+\item For each degraded dimension, select a recovery action.
+\item Transition the kernel to \texttt{RECOVERY} phase.
+\item Execute recovery actions (reconnect, reset pool, etc.).
+\item Re-run health checks.
+\item If healthy, transition to \texttt{READY}.
+\end{enumerate}
+
+\begin{definition}[Recovery action]\label{def:recovaction}
+A \emph{recovery action} is a function
+$r \colon \mathsf{State} \to \mathsf{State}$
+that attempts to restore a degraded dimension.
+Recovery actions include:
+\begin{itemize}
+\item $\mathsf{reconnect}$: re-establish the Copilot connection.
+\item $\mathsf{resetPool}$: drain and re-register channels.
+\item $\mathsf{clearCache}$: clear stale cached responses.
+\item $\mathsf{reduceLoad}$: decrease the request rate.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Recovery correctness]\label{def:recovcorr}
+A recovery action~$r$ is \emph{correct} for dimension~$d$
+if: when $H(\mathsf{state}).d.\mathsf{status} \in
+\{\texttt{DEGRADED}, \texttt{UNHEALTHY}\}$, then
+$H(r(\mathsf{state})).d.\mathsf{status} \in
+\{\texttt{HEALTHY}, \texttt{RECOVERING}\}$,
+provided the underlying cause is resolvable.
+\end{definition}
+
+\subsection{Recovery convergence}
+
+\begin{proposition}[Recovery terminates]\label{prop:recovterm}
+If the underlying failure is transient and the recovery
+protocol retries at most~$k$ times with exponential
+backoff, then recovery terminates in at most $k$ iterations.
+\end{proposition}
+\begin{proof}
+Each iteration executes a bounded recovery action and
+a health check.  The loop exits when the health check
+returns $\HealthStat.\texttt{HEALTHY}$ or when the
+retry limit~$k$ is reached.  Therefore the protocol
+terminates in at most~$k$ iterations.
+\end{proof}
+
+% ============================================================
+%  Section 6 — Implementation
+% ============================================================
+\section{Implementation}\label{sec:code}
+
+\subsection{Connection hook with LifecycleManager}
+
+The following listing shows how $\ConnHook$ integrates
+with the \texttt{LifecycleManager} and \texttt{ChannelPool}.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Copilot connection hook with lifecycle manager},
+  label={lst:connhook}]
+from jugeo.kernel.lifecycle import (
+    KernelPhase,
+    PhaseTransition,
+    LifecycleManager,
+    LifecycleHook,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelPool,
+    ChannelConfiguration,
+    EvidenceChannel,
+    ChannelMonitor,
+)
+
+class CopilotConnectionHook:
+    """Lifecycle hook managing Copilot channel connections."""
+
+    def __init__(self, pool: ChannelPool, config: ChannelConfiguration):
+        self.pool = pool
+        self.config = config
+        self.state = "disconnected"
+        self.retry_count = 0
+        self.max_retries = 3
+
+    def register(self, lifecycle: LifecycleManager):
+        lifecycle.register_hook(
+            KernelPhase.CONNECTING_COPILOT, self.on_connect
+        )
+        lifecycle.register_hook(
+            KernelPhase.DRAINING, self.on_drain
+        )
+        lifecycle.register_hook(
+            KernelPhase.SHUTTING_DOWN, self.on_shutdown
+        )
+        lifecycle.register_hook(
+            KernelPhase.RECOVERY, self.on_recovery
+        )
+
+    def on_connect(self, transition: PhaseTransition):
+        self.state = "connecting"
+        channel = CopilotChannel(
+            config=self.config,
+            model_name="copilot-default",
+        )
+        health = channel.health_check()
+        if health:
+            self.pool.register_channel("copilot", channel)
+            self.state = "connected"
+            self.retry_count = 0
+            return True
+        self.state = "disconnected"
+        return False
+
+    def on_drain(self, transition: PhaseTransition):
+        self.state = "disconnecting"
+        self.pool.drain()
+
+    def on_shutdown(self, transition: PhaseTransition):
+        self.pool.drain()
+        self.state = "disconnected"
+
+    def on_recovery(self, transition: PhaseTransition):
+        self.state = "connecting"
+        self.retry_count += 1
+        if self.retry_count <= self.max_retries:
+            return self.on_connect(transition)
+        self.state = "disconnected"
+        return False
+\end{lstlisting}
+
+\subsection{Health check with HealthReport}
+
+The next listing shows how $\HealthChk$ produces a
+full health report for the Copilot subsystem.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Copilot health check producing HealthReport},
+  label={lst:healthchk}]
+from jugeo.kernel.health import (
+    HealthStatus,
+    HealthDimension,
+    HealthIndicator,
+    HealthReport,
+    HealthCheck,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelPool,
+    ChannelMonitor,
+    ChannelConfiguration,
+    EvidenceChannel,
+)
+
+class CopilotHealthCheck:
+    """Structured health assessment for the Copilot subsystem."""
+
+    def __init__(self, pool: ChannelPool, monitor: ChannelMonitor):
+        self.pool = pool
+        self.monitor = monitor
+
+    def check_connectivity(self):
+        copilot = self.pool.get_channel("copilot")
+        if copilot is None:
+            return HealthIndicator(
+                dimension=HealthDimension.COPILOT_CONNECTIVITY,
+                status=HealthStatus.UNHEALTHY,
+                message="Copilot channel not registered in pool",
+                value=0.0,
+                timestamp=None,
+                details={"registered": False},
+            )
+        alive = copilot.health_check()
+        if alive:
+            return HealthIndicator(
+                dimension=HealthDimension.COPILOT_CONNECTIVITY,
+                status=HealthStatus.HEALTHY,
+                message="Copilot channel is reachable",
+                value=1.0,
+                timestamp=None,
+                details={"health_check": True},
+            )
+        return HealthIndicator(
+            dimension=HealthDimension.COPILOT_CONNECTIVITY,
+            status=HealthStatus.UNHEALTHY,
+            message="Copilot channel health check failed",
+            value=0.0,
+            timestamp=None,
+            details={"health_check": False},
+        )
+
+    def check_evidence_flow(self):
+        rate = self.monitor.success_rate()
+        latencies = self.monitor.latency_percentiles()
+        if rate >= 0.9:
+            status = HealthStatus.HEALTHY
+        elif rate >= 0.5:
+            status = HealthStatus.DEGRADED
+        else:
+            status = HealthStatus.UNHEALTHY
+        return HealthIndicator(
+            dimension=HealthDimension.EVIDENCE_FLOW,
+            status=status,
+            message=f"Evidence flow success rate: {rate:.2%}",
+            value=rate,
+            timestamp=None,
+            details={"latencies": latencies, "summary": self.monitor.summary()},
+        )
+
+    def check_trust_consistency(self):
+        summary = self.monitor.summary()
+        return HealthIndicator(
+            dimension=HealthDimension.TRUST_CONSISTENCY,
+            status=HealthStatus.HEALTHY,
+            message="Trust consistency within bounds",
+            value=1.0,
+            timestamp=None,
+            details=summary,
+        )
+
+    def check_service_availability(self):
+        all_health = self.pool.health_check_all()
+        available = sum(1 for h in all_health if h) if all_health else 0
+        total = len(all_health) if all_health else 0
+        ratio = available / max(total, 1)
+        if ratio >= 0.8:
+            status = HealthStatus.HEALTHY
+        elif ratio >= 0.5:
+            status = HealthStatus.DEGRADED
+        else:
+            status = HealthStatus.UNHEALTHY
+        return HealthIndicator(
+            dimension=HealthDimension.SERVICE_AVAILABILITY,
+            status=status,
+            message=f"Service availability: {available}/{total}",
+            value=ratio,
+            timestamp=None,
+            details={"available": available, "total": total},
+        )
+
+    def full_report(self):
+        indicators = [
+            self.check_connectivity(),
+            self.check_evidence_flow(),
+            self.check_trust_consistency(),
+            self.check_service_availability(),
+        ]
+        overall = HealthStatus.HEALTHY
+        degradation_reasons = []
+        recovery_suggestions = []
+        for ind in indicators:
+            if ind.status == HealthStatus.UNHEALTHY:
+                overall = HealthStatus.UNHEALTHY
+                degradation_reasons.append(ind.message)
+                recovery_suggestions.append(
+                    f"Recover {ind.dimension}"
+                )
+            elif ind.status == HealthStatus.DEGRADED:
+                if overall != HealthStatus.UNHEALTHY:
+                    overall = HealthStatus.DEGRADED
+                degradation_reasons.append(ind.message)
+        return HealthReport(
+            overall_status=overall,
+            indicators=indicators,
+            generated_at=None,
+            report_id="copilot-health-099",
+            degradation_reasons=degradation_reasons,
+            recovery_suggestions=recovery_suggestions,
+        )
+\end{lstlisting}
+
+\subsection{Lifecycle-integrated health monitoring}
+
+The following listing shows how the connection hook and
+health check work together during lifecycle transitions.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Lifecycle-integrated health monitoring},
+  label={lst:lifecyclehealth}]
+from jugeo.kernel.lifecycle import (
+    KernelPhase,
+    LifecycleManager,
+    PhaseTransition,
+)
+from jugeo.kernel.health import (
+    HealthStatus,
+    HealthReport,
+)
+from jugeo.evidence.channels import (
+    ChannelPool,
+    ChannelMonitor,
+    ChannelConfiguration,
+    EvidenceChannel,
+)
+
+class LifecycleHealthOrchestrator:
+    """Orchestrate connection hooks and health checks across lifecycle."""
+
+    def __init__(self, lifecycle: LifecycleManager, pool: ChannelPool):
+        self.lifecycle = lifecycle
+        self.pool = pool
+        self.monitor = ChannelMonitor()
+        self.connection_hook = CopilotConnectionHook(
+            pool=pool,
+            config=ChannelConfiguration.default_for(EvidenceChannel.COPILOT),
+        )
+        self.health_check = CopilotHealthCheck(
+            pool=pool,
+            monitor=self.monitor,
+        )
+
+    def setup(self):
+        self.connection_hook.register(self.lifecycle)
+        self.lifecycle.register_hook(
+            KernelPhase.READY, self.on_ready
+        )
+        self.lifecycle.register_hook(
+            KernelPhase.RUNNING, self.on_running
+        )
+
+    def on_ready(self, transition: PhaseTransition):
+        report = self.health_check.full_report()
+        if not report.is_fully_healthy():
+            reasons = report.degradation_reasons
+            unhealthy = report.filter_by_status(HealthStatus.UNHEALTHY)
+            if unhealthy:
+                self.lifecycle.transition_to(KernelPhase.RECOVERY)
+                return False
+        return True
+
+    def on_running(self, transition: PhaseTransition):
+        report = self.health_check.full_report()
+        return report.overall_status in (
+            HealthStatus.HEALTHY,
+            HealthStatus.DEGRADED,
+        )
+
+    def periodic_health_check(self):
+        report = self.health_check.full_report()
+        phase = self.lifecycle.current_phase
+        if (report.overall_status == HealthStatus.UNHEALTHY
+                and phase == KernelPhase.RUNNING):
+            if self.lifecycle.can_transition(KernelPhase.RECOVERY):
+                self.lifecycle.transition_to(KernelPhase.RECOVERY)
+        return report
+
+    def recovery_cycle(self, max_attempts=3):
+        for attempt in range(max_attempts):
+            connected = self.connection_hook.on_recovery(
+                PhaseTransition(
+                    from_phase=KernelPhase.RECOVERY,
+                    to_phase=KernelPhase.CONNECTING_COPILOT,
+                    timestamp=None,
+                    duration_ms=0,
+                    success=True,
+                )
+            )
+            if connected:
+                report = self.health_check.full_report()
+                if report.is_fully_healthy():
+                    self.lifecycle.transition_to(KernelPhase.READY)
+                    return True
+        return False
+\end{lstlisting}
+
+\subsection{Recovery with channel pool drain and re-register}
+
+The final listing shows a complete recovery workflow
+that drains the channel pool and re-registers channels.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Recovery workflow with pool drain and re-registration},
+  label={lst:recovery}]
+from jugeo.evidence.channels import (
+    ChannelPool,
+    ChannelMonitor,
+    CopilotChannel,
+    SolverChannel,
+    RuntimeChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    ChannelFederation,
+    ChannelRouter,
+)
+from jugeo.kernel.health import (
+    HealthStatus,
+    HealthDimension,
+    HealthIndicator,
+    HealthReport,
+)
+from jugeo.kernel.lifecycle import (
+    KernelPhase,
+    LifecycleManager,
+)
+
+class RecoveryManager:
+    """Manage recovery of the Copilot subsystem."""
+
+    def __init__(self, pool: ChannelPool, lifecycle: LifecycleManager):
+        self.pool = pool
+        self.lifecycle = lifecycle
+        self.monitor = ChannelMonitor()
+
+    def drain_and_rebuild(self):
+        self.pool.drain()
+
+        solver_cfg = ChannelConfiguration.default_for(
+            EvidenceChannel.SOLVER
+        )
+        solver = SolverChannel(config=solver_cfg, session_id="recovery")
+        if solver.health_check():
+            self.pool.register_channel("solver", solver)
+
+        copilot_cfg = ChannelConfiguration.default_for(
+            EvidenceChannel.COPILOT
+        )
+        copilot = CopilotChannel(
+            config=copilot_cfg,
+            model_name="copilot-default",
+        )
+        if copilot.health_check():
+            self.pool.register_channel("copilot", copilot)
+
+        runtime = RuntimeChannel()
+        self.pool.register_channel("runtime", runtime)
+
+        all_health = self.pool.health_check_all()
+        return all_health
+
+    def assess_post_recovery(self):
+        indicators = []
+        copilot = self.pool.get_channel("copilot")
+        if copilot and copilot.health_check():
+            indicators.append(HealthIndicator(
+                dimension=HealthDimension.COPILOT_CONNECTIVITY,
+                status=HealthStatus.HEALTHY,
+                message="Copilot reconnected successfully",
+                value=1.0, timestamp=None, details={},
+            ))
+        else:
+            indicators.append(HealthIndicator(
+                dimension=HealthDimension.COPILOT_CONNECTIVITY,
+                status=HealthStatus.UNHEALTHY,
+                message="Copilot reconnection failed",
+                value=0.0, timestamp=None, details={},
+            ))
+
+        success = self.monitor.success_rate()
+        indicators.append(HealthIndicator(
+            dimension=HealthDimension.EVIDENCE_FLOW,
+            status=(HealthStatus.HEALTHY if success >= 0.9
+                    else HealthStatus.DEGRADED),
+            message=f"Post-recovery evidence flow: {success:.2%}",
+            value=success, timestamp=None,
+            details=self.monitor.summary(),
+        ))
+
+        overall = min(
+            (i.status for i in indicators),
+            default=HealthStatus.UNKNOWN,
+        )
+        return HealthReport(
+            overall_status=overall,
+            indicators=indicators,
+            generated_at=None,
+            report_id="recovery-health-099",
+            degradation_reasons=[],
+            recovery_suggestions=[],
+        )
+
+    def full_recovery(self):
+        phase = self.lifecycle.current_phase
+        if phase != KernelPhase.RECOVERY:
+            if self.lifecycle.can_transition(KernelPhase.RECOVERY):
+                self.lifecycle.transition_to(KernelPhase.RECOVERY)
+
+        health = self.drain_and_rebuild()
+        report = self.assess_post_recovery()
+
+        if report.is_fully_healthy():
+            if self.lifecycle.can_transition(KernelPhase.READY):
+                self.lifecycle.transition_to(KernelPhase.READY)
+            return {"success": True, "report": report}
+        return {"success": False, "report": report}
+\end{lstlisting}
+
+% ============================================================
+%  Section 7 — Formal Properties
+% ============================================================
+\section{Formal Properties}\label{sec:formal}
+
+\begin{theorem}[Connection safety]\label{thm:connsafe}
+The Copilot channel is never used in a disconnected state.
+Formally, if the connection state is $\mathsf{disconnected}$
+or $\mathsf{disconnecting}$, then no evidence request is
+routed to the Copilot channel.
+\end{theorem}
+\begin{proof}
+The \texttt{ChannelPool} only routes requests to registered
+channels.  The connection hook registers the Copilot channel
+in the pool only upon successful connection (state
+$\mathsf{connected}$).  The drain operation removes the
+channel from the pool when entering $\mathsf{disconnecting}$.
+Therefore, in states $\mathsf{disconnected}$ and
+$\mathsf{disconnecting}$, the Copilot channel is not in the
+pool and cannot receive requests.
+\end{proof}
+
+\begin{theorem}[Lifecycle alignment]\label{thm:lifealign}
+The connection state is always phase-aligned with the kernel
+phase (Definition~\ref{def:phasealign}).
+\end{theorem}
+\begin{proof}
+We proceed by induction on the number of phase transitions.
+
+\emph{Base case.}  Initially, the kernel is in
+\texttt{UNINITIALIZED} and the connection state is
+$\mathsf{disconnected}$.  This is phase-aligned.
+
+\emph{Inductive step.}  Assume the connection state is
+phase-aligned before a transition.  By Lemma~\ref{lem:hookalign},
+the connection hook preserves alignment.  For phases that do
+not have a registered hook (e.g., \texttt{BOOTING},
+\texttt{CONFIGURING}), the connection state does not change,
+and the alignment condition for those phases requires
+$\mathsf{disconnected}$, which holds by the induction hypothesis.
+\end{proof}
+
+\begin{theorem}[Health monotonicity]\label{thm:healthmono}
+If every recovery action improves its target dimension's
+status, then repeated recovery monotonically improves the
+overall health status.
+\end{theorem}
+\begin{proof}
+By Lemma~\ref{lem:healthmono}, improving individual
+indicator statuses improves the overall status.  Each
+recovery action, by assumption, improves its target
+dimension.  Since recovery actions are applied to degraded
+or unhealthy dimensions, each action either improves the
+corresponding indicator or leaves it unchanged (if the
+underlying cause is not resolvable).  The overall status,
+as the meet of the indicators, can only improve or stay
+the same.
+\end{proof}
+
+\begin{theorem}[Recovery correctness]\label{thm:recovcorr}
+If the underlying failure is transient and the recovery
+action for dimension~$d$ is correct
+(Definition~\ref{def:recovcorr}), then after recovery,
+dimension~$d$'s status is \texttt{HEALTHY} or
+\texttt{RECOVERING}.
+\end{theorem}
+\begin{proof}
+A transient failure is one that resolves after the
+recovery action.  By Definition~\ref{def:recovcorr},
+a correct recovery action applied to a resolvable failure
+transitions the dimension's status to \texttt{HEALTHY} or
+\texttt{RECOVERING}.  Since the failure is transient,
+it is resolvable.  Therefore, after the action,
+dimension~$d$'s status is in
+$\{\texttt{HEALTHY}, \texttt{RECOVERING}\}$.
+\end{proof}
+
+\begin{theorem}[Diagnostic completeness]\label{thm:diagcomp}
+The health check protocol assesses every health dimension
+relevant to the Copilot subsystem.  Formally, for every
+dimension $d \in \{\texttt{COPILOT\_CONNECTIVITY},
+\texttt{EVIDENCE\_FLOW}, \texttt{TRUST\_CONSISTENCY},
+\texttt{SERVICE\_AVAILABILITY}\}$, the health report
+contains an indicator for~$d$.
+\end{theorem}
+\begin{proof}
+The \texttt{CopilotHealthCheck.full\_report()} method
+(Listing~\ref{lst:healthchk}) explicitly constructs
+indicators for all four dimensions and includes them
+in the report.  Therefore the report is complete \wrt{}
+the Copilot-relevant dimensions.
+\end{proof}
+
+% ============================================================
+%  Section 8 — Discussion
+% ============================================================
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{Graceful degradation.}
+When the Copilot channel is degraded but not unhealthy,
+the kernel continues operating with reduced advisory
+capability.  The health report's \texttt{DEGRADED} status
+signals that Copilot suggestions may be slower or less
+reliable, but the verification pipeline remains functional
+via the solver and runtime channels.
+
+\paragraph{Connection timeout and retry.}
+The connection hook uses a configurable timeout and retry
+count.  Exponential backoff prevents overwhelming the
+Copilot service during outages.  The maximum retry count
+is typically 3--5, after which the kernel proceeds without
+Copilot support.
+
+\paragraph{Health check frequency.}
+Health checks can be periodic (e.g., every 60 seconds) or
+event-driven (triggered by a failed evidence request).
+Periodic checks provide a baseline; event-driven checks
+provide responsiveness.
+
+\paragraph{Multi-model Copilot connections.}
+The framework supports multiple Copilot channel instances
+(e.g., different model providers).  The connection hook can
+register multiple channels, and the health check assesses
+each independently.  The overall $\texttt{COPILOT\_CONNECTIVITY}$
+indicator reports the best available channel.
+
+\paragraph{Integration with other advisors.}
+When the Copilot channel is unhealthy, all Copilot advisors
+(Papers~80--84) are effectively disabled.  The health report
+provides the signal that the kernel uses to bypass advisory
+workflows and rely on direct solver invocation.
+
+% ============================================================
+%  Section 9 — Related Work
+% ============================================================
+\section{Related Work}\label{sec:related}
+
+\paragraph{Service health monitoring.}
+Health check patterns in microservice
+architectures~\cite{newman2015microservices} inform
+our design.  The Kubernetes liveness and readiness
+probes~\cite{burns2018kubernetes} are analogous to
+our health indicators.
+
+\paragraph{Circuit breaker pattern.}
+The circuit breaker~\cite{nygard2018release} prevents
+repeated calls to a failing service.  Our recovery
+protocol with retry limits serves a similar purpose.
+
+\paragraph{Lifecycle management.}
+OSGi bundle lifecycle~\cite{hall2011osgi} and Spring
+Boot actuators~\cite{webb2023spring} provide lifecycle
+hooks for service management.  Our lifecycle manager
+is specialised for verification kernels.
+
+\paragraph{AI service reliability.}
+Studies of language model API
+reliability~\cite{chen2023reliability} motivate the
+need for connection hooks and health checks.  Our
+framework provides a formal treatment of these concerns.
+
+\paragraph{Copilot advisors.}
+Papers~80--84 of this series introduce advisors that
+depend on the Copilot channel.  This paper provides
+the infrastructure that keeps those advisors operational.
+
+\paragraph{Fault-tolerant verification.}
+Work on fault-tolerant model
+checking~\cite{clarke1999mc} and resilient proof
+assistants~\cite{wenzel2014isabelle} addresses related
+concerns at different layers of the verification stack.
+
+% ============================================================
+%  Section 10 — Conclusion
+% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We have introduced two components for managing Copilot
+channel connectivity in the \JuGeo{} framework:
+\begin{itemize}
+\item The $\ConnHook$ manages connections during kernel
+      lifecycle transitions.
+\item The $\HealthChk$ assesses subsystem health across
+      four dimensions.
+\end{itemize}
+Five theorems establish connection safety, lifecycle
+alignment, health monotonicity, recovery correctness,
+and diagnostic completeness.  The recovery protocol
+provides automated remediation for transient failures.
+
+Future work includes extending the health model with
+time-series analysis of indicator values and supporting
+automatic failover between multiple Copilot providers.
+
+% ============================================================
+%  Bibliography
+% ============================================================
+\begin{thebibliography}{25}
+
+\bibitem{newman2015microservices}
+S.~Newman,
+\emph{Building Microservices}.
+O'Reilly, 2015.
+
+\bibitem{burns2018kubernetes}
+B.~Burns, J.~Beda, and K.~Hightower,
+\emph{Kubernetes: Up and Running}, 2nd ed.
+O'Reilly, 2019.
+
+\bibitem{nygard2018release}
+M.~T.~Nygard,
+\emph{Release It!}, 2nd ed.
+Pragmatic Bookshelf, 2018.
+
+\bibitem{hall2011osgi}
+R.~S.~Hall, K.~Pauls, S.~McCulloch, and D.~Savage,
+\emph{OSGi in Action}.
+Manning, 2011.
+
+\bibitem{webb2023spring}
+P.~Webb \etal{},
+``Spring Boot reference documentation,''
+\emph{Pivotal}, 2023.
+
+\bibitem{chen2023reliability}
+M.~Chen \etal{},
+``Evaluating large language models trained on code,''
+\emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem{clarke1999mc}
+E.~M.~Clarke, O.~Grumberg, and D.~A.~Peled,
+\emph{Model Checking}.
+MIT Press, 1999.
+
+\bibitem{wenzel2014isabelle}
+M.~Wenzel,
+``Isabelle/jEdit --- a prover IDE within the PIDE framework,''
+\emph{AISC/Calculemus/MKM}, 2012.
+
+\bibitem{young2024jugeo}
+H.~Young,
+``Judgment geometry: a framework for trust-calibrated
+verification,''
+\emph{JuGeo Technical Reports}, Paper~1, 2024.
+
+\bibitem{young2024channels}
+H.~Young,
+``Evidence channels in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~88, 2024.
+
+\bibitem{young2024advisors}
+H.~Young,
+``Copilot advisors for heap, scope, import, and callable
+analysis,''
+\emph{JuGeo Technical Reports}, Papers~80--81, 2024.
+
+\bibitem{young2024lifecycle}
+H.~Young,
+``Kernel lifecycle and health monitoring in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~93, 2024.
+
+\bibitem{young2024research}
+H.~Young,
+``Copilot research and experiment advisors,''
+\emph{JuGeo Technical Reports}, Paper~82, 2024.
+
+\bibitem{young2024optimization}
+H.~Young,
+``Copilot optimization advisor,''
+\emph{JuGeo Technical Reports}, Paper~83, 2024.
+
+\bibitem{young2024lowering}
+H.~Young,
+``Copilot lowering hints and IR advisors,''
+\emph{JuGeo Technical Reports}, Paper~84, 2024.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner,
+``Z3: an efficient SMT solver,''
+\emph{TACAS}, 2008.
+
+\bibitem{moura2021lean4}
+L.~de~Moura and S.~Ullrich,
+``The Lean~4 theorem prover and programming language,''
+\emph{CADE}, 2021.
+
+\bibitem{polu2020gptf}
+S.~Polu and I.~Sutskever,
+``Generative language modeling for automated theorem proving,''
+\emph{arXiv preprint arXiv:2009.03393}, 2020.
+
+\bibitem{lample2022hypertree}
+G.~Lample \etal{},
+``HyperTree proof search for neural theorem proving,''
+\emph{NeurIPS}, 2022.
+
+\bibitem{first2022diversity}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun,
+``Diversity-driven automated formal verification,''
+\emph{ICSE}, 2022.
+
+\bibitem{yang2019learning}
+K.~Yang and J.~Deng,
+``Learning to prove theorems via interacting with proof
+assistants,''
+\emph{ICML}, 2019.
+
+\end{thebibliography}
+
+% ============================================================
+%  Appendix
+% ============================================================
+\appendix
+
+\section{Auxiliary Definitions and Proofs}\label{app:proofs}
+
+\begin{lemma}[Connection state machine is deterministic]%
+\label{lem:conndeterm}
+The connection state machine has a unique successor state
+for every (state, event) pair.
+\end{lemma}
+\begin{proof}
+The transition table is:
+\begin{center}
+\begin{tabular}{lll}
+\textbf{Current} & \textbf{Event} & \textbf{Next} \\
+\hline
+disconnected & connect-success & connected \\
+disconnected & connect-fail & disconnected \\
+connecting & connect-success & connected \\
+connecting & connect-fail & disconnected \\
+connected & drain & disconnecting \\
+disconnecting & shutdown & disconnected \\
+disconnected & recovery & connecting \\
+\end{tabular}
+\end{center}
+Each row specifies a unique next state.
+\end{proof}
+
+\begin{lemma}[Health report filtering]\label{lem:healthfilter}
+\texttt{HealthReport.filter\_by\_status(s)} returns exactly
+the indicators whose status equals~$s$.
+\end{lemma}
+\begin{proof}
+The method iterates over the indicator list and selects
+those with matching status.  Since iteration visits every
+indicator exactly once, the result is exact.
+\end{proof}
+
+\begin{lemma}[Health indicator value bounds]\label{lem:healthvalbounds}
+Every health indicator produced by $\HealthChk$ has
+$v \in [0, 1]$.
+\end{lemma}
+\begin{proof}
+Connectivity: $v = 0$ or $v = 1$.
+Evidence flow: $v = \mathrm{success\_rate} \in [0,1]$.
+Trust consistency: $v = 1$.
+Service availability: $v = \text{available}/\text{total} \in [0,1]$.
+All values are in $[0,1]$.
+\end{proof}
+
+\begin{lemma}[Recovery action idempotence for reconnect]%
+\label{lem:reconnidem}
+Calling the reconnect action twice in succession from state
+$\mathsf{disconnected}$ is equivalent to calling it once
+(assuming the underlying service state does not change
+between calls).
+\end{lemma}
+\begin{proof}
+The first call transitions to $\mathsf{connecting}$, then
+either to $\mathsf{connected}$ (success) or back to
+$\mathsf{disconnected}$ (failure).
+If successful, the second call finds state $\mathsf{connected}$
+and is a no-op (the channel is already registered).
+If failed, the second call retries from $\mathsf{disconnected}$,
+which is the same starting state.  In both cases, the
+result is the same as a single call.
+\end{proof}
+
+\begin{lemma}[Drain is safe during connected state]%
+\label{lem:drainsafe}
+Calling drain from state $\mathsf{connected}$ correctly
+transitions to $\mathsf{disconnecting}$ and removes the
+Copilot channel from the pool.
+\end{lemma}
+\begin{proof}
+The drain operation in \texttt{ChannelPool} removes all
+channels and waits for outstanding requests to complete.
+The connection hook sets state to $\mathsf{disconnecting}$
+before calling drain.  After drain completes, no channel
+is available for routing.  The subsequent shutdown hook
+transitions to $\mathsf{disconnected}$.
+\end{proof}
+
+\begin{lemma}[Phase transition validity]\label{lem:phasetransval}
+The $\LifeMgr.\texttt{can\_transition}$ check ensures that
+only valid phase transitions are executed.  Invalid transitions
+are rejected.
+\end{lemma}
+\begin{proof}
+The lifecycle manager maintains a transition graph.  The
+\texttt{can\_transition} method checks whether the target
+phase is reachable from the current phase in one step.
+If not, the transition is rejected and the phase does not
+change.
+\end{proof}
+
+\begin{lemma}[Health report immutability]\label{lem:healthimmut}
+Once constructed, a $\HealthRep$ is immutable: its indicators
+and overall status cannot be modified.
+\end{lemma}
+\begin{proof}
+The \texttt{HealthReport} class stores indicators in an
+immutable tuple.  The overall status is computed at
+construction time and stored as a read-only attribute.
+No mutator methods exist.
+\end{proof}
+
+\begin{corollary}[Health report consistency]\label{cor:healthcons}
+The overall status of a $\HealthRep$ always equals the meet
+of its indicator statuses, even after the report is passed
+to other components.
+\end{corollary}
+\begin{proof}
+By Lemma~\ref{lem:healthimmut}, the report is immutable.
+The overall status was computed as the meet at construction
+(Lemma~\ref{lem:overallmeet}).  Since neither field changes,
+the invariant holds throughout the report's lifetime.
+\end{proof}
+
+\begin{proposition}[End-to-end lifecycle safety]%
+\label{prop:e2esafety}
+Throughout the kernel lifecycle, the Copilot channel is used
+only when connected, health-checked, and phase-aligned.
+\end{proposition}
+\begin{proof}
+Combining Theorem~\ref{thm:connsafe} (channel used only when
+registered), Theorem~\ref{thm:lifealign} (state is
+phase-aligned), and the health check protocol (the kernel
+checks health at \texttt{READY}), we have:
+\begin{enumerate}
+\item The channel is registered only after a successful
+      health check (Listing~\ref{lst:connhook}).
+\item The channel is phase-aligned (Theorem~\ref{thm:lifealign}).
+\item Requests are routed only to registered channels
+      (Theorem~\ref{thm:connsafe}).
+\end{enumerate}
+Therefore, the channel is used only when connected,
+health-checked, and phase-aligned.
+\end{proof}
+
+\begin{lemma}[Recovery does not escalate trust]%
+\label{lem:recovnotrust}
+Recovery actions (reconnect, pool drain, cache clear) do not
+produce evidence and therefore do not affect trust tiers.
+\end{lemma}
+\begin{proof}
+Recovery actions modify the connection state and channel
+pool configuration.  They do not create or modify evidence
+records.  Therefore, no trust tier is affected.
+\end{proof}
+
+\begin{remark}[Extension to distributed health]
+In a distributed deployment where multiple kernel instances
+share a Copilot service, the health model can be extended
+with a \emph{consensus} dimension that tracks agreement
+among instances.  We leave this to future work.
+\end{remark}
+
+\end{document}

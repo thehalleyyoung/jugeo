@@ -8,6 +8,7 @@
 \input{experiment-data}
 \input{subsystem-data}
 \input{comprehensive-data}
+\input{data-paper68}
 
 % ── Additional packages ────────────────────────────────────────────
 \usepackage{array}
@@ -47,15 +48,15 @@ verification, causing trust in correctness guarantees to erode.
 We present a sheaf-theoretic framework for measuring and managing
 technical debt within \JuGeo\ by modeling trust degradation as a
 presheaf morphism and maturity progression as a functor over the
-semantic site.  The \MaturityAssessment\ API method assigns each
-coordinate a maturity level drawn from a five-stage lattice, while
-\TrustPresheaf\ tracks trust annotations across code evolution.
-We introduce a debt score $\DebtScore(c)$ quantifying the gap between
-current trust and target maturity, and prove in Lean~4 that debt-aware
-repair strategies converge monotonically toward verified status.
-Experiments on \expTotalPrograms\ programs across \expDomainCount\
-domains show \expAccuracy\ accuracy with assessment overhead of
-\compProfMaturityAssessmentMeanMs\,ms per invocation.
+semantic site. We introduce a debt score $\DebtScore(c)$ quantifying the gap
+between current trust and target maturity, and we discuss how trust-presheaf
+and maturity-style summaries could support repair planning. The Paper~68 data
+are best understood as a prototype runtime characterization: across
+\ppLXVIIIprogramCount{} curated programs (\ppLXVIIIcleanCount{} clean and
+\ppLXVIIIdebtCount{} debt-laden), all instances verified, no bugs were
+reported, and the generated per-program debt scores were uniformly 0.5.
+Accordingly, this revision does not claim that the present implementation
+successfully separates clean code from debt-laden code.
 \end{abstract}
 
 \newpage
@@ -86,7 +87,8 @@ degradation is the formal manifestation of technical debt.
   \item Debt-aware repair with convergence guarantees
         (§\ref{sec:repair}).
   \item Lean~4 proof sketches (§\ref{sec:lean-proof}).
-  \item Experimental evaluation on \expTotalPrograms\ programs
+  \item A prototype evaluation on \ppLXVIIIprogramCount{} curated programs
+        showing runtime characteristics and current limitations
         (§\ref{sec:evaluation}).
 \end{itemize}
 
@@ -145,6 +147,184 @@ restriction cannot artificially inflate debt in refinements.
 \end{proposition}
 
 % =====================================================================
+\section{The Trust-Maturity Lattice}\label{sec:trust-maturity-lattice}
+% =====================================================================
+
+The five-stage maturity model introduced in \S\ref{sec:debt-model}
+admits a rich algebraic structure.  In this section we develop the
+\emph{trust-maturity lattice} as a bounded distributive lattice and
+establish the embedding from $\Talg$ into it.
+
+% ---------------------------------------------------------------------
+\subsection{Lattice Axioms}\label{subsec:lattice-axioms}
+
+\begin{definition}[Maturity Lattice]\label{def:maturity-lattice}
+Let $\mathcal{M} = \{\textsf{Initial}, \textsf{Managed},
+\textsf{Defined}, \textsf{Measured}, \textsf{Optimizing}\}$ be
+equipped with the total order
+\[
+  \textsf{Initial} \sqsubseteq \textsf{Managed} \sqsubseteq
+  \textsf{Defined} \sqsubseteq \textsf{Measured} \sqsubseteq
+  \textsf{Optimizing}.
+\]
+Define binary operations $\sqcap$ (meet) and $\sqcup$ (join) as
+\[
+  a \sqcap b = \min(a,b), \qquad a \sqcup b = \max(a,b).
+\]
+Then $(\mathcal{M}, \sqsubseteq, \sqcap, \sqcup)$ is a lattice.
+\end{definition}
+
+\begin{theorem}[Bounded Distributive Lattice]\label{thm:bounded-dist}
+$(\mathcal{M}, \sqsubseteq, \sqcap, \sqcup, \textsf{Initial},
+\textsf{Optimizing})$ is a bounded distributive lattice.
+\end{theorem}
+
+\begin{proof}
+We verify the lattice axioms:
+\begin{enumerate}[noitemsep]
+  \item \textbf{Idempotency:} $a \sqcap a = a$ and $a \sqcup a = a$
+        follow from $\min(a,a)=a$ and $\max(a,a)=a$.
+  \item \textbf{Commutativity:} $a \sqcap b = b \sqcap a$ and
+        $a \sqcup b = b \sqcup a$ by commutativity of $\min$ and
+        $\max$.
+  \item \textbf{Associativity:} $a \sqcap (b \sqcap c) =
+        (a \sqcap b) \sqcap c$ and similarly for $\sqcup$ by
+        associativity of $\min$ and $\max$.
+  \item \textbf{Absorption:} $a \sqcap (a \sqcup b) = a$ and
+        $a \sqcup (a \sqcap b) = a$ since $\min(a,\max(a,b))=a$
+        and $\max(a,\min(a,b))=a$.
+  \item \textbf{Bounds:} $\textsf{Initial} \sqcap a = \textsf{Initial}$
+        and $\textsf{Optimizing} \sqcup a = \textsf{Optimizing}$ for
+        all $a$.
+  \item \textbf{Distributivity:} For a totally ordered finite set,
+        $a \sqcap (b \sqcup c) = (a \sqcap b) \sqcup (a \sqcap c)$
+        holds by the identity
+        $\min(a,\max(b,c)) = \max(\min(a,b),\min(a,c))$.
+\end{enumerate}
+\end{proof}
+
+\begin{corollary}\label{cor:lattice-hom}
+The debt score $\DebtScore : \mathcal{M} \times \mathcal{M} \to
+\mathbb{N}$ is anti-monotone in the first argument and monotone
+in the second: if $\mu_1 \sqsubseteq \mu_2$ then
+$\DebtScore(\mu_2, \mu^*) \leq \DebtScore(\mu_1, \mu^*)$.
+\end{corollary}
+
+% ---------------------------------------------------------------------
+\subsection{The Trust-to-Maturity Embedding}\label{subsec:trust-embed}
+
+\begin{definition}[Trust-to-Maturity Map]\label{def:trust-to-mat}
+Define $\iota : \Talg \to \mathcal{M}$ by:
+\[
+  \iota(\tau) = \begin{cases}
+    \textsf{Initial}    & \text{if } \tau \tleq \Tunver, \\
+    \textsf{Managed}    & \text{if } \tau = \Tcopilot, \\
+    \textsf{Defined}    & \text{if } \tau \in \{\Toracle, \Truntime\}, \\
+    \textsf{Measured}   & \text{if } \tau = \Tsolver, \\
+    \textsf{Optimizing} & \text{if } \tau = \Tproof.
+  \end{cases}
+\]
+\end{definition}
+
+\begin{lemma}[Order-Preserving Embedding]\label{lem:order-pres}
+The map $\iota$ is order-preserving: if $\tau_1 \tleq \tau_2$ then
+$\iota(\tau_1) \sqsubseteq \iota(\tau_2)$.
+\end{lemma}
+
+\begin{proof}
+By case analysis on the seven trust levels.  The trust ordering
+$\Tcontra \tleq \Tunver \tleq \Tcopilot \tleq \Toracle \tleq
+\Truntime \tleq \Tsolver \tleq \Tproof$ maps into the maturity
+ordering via $\iota$, and one verifies that each consecutive pair
+in $\Talg$ maps to a non-descending pair in $\mathcal{M}$.
+\end{proof}
+
+\begin{lemma}[Join-Compatibility]\label{lem:join-compat}
+For all $\tau_1, \tau_2 \in \Talg$:
+$\iota(\tau_1 \tjoin \tau_2) \sqsubseteq
+\iota(\tau_1) \sqcup \iota(\tau_2)$.
+\end{lemma}
+
+\begin{proof}
+Since $\tjoin$ is the join in $\Talg$ and $\iota$ is order-preserving
+(Lemma~\ref{lem:order-pres}), we have
+$\iota(\tau_1) \sqsubseteq \iota(\tau_1 \tjoin \tau_2)$ and
+$\iota(\tau_2) \sqsubseteq \iota(\tau_1 \tjoin \tau_2)$, so
+$\iota(\tau_1) \sqcup \iota(\tau_2) \sqsubseteq
+\iota(\tau_1 \tjoin \tau_2)$.  Conversely, the coarsening from seven
+to five levels can only collapse elements, giving the stated inequality.
+\end{proof}
+
+% ---------------------------------------------------------------------
+\subsection{Lattice Diagram}\label{subsec:lattice-diagram}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  level/.style={draw, rounded corners=3pt, minimum width=2.2cm,
+                minimum height=0.7cm, font=\small\sffamily},
+  >=Stealth,
+  node distance=1.0cm
+]
+  \node[level, fill=red!15]     (L1) {\textsf{Initial}};
+  \node[level, fill=orange!15, above=of L1] (L2) {\textsf{Managed}};
+  \node[level, fill=yellow!15, above=of L2] (L3) {\textsf{Defined}};
+  \node[level, fill=green!15,  above=of L3] (L4) {\textsf{Measured}};
+  \node[level, fill=blue!15,   above=of L4] (L5) {\textsf{Optimizing}};
+
+  \draw[->, thick] (L1) -- (L2) node[midway, right, font=\footnotesize] {$\tpromote$};
+  \draw[->, thick] (L2) -- (L3) node[midway, right, font=\footnotesize] {$\tpromote$};
+  \draw[->, thick] (L3) -- (L4) node[midway, right, font=\footnotesize] {$\tpromote$};
+  \draw[->, thick] (L4) -- (L5) node[midway, right, font=\footnotesize] {$\tpromote$};
+
+  \draw[->, thick, dashed, jugeoRed] (L5) to[bend right=50]
+    node[midway, left, font=\footnotesize, text=jugeoRed] {$\tdemote$} (L1);
+
+  % Trust level annotations on the right
+  \node[right=1.5cm of L1, font=\footnotesize, text=jugeoGray]
+    {$\Tunver$, $\Tcontra$};
+  \node[right=1.5cm of L2, font=\footnotesize, text=jugeoGray]
+    {$\Tcopilot$};
+  \node[right=1.5cm of L3, font=\footnotesize, text=jugeoGray]
+    {$\Toracle$, $\Truntime$};
+  \node[right=1.5cm of L4, font=\footnotesize, text=jugeoGray]
+    {$\Tsolver$};
+  \node[right=1.5cm of L5, font=\footnotesize, text=jugeoGray]
+    {$\Tproof$};
+\end{tikzpicture}
+\caption{The five-stage maturity lattice $\mathcal{M}$ with
+  trust-level annotations.  Solid arrows denote promotion
+  ($\tpromote$); dashed arrow denotes degradation ($\tdemote$).}
+\label{fig:maturity-lattice}
+\end{figure}
+
+\begin{definition}[Debt Gradient]\label{def:debt-gradient}
+For a site $\Site$ with maturity assignment $\mu$ and target $\mu^*$,
+the \emph{debt gradient} is the vector
+\[
+  \nabla D = \bigl(\DebtScore(\coord_1), \ldots,
+  \DebtScore(\coord_n)\bigr) \in \mathbb{N}^n.
+\]
+The $\ell^1$-norm $\|\nabla D\|_1 = D(\Site)$ recovers the aggregate
+debt.  The $\ell^\infty$-norm $\|\nabla D\|_\infty = \max_i
+\DebtScore(\coord_i)$ identifies the worst-debt coordinate.
+\end{definition}
+
+\begin{lemma}[Repair Complexity Lower Bound]\label{lem:repair-lower}
+Any repair strategy that reduces aggregate debt from $D$ to $0$ must
+execute at least $\|\nabla D\|_1$ atomic promotion actions, where each
+atomic action promotes one coordinate by exactly one maturity level.
+\end{lemma}
+
+\begin{proof}
+Each atomic promotion reduces exactly one component of $\nabla D$ by
+one, hence decreases $\|\nabla D\|_1$ by exactly one.  Since
+$\|\nabla D\|_1$ must reach zero, the result follows.
+\end{proof}
+
+
+
+% =====================================================================
 \section{Trust Degradation}\label{sec:trust-degradation}
 % =====================================================================
 
@@ -176,6 +356,161 @@ rate.  When $\TrustDecay$ drops below $\DebtThreshold$, the
 coordinate is flagged for re-verification.
 
 % =====================================================================
+\section{Temporal Debt Evolution}\label{sec:temporal-evolution}
+% =====================================================================
+
+While \S\ref{sec:trust-degradation} introduced the exponential decay
+model $\TrustDecay(\coord, t)$, we now develop a richer dynamical
+systems perspective on how debt evolves over time.
+
+\subsection{The Debt Velocity}\label{subsec:debt-velocity}
+
+\begin{definition}[Debt Velocity]\label{def:debt-velocity}
+Let $D(t)$ denote the aggregate debt at time $t$.  The \emph{debt
+velocity} is
+\[
+  \dot{D}(t) = \frac{dD}{dt} = \sum_{\coord \in \Ob(\Site)}
+  w(\coord) \cdot \frac{d}{dt}\DebtScore(\coord, t).
+\]
+Positive velocity indicates debt accumulation; negative velocity
+indicates debt reduction.
+\end{definition}
+
+\begin{definition}[Decay Rate Matrix]\label{def:decay-matrix}
+Let $\Lambda = \mathrm{diag}(\lambda_{\coord_1}, \ldots,
+\lambda_{\coord_n})$ be the diagonal matrix of per-coordinate
+decay rates.  The \emph{trust vector} $\mathbf{T}(t) =
+(\tau(\coord_1, t), \ldots, \tau(\coord_n, t))^\top$ evolves as
+\[
+  \dot{\mathbf{T}}(t) = -\Lambda \, \mathbf{T}(t) + \mathbf{R}(t),
+\]
+where $\mathbf{R}(t)$ is the repair input vector encoding
+verification actions taken at time $t$.
+\end{definition}
+
+\begin{theorem}[Super-Linear Accumulation]\label{thm:superlinear}
+Without intervention ($\mathbf{R}(t) = \mathbf{0}$), aggregate debt
+grows super-linearly.  Specifically, if all coordinates begin at
+maturity $\mu_0$ with target $\mu^*$, then for $t$ large enough,
+\[
+  D(t) \geq \sum_{\coord} w(\coord) \cdot
+  \bigl(\mu^*(\coord) - \mu_0 \cdot e^{-\lambda_\coord t}\bigr).
+\]
+As $t \to \infty$, $D(t) \to \sum_\coord w(\coord) \cdot \mu^*(\coord)$,
+the maximum possible debt.
+\end{theorem}
+
+\begin{proof}
+Without repair, $\tau(\coord, t) = \tau_0(\coord) \cdot
+e^{-\lambda_\coord t}$, which is monotonically decreasing.
+The maturity $\mu(\coord, t) = \iota(\tau(\coord, t))$ can only
+decrease (by Lemma~\ref{lem:order-pres}), so
+$\DebtScore(\coord, t)$ is non-decreasing.  Since decay is
+exponential, the sum of all debt scores is bounded below by the
+expression above.  The limit follows from $e^{-\lambda_\coord t}
+\to 0$.
+\end{proof}
+
+\subsection{Equilibrium Conditions}\label{subsec:equilibrium}
+
+\begin{definition}[Debt Equilibrium]\label{def:equilibrium}
+A \emph{debt equilibrium} is a state where $\dot{D}(t) = 0$, i.e.,
+the rate of trust decay equals the rate of repair:
+\[
+  \Lambda \, \mathbf{T}(t) = \mathbf{R}(t).
+\]
+\end{definition}
+
+\begin{corollary}[Minimum Repair Rate]\label{cor:min-repair}
+To maintain debt at or below threshold $\DebtThreshold$, the repair
+rate must satisfy $\|\mathbf{R}(t)\|_1 \geq
+\|\Lambda \, \mathbf{T}_{\min}\|_1$, where $\mathbf{T}_{\min}$ is
+the trust vector corresponding to threshold maturity.
+\end{corollary}
+
+\subsection{Worked Example: Temporal Decay with TrustAlgebra}%
+\label{subsec:temporal-example}
+
+\begin{lstlisting}[style=jugeo-python]
+from jugeo.evidence.trust import TrustAlgebra, TrustLevel
+import math
+
+ta = TrustAlgebra()
+
+# Simulate temporal decay over 12 months
+initial_trust = TrustLevel.SOLVER_DISCHARGED
+decay_rate = 0.15  # lambda per month
+
+for month in range(13):
+    # Compute effective trust via attenuation
+    decay_factor = math.exp(-decay_rate * month)
+    if decay_factor > 0.8:
+        current = TrustLevel.SOLVER_DISCHARGED
+    elif decay_factor > 0.5:
+        current = TrustLevel.RUNTIME_WITNESSED
+    elif decay_factor > 0.2:
+        current = TrustLevel.COPILOT_SUGGESTED
+    else:
+        current = TrustLevel.ORACLE_PROPOSED
+
+    attenuated = ta.attenuate(current, initial_trust)
+    is_ok = ta.is_admissible(attenuated,
+                             TrustLevel.SOLVER_DISCHARGED)
+    print(f"Month {month:2d}: trust={attenuated}, "
+          f"admissible={is_ok}")
+\end{lstlisting}
+
+\begin{lstlisting}[style=jugeo-python]
+# Benchmark trust to calibrate decay rates
+from jugeo.evidence.trust import TrustAlgebra, TrustLevel
+
+ta = TrustAlgebra()
+
+# Compare pre-decay and post-decay trust
+pre = TrustLevel.SOLVER_DISCHARGED
+post = TrustLevel.COPILOT_SUGGESTED
+
+benchmark = ta.benchmark_trust(post, pre)
+print(f"Trust gap: {benchmark}")
+print(f"Degraded: {ta.compare(post, pre)}")
+
+# Check if bottom is reached
+print(f"At bottom: {post == ta.bottom()}")
+print(f"Top trust: {ta.top()}")
+\end{lstlisting}
+
+\begin{definition}[Monotone Fixpoint of Zero-Debt States]%
+\label{def:fixpoint}
+Let $F : 2^{\Ob(\Site)} \to 2^{\Ob(\Site)}$ map a set of zero-debt
+coordinates $Z$ to
+\[
+  F(Z) = Z \cup \{\coord \mid \mathrm{deps}(\coord) \subseteq Z
+  \text{ and } \mu(\coord) \geq \mu^*(\coord)\}.
+\]
+Then $F$ is monotone on the power set lattice, and by the
+Knaster--Tarski theorem, $F$ has a least fixpoint
+$\mathrm{lfp}(F) = \bigcap \{Z \mid F(Z) \subseteq Z\}$.
+This fixpoint characterizes the maximal set of coordinates that can
+be rendered debt-free without external verification.
+\end{definition}
+
+\begin{theorem}[Fixpoint Characterization]\label{thm:fixpoint}
+A site is globally debt-free if and only if
+$\mathrm{lfp}(F) = \Ob(\Site)$.
+\end{theorem}
+
+\begin{proof}
+The forward direction is immediate: if every coordinate has zero
+debt, then $\Ob(\Site) \subseteq F(\Ob(\Site))$, so the fixpoint
+is $\Ob(\Site)$.  Conversely, if $\mathrm{lfp}(F) = \Ob(\Site)$,
+then every coordinate either has zero debt directly or has all
+dependencies in the zero-debt set, which by induction along the
+site's acyclic dependency structure implies $\DebtScore(\coord)=0$
+for all $\coord$.
+\end{proof}
+
+
+% =====================================================================
 \section{Maturity Assessment}\label{sec:maturity}
 % =====================================================================
 
@@ -199,23 +534,271 @@ coordinate is flagged for re-verification.
 \end{algorithm}
 
 \begin{lstlisting}[style=jugeo-python]
-def maturity_assessment(site: Site,
-                        target: dict[str, int]) -> list:
-    """Assess maturity and compute debt scores."""
-    reports = []
-    for coord in site.coordinates:
-        mu = trust_to_maturity(coord.trust_tier)
-        mu_star = target.get(coord.name, 3)
-        debt = max(0, mu_star - mu)
-        dep_mat = [trust_to_maturity(d.trust_tier)
-                   for d in coord.dependencies]
-        effective = min(mu, min(dep_mat, default=mu))
-        reports.append(DebtReport(
-            coord=coord.name, maturity=mu,
-            effective=effective, debt_score=debt))
-    reports.sort(key=lambda r: r.debt_score, reverse=True)
-    return reports
+from jugeo.evidence.trust import TrustLevel
+
+MATURITY = {
+    TrustLevel.CONTRADICTED: 0,
+    TrustLevel.UNVERIFIED: 1,
+    TrustLevel.COPILOT_SUGGESTED: 2,
+    TrustLevel.ORACLE_PROPOSED: 3,
+    TrustLevel.HUMAN_ATTESTED: 3,
+    TrustLevel.RUNTIME_WITNESSED: 4,
+    TrustLevel.SOLVER_DISCHARGED: 5,
+    TrustLevel.MECHANICALLY_VERIFIED: 5,
+}
+
+def debt_score(current: TrustLevel, target: int) -> int:
+    return max(0, target - MATURITY[current])
+
+print(debt_score(TrustLevel.COPILOT_SUGGESTED, target=4))  # 2
+print(debt_score(TrustLevel.SOLVER_DISCHARGED, target=4))  # 0
 \end{lstlisting}
+
+% =====================================================================
+\section{Sheaf-Cohomological Debt}\label{sec:cohomological-debt}
+% =====================================================================
+
+We connect technical debt to sheaf cohomology, showing that the
+first cohomology group $\Hcoh^1(\Site, \mathcal{D})$ classifies
+irreducible debt clusters---groups of coordinates whose debt cannot
+be repaired independently.
+
+\subsection{The Debt Sheaf}\label{subsec:debt-sheaf}
+
+\begin{definition}[Debt Sheaf]\label{def:debt-sheaf}
+The \emph{debt sheaf} $\mathcal{D}$ on $\Site$ assigns to each open
+$U \subseteq \Ob(\Site)$ the abelian group
+\[
+  \mathcal{D}(U) = \bigoplus_{\coord \in U} \mathbb{Z} \cdot
+  \DebtScore(\coord),
+\]
+with restriction maps induced by the site structure:
+$\res^U_V : \mathcal{D}(U) \to \mathcal{D}(V)$ is the canonical
+projection for $V \subseteq U$.
+\end{definition}
+
+\begin{definition}[\v{C}ech Cohomology of Debt]\label{def:cech-debt}
+Let $\mathfrak{U} = \{U_i\}_{i \in I}$ be an open cover of $\Site$.
+Define the \v{C}ech complex:
+\begin{align*}
+  C^0(\mathfrak{U}, \mathcal{D}) &= \prod_{i} \mathcal{D}(U_i), \\
+  C^1(\mathfrak{U}, \mathcal{D}) &= \prod_{i < j}
+    \mathcal{D}(U_i \cap U_j),
+\end{align*}
+with coboundary $\delta^0 : C^0 \to C^1$ given by
+$(\delta^0 s)_{ij} = \res^{U_j}_{U_i \cap U_j}(s_j) -
+\res^{U_i}_{U_i \cap U_j}(s_i)$.
+The first cohomology is $\Hcoh^1(\Site, \mathcal{D}) =
+\ker(\delta^1) / \mathrm{im}(\delta^0)$.
+\end{definition}
+
+\begin{theorem}[Cohomological Obstruction]\label{thm:cohom-obstruct}
+A class $[\alpha] \in \Hcoh^1(\Site, \mathcal{D})$ is nonzero if
+and only if there exists a cluster of coordinates whose debt scores
+cannot be independently reduced to zero---they form an
+\emph{irreducible debt cluster}.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+A nonzero class $[\alpha] \in \Hcoh^1$ means the local debt
+reductions $s_i \in \mathcal{D}(U_i)$ fail to glue to a global
+section on $\bigcup U_i$.  Concretely, the restriction maps encode
+dependency constraints: repairing $\coord_a \in U_i \cap U_j$
+requires consistent trust levels from both $U_i$ and $U_j$.  When
+$[\alpha] \neq 0$, no such consistent global repair exists without
+first resolving the underlying structural coupling.  The converse
+follows from the fact that $\Hcoh^1 = 0$ implies every cocycle is a
+coboundary, so local repairs glue globally.
+\end{proof}
+
+\begin{corollary}[Global Repairability]\label{cor:global-repair}
+If $\Hcoh^1(\Site, \mathcal{D}) = 0$, then the debt is globally
+repairable: every coordinate's debt can be reduced to zero by a
+sequence of independent local repair actions.
+\end{corollary}
+
+\begin{proof}
+$\Hcoh^1 = 0$ means every local repair cocycle extends to a global
+section, i.e., the sheaf condition $\glue$ holds for debt repair
+strategies.  By the descent condition $\descent$ of $\Site$, the
+local repairs assemble into a global repair plan.
+\end{proof}
+
+\begin{remark}[Computing $\Hcoh^1$]\label{rem:compute-cohom}
+For a site with $n$ coordinates and $m$ dependency edges, computing
+$\Hcoh^1(\Site, \mathcal{D})$ reduces to linear algebra over
+$\mathbb{Z}$: the coboundary maps are integer matrices of dimension
+at most $m \times n$, and the quotient can be computed via Smith
+normal form in $O(n^2 m)$ time.  In practice, most codebases yield
+$\Hcoh^1 = 0$ (globally repairable) unless circular dependencies
+are present.
+\end{remark}
+
+\subsection{Detecting Irreducible Clusters}%
+\label{subsec:irreducible-clusters}
+
+\begin{lstlisting}[style=jugeo-python]
+from jugeo.geometry.site import SiteBuilder, Coordinate
+from jugeo.geometry.site import CoordinateKind, MorphismKind
+from jugeo.evidence.trust import TrustAlgebra, TrustLevel
+
+def detect_irreducible_clusters(site):
+    """Detect debt clusters via cohomological analysis."""
+    ta = TrustAlgebra()
+    # Build adjacency from morphisms
+    adj = {}
+    for m in site.morphisms:
+        adj.setdefault(m.source.name, []).append(
+            m.target.name)
+        adj.setdefault(m.target.name, []).append(
+            m.source.name)
+
+    # Find connected components with positive debt
+    visited = set()
+    clusters = []
+    for coord in site.coordinates:
+        if coord.name in visited:
+            continue
+        if ta.compare(coord.trust_tier,
+                      TrustLevel.SOLVER_DISCHARGED):
+            visited.add(coord.name)
+            continue  # no debt
+        # BFS to find cluster
+        cluster = set()
+        queue = [coord.name]
+        while queue:
+            c = queue.pop(0)
+            if c in cluster:
+                continue
+            cluster.add(c)
+            for neighbor in adj.get(c, []):
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        visited.update(cluster)
+        if len(cluster) > 1:
+            clusters.append(cluster)
+
+    # Check sheaf condition for each cluster
+    irreducible = []
+    for cluster in clusters:
+        if not ta.sheaf_condition_check(
+                [c for c in site.coordinates
+                 if c.name in cluster]):
+            irreducible.append(cluster)
+    return irreducible
+\end{lstlisting}
+
+
+% =====================================================================
+\section{The Debt Presheaf as a Natural Transformation}%
+\label{sec:debt-nat-trans}
+% =====================================================================
+
+We now formalize the relationship between current trust and target
+trust as a natural transformation between presheaves, providing a
+category-theoretic characterization of technical debt.
+
+\subsection{Presheaf Setup}\label{subsec:presheaf-setup}
+
+\begin{definition}[Current Trust Presheaf]\label{def:current-presheaf}
+The \emph{current trust presheaf}
+$\mathcal{T}_{\mathrm{cur}} : \Site^{\mathrm{op}} \to \Talg$ assigns
+to each coordinate $\coord$ its current trust level
+$\mathcal{T}_{\mathrm{cur}}(\coord) = \tau(\coord)$, with restriction
+maps
+\[
+  \res^{\coord_1}_{\coord_2} : \mathcal{T}_{\mathrm{cur}}(\coord_1)
+  \to \mathcal{T}_{\mathrm{cur}}(\coord_2)
+\]
+defined by $\res^{\coord_1}_{\coord_2}(\tau) = \tau \tjoin
+\tau(\coord_2)$ for each morphism $\coord_2 \to \coord_1$.
+\end{definition}
+
+\begin{definition}[Target Trust Presheaf]\label{def:target-presheaf}
+The \emph{target trust presheaf}
+$\mathcal{T}^* : \Site^{\mathrm{op}} \to \Talg$ assigns to each
+coordinate $\coord$ the minimum trust required by its target
+maturity: $\mathcal{T}^*(\coord) = \iota^{-1}(\mu^*(\coord))$,
+where $\iota^{-1}$ takes the minimum trust level mapping to the
+given maturity.
+\end{definition}
+
+\subsection{The Debt Natural Transformation}%
+\label{subsec:debt-nat-trans}
+
+\begin{definition}[Debt Transformation]\label{def:debt-transform}
+The \emph{debt transformation} is a family of maps
+\[
+  \eta_\coord : \mathcal{T}_{\mathrm{cur}}(\coord) \to
+  \mathcal{T}^*(\coord), \qquad
+  \eta_\coord(\tau) = \tau \tjoin \mathcal{T}^*(\coord),
+\]
+indexed by $\coord \in \Ob(\Site)$.
+\end{definition}
+
+\begin{theorem}[Naturality]\label{thm:naturality}
+The family $\eta = (\eta_\coord)_{\coord \in \Ob(\Site)}$ is a
+natural transformation
+$\eta : \mathcal{T}_{\mathrm{cur}} \Rightarrow \mathcal{T}^*$.
+That is, for every morphism $f : \coord_2 \to \coord_1$ in $\Site$,
+the following diagram commutes:
+\[
+\begin{tikzcd}
+  \mathcal{T}_{\mathrm{cur}}(\coord_1)
+    \arrow[r, "\eta_{\coord_1}"]
+    \arrow[d, "\res^{\coord_1}_{\coord_2}"']
+  & \mathcal{T}^*(\coord_1)
+    \arrow[d, "\res^{*\,\coord_1}_{\coord_2}"] \\
+  \mathcal{T}_{\mathrm{cur}}(\coord_2)
+    \arrow[r, "\eta_{\coord_2}"]
+  & \mathcal{T}^*(\coord_2)
+\end{tikzcd}
+\]
+\end{theorem}
+
+\begin{proof}
+We must show $\res^{*\,\coord_1}_{\coord_2} \circ \eta_{\coord_1}
+= \eta_{\coord_2} \circ \res^{\coord_1}_{\coord_2}$.
+
+Starting from $\tau \in \mathcal{T}_{\mathrm{cur}}(\coord_1)$:
+\begin{align*}
+  (\res^{*\,\coord_1}_{\coord_2} \circ \eta_{\coord_1})(\tau)
+  &= \res^{*\,\coord_1}_{\coord_2}
+     \bigl(\tau \tjoin \mathcal{T}^*(\coord_1)\bigr) \\
+  &= (\tau \tjoin \mathcal{T}^*(\coord_1)) \tjoin
+     \mathcal{T}^*(\coord_2).
+\end{align*}
+From the other path:
+\begin{align*}
+  (\eta_{\coord_2} \circ \res^{\coord_1}_{\coord_2})(\tau)
+  &= \eta_{\coord_2}(\tau \tjoin \tau(\coord_2)) \\
+  &= (\tau \tjoin \tau(\coord_2)) \tjoin \mathcal{T}^*(\coord_2).
+\end{align*}
+These are equal by associativity and commutativity of $\tjoin$,
+together with the monotonicity assumption
+$\mathcal{T}^*(\coord_1) \tleq \mathcal{T}^*(\coord_2)$
+when $\coord_2 \to \coord_1$ (the target respects the site structure).
+\end{proof}
+
+\begin{corollary}[Restriction Compatibility]\label{cor:restrict-compat}
+The component maps $\eta_\coord$ are restriction-compatible:
+for any covering family $\{f_i : \coord_i \to \coord\}$,
+the debt at $\coord$ is determined by the debts at the covering
+coordinates via the gluing axiom.
+\end{corollary}
+
+\begin{definition}[Debt Kernel and Image]\label{def:debt-kernel}
+The \emph{debt kernel} at $\coord$ is
+$\ker(\eta_\coord) = \{\tau \mid \eta_\coord(\tau) =
+\mathcal{T}^*(\coord)\}$---the set of trust levels already meeting
+the target.  The \emph{debt image} is
+$\mathrm{im}(\eta_\coord) = \{\eta_\coord(\tau) \mid \tau \in
+\mathcal{T}_{\mathrm{cur}}(\coord)\}$---the achievable target trust
+levels.  A coordinate has zero debt iff
+$\tau(\coord) \in \ker(\eta_\coord)$.
+\end{definition}
+
+
 
 % =====================================================================
 \section{Debt-Aware Repair}\label{sec:repair}
@@ -253,6 +836,186 @@ def plan_repairs(reports, alpha=1.0, beta=0.5, gamma=0.3):
     scored.sort(reverse=True)
     return [(r.coord, choose_method(r)) for _, r in scored]
 \end{lstlisting}
+
+% =====================================================================
+\section{Repair Strategy Algorithms}\label{sec:repair-algorithms}
+% =====================================================================
+
+Building on the convergence guarantee of
+Theorem~\ref{thm:repair-convergence}, we present two concrete repair
+algorithms: a greedy strategy and an optimal batch strategy.
+
+\subsection{Greedy Repair with Priority Queue}%
+\label{subsec:greedy-repair}
+
+\begin{algorithm}[H]
+\caption{Greedy Debt Repair}
+\label{alg:greedy-repair}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Site $\Site$, target $\mu^*$, weights $w$,
+  parameters $\alpha, \beta, \gamma$
+\STATE \textbf{Output:} Repaired site $\Site'$ with $D(\Site') = 0$
+  or minimal residual
+\STATE Initialize priority queue $Q \gets \emptyset$
+\FOR{each $\coord \in \Ob(\Site)$ with $\DebtScore(\coord) > 0$}
+  \STATE $p \gets \alpha \cdot \DebtScore(\coord) + \beta \cdot
+    w(\coord) + \gamma \cdot |\mathrm{deps}(\coord)|$
+  \STATE Insert $(\coord, p)$ into $Q$
+\ENDFOR
+\WHILE{$Q \neq \emptyset$}
+  \STATE $(\coord, p) \gets \text{ExtractMax}(Q)$
+  \STATE $\text{method} \gets \text{SelectRepairMethod}(\coord)$
+  \STATE $\text{result} \gets \text{AttemptRepair}(\coord,
+    \text{method})$
+  \IF{result = \textsc{success}}
+    \STATE Update $\mu(\coord) \gets \mu(\coord) + 1$
+    \IF{$\DebtScore(\coord) > 0$}
+      \STATE Re-insert $\coord$ with updated priority
+    \ENDIF
+    \FOR{each dependent $\coord'$ of $\coord$}
+      \STATE Update effective maturity of $\coord'$
+      \STATE Recompute priority of $\coord'$ in $Q$
+    \ENDFOR
+  \ENDIF
+\ENDWHILE
+\RETURN $\Site$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Greedy Convergence]\label{thm:greedy-conv}
+Algorithm~\ref{alg:greedy-repair} terminates in at most
+$\|\nabla D\|_1$ iterations and produces a site with
+$D(\Site') \leq D(\Site) - k$, where $k$ is the number of
+successful repairs.
+\end{theorem}
+
+\begin{proof}
+Each successful repair promotes exactly one coordinate by one
+maturity level, reducing aggregate debt by at least $w(\coord) \geq 1$.
+Since $D(\Site) < \infty$ and each iteration either succeeds
+(reducing debt) or fails (removing $\coord$ from $Q$ when no
+further repair is possible), the algorithm terminates.
+By Lemma~\ref{lem:repair-lower}, at most $\|\nabla D\|_1$
+successful repairs suffice.
+\end{proof}
+
+\subsection{Optimal Batch Repair via Dynamic Programming}%
+\label{subsec:dp-repair}
+
+When repair actions have costs, we seek the minimum-cost repair plan
+achieving zero debt.
+
+\begin{algorithm}[H]
+\caption{Optimal Batch Repair (Dynamic Programming)}
+\label{alg:dp-repair}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Coordinates $\coord_1, \ldots, \coord_n$,
+  debt vector $\nabla D$, cost function
+  $\text{cost}(\coord, \ell_1, \ell_2)$ for promoting from level
+  $\ell_1$ to $\ell_2$, budget $B$
+\STATE \textbf{Output:} Repair plan $\rho^*$ maximizing debt
+  reduction within budget
+\STATE $\textit{dp}[0][0] \gets 0$ \COMMENT{Base case}
+\FOR{$i = 1$ to $n$}
+  \FOR{$b = 0$ to $B$}
+    \STATE $\textit{dp}[i][b] \gets \textit{dp}[i-1][b]$
+    \COMMENT{Skip $\coord_i$}
+    \FOR{$\ell = \mu(\coord_i)+1$ to $\mu^*(\coord_i)$}
+      \STATE $c \gets \text{cost}(\coord_i, \mu(\coord_i), \ell)$
+      \STATE $r \gets w(\coord_i) \cdot (\ell - \mu(\coord_i))$
+      \IF{$b \geq c$ \AND $\textit{dp}[i-1][b-c] + r >
+        \textit{dp}[i][b]$}
+        \STATE $\textit{dp}[i][b] \gets
+          \textit{dp}[i-1][b-c] + r$
+        \STATE Record: promote $\coord_i$ to level $\ell$
+      \ENDIF
+    \ENDFOR
+  \ENDFOR
+\ENDFOR
+\STATE Backtrack through $\textit{dp}$ to extract $\rho^*$
+\RETURN $\rho^*$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[DP Optimality]\label{thm:dp-optimal}
+Algorithm~\ref{alg:dp-repair} computes the maximum debt reduction
+achievable within budget $B$ in $O(n \cdot B \cdot 5)$ time, where
+$5$ is the number of maturity levels.
+\end{theorem}
+
+\begin{proof}
+This is a variant of the bounded knapsack problem.  Each coordinate
+$\coord_i$ has at most $4$ promotion options (levels $2$--$5$), each
+with a cost and a debt reduction value.  The dynamic programming
+recurrence correctly enumerates all feasible combinations, and the
+optimality follows from the principle of optimal substructure.
+\end{proof}
+
+\subsection{Implementation with CyclicSystemCoordinator}%
+\label{subsec:cyclic-repair}
+
+\begin{lstlisting}[style=jugeo-python]
+from jugeo.maturity.cyclic_picture\
+    .the_system_should_be_cyclic_not_pi import (
+    CyclicSystemCoordinator, CyclePhase,
+    CycleRecord, CyclicSystemWitness, CycleMetrics,
+)
+from jugeo.orchestration.synthesis_orchestrator import (
+    SynthesisOrchestrator,
+)
+from jugeo.evidence.trust import TrustAlgebra, TrustLevel
+
+def execute_repair_plan(site, repair_plan):
+    """Execute a repair plan using cyclic refinement."""
+    ta = TrustAlgebra()
+    coordinator = CyclicSystemCoordinator()
+    orchestrator = SynthesisOrchestrator()
+
+    results = []
+    for coord_name, target_level in repair_plan:
+        # Start a repair cycle for this coordinate
+        record = CycleRecord(
+            coordinate=coord_name,
+            phase=CyclePhase.SPECIFY,
+        )
+        coordinator.begin_cycle(record)
+
+        # Phase 1: Specify the target
+        witness = CyclicSystemWitness(
+            coordinate=coord_name,
+            target_trust=target_level,
+        )
+
+        # Phase 2: Synthesize repair
+        record.phase = CyclePhase.SYNTHESIZE
+        synthesis = orchestrator.synthesize(
+            coordinate=coord_name,
+            witness=witness,
+        )
+
+        # Phase 3: Verify the repair
+        record.phase = CyclePhase.VERIFY
+        verified = ta.solver_verified(
+            synthesis.result)
+        new_trust = (TrustLevel.SOLVER_DISCHARGED
+                     if verified
+                     else TrustLevel.COPILOT_SUGGESTED)
+
+        # Phase 4: Integrate
+        record.phase = CyclePhase.INTEGRATE
+        coordinator.complete_cycle(record)
+
+        metrics = CycleMetrics(
+            coordinate=coord_name,
+            old_trust=ta.bottom(),
+            new_trust=new_trust,
+        )
+        results.append(metrics)
+
+    return results
+\end{lstlisting}
+
+
 
 % =====================================================================
 \section{Lean 4 Proof Sketch}\label{sec:lean-proof}
@@ -330,6 +1093,18 @@ for coord, method in plan:
 \end{lstlisting}
 
 % =====================================================================
+\section{Practical Scope}\label{sec:case-studies}
+% =====================================================================
+
+The repository version audited for this paper does not expose stable
+directory-wide maturity scoring, debt-gate CLIs, or scripted repair commands
+of the form shown in earlier drafts. We therefore omit shell transcripts and
+deployment claims here. At present, the trustworthy public surface is the core
+trust algebra plus small scripted analyses over explicit benchmark outputs.
+
+
+
+% =====================================================================
 \section{Evaluation}\label{sec:evaluation}
 % =====================================================================
 
@@ -341,68 +1116,113 @@ for coord, method in plan:
 \toprule
 \textbf{Metric} & \textbf{Value} & \textbf{Unit} \\
 \midrule
-Total Programs       & \expTotalPrograms   & programs \\
-Verified (post-repair) & \expVerified      & programs \\
-Accuracy             & \expAccuracy        & \% \\
-Total Propositions   & \expPropsSum        & props \\
-Discharged           & \expPropsOkSum      & props \\
-Assessment Time      & \compProfMaturityAssessmentMeanMs\,ms & per call \\
-Verification Time    & \expTimeMean        & per program \\
-Total Time           & \expTimeTotal       & \\
+Total Programs       & \ppLXVIIIprogramCount & programs \\
+Clean Programs       & \ppLXVIIIcleanCount   & programs \\
+Debt-laden Programs  & \ppLXVIIIdebtCount    & programs \\
+Verified             & \ppLXVIIIverifiedPct  & \% \\
+Total Propositions   & \ppLXVIIIpropsTotal   & props \\
+Detected Bugs        & \ppLXVIIIbugsTotal    & bugs \\
+Mean Runtime         & \ppLXVIIItimeMean     & per program \\
+Total Time           & \ppLXVIIItimeTotal    & \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \begin{table}[H]
 \centering
-\caption{Debt Distribution by Size Tier}
+\caption{Observed Prototype Characteristics}
 \label{tab:debt-by-size}
 \begin{tabular}{lrrrr}
 \toprule
-\textbf{Tier} & \textbf{Count} & \textbf{Coords} & \textbf{Props}
-  & \textbf{Time} \\
+\textbf{Subset} & \textbf{Count} & \textbf{Mean Coords} & \textbf{Mean Props}
+  & \textbf{Mean Time} \\
 \midrule
-Tiny   & \compTinyCount   & \compTinyMeanCoords
-  & \compTinyMeanProps   & \compTinyMeanTime \\
-Small  & \compSmallCount  & \compSmallMeanCoords
-  & \compSmallMeanProps  & \compSmallMeanTime \\
-Medium & \compMediumCount & \compMediumMeanCoords
-  & \compMediumMeanProps & \compMediumMeanTime \\
-Large  & \compLargeCount  & \compLargeMeanCoords
-  & \compLargeMeanProps  & \compLargeMeanTime \\
+Clean       & \ppLXVIIIcleanCount & \ppLXVIIIcleanCoordsMean
+  & \ppLXVIIIcleanPropsMean & \ppLXVIIIcleanTimeMean \\
+Debt-laden  & \ppLXVIIIdebtCount  & \ppLXVIIIdebtCoordsMean
+  & \ppLXVIIIdebtPropsMean  & \ppLXVIIIdebtTimeMean \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The framework achieves \expAccuracy\ post-repair accuracy.  Assessment
-overhead is \compProfMaturityAssessmentMeanMs\,ms per call.  All
-\compTrustSolverdischarged\ propositions achieved $\SolverDisch$
-(\compTrustSolverdischargedPct).  Repair completed in
-\subOrchestrateverificationSmallTime\ (small) to
-\subOrchestrateverificationLargeTime\ (large) per program.
+All programs in the Paper~68 corpus verified successfully, and no bugs were
+reported. At the same time, the generated per-program trust and debt scores in
+\texttt{data-paper68.tex} are constant (0.5 for every instance), so the
+current prototype does \emph{not} empirically distinguish clean from
+debt-laden examples.
 
-\paragraph{Domain results.}
-Data Structures: \expDomainDsVerified\ verified, avg.\
-\expDomainDsAvgProps\ props.  Sorting: \expDomainSortVerified\
-verified, avg.\ \expDomainSortAvgProps\ props (lowest initial debt).
-Mathematics: \expDomainMathVerified\ verified, avg.\
-\expDomainMathAvgProps\ props.
+\paragraph{Interpretation.}
+The useful empirical signal in this dataset is runtime, not discrimination:
+clean and debt-laden subsets have comparable site sizes and similar runtimes.
+Any future debt-measurement claim should therefore be supported by regenerated
+data that actually vary with program condition.
 
 % =====================================================================
 \section{Related Work}\label{sec:related}
 % =====================================================================
 
-\paragraph{Technical Debt.}
+\paragraph{Technical Debt Taxonomy.}
+Cunningham~\cite{Cunningham1992} introduced the debt metaphor.
+Kruchten et al.~\cite{Kruchten2012} and Ernst et al.~\cite{Ernst2015}
+classified debt categories.  Martin Fowler's \emph{Technical Debt
+Quadrant}~\cite{Fowler2009} distinguishes deliberate vs.\ inadvertent
+and reckless vs.\ prudent debt.  Our framework captures all four
+quadrants: deliberate debt appears as explicitly set low target
+maturity, while inadvertent debt manifests as temporal decay.
+
+\paragraph{Quantitative Debt Models.}
 SQALE~\cite{Letouzey2012} and SonarQube~\cite{SonarQube} measure
-debt via heuristic metrics.  We ground debt in formal trust.
+debt via heuristic metrics based on code smells, duplications, and
+complexity.  The CAST Software Analysis model~\cite{CAST2020}
+extends this with structural quality metrics and automated sizing.
+The Software Improvement Group (SIG) maintainability
+model~\cite{Heitlager2007} benchmarks code against industry norms
+using a star-rating system.  In contrast, our approach grounds debt
+quantification in formal trust levels rather than syntactic heuristics,
+enabling debt scores that reflect actual verification status.
+
+\paragraph{SEI Technical Debt Taxonomy.}
+The Software Engineering Institute's taxonomy~\cite{SEI2012}
+classifies debt into architecture debt, build debt, code debt,
+defect debt, design debt, documentation debt, infrastructure debt,
+people debt, process debt, requirement debt, service debt, and test
+automation debt.  Our maturity lattice subsumes several of these
+categories: code debt and defect debt map to trust degradation,
+while architecture debt corresponds to cohomological obstructions
+($\Hcoh^1 \neq 0$).
 
 \paragraph{Maturity Models.}
-CMMI~\cite{CMMI2010} defines process maturity.  We adapt five-stage
-maturity to per-coordinate verification within sheaf theory.
+CMMI~\cite{CMMI2010} defines five process maturity levels.  We
+adapt this structure to per-coordinate verification maturity within
+sheaf theory.  The ISO/IEC 15504 (SPICE) process assessment
+model provides a similar five-level scheme, which we extend with
+formal trust annotations.
 
 \paragraph{Proof Maintenance.}
-Ringer et al.~\cite{Ringer2020} address evolving proofs.  Our
-degradation presheaf extends this to lightweight automated tracking.
+Ringer et al.~\cite{Ringer2020} address evolving Coq proofs across
+type equivalences.  Czajka and Kaliszyk~\cite{Czajka2018} study
+machine learning for proof automation.  Our degradation presheaf
+extends proof maintenance to a broader setting that includes
+lightweight automated tracking of trust levels across arbitrary
+code evolution, not just type changes.
+
+\paragraph{Formal Methods and Debt.}
+Leino~\cite{Leino2010} describes Dafny's approach to verified
+software, where proof obligations serve a similar role to our trust
+annotations.  The connection between formal methods and technical debt
+was explored by Kiniry and Zimmerman~\cite{Kiniry2008}, who argue
+that formal specifications can prevent debt accumulation.  Our
+framework makes this connection precise through the debt presheaf
+and its cohomological properties.
+
+\paragraph{Economics of Technical Debt.}
+Schmid~\cite{Schmid2013} models debt using real options theory.
+Ampatzoglou et al.~\cite{Ampatzoglou2015} provide a systematic
+literature review of financial approaches to debt management.  Our
+approach complements these economic models by providing the
+underlying formal metric (the debt score) that economic analyses
+can be built upon.
+
 
 % =====================================================================
 \section{Conclusion}\label{sec:conclusion}
@@ -410,11 +1230,13 @@ degradation presheaf extends this to lightweight automated tracking.
 
 We presented a sheaf-theoretic framework for technical debt through
 trust degradation and maturity assessment.  The debt score provides
-a precise metric for each coordinate; the repair planner ensures
-monotonic convergence to zero debt.  Experiments demonstrate
-\expAccuracy\ accuracy with \compProfMaturityAssessmentMeanMs\,ms
-overhead.  Future work will integrate temporal decay with CI/CD and
-explore ML-based decay rate calibration.
+a precise metric at the modeling level, but the current Paper~68 dataset only
+supports a modest empirical conclusion: the prototype runs on
+\ppLXVIIIprogramCount{} curated programs in \ppLXVIIItimeMean{} on average.
+Because the generated debt scores are uniform and no bugs were reported, this
+revision does not claim successful technical-debt discrimination. Future work
+should regenerate the benchmark with non-degenerate scoring and then revisit
+repair-planning claims empirically.
 
 % ─────────────────────────────────────────────────────────────────────
 \begin{thebibliography}{99}
@@ -458,6 +1280,43 @@ Language,'' CADE 2021.
 \bibitem{Z32008}
 L.~de~Moura and N.~Bj{\o}rner, ``Z3: An Efficient SMT Solver,''
 TACAS 2008.
+
+
+\bibitem{Fowler2009}
+M.~Fowler, ``Technical Debt Quadrant,''
+\url{https://martinfowler.com/bliki/TechnicalDebtQuadrant.html}, 2009.
+
+\bibitem{CAST2020}
+CAST Software, ``Automated Software Analysis for Structural Quality,''
+Technical Report, 2020.
+
+\bibitem{Heitlager2007}
+I.~Heitlager, T.~Kuipers, and J.~Visser, ``A Practical Model for
+Measuring Maintainability,'' QUATIC 2007.
+
+\bibitem{SEI2012}
+Software Engineering Institute, ``A Field Study of Technical Debt,''
+CMU/SEI-2012-SR-013, 2012.
+
+\bibitem{Czajka2018}
+L.~Czajka and C.~Kaliszyk, ``Hammer for Coq: Automation for
+Dependent Type Theory,'' JAR 2018.
+
+\bibitem{Leino2010}
+K.~R.~M.~Leino, ``Dafny: An Automatic Program Verifier for
+Functional Correctness,'' LPAR 2010.
+
+\bibitem{Kiniry2008}
+J.~R.~Kiniry and D.~R.~Zimmerman, ``Secret Ninja Formal Methods,''
+FM 2008.
+
+\bibitem{Schmid2013}
+K.~Schmid, ``A Formal Approach to Technical Debt Decision Making,''
+QoSA 2013.
+
+\bibitem{Ampatzoglou2015}
+A.~Ampatzoglou et al., ``The Financial Aspect of Managing Technical
+Debt: A Systematic Literature Review,'' IST 2015.
 
 \end{thebibliography}
 

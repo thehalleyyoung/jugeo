@@ -7,6 +7,7 @@
 \input{experiment-data}
 \input{subsystem-data}
 \input{supplementary-data}
+\input{data-paper38}
 
 % ── Additional packages ────────────────────────────────────────────────
 \usepackage{array}
@@ -88,10 +89,11 @@ Our central result---the \emph{Cache Correctness Theorem}---states that
 any cache entry that has not been marked stale by $\CacheInval$
 faithfully reflects the current verification status of the
 corresponding code fragment.  We formalise the theorem in \LEAN{} with
-a complete, sorry-free proof.  Empirically, semantic caching reduces
-average verification latency on a suite of \expTotalPrograms{}
-programs under a realistic edit-compile-verify loop, with the majority of
-verification calls served from cache.
+a complete, sorry-free proof.  Empirically, the current benchmark is
+limited: across \ppXXXVIIITotalPrograms{} programs the observed hit rate
+is \ppXXXVIIIHitRate{} and the overall speedup is
+\ppXXXVIIISpeedup.  This audited version therefore keeps the
+cache-correctness claim but not the stronger latency-win claim.
 \end{abstract}
 
 \newpage
@@ -271,6 +273,27 @@ where $\CacheIndex$ is a cache index
 (\S\ref{sec:invalidation}).
 \end{definition}
 
+\begin{lstlisting}[language=Python, caption={Querying the semantic closure of a verification site with incremental caching.}]
+from jugeo.geometry import SiteBuilder
+
+code = open("web_server.py").read()
+site = SiteBuilder(code).build()
+
+print(f"Coordinates:       {site.coordinate_count()}")
+print(f"Covering families: {len(site.covering_families())}")
+
+# Compute the semantic closure (cache-aware transitive closure)
+closure = site.semantic_closure()
+print(f"Cache hits:        {closure['cache_hit_count']}")
+print(f"Cache misses:      {closure['cache_miss_count']}")
+hit_rate = (closure['cache_hit_count']
+            / max(closure['cache_hit_count']
+                  + closure['cache_miss_count'], 1))
+print(f"Hit rate:          {hit_rate * 100:.1f}%")
+print(f"Latency (cached):  {closure['latency_ms']:.2f} ms")
+print(f"Speedup factor:    {closure['speedup_factor']:.2f}x")
+\end{lstlisting}
+
 \begin{figure}[t]
 \centering
 \begin{tikzcd}[column sep=large, row sep=large]
@@ -361,6 +384,34 @@ Under \LFU{}, the hit-counter update is $O(\log N)$ via a min-heap.
 Under \FIFO{}, eviction is $O(1)$ via a deque.  Under \TTL{}, the
 expiry scan is $O(N)$ in the worst case, but is amortised to $O(1)$
 per operation if triggered lazily.
+
+The following snippet shows how to instantiate a cache policy and
+insert or retrieve entries through the Python API:
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Configuring a semantic cache policy and querying cached
+           verification results.},
+  label={lst:cache-policy-api}]
+from jugeo.cache import CachePolicy, SemanticCache
+
+# Configure an LRU-based cache with capacity 10,000
+policy = CachePolicy(
+    strategy="LRU",
+    max_entries=10_000,
+    ttl_seconds=3600,
+    warm_on_miss=True,
+    persist_on_exit=True,
+)
+cache = SemanticCache(policy=policy)
+
+# Insert a verification result keyed by code + spec hashes
+cache.put(code_hash="a3f1b8", spec_hash="b7d20e",
+          result="Valid", proof_obligations=12)
+
+entry = cache.get(code_hash="a3f1b8", spec_hash="b7d20e")
+print(f"Result: {entry.result}")      # Valid
+print(f"Fresh:  {entry.is_fresh()}")   # True
+\end{lstlisting}
 
 % =====================================================================
 \section{Cache Invalidation}\label{sec:invalidation}
@@ -758,19 +809,11 @@ the default cascade strategy is \texttt{Transitive}.
 
 \subsection{Setup}
 
-We evaluate the semantic cache on the standard \JuGeo{} benchmark
-suite: $300$ Python programs drawn from $10$ domains (sorting,
-graph algorithms, numerical methods, parsers, web frameworks,
-compilers, cryptography, data structures, machine learning utilities,
-and system utilities), each with between $5$ and $200$ coordinates.
-For each program, we simulate $20$ rounds of sequential edits (each
-edit changes one randomly selected function) and measure verification
-latency with and without the semantic cache.
-
-The verifier back-end is the \JuGeo{} standard stack: Z3 for
-$\QFLIA/\QFLRA$ queries and Lean~4 elaboration for proof-level
-trust.  All experiments run on a laptop with an Apple M2 processor
-and $16$\,GB RAM.
+We evaluate the semantic cache on the 10-program benchmark reported in
+\texttt{data-paper38.tex}.  The audited data records cache-warming key
+counts and hit counts for three triggers (\texttt{FileEdit},
+\texttt{ImportChange}, and \texttt{ScheduledSweep}) together with the
+overall hit rate and speedup.
 
 \subsection{Hit rate}
 
@@ -786,44 +829,37 @@ All results use \LRU{} eviction and capacity $N_{\max} = 10{,}000$.}
 \midrule
 \multicolumn{5}{l}{\emph{Per-domain breakdowns omitted; see universal benchmark for validated totals.}} \\
 \midrule
-\textbf{Overall} & \textbf{\expTotalPrograms} & \multicolumn{3}{c}{\emph{Cache correctness proved in \LEAN{}; see Theorem~\ref{thm:cache-correct}}} \\
+\textbf{Overall} & \textbf{\ppXXXVIIITotalPrograms} & \multicolumn{3}{c}{\emph{Observed hit rate \ppXXXVIIIHitRate{}; theorem covers correctness, not speed}} \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-Table~\ref{tab:hit-rates} summarises cache behaviour for the three cascade
-strategies.  Cache correctness---the property that non-invalidated entries
-faithfully reflect the current verification status---is established by
-Theorem~\ref{thm:cache-correct}, proved in \LEAN{}.  On the universal
-benchmark (\expTotalPrograms{} programs, \expAccuracy{} accuracy), all
-three strategies preserve correctness; the strategies differ only in
-invalidation aggressiveness.
+Table~\ref{tab:hit-rates} summarises the available cache behaviour
+measurements.  Cache correctness remains a theorem-level property;
+practically, the observed hit rate on the current benchmark is low.
 
 \subsection{Latency reduction}
 
 \begin{table}[t]
 \centering
-\caption{Median per-query verification latency with and without
-caching, by eviction strategy.  Cache size $N_{\max} = 10{,}000$;
-cascade: \texttt{Transitive}.}
+\caption{Observed latency summary for the audited cache benchmark.}
 \label{tab:latency}
 \begin{tabular}{l r r r}
 \toprule
 \textbf{Eviction} & \textbf{No cache (ms)} &
 \textbf{With cache (ms)} & \textbf{Speedup} \\
 \midrule
-\LRU{}  & \suppColdMeanMs\,ms & \subSiteMeanTime & \suppCacheSpeedup \\
-\LFU{}  & \suppColdMeanMs\,ms & \subSiteMeanTime & \suppCacheSpeedup \\
-\FIFO{} & \suppColdMeanMs\,ms & \subSiteMeanTime & \suppCacheSpeedup \\
-\TTL{}  & \suppColdMeanMs\,ms & \subSiteMeanTime & \suppCacheSpeedup \\
+\LRU{}  & --- & --- & \ppXXXVIIISpeedup \\
+\LFU{}  & --- & --- & \ppXXXVIIISpeedup \\
+\FIFO{} & --- & --- & \ppXXXVIIISpeedup \\
+\TTL{}  & --- & --- & \ppXXXVIIISpeedup \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:latency} shows median per-query latency.  \LRU{}
-achieves the highest speedup because it retains the
-most recently accessed entries, which are the most likely to be
-queried again.
+Table~\ref{tab:latency} should be read conservatively: the observed
+overall speedup is \ppXXXVIIISpeedup, so the current benchmark does not
+show a meaningful latency gain from caching.
 
 \subsection{Warming effectiveness}
 
@@ -837,23 +873,22 @@ by pre-computation during idle cycles.}
 \textbf{Trigger} & \textbf{Keys warmed} &
 \textbf{Extra hits} & \textbf{Warm time (ms)} \\
 \midrule
-FileEdit         & --- & --- & \subSiteMeanTime \\
-ImportChange     & --- & --- & \subSiteMeanTime \\
-ScheduledSweep   & --- & --- & \subSiteMeanTime \\
+FileEdit         & \ppXXXVIIIFileEditKeys & \ppXXXVIIIFileEditHits & \subSiteMeanTime \\
+ImportChange     & \ppXXXVIIIImportChangeKeys & \ppXXXVIIIImportChangeHits & \subSiteMeanTime \\
+ScheduledSweep   & \ppXXXVIIIScheduledSweepKeys & \ppXXXVIIIScheduledSweepHits & \subSiteMeanTime \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:warming} shows that the \texttt{FileEdit} trigger
-provides the best cost-benefit ratio, with warming overhead
-consistent with subsystem timings (\subSiteMeanTime).
+Table~\ref{tab:warming} shows that \texttt{FileEdit} warms the most keys
+and also produces the most extra hits, but the absolute hit counts are
+still small.
 
 \subsection{Checkpoint overhead}
 
-Checkpoint creation via \texttt{CheckpointBuilder} adds sub-millisecond
-overhead per checkpoint in both JSON and MessagePack formats.
-Restoration is similarly fast.  These figures confirm
-that checkpointing is negligible compared to the verification savings.
+The current benchmark does not provide a separate validated checkpoint
+timing measurement, so we make no quantitative checkpoint-overhead claim
+here.
 
 \subsection{Comparison with baseline}
 
@@ -869,8 +904,42 @@ We compare against three baselines:
   opportunities where a spec reformulation preserves semantics.
 \end{enumerate}
 
-Our semantic cache outperforms all baselines (no cache, file-hash, and
-AST-hash), as established by the Cache Correctness Theorem.
+The current benchmark does not support a performance-win claim over the
+listed baselines; the observed overall speedup remains
+\ppXXXVIIISpeedup.  The Cache Correctness Theorem is about soundness of
+served entries, not about outperforming every baseline.
+
+Listing~\ref{lst:cache-benchmark} shows the Python API used to run
+the benchmark and collect the hit-rate and warming statistics reported
+in Tables~\ref{tab:hit-rates}--\ref{tab:warming}.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Measuring cache hit rates and warming effectiveness across
+           the benchmark suite.},
+  label={lst:cache-benchmark}]
+from jugeo.cache import SemanticCache, CachePolicy
+from jugeo.geometry import SiteBuilder
+
+policy = CachePolicy(strategy="LRU", max_entries=10_000)
+cache  = SemanticCache(policy=policy)
+
+# Run verification across all benchmark programs
+programs = load_benchmark("paper38_programs.json")
+for prog in programs:
+    site   = SiteBuilder(prog.source).build()
+    result = site.verify(cache=cache)
+
+stats = cache.stats()
+print(f"Total queries: {stats.total_queries}")
+print(f"Hit rate:      {stats.hit_rate:.1f}%")
+print(f"Speedup:       {stats.speedup:.1f}x")
+
+# Inspect warming effectiveness by trigger kind
+for trigger in ["FileEdit", "ImportChange", "ScheduledSweep"]:
+    w = stats.warming[trigger]
+    print(f"{trigger}: {w.keys_warmed} keys, "
+          f"{w.extra_hits} extra hits")
+\end{lstlisting}
 
 % =====================================================================
 \section{Conclusion}\label{sec:conclusion}
@@ -901,10 +970,10 @@ The key contributions are:
   (Theorem~\ref{thm:cache-correct}): non-invalidated entries
   faithfully reflect the current verification status, with a
   formal \LEAN{} proof.
-\item Empirical validation on \expTotalPrograms{} programs from the
-  universal benchmark (\expAccuracy{} accuracy, mean \expTimeMean{} per
-  program) confirming cache correctness under the
-  \texttt{Transitive} cascade strategy.
+\item Empirical validation on \ppXXXVIIITotalPrograms{} benchmark
+  programs showing a low observed hit rate (\ppXXXVIIIHitRate{}) and no
+  meaningful speedup (\ppXXXVIIISpeedup), while remaining consistent
+  with the theorem's soundness requirements.
 \end{enumerate}
 
 \paragraph{Limitations.}

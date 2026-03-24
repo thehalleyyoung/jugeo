@@ -5,6 +5,7 @@
 \usepackage{lmodern}
 \input{jugeo-common}
 \input{experiment-data}
+\input{data-paper07}
 
 % ── Additional packages for this paper ─────────────────────────────────
 \usepackage{pgfplots}
@@ -648,64 +649,54 @@ def valid_rows(reader) -> Iterator[dict]:
 \end{itemize}
 
 \paragraph{Site construction.}
-The \JuGeo{} analysis constructs a site with coordinates for each
-function, each \texttt{try/except} block, each \texttt{with} block,
-and each generator fiber:
+The public geometry API constructs the site explicitly from typed
+coordinates and morphisms:
 
 \begin{lstlisting}[style=jugeo-python,caption={JuGeo site for the CSV pipeline.}]
 from jugeo.geometry.site import (
-    SiteBuilder, CoordinateKind, MorphismKind
-)
-from jugeo.geometry.descent import (
-    DescentEngine, DescentConfiguration, DescentStrategy
-)
-from jugeo.judgments.judgment_terms import (
-    JudgmentBuilder, Proposition, PropositionKind, TrustLevel
+    Coordinate, CoordinateKind, Morphism, MorphismKind, SiteBuilder,
 )
 
-site = SiteBuilder("csv_pipeline")
+c_mod = Coordinate(("csv_pipeline",), kind=CoordinateKind.MODULE)
+c_process = Coordinate(
+    ("csv_pipeline", "process_csv"), kind=CoordinateKind.FUNCTION,
+)
+c_valid = Coordinate(
+    ("csv_pipeline", "valid_rows"), kind=CoordinateKind.FUNCTION,
+)
+c_try_outer = Coordinate(
+    ("csv_pipeline", "process_csv", "try_outer"),
+    kind=CoordinateKind.REGION,
+)
 
-# Module coordinate
-c_mod = site.add_coordinate("csv_pipeline",
-    kind=CoordinateKind.MODULE)
-
-# Function coordinates
-c_process = site.add_coordinate("csv_pipeline.process_csv",
-    kind=CoordinateKind.FUNCTION)
-c_valid = site.add_coordinate("csv_pipeline.valid_rows",
-    kind=CoordinateKind.FUNCTION)
-
-# Exception forks
-c_try_outer = site.add_coordinate(
-    "csv_pipeline.process_csv.try_outer",
-    kind=CoordinateKind.REGION)
-c_try_inner = site.add_coordinate(
-    "csv_pipeline.valid_rows.try_score",
-    kind=CoordinateKind.REGION)
-
-# Context manager coverings
-c_with_in = site.add_coordinate(
-    "csv_pipeline.process_csv.with_input",
-    kind=CoordinateKind.REGION)
-c_with_out = site.add_coordinate(
-    "csv_pipeline.process_csv.with_output",
-    kind=CoordinateKind.REGION)
-
-# Build morphisms
-site.add_morphism(c_mod, c_process,
-    kind=MorphismKind.RESTRICTION)
-site.add_morphism(c_mod, c_valid,
-    kind=MorphismKind.RESTRICTION)
-site.add_morphism(c_process, c_try_outer,
-    kind=MorphismKind.RESTRICTION)
-site.add_morphism(c_valid, c_try_inner,
-    kind=MorphismKind.RESTRICTION)
-
-# Cross-function transport (generator call)
-site.add_morphism(c_process, c_valid,
-    kind=MorphismKind.TRANSPORT)
-
-built_site = site.build()
+built_site = (
+    SiteBuilder("csv_pipeline")
+    .add_coordinate(c_mod)
+    .add_coordinate(c_process)
+    .add_coordinate(c_valid)
+    .add_coordinate(c_try_outer)
+    .add_morphism(Morphism(
+        source=c_process,
+        target=c_mod,
+        kind=MorphismKind.RESTRICTION,
+    ))
+    .add_morphism(Morphism(
+        source=c_valid,
+        target=c_mod,
+        kind=MorphismKind.RESTRICTION,
+    ))
+    .add_morphism(Morphism(
+        source=c_try_outer,
+        target=c_process,
+        kind=MorphismKind.RESTRICTION,
+    ))
+    .add_morphism(Morphism(
+        source=c_process,
+        target=c_valid,
+        kind=MorphismKind.TRANSPORT,
+    ))
+    .build()
+)
 \end{lstlisting}
 
 \paragraph{Judgment construction.}
@@ -713,58 +704,69 @@ For each coordinate, \JuGeo{} constructs judgments capturing the
 local properties:
 
 \begin{lstlisting}[style=jugeo-python,caption={Judgments for the CSV pipeline.}]
-builder = JudgmentBuilder(built_site)
-
-# Process_csv returns int
-j_return = builder.build(
-    coordinate=c_process,
-    proposition=Proposition(
-        kind=PropositionKind.STRUCTURAL,
-        statement="process_csv returns int"),
-    trust=TrustLevel.COPILOT_SUGGESTED
+from jugeo.judgments.judgment_terms import (
+    JudgmentBuilder, Proposition, PropositionKind, TrustLevel,
 )
 
-# File handles are properly closed
-j_cleanup = builder.build(
-    coordinate=c_with_in,
-    proposition=Proposition(
-        kind=PropositionKind.BEHAVIORAL,
-        statement="input file handle closed on all paths"),
-    trust=TrustLevel.COPILOT_SUGGESTED
+j_return = (
+    JudgmentBuilder()
+    .at(c_process)
+    .claiming(Proposition(
+        PropositionKind.STRUCTURAL,
+        "process_csv returns int",
+    ))
+    .of_type_named("FunctionContract")
+    .with_trust_level(TrustLevel.COPILOT_SUGGESTED)
+    .build()
 )
 
-# Generator yields valid rows only
-j_gen = builder.build(
-    coordinate=c_valid,
-    proposition=Proposition(
-        kind=PropositionKind.BEHAVIORAL,
-        statement="valid_rows yields only rows with "
-                  "non-empty name and positive score"),
-    trust=TrustLevel.COPILOT_SUGGESTED
+j_gen = (
+    JudgmentBuilder()
+    .at(c_valid)
+    .claiming(Proposition(
+        PropositionKind.BEHAVIORAL,
+        "valid_rows yields only rows with positive score",
+    ))
+    .of_type_named("GeneratorContract")
+    .with_trust_level(TrustLevel.COPILOT_SUGGESTED)
+    .build()
 )
 \end{lstlisting}
 
 \paragraph{Descent.}
-The descent engine checks overlap conditions between all coordinate
-pairs:
+The descent engine then checks whether the local data glues across a
+cover built from the relevant patches:
 
 \begin{lstlisting}[style=jugeo-python,caption={Descent for the CSV pipeline.}]
+from jugeo.geometry.covers import Cover
+from jugeo.geometry.descent import (
+    DescentConfiguration, DescentEngine, DescentStrategy,
+)
+
 config = DescentConfiguration(
     strategy=DescentStrategy.EAGER,
     depth_limit=5,
     copilot_assisted_repair=True
 )
-engine = DescentEngine(built_site, config)
-result = engine.run()
+cover = Cover(
+    c_process,
+    patches=(c_try_outer, c_valid),
+    overlaps=((c_try_outer.key, c_valid.key),),
+)
+sections = {
+    c_try_outer.key: {"returns_int": True},
+    c_valid.key: {"returns_int": True},
+}
 
-assert result.is_global_section()
-assert result.obstruction_count == 0
-assert result.trust_floor >= TrustLevel.COPILOT_SUGGESTED
+engine = DescentEngine(configuration=config)
+report = engine.run(cover, sections)
+
+assert report.success
+assert report.obstruction_rank == 0
 \end{lstlisting}
 
-The descent completes with zero obstructions, producing a global
-section that certifies the pipeline's correctness across all effect
-interactions.
+In this minimal example, descent succeeds because both local sections
+agree on the overlap data supplied to the cover.
 
 % =====================================================================
 \section{Worked Example: Web Request Handler}\label{sec:web-example}
@@ -1001,11 +1003,11 @@ Our approach differs in three ways:
 \midrule
 \JuGeo{} & \checkmark & \checkmark & \checkmark & \checkmark
   & \checkmark & topology \\
-\Fstar{} & \checkmark & \checkmark & --- & --- & ---
+\Fstar{} & \checkmark & \checkmark & \ppSEVENfstarAsync & \ppSEVENfstarGen & \ppSEVENfstarCtx
   & monad transformers \\
-\LEAN{}  & --- & --- & --- & --- & --- & manual encoding \\
-\Dafny{} & --- & \checkmark & --- & --- & --- & frame conditions \\
-\Coq{}   & --- & --- & --- & --- & --- & manual encoding \\
+\LEAN{}  & \ppSEVENleanExc & \ppSEVENleanMut & \ppSEVENleanAsync & \ppSEVENleanGen & \ppSEVENleanCtx & manual encoding \\
+\Dafny{} & \ppSEVENdafnyExc & \checkmark & \ppSEVENdafnyAsync & \ppSEVENdafnyGen & \ppSEVENdafnyCtx & frame conditions \\
+\Coq{}   & \ppSEVENcoqExc & \ppSEVENcoqMut & \ppSEVENcoqAsync & \ppSEVENcoqGen & \ppSEVENcoqCtx & manual encoding \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1130,7 +1132,8 @@ benchmark:
 
 \begin{table}[H]
 \centering
-\caption{Verifiable fraction across tools.}\label{tab:verifiable}
+\caption{Verifiable fraction across tools.
+  \textsuperscript{$\dagger$}Measurement pending; real tool comparison experiments in progress.}\label{tab:verifiable}
 \begin{tabular}{@{}l c c l@{}}
 \toprule
 \textbf{Tool} & \textbf{Verified} & \textbf{Fraction}
@@ -1138,11 +1141,11 @@ benchmark:
 \midrule
 \JuGeo{}    & \expVerified{}/\expTotalPrograms{} & \expAccuracy{}
   & all 5 \\
-\Fstar{}    & 12/\expTotalPrograms{} & 40\%
+\Fstar{}    & ---\textsuperscript{$\dagger$} & ---\textsuperscript{$\dagger$}
   & $\Exc$, $\Mut$ \\
-\Dafny{}    & 8/\expTotalPrograms{} & 27\%
+\Dafny{}    & ---\textsuperscript{$\dagger$} & ---\textsuperscript{$\dagger$}
   & $\Mut$ only \\
-\LEAN{}     & 5/\expTotalPrograms{} & 17\%
+\LEAN{}     & ---\textsuperscript{$\dagger$} & ---\textsuperscript{$\dagger$}
   & manual monads \\
 \bottomrule
 \end{tabular}

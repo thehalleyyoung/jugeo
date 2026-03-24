@@ -1,0 +1,1279 @@
+% paper100-copilot-api-bridge.tex — CopilotAPIBridge
+%   The API bridge connecting Copilot channels to the JuGeo API layer.
+%   Paper 100 of the Judgment Geometry series.
+% Compile: pdflatex paper100-copilot-api-bridge
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+
+% ——— Paper-specific macros (letters only) ———
+\newcommand{\Bridge}{\mathsf{CopilotAPIBridge}}
+\newcommand{\JuGeoAPI}{\mathsf{JuGeoAPI}}
+\newcommand{\APIReq}{\mathsf{APIRequest}}
+\newcommand{\APIResp}{\mathsf{APIResponse}}
+\newcommand{\APISess}{\mathsf{APISession}}
+\newcommand{\APILog}{\mathsf{APIEventLog}}
+\newcommand{\APIAuth}{\mathsf{APIAuthenticator}}
+\newcommand{\APIRate}{\mathsf{APIRateLimiter}}
+\newcommand{\APIVal}{\mathsf{APIValidator}}
+\newcommand{\OpKind}{\mathsf{OperationKind}}
+\newcommand{\ReqStat}{\mathsf{RequestStatus}}
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\ChanCfg}{\mathsf{ChannelConfiguration}}
+\newcommand{\ChanPool}{\mathsf{ChannelPool}}
+\newcommand{\ChanMon}{\mathsf{ChannelMonitor}}
+\newcommand{\ChanFed}{\mathsf{ChannelFederation}}
+\newcommand{\EvReq}{\mathsf{EvidenceRequest}}
+\newcommand{\EvResp}{\mathsf{EvidenceResponse}}
+\newcommand{\EvRec}{\mathsf{EvidenceRecord}}
+\newcommand{\SuppRoute}{\mathsf{SupportRoute}}
+
+\title{\textbf{CopilotAPIBridge:\\
+Bridging Copilot Channels and the JuGeo API Layer}}
+\author{Halley Young}
+\date{Paper~100 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+%  Abstract
+% ============================================================
+\begin{abstract}
+The $\Bridge$ is the central integration point between the
+Copilot evidence channel and the \JuGeo{} API layer.  It
+translates API-level operations (verify, construct, descend,
+federate, inspect) into Copilot channel queries, enforces
+the $\Tcopilot$ trust ceiling, optionally requires
+corroboration from higher-trust channels, and logs all
+interactions.  This paper provides a comprehensive formal
+treatment: we model the bridge as a trust-bounded natural
+transformation between the API functor and the channel
+functor, prove five theorems (trust ceiling enforcement,
+corroboration soundness, event log completeness, session
+isolation, and rate-limit compliance), and present four
+\Python{} listings covering the full bridge lifecycle.
+An appendix collects auxiliary lemmas and proofs.
+\end{abstract}
+
+% ============================================================
+%  Section 1 — Introduction
+% ============================================================
+\section{Introduction}\label{sec:intro}
+
+The \JuGeo{} framework exposes a public API through the
+$\JuGeoAPI$ class.  This API supports five operation kinds:
+$\OpKind.\texttt{VERIFY}$, $\OpKind.\texttt{CONSTRUCT}$,
+$\OpKind.\texttt{DESCEND}$, $\OpKind.\texttt{FEDERATE}$,
+and $\OpKind.\texttt{INSPECT}$.  Internally, many of these
+operations benefit from Copilot assistance: the language
+model can suggest verification strategies, construction
+hints, descent directions, and inspection summaries.
+
+The $\Bridge$ mediates this integration.  It receives
+API-level requests, formulates appropriate prompts, queries
+the Copilot channel, post-processes the responses (clamping
+trust, checking corroboration), and returns API-level
+responses.  All interactions are logged in the $\APILog$.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item A categorical model of the bridge as a natural
+      transformation between two functors
+      (\S\ref{sec:categorical}).
+\item A detailed description of the bridge's trust
+      enforcement and corroboration mechanisms
+      (\S\ref{sec:trustenforce}).
+\item The design of the event logging and session management
+      protocols (\S\ref{sec:logging}).
+\item Five theorems: trust ceiling enforcement, corroboration
+      soundness, event log completeness, session isolation,
+      and rate-limit compliance (\S\ref{sec:formal}).
+\item Four \Python{} listings showing the full bridge
+      implementation (\S\ref{sec:code}).
+\end{enumerate}
+
+\paragraph{Paper outline.}
+Section~\ref{sec:background} recalls the API and channel layers.
+Section~\ref{sec:categorical} presents the categorical model.
+Section~\ref{sec:trustenforce} describes trust enforcement.
+Section~\ref{sec:corroboration} treats corroboration.
+Section~\ref{sec:logging} covers event logging.
+Section~\ref{sec:code} gives the implementation.
+Section~\ref{sec:formal} states and proves the main theorems.
+Section~\ref{sec:discussion} discusses limitations.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+Appendix~\ref{app:proofs} collects auxiliary proofs.
+
+% ============================================================
+%  Section 2 — Background
+% ============================================================
+\section{Background}\label{sec:background}
+
+\subsection{The JuGeo API layer}
+
+The API layer consists of:
+\begin{itemize}
+\item $\JuGeoAPI$: the main entry point, supporting
+      \texttt{verify}, \texttt{construct}, \texttt{descend},
+      \texttt{federate}, \texttt{inspect}, and
+      \texttt{copilot\_query}.
+\item $\APIReq$: encapsulates a request with id, operation,
+      coordinate, proposition, budget, deadline, and metadata.
+\item $\APIResp$: encapsulates a response with status,
+      evidence, trust, and residuals.
+\item $\APISess$: manages a sequence of related requests.
+\item $\APILog$: records all API events for auditing.
+\item $\APIAuth$: authenticates callers.
+\item $\APIRate$: enforces rate limits.
+\item $\APIVal$: validates request parameters.
+\end{itemize}
+
+\begin{definition}[Operation kind]\label{def:opkind}
+$\OpKind$ is an enumeration:
+$\{\texttt{VERIFY}, \texttt{CONSTRUCT}, \texttt{DESCEND},
+\texttt{FEDERATE}, \texttt{INSPECT}\}$.
+Each kind determines the prompt template used by the bridge.
+\end{definition}
+
+\subsection{The evidence channel layer}
+
+The channel layer (Paper~88) provides:
+\begin{itemize}
+\item $\CopChan$: queries a language model with trust ceiling
+      $\Tcopilot$.
+\item $\ChanPool$: manages registered channels.
+\item $\ChanMon$: records request--response pairs.
+\item $\ChanFed$: collects evidence from multiple channels.
+\end{itemize}
+
+\subsection{Trust lattice}
+
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot
+  \;\tleq\; \Toracle \;\tleq\; \Truntime
+  \;\tleq\; \Tsolver \;\tleq\; \Tproof.
+\]
+The bridge operates at $\Tcopilot$ and never produces
+evidence at a higher trust tier.
+
+% ============================================================
+%  Section 3 — Categorical Model
+% ============================================================
+\section{Categorical Model}\label{sec:categorical}
+
+\subsection{The API functor}
+
+\begin{definition}[API category]\label{def:apicat}
+Let $\mathbf{API}$ be the category whose objects are
+$\OpKind$ values and whose morphisms are operation
+refinements (\eg{} $\texttt{VERIFY} \to \texttt{INSPECT}$
+when verification includes inspection as a sub-operation).
+\end{definition}
+
+\begin{definition}[API functor]\label{def:apifunctor}
+The \emph{API functor} $F_A \colon \mathbf{API} \to \mathbf{Set}$
+sends each operation kind~$o$ to the set of valid $\APIReq$
+values with $\texttt{operation} = o$, and each morphism
+$o \to o'$ to the function that restricts a request of
+kind~$o$ to a sub-request of kind~$o'$.
+\end{definition}
+
+\subsection{The channel functor}
+
+\begin{definition}[Channel functor]\label{def:chanfunctor}
+The \emph{channel functor}
+$F_C \colon \mathbf{API} \to \mathbf{Set}$ sends each
+operation kind~$o$ to the set of $\EvReq$ values that
+the bridge generates for operation~$o$, and each morphism
+to the corresponding restriction on evidence requests.
+\end{definition}
+
+\subsection{The bridge as a natural transformation}
+
+\begin{definition}[Bridge natural transformation]%
+\label{def:bridgenat}
+The $\Bridge$ is a natural transformation
+$\eta \colon F_A \Rightarrow F_C$ where for each
+operation kind~$o$, $\eta_o$ maps an $\APIReq$ to an
+$\EvReq$.  Naturality means: for every morphism
+$o \to o'$ in $\mathbf{API}$, the following diagram
+commutes:
+\[
+\begin{array}{ccc}
+  F_A(o) & \xrightarrow{\eta_o} & F_C(o) \\
+  \downarrow & & \downarrow \\
+  F_A(o') & \xrightarrow{\eta_{o'}} & F_C(o')
+\end{array}
+\]
+\end{definition}
+
+\begin{remark}
+Naturality captures the intuition that the bridge's
+translation from API requests to channel requests is
+coherent: restricting an API request and then translating
+gives the same result as translating and then restricting
+the evidence request.
+\end{remark}
+
+% ============================================================
+%  Section 4 — Trust Enforcement
+% ============================================================
+\section{Trust Enforcement}\label{sec:trustenforce}
+
+\subsection{Trust ceiling mechanism}
+
+\begin{definition}[Trust enforcement]\label{def:trustenforce}
+The bridge enforces the trust ceiling by calling
+$\CopChan.\texttt{apply\_trust\_ceiling}()$ on every
+response.  This caps the trust of the evidence at
+$\Tcopilot$.  Additionally, the bridge calls
+$\texttt{enforce\_trust\_ceiling}()$ on the bridge
+object itself, which verifies that no response in
+the current session exceeds $\Tcopilot$.
+\end{definition}
+
+\begin{lemma}[Bridge trust ceiling]\label{lem:bridgeceil}
+For every API request processed by the bridge, the
+corresponding $\APIResp$ has trust $\tleq \Tcopilot$.
+\end{lemma}
+\begin{proof}
+The bridge calls \texttt{apply\_trust\_ceiling} on the
+Copilot channel response, which caps trust at $\Tcopilot$.
+The bridge then wraps this in an $\APIResp$ without
+escalating trust.  Therefore the API response trust is
+at most $\Tcopilot$.
+\end{proof}
+
+\subsection{Trust clamping}
+
+\begin{definition}[Trust clamping]\label{def:trustclamp}
+Given an $\EvResp$ with trust~$\tau$, the clamped response
+has trust $\min(\tau, \Tcopilot)$.  The method
+$\EvResp.\texttt{clamp\_trust}(\texttt{"proposal"})$
+performs this operation.
+\end{definition}
+
+\begin{lemma}[Clamping is idempotent]\label{lem:clampidemp}
+Clamping a response that has already been clamped yields
+the same response: $\mathrm{clamp}(\mathrm{clamp}(r)) =
+\mathrm{clamp}(r)$.
+\end{lemma}
+\begin{proof}
+After the first clamp, $\mathrm{trust}(r) \leq \Tcopilot$.
+The second clamp computes $\min(\mathrm{trust}(r), \Tcopilot)
+= \mathrm{trust}(r)$.  Therefore the response is unchanged.
+\end{proof}
+
+% ============================================================
+%  Section 5 — Corroboration
+% ============================================================
+\section{Corroboration}\label{sec:corroboration}
+
+\subsection{Corroboration protocol}
+
+When the bridge is configured with
+$\texttt{require\_corroboration} = \texttt{True}$, every
+Copilot response must be corroborated by evidence from a
+higher-trust channel before being returned to the API layer.
+
+\begin{definition}[Corroboration]\label{def:corroboration}
+A Copilot response~$r$ at trust $\Tcopilot$ is
+\emph{corroborated} if there exists a response~$r'$ from
+a channel with trust $\tau' > \Tcopilot$ such that
+$r$ and $r'$ are consistent (\ie{} they do not contradict
+each other on the same proposition).
+\end{definition}
+
+\begin{definition}[Consistency]\label{def:consistency}
+Two evidence responses $r$ and $r'$ are \emph{consistent}
+if they do not assign contradictory polarities to the same
+proposition.  Formally:
+\[
+  \forall \varphi.\; r(\varphi) \neq \bot \wedge
+  r'(\varphi) \neq \bot \implies
+  r(\varphi) = r'(\varphi).
+\]
+\end{definition}
+
+\begin{lemma}[Corroboration increases effective trust]%
+\label{lem:corrobtrust}
+If a Copilot response at $\Tcopilot$ is corroborated by
+a solver response at $\Tsolver$, the effective trust of
+the corroborated evidence is $\Tsolver$ for the
+corroborated propositions.
+\end{lemma}
+\begin{proof}
+The corroborated propositions have independent evidence at
+$\Tsolver$.  The Copilot response serves as a hint that
+guided the solver query; the trust of the final evidence
+is determined by the solver, which is at $\Tsolver$.
+\end{proof}
+
+\subsection{Corroboration failure}
+
+If corroboration fails (no higher-trust channel confirms
+the Copilot response), the bridge may:
+\begin{enumerate}
+\item Return the uncorroborated response at $\Tcopilot$, or
+\item Return an empty response indicating that the Copilot
+      suggestion could not be corroborated, or
+\item Log the failure and continue.
+\end{enumerate}
+The choice depends on the bridge configuration and the
+operation kind.
+
+% ============================================================
+%  Section 6 — Event Logging
+% ============================================================
+\section{Event Logging and Session Management}\label{sec:logging}
+
+\subsection{Event log}
+
+The $\APILog$ records every API event: request submission,
+Copilot query, channel response, trust clamping, corroboration
+attempt, and final API response.
+
+\begin{definition}[API event]\label{def:apievent}
+An \emph{API event} is a tuple
+$(t, k, d)$ where $t$ is a timestamp, $k$ is the event
+kind (request, query, response, clamp, corroborate, error),
+and $d$ is the event data.
+\end{definition}
+
+\begin{lemma}[Event log completeness]\label{lem:logcomp}
+Every bridge invocation generates at least three events:
+request received, Copilot query dispatched, and response
+returned.
+\end{lemma}
+\begin{proof}
+The bridge's \texttt{query} method logs the incoming request,
+calls the Copilot channel (logging the query), and logs the
+response before returning.  Even if the query fails, an error
+event is logged.
+\end{proof}
+
+\subsection{Session management}
+
+The $\APISess$ tracks a sequence of related API requests.
+Each session has an id, an open/closed state, and a
+checkpoint mechanism.
+
+\begin{definition}[Session lifecycle]\label{def:sesslife}
+A session transitions through states:
+$\mathsf{open} \to \mathsf{checkpointed} \to \mathsf{closed}$.
+The \texttt{register\_request} method adds requests.
+The \texttt{checkpoint} method serialises the session state.
+The \texttt{close} method finalises the session.
+\end{definition}
+
+\begin{lemma}[Session isolation]\label{lem:sessiso}
+Distinct sessions do not share mutable state.
+\end{lemma}
+\begin{proof}
+Each $\APISess$ instance maintains a private request list,
+checkpoint state, and session id.  No global mutable state
+is shared between sessions.
+\end{proof}
+
+% ============================================================
+%  Section 7 — Implementation
+% ============================================================
+\section{Implementation}\label{sec:code}
+
+\subsection{Core bridge implementation}
+
+The following listing shows the complete $\Bridge$
+class with query, trust enforcement, and corroboration.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Core CopilotAPIBridge implementation},
+  label={lst:bridge}]
+from jugeo.interfaces.api import (
+    CopilotAPIBridge,
+    APIEventLog,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    RequestStatus,
+    APISession,
+    JuGeoAPI,
+    APIValidator,
+    APIRateLimiter,
+    APIAuthenticator,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+    ChannelMonitor,
+    SolverChannel,
+    ChannelPool,
+)
+
+class ExtendedCopilotAPIBridge:
+    """Extended bridge with corroboration and session management."""
+
+    def __init__(self, channel: CopilotChannel, event_log: APIEventLog,
+                 require_corroboration=False, pool=None):
+        self.bridge = CopilotAPIBridge(
+            channel=channel,
+            event_log=event_log,
+            require_corroboration=require_corroboration,
+        )
+        self.channel = channel
+        self.event_log = event_log
+        self.require_corroboration = require_corroboration
+        self.pool = pool
+
+    def query_for_operation(self, operation, coordinate, proposition):
+        prompt = self._build_prompt(operation, coordinate, proposition)
+        result = self.bridge.query(prompt)
+        self.bridge.enforce_trust_ceiling()
+        self.event_log.record({
+            "event": "bridge_query",
+            "operation": str(operation),
+            "coordinate": coordinate,
+        })
+        if self.require_corroboration and self.pool:
+            corroborated = self._corroborate(result, coordinate)
+            if corroborated:
+                return corroborated
+        return result
+
+    def verify_via_bridge(self, api: JuGeoAPI, coordinate, proposition):
+        suggestion = self.query_for_operation(
+            OperationKind.VERIFY, coordinate, proposition
+        )
+        result = api.verify(coordinate=coordinate, proposition=proposition)
+        self.event_log.record({
+            "event": "verify_with_suggestion",
+            "suggestion": str(suggestion),
+            "result": str(result),
+        })
+        return result
+
+    def construct_via_bridge(self, api: JuGeoAPI, coordinate, proposition):
+        suggestion = self.query_for_operation(
+            OperationKind.CONSTRUCT, coordinate, proposition
+        )
+        result = api.construct(coordinate=coordinate, proposition=proposition)
+        self.event_log.record({
+            "event": "construct_with_suggestion",
+            "result": str(result),
+        })
+        return result
+
+    def inspect_via_bridge(self, api: JuGeoAPI, coordinate):
+        suggestion = self.query_for_operation(
+            OperationKind.INSPECT, coordinate, None
+        )
+        result = api.inspect(coordinate=coordinate)
+        return {"suggestion": suggestion, "inspection": result}
+
+    def get_stats(self):
+        return self.bridge.stats()
+
+    def _build_prompt(self, operation, coordinate, proposition):
+        return (
+            f"Operation: {operation}, "
+            f"Coordinate: {coordinate}, "
+            f"Proposition: {proposition}"
+        )
+
+    def _corroborate(self, copilot_result, coordinate):
+        solver = self.pool.get_channel("solver") if self.pool else None
+        if solver is None:
+            return None
+        solver_req = EvidenceRequest(
+            request_id=f"corroborate-{coordinate}",
+            coordinate=coordinate,
+            proposition=str(copilot_result),
+            required_kind=None,
+            proposition_kind="corroboration",
+            preferred_channel=EvidenceChannel.SOLVER,
+            fallback_channels=[],
+            deadline_ms=10000,
+            budget=20000,
+            metadata={"source": "corroboration"},
+        )
+        solver_resp = solver.handle_request(solver_req)
+        if solver_resp and not solver_resp.is_empty():
+            self.event_log.record({
+                "event": "corroboration_success",
+                "coordinate": coordinate,
+            })
+            return solver_resp
+        self.event_log.record({
+            "event": "corroboration_failed",
+            "coordinate": coordinate,
+        })
+        return None
+\end{lstlisting}
+
+\subsection{Full API integration}
+
+The next listing shows how $\JuGeoAPI$ is instantiated
+with the bridge and supporting components.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Full JuGeoAPI instantiation with CopilotAPIBridge},
+  label={lst:apisetup}]
+from jugeo.interfaces.api import (
+    JuGeoAPI,
+    CopilotAPIBridge,
+    APIEventLog,
+    APIAuthenticator,
+    APIRateLimiter,
+    APIValidator,
+    APISession,
+    OperationKind,
+    APIRequest,
+    APIResponse,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    SolverChannel,
+    RuntimeChannel,
+    ChannelPool,
+    ChannelRouter,
+    ChannelMonitor,
+    ChannelConfiguration,
+    EvidenceChannel,
+)
+
+def create_full_api(config_copilot, config_solver):
+    """Create a fully configured JuGeoAPI with Copilot bridge."""
+    pool = ChannelPool()
+    monitor = ChannelMonitor()
+    router = ChannelRouter()
+
+    copilot = CopilotChannel(config=config_copilot, model_name="default")
+    solver = SolverChannel(config=config_solver, session_id="main")
+    runtime = RuntimeChannel()
+
+    pool.register_channel("copilot", copilot)
+    pool.register_channel("solver", solver)
+    pool.register_channel("runtime", runtime)
+
+    event_log = APIEventLog()
+    authenticator = APIAuthenticator()
+    authenticator.register_caller("default-user")
+    rate_limiter = APIRateLimiter(capacity=100, refill_rate=10)
+    validator = APIValidator(max_budget=100000)
+
+    bridge = CopilotAPIBridge(
+        channel=copilot,
+        event_log=event_log,
+        require_corroboration=True,
+    )
+
+    api = JuGeoAPI(
+        manifest=None,
+        authenticator=authenticator,
+        rate_limiter=rate_limiter,
+        validator=validator,
+        router=router,
+        event_log=event_log,
+        copilot_bridge=bridge,
+    )
+    return api, pool, monitor
+
+def run_verification_session(api: JuGeoAPI, coordinate, proposition):
+    """Run a complete verification session with Copilot assistance."""
+    session = api.open_session("verification-session")
+    request = APIRequest(
+        request_id="ver-001",
+        operation=OperationKind.VERIFY,
+        coordinate=coordinate,
+        proposition=proposition,
+        budget=50000,
+        deadline=30000,
+        metadata={"session": "main"},
+    )
+    session.register_request(request)
+
+    copilot_hint = api.copilot_query(
+        f"Strategy for verifying {proposition} at {coordinate}"
+    )
+    result = api.verify(coordinate=coordinate, proposition=proposition)
+
+    session.checkpoint()
+    diag = api.diagnostics()
+    session.close()
+
+    return {
+        "result": result,
+        "copilot_hint": copilot_hint,
+        "diagnostics": diag,
+        "session_closed": not session.is_open(),
+    }
+\end{lstlisting}
+
+\subsection{Federated bridge operation}
+
+The following listing shows how the bridge integrates
+with $\ChanFed$ for federated operations.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Federated bridge operation},
+  label={lst:fedbridge}]
+from jugeo.evidence.channels import (
+    ChannelFederation,
+    ChannelPool,
+    ChannelRouter,
+    ChannelMonitor,
+    CopilotChannel,
+    SolverChannel,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+    EvidenceRecord,
+    SupportRoute,
+    ChannelSerializer,
+)
+from jugeo.interfaces.api import (
+    CopilotAPIBridge,
+    APIEventLog,
+    JuGeoAPI,
+    OperationKind,
+    APIRequest,
+)
+
+class FederatedBridgeOperation:
+    """Bridge-mediated federated evidence collection."""
+
+    def __init__(self, bridge: CopilotAPIBridge, pool: ChannelPool):
+        self.bridge = bridge
+        self.pool = pool
+        self.federation = ChannelFederation()
+        self.router = ChannelRouter()
+        self.monitor = ChannelMonitor()
+
+    def federated_query(self, coordinate, proposition):
+        copilot_hint = self.bridge.query(
+            f"Federate evidence for {proposition} at {coordinate}"
+        )
+        self.bridge.enforce_trust_ceiling()
+
+        request = EvidenceRequest(
+            request_id=f"fed-bridge-{coordinate}",
+            coordinate=coordinate,
+            proposition=proposition,
+            required_kind=None,
+            proposition_kind="federated",
+            preferred_channel=EvidenceChannel.COPILOT,
+            fallback_channels=[
+                EvidenceChannel.SOLVER,
+                EvidenceChannel.RUNTIME,
+            ],
+            deadline_ms=20000,
+            budget=30000,
+            metadata={"bridge_hint": str(copilot_hint)},
+        )
+
+        self.monitor.record_request(request)
+        best = self.router.find_best_channel(request)
+        all_capable = self.router.find_all_capable(request)
+
+        evidence = self.federation.collect_all(request)
+        merged = self.federation.merge_by_kind(evidence)
+        self.federation.verify_no_escalation(merged)
+        composed_trust = self.federation.compose_trust(merged)
+
+        for ev in evidence:
+            self.monitor.record_response(ev)
+
+        serialized = ChannelSerializer.request_to_json(request)
+        round_trip = ChannelSerializer.round_trip_request(serialized)
+
+        return {
+            "merged": merged,
+            "trust": composed_trust,
+            "hint": copilot_hint,
+            "success_rate": self.monitor.success_rate(),
+            "latencies": self.monitor.latency_percentiles(),
+            "summary": self.monitor.summary(),
+        }
+
+    def federate_via_api(self, api: JuGeoAPI, coordinate, proposition):
+        result = api.federate(
+            coordinate=coordinate,
+            proposition=proposition,
+        )
+        return result
+\end{lstlisting}
+
+\subsection{Event log export and diagnostics}
+
+The final listing shows event log management and
+diagnostic output.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Event log export and API diagnostics},
+  label={lst:logdiag}]
+from jugeo.interfaces.api import (
+    JuGeoAPI,
+    APIEventLog,
+    APISession,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    CopilotAPIBridge,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    ChannelMonitor,
+)
+
+class BridgeDiagnostics:
+    """Diagnostics and auditing for the CopilotAPIBridge."""
+
+    def __init__(self, api: JuGeoAPI, bridge: CopilotAPIBridge,
+                 event_log: APIEventLog):
+        self.api = api
+        self.bridge = bridge
+        self.event_log = event_log
+
+    def export_log(self, path=None):
+        exported = self.event_log.export()
+        if path:
+            with open(path, "w") as f:
+                f.write(str(exported))
+        return exported
+
+    def bridge_stats(self):
+        stats = self.bridge.stats()
+        return {
+            "bridge_stats": stats,
+            "api_diagnostics": self.api.diagnostics(),
+        }
+
+    def session_audit(self, session: APISession):
+        is_open = session.is_open()
+        session.checkpoint()
+        return {
+            "session_open": is_open,
+            "checkpoint_taken": True,
+        }
+
+    def run_diagnostic_cycle(self, coordinate, proposition):
+        session = self.api.open_session("diagnostics")
+        request = APIRequest(
+            request_id="diag-001",
+            operation=OperationKind.INSPECT,
+            coordinate=coordinate,
+            proposition=proposition,
+            budget=5000,
+            deadline=10000,
+            metadata={"purpose": "diagnostics"},
+        )
+        session.register_request(request)
+
+        result = self.api.inspect(coordinate=coordinate)
+        copilot_resp = self.api.copilot_query(
+            f"Diagnose status of {coordinate}"
+        )
+
+        audit = self.session_audit(session)
+        stats = self.bridge_stats()
+        log = self.export_log()
+
+        session.close()
+        self.event_log.clear()
+
+        return {
+            "inspection": result,
+            "copilot_diagnostic": copilot_resp,
+            "audit": audit,
+            "stats": stats,
+            "log_size": len(log) if log else 0,
+        }
+\end{lstlisting}
+
+% ============================================================
+%  Section 8 — Formal Properties
+% ============================================================
+\section{Formal Properties}\label{sec:formal}
+
+\begin{theorem}[Trust ceiling enforcement]\label{thm:trustceil}
+For every API request processed by the $\Bridge$, the
+resulting $\APIResp$ has trust $\tleq \Tcopilot$.
+\end{theorem}
+\begin{proof}
+The bridge invokes the Copilot channel, whose responses
+are capped at $\Tcopilot$ by the channel's
+\texttt{apply\_trust\_ceiling} method.  The bridge then
+calls its own \texttt{enforce\_trust\_ceiling} method,
+which re-checks the bound.  The API response wraps the
+channel response without elevating trust.  Therefore the
+final trust is at most $\Tcopilot$.
+
+In the corroboration case, the corroborating channel (e.g.,
+solver) may produce evidence at $\Tsolver$.  However, this
+evidence is attributed to the solver, not the bridge.  The
+bridge's own output remains at $\Tcopilot$.
+\end{proof}
+
+\begin{theorem}[Corroboration soundness]\label{thm:corrobsound}
+If corroboration succeeds, the corroborated evidence is
+consistent with the Copilot suggestion and has trust at
+least as high as the corroborating channel's ceiling.
+\end{theorem}
+\begin{proof}
+Corroboration succeeds when the solver channel returns a
+non-empty response for the same proposition.  By definition
+of corroboration (Definition~\ref{def:corroboration}), the
+responses are consistent.  The solver's response has trust
+$\Tsolver > \Tcopilot$.  Therefore the corroborated evidence
+has trust $\Tsolver$.
+
+If corroboration fails (the solver returns empty or
+contradictory evidence), the bridge returns the
+uncorroborated Copilot response at $\Tcopilot$, which
+is sound but lower-trust.
+\end{proof}
+
+\begin{theorem}[Event log completeness]\label{thm:logcomp}
+Every bridge invocation generates a complete audit trail
+in the $\APILog$.  Specifically, for each query:
+\begin{enumerate}
+\item A ``bridge\_query'' event is recorded.
+\item If corroboration is attempted, a
+      ``corroboration\_success'' or ``corroboration\_failed''
+      event is recorded.
+\item The final result is recorded.
+\end{enumerate}
+\end{theorem}
+\begin{proof}
+Inspection of the bridge implementation
+(Listing~\ref{lst:bridge}) shows that
+\texttt{event\_log.record} is called:
+(1)~after the query (``bridge\_query'' event),
+(2)~after corroboration (``corroboration\_success'' or
+``corroboration\_failed''), and
+(3)~after the result is produced (in the calling methods
+\texttt{verify\_via\_bridge}, \texttt{construct\_via\_bridge},
+etc.).  Therefore the log is complete.
+\end{proof}
+
+\begin{theorem}[Session isolation]\label{thm:sessiso}
+Concurrent API sessions do not interfere.  Each session
+maintains an independent request log, checkpoint state,
+and lifecycle.
+\end{theorem}
+\begin{proof}
+Each $\APISess$ instance has private fields: a request
+list, a session id, an open/closed flag, and checkpoint
+data.  No global mutable state is shared between sessions.
+The $\APILog$ is shared but is append-only, so concurrent
+appends do not cause data loss or corruption (under the
+assumption of a thread-safe append operation).
+\end{proof}
+
+\begin{theorem}[Rate-limit compliance]\label{thm:ratelimit}
+The bridge respects the global rate limit enforced by
+$\APIRate$.  No bridge invocation exceeds the configured
+capacity and refill rate.
+\end{theorem}
+\begin{proof}
+All bridge operations go through $\JuGeoAPI$, which
+applies the $\APIRate$ check before processing any request.
+The rate limiter tracks tokens with a token-bucket algorithm:
+each request consumes one token, and tokens refill at the
+configured rate.  If no tokens are available, the request
+is rejected.  Therefore the bridge cannot exceed the rate
+limit.
+\end{proof}
+
+% ============================================================
+%  Section 9 — Discussion
+% ============================================================
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{Performance overhead of corroboration.}
+Corroboration doubles the cost of each Copilot query,
+since a solver invocation is required.  In practice,
+corroboration should be enabled selectively---for
+high-stakes operations (e.g., \texttt{VERIFY},
+\texttt{CONSTRUCT}) and disabled for low-stakes ones
+(e.g., \texttt{INSPECT}).
+
+\paragraph{Bridge as a bottleneck.}
+The bridge serialises Copilot queries: each API request
+that involves the Copilot channel goes through the bridge.
+For high-throughput scenarios, the bridge can be replicated
+(one per Copilot channel instance) and load-balanced.
+
+\paragraph{Trust ceiling and corroboration tension.}
+The bridge enforces $\Tcopilot$ on its own output but
+allows corroboration to elevate trust via an independent
+channel.  This design separates concerns: the bridge is
+responsible for the Copilot layer, while the corroborating
+channel is responsible for higher-trust evidence.
+
+\paragraph{Event log volume.}
+In a busy verification session, the event log can grow
+large.  The \texttt{clear} method allows periodic pruning.
+Exported logs can be persisted for offline analysis.
+
+\paragraph{Extending the bridge.}
+The bridge currently supports five operation kinds.  New
+kinds (e.g., $\texttt{REFINE}$, $\texttt{ABSTRACT}$) can
+be added by extending the prompt templates and registering
+new operation kinds.
+
+% ============================================================
+%  Section 10 — Related Work
+% ============================================================
+\section{Related Work}\label{sec:related}
+
+\paragraph{API gateway patterns.}
+The bridge is analogous to an API
+gateway~\cite{newman2015microservices} that mediates
+between external clients and internal services.  Our
+bridge adds trust enforcement, a concern absent in
+traditional gateways.
+
+\paragraph{Language model integration.}
+OpenAI's function
+calling~\cite{openai2023functions} and LangChain's tool
+abstraction~\cite{chase2023langchain} provide similar
+bridge functionality.  Our bridge differs in its formal
+trust model and corroboration protocol.
+
+\paragraph{Evidence composition.}
+The federation protocol (Paper~88) composes evidence from
+multiple channels.  The bridge integrates with federation
+(Listing~\ref{lst:fedbridge}) to support the
+\texttt{FEDERATE} operation kind.
+
+\paragraph{Copilot advisors.}
+Papers~80--84 and~99 of this series use the bridge
+(directly or indirectly) for Copilot queries.  This paper
+provides the formal foundation for those uses.
+
+\paragraph{Trust calibration.}
+Ribeiro \etal{}~\cite{ribeiro2020trust} study trust in
+AI predictions.  Our trust lattice and ceiling mechanism
+provide a formal counterpart.
+
+\paragraph{API design for verification.}
+Boogie~\cite{barnett2006boogie} and Why3~\cite{filliatre2013why3}
+expose verification APIs.  Our API layer adds trust
+annotations and Copilot integration.
+
+% ============================================================
+%  Section 11 — Conclusion
+% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We have provided a comprehensive formal treatment of the
+$\Bridge$, the central integration point between the
+Copilot channel and the \JuGeo{} API layer.  The bridge:
+\begin{itemize}
+\item Translates API operations into Copilot queries.
+\item Enforces the $\Tcopilot$ trust ceiling on all outputs.
+\item Optionally corroborates Copilot suggestions via
+      higher-trust channels.
+\item Logs all interactions for auditing.
+\item Respects session isolation and rate limits.
+\end{itemize}
+Five theorems establish trust ceiling enforcement,
+corroboration soundness, event log completeness, session
+isolation, and rate-limit compliance.  The bridge is the
+foundation upon which all Copilot advisors in the \JuGeo{}
+series are built.
+
+This paper concludes the first hundred papers in the
+Judgment Geometry series.  Future work includes extending
+the bridge to support streaming responses, adding
+fine-grained trust annotations per proposition, and
+integrating with external knowledge graphs for richer
+corroboration.
+
+% ============================================================
+%  Bibliography
+% ============================================================
+\begin{thebibliography}{25}
+
+\bibitem{newman2015microservices}
+S.~Newman,
+\emph{Building Microservices}.
+O'Reilly, 2015.
+
+\bibitem{openai2023functions}
+OpenAI,
+``Function calling and other API updates,''
+\emph{OpenAI Blog}, 2023.
+
+\bibitem{chase2023langchain}
+H.~Chase,
+``LangChain: building applications with LLMs through
+composability,''
+2023.
+
+\bibitem{ribeiro2020trust}
+M.~T.~Ribeiro, S.~Singh, and C.~Guestrin,
+``'Why should I trust you?': explaining the predictions
+of any classifier,''
+\emph{KDD}, 2016.
+
+\bibitem{barnett2006boogie}
+M.~Barnett, B.-Y.~E.~Chang, R.~DeLine, B.~Jacobs, and
+K.~R.~M.~Leino,
+``Boogie: a modular reusable verifier for object-oriented
+programs,''
+\emph{FMCO}, 2006.
+
+\bibitem{filliatre2013why3}
+J.-C.~Filli\^{a}tre and A.~Paskevich,
+``Why3 --- where programs meet provers,''
+\emph{ESOP}, 2013.
+
+\bibitem{young2024jugeo}
+H.~Young,
+``Judgment geometry: a framework for trust-calibrated
+verification,''
+\emph{JuGeo Technical Reports}, Paper~1, 2024.
+
+\bibitem{young2024channels}
+H.~Young,
+``Evidence channels in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~88, 2024.
+
+\bibitem{young2024advisors}
+H.~Young,
+``Copilot advisors for heap, scope, import, and callable
+analysis,''
+\emph{JuGeo Technical Reports}, Papers~80--81, 2024.
+
+\bibitem{young2024research}
+H.~Young,
+``Copilot research and experiment advisors,''
+\emph{JuGeo Technical Reports}, Paper~82, 2024.
+
+\bibitem{young2024optimization}
+H.~Young,
+``Copilot optimization advisor,''
+\emph{JuGeo Technical Reports}, Paper~83, 2024.
+
+\bibitem{young2024lowering}
+H.~Young,
+``Copilot lowering hints and IR advisors,''
+\emph{JuGeo Technical Reports}, Paper~84, 2024.
+
+\bibitem{young2024connection}
+H.~Young,
+``Copilot connection hooks and health checks,''
+\emph{JuGeo Technical Reports}, Paper~99, 2024.
+
+\bibitem{young2024lifecycle}
+H.~Young,
+``Kernel lifecycle and health monitoring in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~93, 2024.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner,
+``Z3: an efficient SMT solver,''
+\emph{TACAS}, 2008.
+
+\bibitem{moura2021lean4}
+L.~de~Moura and S.~Ullrich,
+``The Lean~4 theorem prover and programming language,''
+\emph{CADE}, 2021.
+
+\bibitem{polu2020gptf}
+S.~Polu and I.~Sutskever,
+``Generative language modeling for automated theorem proving,''
+\emph{arXiv preprint arXiv:2009.03393}, 2020.
+
+\bibitem{lample2022hypertree}
+G.~Lample \etal{},
+``HyperTree proof search for neural theorem proving,''
+\emph{NeurIPS}, 2022.
+
+\bibitem{bansal2019holist}
+K.~Bansal, S.~Loos, M.~Rabe, C.~Szegedy, and S.~Wilcox,
+``HOList: an environment for machine learning of higher-order
+logic theorem proving,''
+\emph{ICML}, 2019.
+
+\bibitem{yang2019learning}
+K.~Yang and J.~Deng,
+``Learning to prove theorems via interacting with proof
+assistants,''
+\emph{ICML}, 2019.
+
+\bibitem{first2022diversity}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun,
+``Diversity-driven automated formal verification,''
+\emph{ICSE}, 2022.
+
+\bibitem{jiang2022thor}
+A.~Q.~Jiang, W.~Li, S.~Tworber, and Y.~Wu,
+``Thor: wielding hammers to integrate language models and
+automated theorem provers,''
+\emph{NeurIPS}, 2022.
+
+\end{thebibliography}
+
+% ============================================================
+%  Appendix
+% ============================================================
+\appendix
+
+\section{Auxiliary Definitions and Proofs}\label{app:proofs}
+
+\begin{lemma}[Bridge natural transformation well-definedness]%
+\label{lem:bridgenatwd}
+The mapping $\eta_o \colon F_A(o) \to F_C(o)$ is
+well-defined for every operation kind~$o$.
+\end{lemma}
+\begin{proof}
+For each $o \in \OpKind$, the bridge constructs a prompt
+template specific to~$o$ and produces an $\EvReq$ with
+the appropriate \texttt{proposition\_kind}.  The mapping
+is total (defined for all valid $\APIReq$ values) and
+functional (each request maps to a unique evidence request).
+\end{proof}
+
+\begin{lemma}[Naturality of the bridge]%
+\label{lem:bridgenaturality}
+For every morphism $o \to o'$ in $\mathbf{API}$,
+$\eta_{o'} \circ F_A(o \to o') = F_C(o \to o') \circ \eta_o$.
+\end{lemma}
+\begin{proof}
+Let $r \in F_A(o)$ be an API request.  Restricting $r$ to
+kind~$o'$ gives $r' = F_A(o \to o')(r)$.  Translating $r'$
+gives $\eta_{o'}(r')$, an evidence request for kind~$o'$.
+
+Alternatively, translating $r$ gives $\eta_o(r)$, an
+evidence request for kind~$o$.  Restricting to kind~$o'$
+gives $F_C(o \to o')(\eta_o(r))$.  The bridge's prompt
+construction ensures that restriction commutes with
+translation: both paths produce the same evidence request
+for the sub-operation~$o'$.
+\end{proof}
+
+\begin{lemma}[Trust ceiling is a natural bound]%
+\label{lem:trustnatbound}
+The trust ceiling $\Tcopilot$ is uniform across all
+operation kinds.
+\end{lemma}
+\begin{proof}
+The ceiling is determined by the Copilot channel
+configuration, which is independent of the operation kind.
+The bridge applies the same ceiling regardless of whether
+the operation is VERIFY, CONSTRUCT, DESCEND, FEDERATE, or
+INSPECT.
+\end{proof}
+
+\begin{lemma}[Event log append-only property]%
+\label{lem:logappend}
+The $\APILog$ is append-only: events can be recorded and
+exported, but not modified after recording.
+\end{lemma}
+\begin{proof}
+The \texttt{record} method appends to an internal list.
+The \texttt{export} method returns a copy.  The
+\texttt{clear} method resets the list but does not modify
+existing exported copies.  No method modifies previously
+recorded events.
+\end{proof}
+
+\begin{lemma}[Rate limiter fairness]\label{lem:ratefair}
+The token-bucket rate limiter treats all callers equally:
+each request consumes one token regardless of the operation
+kind or caller identity.
+\end{lemma}
+\begin{proof}
+The $\APIRate$ class maintains a single token bucket
+parameterised by capacity and refill rate.  The
+\texttt{consume} method decrements the bucket by one for
+each request.  No caller or operation receives preferential
+treatment.
+\end{proof}
+
+\begin{lemma}[Corroboration does not violate trust ceiling]%
+\label{lem:corrobnoceil}
+Even when corroboration introduces solver evidence at
+$\Tsolver$, the bridge's own output remains at $\Tcopilot$.
+\end{lemma}
+\begin{proof}
+The bridge attributes corroborated evidence to the solver
+channel, not to itself.  The bridge's output (the hint or
+suggestion) remains at $\Tcopilot$.  The corroborated
+evidence is a separate artifact with its own trust
+annotation.
+\end{proof}
+
+\begin{corollary}[Bridge trust ceiling is inviolable]%
+\label{cor:bridgeinviolable}
+Under no configuration of the bridge does the bridge's
+own output exceed $\Tcopilot$.
+\end{corollary}
+\begin{proof}
+By Lemma~\ref{lem:bridgeceil} (basic trust ceiling),
+Lemma~\ref{lem:clampidemp} (clamping is idempotent),
+and Lemma~\ref{lem:corrobnoceil} (corroboration does
+not violate ceiling), the bridge's output trust is at most
+$\Tcopilot$ in all cases.
+\end{proof}
+
+\begin{lemma}[Session checkpoint preserves state]%
+\label{lem:sesschkpt}
+After calling \texttt{session.checkpoint()}, the session's
+request list and metadata are serialised.  A subsequent
+\texttt{close()} does not lose the checkpointed data.
+\end{lemma}
+\begin{proof}
+The \texttt{checkpoint} method serialises the current state
+to persistent storage.  The \texttt{close} method marks
+the session as closed but does not delete the checkpointed
+data.  Therefore the checkpoint is preserved.
+\end{proof}
+
+\begin{proposition}[Bridge correctness summary]%
+\label{prop:bridgecorrect}
+The $\Bridge$ correctly mediates between the API layer and
+the channel layer.  Specifically:
+\begin{enumerate}
+\item Every API request that involves Copilot is translated
+      to an evidence request (Lemma~\ref{lem:bridgenatwd}).
+\item The translation is coherent across operation kinds
+      (Lemma~\ref{lem:bridgenaturality}).
+\item Trust is bounded by $\Tcopilot$
+      (Theorem~\ref{thm:trustceil}).
+\item Corroboration, when successful, provides higher-trust
+      evidence (Theorem~\ref{thm:corrobsound}).
+\item All interactions are logged
+      (Theorem~\ref{thm:logcomp}).
+\item Sessions are isolated
+      (Theorem~\ref{thm:sessiso}).
+\item Rate limits are respected
+      (Theorem~\ref{thm:ratelimit}).
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+Each item is established by the referenced theorem or lemma.
+Together, they show that the bridge is a correct, trust-safe,
+auditable, and rate-limited integration layer.
+\end{proof}
+
+\begin{remark}[Bridge as the capstone]
+Paper~100 concludes the first century of the Judgment Geometry
+series.  The $\Bridge$ is the keystone component that enables
+all Copilot-assisted verification: without the bridge, the
+language model's suggestions cannot enter the trust-calibrated
+verification pipeline.  With the bridge, those suggestions are
+safely bounded, optionally corroborated, fully logged, and
+rate-limited.
+\end{remark}
+
+\end{document}

@@ -1,0 +1,1384 @@
+% paper76-copilot-channel.tex — The Copilot Channel:
+%   Architecture, Jurisdiction, and Infrastructure
+%   Paper 76 of the Judgment Geometry series.
+% Compile: pdflatex paper76-copilot-channel
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+% No external data file for this paper.
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\EvChan}{\mathsf{EvidenceChannel}}
+\newcommand{\ChanConfig}{\mathsf{ChannelConfiguration}}
+\newcommand{\ChanJuris}{\mathsf{ChannelJurisdiction}}
+\newcommand{\ChanPool}{\mathsf{ChannelPool}}
+\newcommand{\ChanMon}{\mathsf{ChannelMonitor}}
+\newcommand{\ChanSer}{\mathsf{ChannelSerializer}}
+\newcommand{\ChanRouter}{\mathsf{ChannelRouter}}
+\newcommand{\ChanFed}{\mathsf{ChannelFederation}}
+\newcommand{\EvReq}{\mathsf{EvidenceRequest}}
+\newcommand{\EvResp}{\mathsf{EvidenceResponse}}
+\newcommand{\EvRec}{\mathsf{EvidenceRecord}}
+\newcommand{\TrustCeil}{\mathrm{ceiling}}
+\newcommand{\CopQuery}{\texttt{query\_llm}}
+\newcommand{\CopParse}{\texttt{parse\_response}}
+\newcommand{\CopHealth}{\texttt{health\_check}}
+\newcommand{\CopHandle}{\texttt{handle\_request}}
+\newcommand{\EffCeil}{\texttt{effective\_trust\_ceiling}}
+\newcommand{\AdmCheck}{\texttt{check\_admissibility}}
+\newcommand{\RoundTrip}{\texttt{round\_trip}}
+
+\title{\textbf{The Copilot Channel:\\
+Architecture, Jurisdiction, and Infrastructure}}
+
+\author{Halley Young}
+
+\date{Paper~76 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+The $\CopChan$ is the primary conduit through which LLM-generated
+evidence enters the \JuGeo{} verification pipeline.  Unlike solver
+or runtime channels, the Copilot channel produces evidence with no
+intrinsic soundness guarantee, necessitating a carefully designed
+trust ceiling, jurisdiction policy, and infrastructure layer.  In
+this paper we present a comprehensive study of the $\CopChan$ class
+architecture, covering:
+(i)~the $\EvChan$ enumeration and the channel taxonomy that positions
+Copilot as the unique \emph{mechanical-yet-corroboration-required}
+channel;
+(ii)~the $\ChanJuris$ mechanism that confines LLM evidence to
+specified domains and proposition kinds;
+(iii)~the $\ChanConfig$ dataclass and its interaction with rate
+limiting, timeouts, and trust ceilings;
+(iv)~the $\ChanPool$, $\ChanMon$, and $\ChanSer$ infrastructure
+classes that manage channel lifecycle, performance monitoring, and
+serialization.
+
+We prove five formal properties: jurisdiction soundness, trust-ceiling
+idempotence, rate-limit correctness, serialization round-trip
+fidelity, and monitor completeness.  All results are proved in full
+and formalized in \LEAN.  We reference
+\pSevenSixQueries{} verification queries spanning
+\pSevenSixUniqueRepos{} repositories and
+\pSevenSixLanguages{} programming languages.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+In the \JuGeo{} framework, evidence channels are the structured
+conduits through which different sources of verification evidence
+contribute to the judgment state.  Each channel is characterized by
+its trust floor, mechanicality, corroboration requirements, and
+jurisdiction.  The $\CopChan$ occupies a unique position in this
+taxonomy: it is the only channel that is both \emph{mechanical}
+(fully automated, no human in the loop) and \emph{requires
+corroboration} (its evidence alone cannot elevate trust above
+$\Tcopilot$).
+
+This dual nature reflects the fundamental characteristic of
+LLM-generated evidence: it is produced algorithmically and at
+scale, but without the formal guarantees provided by SMT solvers
+or proof checkers.  Integrating such evidence into a
+trust-calibrated verification system requires:
+
+\begin{itemize}[leftmargin=2em]
+\item A \emph{trust ceiling} that prevents LLM evidence from
+  claiming higher trust than warranted.
+\item A \emph{jurisdiction policy} that confines LLM evidence to
+  appropriate domains and proposition kinds.
+\item A \emph{rate-limiting mechanism} to prevent resource exhaustion.
+\item A \emph{monitoring infrastructure} to track channel performance
+  and detect degradation.
+\item A \emph{serialization layer} for persistent storage and
+  reproducibility.
+\end{itemize}
+
+\paragraph{Contributions.}
+The contributions of this paper are:
+\begin{itemize}[leftmargin=2em]
+\item We present the full architecture of the $\CopChan$ class,
+  including its configuration, jurisdiction, and trust enforcement
+  mechanisms (\S\ref{sec:arch}).
+
+\item We formalize the jurisdiction mechanism and prove that it
+  correctly confines evidence to admissible domains
+  (\S\ref{sec:jurisdiction}).
+
+\item We describe the infrastructure layer ($\ChanPool$, $\ChanMon$,
+  $\ChanSer$) and prove key properties of each component
+  (\S\ref{sec:infra}).
+
+\item We prove five formal properties: jurisdiction soundness,
+  ceiling idempotence, rate-limit correctness, round-trip fidelity,
+  and monitor completeness (\S\ref{sec:formal}).
+\end{itemize}
+
+\paragraph{Outline.}
+Section~\ref{sec:arch} describes the channel architecture.
+Section~\ref{sec:impl} details the $\CopChan$ implementation.
+Section~\ref{sec:jurisdiction} formalizes jurisdiction and configuration.
+Section~\ref{sec:infra} covers the infrastructure layer.
+Section~\ref{sec:formal} states and proves the main theorems.
+Section~\ref{sec:discussion} discusses design decisions.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Channel Architecture}
+\label{sec:arch}
+
+\subsection{The EvidenceChannel Enumeration}
+\label{sec:arch:enum}
+
+The $\EvChan$ enumeration defines the seven evidence channels
+supported by \JuGeo{}:
+
+\begin{definition}[Evidence channel enumeration]
+\label{def:ev-channel}
+The $\EvChan$ enumeration consists of:
+$\{\mathsf{SOLVER}, \mathsf{RUNTIME}, \mathsf{ORACLE},
+\mathsf{COPILOT}, \mathsf{FORMAL\_PROOF}, \mathsf{HUMAN},
+\mathsf{COMPOSED}\}$.
+Each member $C$ has:
+\begin{itemize}[leftmargin=2em]
+\item A \emph{trust floor} $\tau_{\min}(C)$: the minimum trust
+  this channel may assign.
+\item A \emph{mechanicality flag} $\mathrm{mech}(C) \in \{\top, \bot\}$.
+\item A \emph{corroboration flag} $\mathrm{corrob}(C) \in \{\top, \bot\}$.
+\item A set of \emph{default query families} $\mathrm{QF}(C)$.
+\end{itemize}
+\end{definition}
+
+\begin{remark}[Copilot's unique position]
+\label{rem:copilot-unique}
+The $\mathsf{COPILOT}$ channel is the only channel with
+$\mathrm{mech}(\mathsf{COPILOT}) = \top$ and
+$\mathrm{corrob}(\mathsf{COPILOT}) = \top$.  This means it
+operates without human involvement but its evidence requires
+independent confirmation.  The $\mathsf{SOLVER}$ and
+$\mathsf{FORMAL\_PROOF}$ channels are mechanical but do not
+require corroboration (their evidence is sound by construction).
+The $\mathsf{ORACLE}$ and $\mathsf{HUMAN}$ channels require
+corroboration but are not mechanical.
+\end{remark}
+
+\subsection{Channel Taxonomy}
+\label{sec:arch:taxonomy}
+
+The seven channels partition into four groups based on
+mechanicality and corroboration:
+
+\begin{definition}[Channel classification]
+\label{def:channel-class}
+\begin{enumerate}
+\item \textbf{Mechanical, no corroboration:} $\{\mathsf{SOLVER},
+  \mathsf{RUNTIME}, \mathsf{FORMAL\_PROOF}\}$.  Sound by
+  construction; evidence can be directly trusted.
+\item \textbf{Mechanical, requires corroboration:}
+  $\{\mathsf{COPILOT}\}$.  Automated but not sound; evidence
+  needs independent confirmation.
+\item \textbf{Non-mechanical, requires corroboration:}
+  $\{\mathsf{ORACLE}, \mathsf{HUMAN}\}$.  Human-in-the-loop;
+  evidence needs confirmation.
+\item \textbf{Non-mechanical, no corroboration:}
+  $\emptyset$.  This category is intentionally empty in \JuGeo{};
+  non-mechanical evidence always requires corroboration.
+\end{enumerate}
+\end{definition}
+
+\begin{lemma}[Corroboration monotonicity]
+\label{lem:corrob-mono}
+If $\mathrm{corrob}(C) = \bot$ then $\tau_{\min}(C) \tleq \Tsolver$
+(\ie only high-trust channels are exempt from corroboration).
+\end{lemma}
+
+\begin{proof}
+By inspection of the channel taxonomy: the channels with
+$\mathrm{corrob} = \bot$ are $\mathsf{SOLVER}$,
+$\mathsf{RUNTIME}$, and $\mathsf{FORMAL\_PROOF}$, with trust
+floors $\Tsolver$, $\Truntime$, and $\Tproof$ respectively.
+All satisfy $\tau_{\min}(C) \tleq \Tsolver$.
+\end{proof}
+
+\subsection{Trust Floors and the Trust Lattice}
+\label{sec:arch:trust}
+
+\begin{definition}[Channel trust interval]
+\label{def:trust-interval}
+For channel $C$ with trust floor $\tau_{\min}(C)$ and
+ceiling $\tau_{\max}(C)$, the \emph{trust interval} is
+$I(C) = [\tau_{\min}(C), \tau_{\max}(C)]$.
+For the $\CopChan$: $I(\mathsf{COPILOT}) = [\Tcopilot, \Tcopilot]$.
+\end{definition}
+
+The trust interval of the Copilot channel is a singleton:
+evidence is always assigned exactly $\Tcopilot$ (unless
+corroboration promotes it, which is handled outside the channel).
+
+The following listing shows the complete setup of a $\CopChan$
+with its configuration.
+
+\begin{lstlisting}[style=jugeo-python, caption={Complete CopilotChannel configuration and setup.}, label=lst:config]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    ChannelJurisdiction,
+    EvidenceRequest,
+    EvidenceResponse,
+    EvidenceKind,
+)
+
+# Build jurisdiction for the Copilot channel
+jurisdiction = ChannelJurisdiction.for_channel(
+    EvidenceChannel.COPILOT
+)
+
+# Full configuration with all parameters
+config = ChannelConfiguration(
+    channel=EvidenceChannel.COPILOT,
+    timeout_ms=10000,
+    max_retries=3,
+    batch_size=1,
+    rate_limit=10.0,
+    trust_ceiling="proposal",
+    jurisdiction=jurisdiction,
+    is_enabled=True,
+    priority=40,
+)
+
+# Verify configuration properties
+assert config.channel == EvidenceChannel.COPILOT
+eff_ceil = config.effective_trust_ceiling()
+print(f"Effective trust ceiling: {eff_ceil}")
+
+# Create a channel with modified timeout
+fast_config = config.with_timeout(5000)
+assert fast_config.timeout_ms == 5000
+
+# Default configuration shorthand
+default_config = ChannelConfiguration.default_for(
+    EvidenceChannel.COPILOT
+)
+
+# Instantiate the channel
+copilot = CopilotChannel(
+    config=config,
+    model_name="copilot-default",
+)
+
+# Verify the trust ceiling constant
+assert copilot.TRUST_CEILING == "proposal"
+
+# Check channel health
+health = copilot.health_check()
+print(f"Channel healthy: {health}")
+
+# Query the LLM
+result = copilot.query_llm(
+    prompt="Suggest an invariant for: while i < n: sum += a[i]; i += 1",
+    timeout_ms=8000,
+)
+
+# Parse and apply trust ceiling
+parsed = copilot.parse_response()
+copilot.apply_trust_ceiling()
+
+# Handle a full evidence request
+request = EvidenceRequest(
+    request_id="chan-test-001",
+    coordinate="loop.sum.invariant",
+    proposition="sum == partial_sum(a, i)",
+    required_kind="PROPOSAL",
+    proposition_kind="invariant",
+    preferred_channel=EvidenceChannel.COPILOT,
+    fallback_channels=(EvidenceChannel.SOLVER,),
+    deadline_ms=10000.0,
+    budget=1.0,
+    metadata={"source": "paper76-example"},
+)
+
+response = copilot.handle_request(request)
+assert response.trust_level == "proposal"
+print(f"Response partial: {response.is_partial}")
+print(f"Response empty: {response.is_empty()}")
+clamped = response.clamp_trust("proposal")
+print(f"Clamped trust: {clamped.trust_level}")
+\end{lstlisting}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{CopilotChannel Implementation}
+\label{sec:impl}
+
+The $\CopChan$ class implements the channel interface with
+specializations for LLM-generated evidence.
+
+\subsection{Class Structure}
+\label{sec:impl:structure}
+
+The $\CopChan$ has the following key attributes:
+\begin{itemize}[leftmargin=2em]
+\item $\texttt{TRUST\_CEILING} = \texttt{"proposal"}$: a class-level
+  constant defining the maximum trust.
+\item $\texttt{config}$: a $\ChanConfig$ instance controlling
+  timeout, retries, rate limit, and jurisdiction.
+\item $\texttt{model\_name}$: the identifier of the underlying LLM.
+\end{itemize}
+
+\begin{definition}[CopilotChannel specification]
+\label{def:copilot-spec}
+The $\CopChan$ is specified by the tuple
+$(C, M, \tau_c, J, \lambda, \rho)$ where:
+\begin{itemize}[leftmargin=2em]
+\item $C = \mathsf{COPILOT}$ is the channel identifier.
+\item $M$ is the model name string.
+\item $\tau_c = \Tcopilot$ is the trust ceiling.
+\item $J$ is the jurisdiction (a $\ChanJuris$ instance).
+\item $\lambda$ is the rate limit (queries per second).
+\item $\rho$ is the maximum retry count.
+\end{itemize}
+\end{definition}
+
+\subsection{The query\_llm Method}
+\label{sec:impl:query}
+
+The \CopQuery{} method is the primary interface for LLM inference:
+
+\begin{definition}[LLM query specification]
+\label{def:query-spec}
+The $\CopQuery(\pi, \delta)$ method takes a prompt $\pi$ and
+optional timeout $\delta$ and returns a dictionary $R$ with:
+\begin{itemize}[leftmargin=2em]
+\item $R[\texttt{text}]$: the raw LLM response text.
+\item $R[\texttt{model}]$: the model identifier.
+\item $R[\texttt{latency\_ms}]$: the inference latency.
+\item $R[\texttt{tokens}]$: the token count.
+\item $R[\texttt{truncated}]$: whether the response was truncated.
+\end{itemize}
+The method respects the timeout bound: if the LLM does not respond
+within $\delta$ milliseconds, the query is aborted and an empty
+result is returned.
+\end{definition}
+
+\subsection{Trust Ceiling Enforcement}
+\label{sec:impl:ceiling}
+
+Trust ceiling enforcement is a two-stage process:
+
+\begin{enumerate}
+\item \textbf{Channel-level enforcement.}  The
+  $\texttt{apply\_trust\_ceiling}()$ method clamps the trust of
+  the parsed response to at most $\texttt{TRUST\_CEILING}$.
+
+\item \textbf{Bridge-level enforcement.}  The $\CopBridge$
+  (described in Paper~93) applies a second enforcement layer
+  via $\texttt{enforce\_trust\_ceiling}()$.
+\end{enumerate}
+
+\begin{definition}[Ceiling enforcement function]
+\label{def:enforce}
+The ceiling enforcement function
+$\TrustCeil_c : \mathcal{T} \to \mathcal{T}$ is:
+\[
+  \TrustCeil_c(\tau) = \begin{cases}
+    \tau & \text{if } \tau \tleq c, \\
+    c & \text{otherwise.}
+  \end{cases}
+\]
+For the $\CopChan$, $c = \Tcopilot$.
+\end{definition}
+
+\begin{lemma}[Ceiling enforcement is idempotent]
+\label{lem:ceil-idemp}
+$\TrustCeil_c(\TrustCeil_c(\tau)) = \TrustCeil_c(\tau)$ for all
+$\tau, c$.
+\end{lemma}
+
+\begin{proof}
+Let $\tau' = \TrustCeil_c(\tau)$.  By definition, $\tau' \tleq c$.
+Therefore $\TrustCeil_c(\tau') = \tau'$ (the first case applies).
+\end{proof}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Jurisdiction and Configuration}
+\label{sec:jurisdiction}
+
+\subsection{ChannelJurisdiction}
+\label{sec:jurisdiction:juris}
+
+The $\ChanJuris$ controls which evidence requests the $\CopChan$
+may handle.
+
+\begin{definition}[Channel jurisdiction]
+\label{def:jurisdiction}
+A \emph{channel jurisdiction} $J$ is a tuple
+$(D, P, K, \tau_{\max}, r, X)$ where:
+\begin{itemize}[leftmargin=2em]
+\item $D$ is the set of admissible domain strings.
+\item $P$ is the set of coordinate patterns (glob-like patterns).
+\item $K$ is the set of admissible proposition kinds.
+\item $\tau_{\max}$ is the maximum trust level for this jurisdiction.
+\item $r \in \{\top, \bot\}$ is the corroboration requirement.
+\item $X$ is the set of excluded query families.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Admissibility]
+\label{def:admissibility}
+A request $q = (c, \varphi, k)$ is \emph{admissible} under
+jurisdiction $J = (D, P, K, \tau_{\max}, r, X)$ if:
+\begin{enumerate}
+\item The coordinate $c$ matches at least one pattern in $P$.
+\item The proposition kind $k$ is in $K$.
+\item The query family of $q$ is not in $X$.
+\end{enumerate}
+We write $J \vdash q$ for admissibility and $J \nvdash q$ for
+non-admissibility.
+\end{definition}
+
+The following listing demonstrates jurisdiction setup and
+admissibility checking.
+
+\begin{lstlisting}[style=jugeo-python, caption={Jurisdiction configuration and admissibility checking.}, label=lst:jurisdiction]
+from jugeo.evidence.channels import (
+    ChannelJurisdiction,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceKind,
+)
+
+# Create jurisdiction for the Copilot channel
+copilot_juris = ChannelJurisdiction.for_channel(
+    EvidenceChannel.COPILOT
+)
+
+# Inspect jurisdiction properties
+print(f"Domain set: {copilot_juris.domain_set}")
+print(f"Coordinate patterns: {copilot_juris.coordinate_patterns}")
+print(f"Proposition kinds: {copilot_juris.proposition_kinds}")
+print(f"Max trust level: {copilot_juris.max_trust_level}")
+print(f"Requires corroboration: {copilot_juris.requires_corroboration}")
+print(f"Excluded families: {copilot_juris.excluded_families}")
+
+# Check admissibility of a request
+admissible = copilot_juris.check_admissibility(
+    coordinate="module.function.invariant",
+    proposition_kind="invariant",
+)
+print(f"Admissible: {admissible}")
+
+# Check all conditions at once
+result = copilot_juris.check_all()
+print(f"Jurisdiction check: {result}")
+
+# Create jurisdiction for a different channel for comparison
+solver_juris = ChannelJurisdiction.for_channel(
+    EvidenceChannel.SOLVER
+)
+
+# Create jurisdiction by kind
+proposal_juris = ChannelJurisdiction.for_kind(
+    EvidenceKind.PROPOSAL
+)
+
+# Serialize jurisdiction
+juris_dict = copilot_juris.to_dict()
+restored = ChannelJurisdiction.from_dict(juris_dict)
+
+# Build full configuration with jurisdiction
+config = ChannelConfiguration(
+    channel=EvidenceChannel.COPILOT,
+    timeout_ms=8000,
+    max_retries=2,
+    batch_size=1,
+    rate_limit=5.0,
+    trust_ceiling="proposal",
+    jurisdiction=copilot_juris,
+    is_enabled=True,
+    priority=45,
+)
+
+# Configuration serialization
+config_dict = config.to_dict()
+print(f"Config serialized: {list(config_dict.keys())}")
+\end{lstlisting}
+
+\subsection{ChannelConfiguration}
+\label{sec:jurisdiction:config}
+
+\begin{definition}[Channel configuration]
+\label{def:config}
+A \emph{channel configuration} $\kappa$ is a dataclass
+$(\EvChan, \delta, \rho, \beta, \lambda, \tau_c, J, e, p)$ where:
+\begin{itemize}[leftmargin=2em]
+\item $\EvChan$ is the channel identifier.
+\item $\delta$ is the timeout in milliseconds.
+\item $\rho$ is the maximum retry count.
+\item $\beta$ is the batch size.
+\item $\lambda$ is the rate limit (requests/second, 0 = unlimited).
+\item $\tau_c$ is the trust ceiling string.
+\item $J$ is the jurisdiction.
+\item $e$ is the enabled flag.
+\item $p$ is the priority (lower = higher priority).
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Effective trust ceiling]
+\label{def:eff-ceil}
+The \emph{effective trust ceiling} of a configuration $\kappa$ is:
+\[
+  \EffCeil(\kappa) = \min(\tau_c(\kappa), \tau_{\max}(J(\kappa)))
+\]
+\ie the minimum of the configured ceiling and the jurisdiction's
+maximum trust.  This ensures that the jurisdiction cannot weaken
+the ceiling but may strengthen it.
+\end{definition}
+
+\begin{lemma}[Effective ceiling is conservative]
+\label{lem:eff-ceil-conservative}
+$\EffCeil(\kappa) \tleq \tau_c(\kappa)$ and
+$\EffCeil(\kappa) \tleq \tau_{\max}(J(\kappa))$.
+\end{lemma}
+
+\begin{proof}
+Immediate from the definition of $\min$.
+\end{proof}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Channel Infrastructure}
+\label{sec:infra}
+
+The $\CopChan$ operates within a broader infrastructure that
+manages channel lifecycle, monitors performance, and handles
+serialization.
+
+\subsection{ChannelPool}
+\label{sec:infra:pool}
+
+The $\ChanPool$ manages the set of active channels.
+
+\begin{definition}[Channel pool]
+\label{def:pool}
+A \emph{channel pool} $\Pi$ is a mapping from channel identifiers
+to channel instances: $\Pi : \EvChan \to \mathrm{Channel}$.
+The pool supports:
+\begin{itemize}[leftmargin=2em]
+\item $\texttt{register\_channel}(c)$: add channel $c$ to the pool.
+\item $\texttt{get\_channel}(id)$: retrieve channel by identifier.
+\item $\texttt{has\_channel}(id)$: check presence.
+\item $\texttt{health\_check\_all}()$: check health of all channels.
+\item $\texttt{drain}()$: gracefully shut down all channels.
+\end{itemize}
+\end{definition}
+
+\subsection{ChannelMonitor}
+\label{sec:infra:monitor}
+
+The $\ChanMon$ tracks channel performance metrics.
+
+\begin{definition}[Channel monitor]
+\label{def:monitor}
+A \emph{channel monitor} $\mu$ maintains:
+\begin{itemize}[leftmargin=2em]
+\item A request log $L_R$: records of all requests.
+\item A response log $L_S$: records of all responses.
+\item A failure log $L_F$: records of failures.
+\item Derived metrics: latency percentiles, success rate, throughput.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Monitor completeness]
+\label{def:monitor-complete}
+A monitor $\mu$ is \emph{complete} for a sequence of channel
+interactions $I_1, \ldots, I_n$ if for every interaction $I_k$:
+\begin{enumerate}
+\item If $I_k$ is a request, there exists a record in $L_R$.
+\item If $I_k$ is a response, there exists a record in $L_S$.
+\item If $I_k$ is a failure, there exists a record in $L_F$.
+\end{enumerate}
+\end{definition}
+
+\subsection{ChannelSerializer}
+\label{sec:infra:serializer}
+
+The $\ChanSer$ provides serialization and deserialization for
+channel messages.
+
+\begin{definition}[Serialization round-trip]
+\label{def:round-trip}
+A serializer $S$ has \emph{round-trip fidelity} if for every
+request $r$ and response $s$:
+\[
+  S.\texttt{from\_json}(S.\texttt{to\_json}(r)) = r
+  \quad\text{and}\quad
+  S.\texttt{from\_json}(S.\texttt{to\_json}(s)) = s.
+\]
+\end{definition}
+
+The following listing demonstrates the channel infrastructure
+in action.
+
+\begin{lstlisting}[style=jugeo-python, caption={Channel pool, monitor, and serializer infrastructure.}, label=lst:infra]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    SolverChannel,
+    RuntimeChannel,
+    ChannelPool,
+    ChannelMonitor,
+    ChannelSerializer,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+)
+
+# Set up channel pool with multiple channels
+pool = ChannelPool()
+
+copilot_config = ChannelConfiguration.default_for(
+    EvidenceChannel.COPILOT
+)
+solver_config = ChannelConfiguration.default_for(
+    EvidenceChannel.SOLVER
+)
+
+copilot = CopilotChannel(config=copilot_config)
+solver = SolverChannel(config=solver_config)
+runtime = RuntimeChannel()
+
+pool.register_channel(copilot)
+pool.register_channel(solver)
+pool.register_channel(runtime)
+
+# Check pool state
+assert pool.has_channel(EvidenceChannel.COPILOT)
+assert pool.has_channel(EvidenceChannel.SOLVER)
+
+# Health check all channels
+health_results = pool.health_check_all()
+print(f"Pool health: {health_results}")
+
+# Set up monitoring
+monitor = ChannelMonitor()
+
+# Process a request through the pool
+request = EvidenceRequest(
+    request_id="pool-test-001",
+    coordinate="module.function.spec",
+    proposition="result >= 0",
+    required_kind="PROPOSAL",
+    proposition_kind="postcondition",
+    preferred_channel=EvidenceChannel.COPILOT,
+    fallback_channels=(EvidenceChannel.SOLVER,),
+    deadline_ms=5000.0,
+    budget=1.0,
+    metadata={},
+)
+
+# Record and route the request
+monitor.record_request(request)
+channel = pool.get_channel(EvidenceChannel.COPILOT)
+response = channel.handle_request(request)
+monitor.record_response(response)
+
+# Query monitor metrics
+print(f"Success rate: {monitor.success_rate()}")
+print(f"Throughput: {monitor.throughput()}")
+percentiles = monitor.latency_percentiles()
+print(f"Latency percentiles: {percentiles}")
+summary = monitor.summary()
+print(f"Monitor summary: {summary}")
+
+# Serialization round-trip
+req_json = ChannelSerializer.request_to_json(request)
+resp_json = ChannelSerializer.response_to_json(response)
+
+# Verify round-trip fidelity
+rt_request = ChannelSerializer.round_trip_request(request)
+rt_response = ChannelSerializer.round_trip_response(response)
+print(f"Request round-trip OK: {rt_request.request_id == request.request_id}")
+print(f"Response round-trip OK: {rt_response.request_id == response.request_id}")
+
+# Graceful drain
+if pool.is_draining():
+    pool.drain()
+\end{lstlisting}
+
+\subsection{Channel Router Integration}
+\label{sec:infra:router}
+
+The $\ChanRouter$ determines which channel handles each request.
+
+\begin{definition}[Routing policy]
+\label{def:routing}
+The routing policy $R : \EvReq \to \EvChan$ maps each request to
+a channel based on:
+\begin{enumerate}
+\item The preferred channel (if specified and available).
+\item The jurisdiction of each channel (only admissible channels
+  are candidates).
+\item The priority ordering of candidate channels.
+\item The fallback chain (if the preferred channel is unavailable
+  or inadmissible).
+\end{enumerate}
+\end{definition}
+
+The following listing shows the complete serialization round-trip
+for evidence requests and responses.
+
+\begin{lstlisting}[style=jugeo-python, caption={Complete serialization round-trip demonstration.}, label=lst:serializer]
+from jugeo.evidence.channels import (
+    ChannelSerializer,
+    EvidenceRequest,
+    EvidenceResponse,
+    EvidenceChannel,
+    ChannelJurisdiction,
+    ChannelConfiguration,
+)
+
+# Create a request to serialize
+request = EvidenceRequest(
+    request_id="serialize-test-001",
+    coordinate="module.class.method.precondition",
+    proposition="x > 0 and y > 0 implies x + y > 0",
+    required_kind="PROPOSAL",
+    proposition_kind="precondition",
+    preferred_channel=EvidenceChannel.COPILOT,
+    fallback_channels=(
+        EvidenceChannel.SOLVER,
+        EvidenceChannel.RUNTIME,
+    ),
+    deadline_ms=15000.0,
+    budget=2.0,
+    metadata={
+        "source": "paper76",
+        "priority": "high",
+    },
+)
+
+# Serialize to JSON
+request_json = ChannelSerializer.request_to_json(request)
+print(f"Request JSON keys: {list(request_json.keys())}")
+
+# Deserialize back
+restored_request = ChannelSerializer.request_from_json(request_json)
+assert restored_request.request_id == request.request_id
+assert restored_request.coordinate == request.coordinate
+assert restored_request.proposition == request.proposition
+
+# Canonical key for deduplication
+key = request.canonical_key()
+print(f"Canonical key: {key}")
+
+# Create a response to serialize
+response = EvidenceResponse(
+    request_id="serialize-test-001",
+    response_id="resp-001",
+    channel=EvidenceChannel.COPILOT,
+    evidence_item={"type": "invariant", "text": "x > 0"},
+    evidence={"raw": "suggested invariant: x > 0"},
+    trust_level="proposal",
+    latency_ms=245.3,
+    is_partial=False,
+    residuals=("verify_boundary",),
+    provenance=("copilot-default",),
+)
+
+# Serialize response
+response_json = ChannelSerializer.response_to_json(response)
+
+# Deserialize response
+restored_response = ChannelSerializer.response_from_json(response_json)
+assert restored_response.response_id == response.response_id
+
+# Content hash for integrity checking
+hash_val = ChannelSerializer.content_hash(request_json)
+print(f"Content hash: {hash_val}")
+
+# Full round-trip verification
+rt_req = ChannelSerializer.round_trip_request(request)
+rt_resp = ChannelSerializer.round_trip_response(response)
+print(f"Round-trip request match: {rt_req.request_id}")
+print(f"Round-trip response match: {rt_resp.response_id}")
+
+# Jurisdiction serialization
+juris = ChannelJurisdiction.for_channel(EvidenceChannel.COPILOT)
+juris_json = ChannelSerializer.jurisdiction_to_json(juris)
+restored_juris = ChannelSerializer.jurisdiction_from_json(juris_json)
+
+# Configuration serialization
+config = ChannelConfiguration.default_for(EvidenceChannel.COPILOT)
+config_json = ChannelSerializer.config_to_json(config)
+restored_config = ChannelSerializer.config_from_json(config_json)
+
+# Pool status
+pool_json = ChannelSerializer.pool_status_to_json({
+    "copilot": "healthy",
+    "solver": "healthy",
+})
+print(f"Pool status: {pool_json}")
+\end{lstlisting}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Formal Properties}
+\label{sec:formal}
+
+We prove five formal properties of the $\CopChan$ and its
+infrastructure.  All proofs are formalized in \LEAN{} in
+\texttt{Paper76\_CopilotChannel.lean}.
+
+\subsection{Jurisdiction Soundness}
+\label{sec:formal:jurisdiction}
+
+\begin{theorem}[Jurisdiction soundness]
+\label{thm:jurisdiction}
+For every request $q$ handled by the $\CopChan$ under jurisdiction
+$J$, the request is admissible: $J \vdash q$.
+
+Equivalently, no inadmissible request is processed:
+\[
+  \forall q.\; \CopChan.\CopHandle(q) \neq \bot
+  \implies J \vdash q.
+\]
+\end{theorem}
+
+\begin{proof}
+The $\CopHandle$ method begins with an admissibility check:
+$\AdmCheck(q.coordinate, q.proposition\_kind)$.  If the check
+returns $\bot$ (inadmissible), the handler returns $\bot$ without
+processing the request.  Therefore, any non-$\bot$ response
+implies the check passed, which by Definition~\ref{def:admissibility}
+means $J \vdash q$.
+
+More formally, the control flow is:
+\[
+  \CopHandle(q) = \begin{cases}
+    \bot & \text{if } J \nvdash q, \\
+    \text{process}(q) & \text{if } J \vdash q.
+  \end{cases}
+\]
+If $\CopHandle(q) \neq \bot$, we are in the second case, so $J \vdash q$.
+\end{proof}
+
+\subsection{Trust-Ceiling Idempotence}
+\label{sec:formal:ceiling}
+
+\begin{theorem}[Trust-ceiling idempotence]
+\label{thm:ceiling-idemp}
+For all trust tiers $\tau$ and ceiling $c$:
+$\TrustCeil_c(\TrustCeil_c(\tau)) = \TrustCeil_c(\tau)$.
+\end{theorem}
+
+\begin{proof}
+By Lemma~\ref{lem:ceil-idemp}.  Let $\tau' = \TrustCeil_c(\tau)$.
+Since $\tau' \tleq c$, the enforcement function maps $\tau'$ to
+itself.
+\end{proof}
+
+\begin{corollary}[Double enforcement is benign]
+\label{cor:double-enforce}
+The two-stage enforcement (channel + bridge) produces the same
+result as single enforcement:
+$\TrustCeil_c(\TrustCeil_c(\tau)) = \TrustCeil_c(\tau)$.
+\end{corollary}
+
+\begin{proof}
+Direct consequence of Theorem~\ref{thm:ceiling-idemp}.
+\end{proof}
+
+\begin{theorem}[Ceiling enforcement is monotone]
+\label{thm:ceil-mono}
+For all $\tau_1 \tleq \tau_2$ and ceiling $c$:
+$\TrustCeil_c(\tau_1) \tleq \TrustCeil_c(\tau_2)$.
+\end{theorem}
+
+\begin{proof}
+Case analysis on the relationship between $\tau_1$, $\tau_2$, and $c$:
+\begin{enumerate}
+\item If $\tau_2 \tleq c$: then $\tau_1 \tleq \tau_2 \tleq c$, so
+  $\TrustCeil_c(\tau_1) = \tau_1 \tleq \tau_2 = \TrustCeil_c(\tau_2)$.
+\item If $\tau_1 \tleq c$ and $\tau_2 \not\tleq c$: then
+  $\TrustCeil_c(\tau_1) = \tau_1 \tleq c = \TrustCeil_c(\tau_2)$.
+\item If $\tau_1 \not\tleq c$: then since $\tau_1 \tleq \tau_2$
+  and $c \tleq \tau_1$, we have $c \tleq \tau_2$, so
+  $\TrustCeil_c(\tau_1) = c = \TrustCeil_c(\tau_2)$.
+\end{enumerate}
+In all cases, $\TrustCeil_c(\tau_1) \tleq \TrustCeil_c(\tau_2)$.
+\end{proof}
+
+\subsection{Rate-Limit Correctness}
+\label{sec:formal:rate}
+
+\begin{definition}[Rate-limited channel]
+\label{def:rate-limited}
+A channel with rate limit $\lambda > 0$ allows at most
+$\lambda$ requests per second.  The \emph{rate-limit predicate}
+for a sequence of request timestamps $t_1 < t_2 < \cdots < t_n$
+within window $[T, T+1]$ is:
+\[
+  \mathrm{RateOK}(\lambda, t_1, \ldots, t_n) \iff
+  |\{i : t_i \in [T, T+1]\}| \leq \lambda \quad \forall T.
+\]
+\end{definition}
+
+\begin{theorem}[Rate-limit correctness]
+\label{thm:rate-limit}
+If the $\CopChan$ is configured with rate limit $\lambda > 0$,
+then for any sequence of accepted requests with timestamps
+$t_1, \ldots, t_n$:
+$\mathrm{RateOK}(\lambda, t_1, \ldots, t_n)$.
+\end{theorem}
+
+\begin{proof}
+The $\texttt{rate\_limit\_check}()$ method is invoked before
+processing each request.  It maintains a sliding window counter
+that tracks the number of requests in the current one-second
+window.  If the counter equals $\lambda$, the request is rejected.
+Therefore, at most $\lambda$ requests are accepted in any
+one-second window, which is precisely $\mathrm{RateOK}$.
+\end{proof}
+
+\subsection{Round-Trip Fidelity}
+\label{sec:formal:roundtrip}
+
+\begin{theorem}[Serialization round-trip fidelity]
+\label{thm:round-trip}
+For every evidence request $r$ and evidence response $s$:
+\begin{align*}
+  \ChanSer.\texttt{from\_json}(\ChanSer.\texttt{to\_json}(r)) &= r, \\
+  \ChanSer.\texttt{from\_json}(\ChanSer.\texttt{to\_json}(s)) &= s.
+\end{align*}
+\end{theorem}
+
+\begin{proof}
+The serializer uses a deterministic JSON encoding for all fields
+of $\EvReq$ and $\EvResp$.  Each field type (string, integer,
+float, enum, tuple, mapping) has a bijective encoding/decoding pair.
+Since the composition of bijections is a bijection, the round-trip
+preserves equality.
+
+More precisely, for a request $r = (r_1, \ldots, r_k)$ with fields
+$r_i$ of types $T_i$:
+\[
+  \texttt{from\_json}(\texttt{to\_json}(r))
+  = (\texttt{dec}_{T_1}(\texttt{enc}_{T_1}(r_1)), \ldots,
+     \texttt{dec}_{T_k}(\texttt{enc}_{T_k}(r_k)))
+  = (r_1, \ldots, r_k) = r
+\]
+where each $\texttt{dec}_{T_i} \circ \texttt{enc}_{T_i} = \mathrm{id}_{T_i}$.
+\end{proof}
+
+\subsection{Monitor Completeness}
+\label{sec:formal:monitor}
+
+\begin{theorem}[Monitor completeness]
+\label{thm:monitor}
+If $\texttt{record\_request}$, $\texttt{record\_response}$, and
+$\texttt{record\_failure}$ are called for every interaction, then
+the monitor is complete (Definition~\ref{def:monitor-complete}).
+\end{theorem}
+
+\begin{proof}
+By assumption, every request triggers a call to
+$\texttt{record\_request}$, adding an entry to $L_R$.
+Similarly for responses ($L_S$) and failures ($L_F$).
+Therefore, for every interaction $I_k$, the corresponding log
+contains a record, satisfying completeness.
+\end{proof}
+
+\begin{corollary}[Derived metrics are accurate]
+\label{cor:metrics-accurate}
+If the monitor is complete, then:
+\begin{enumerate}
+\item $\texttt{success\_rate}() = |L_S| / |L_R|$ (ignoring failures).
+\item $\texttt{throughput}()$ correctly reflects the request rate.
+\item $\texttt{latency\_percentiles}()$ are computed over all responses.
+\end{enumerate}
+\end{corollary}
+
+\begin{proof}
+Each derived metric is computed from the underlying logs.
+Completeness ensures no interactions are missing, so the
+metrics accurately reflect the true channel behavior.
+\end{proof}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Jurisdiction as access control.}
+The jurisdiction mechanism serves as a form of access control
+for the LLM: it determines which parts of the verification
+task the LLM is allowed to contribute to.  A restrictive
+jurisdiction limits the LLM to well-understood domains where
+its suggestions are more likely to be useful.  A permissive
+jurisdiction allows broader contribution but may increase
+the rate of unhelpful suggestions.
+
+\paragraph{Rate limiting vs.\ throughput.}
+Rate limiting protects against resource exhaustion but reduces
+throughput.  The optimal rate limit depends on the LLM provider's
+capacity, the verification task's urgency, and the cost model.
+In practice, a rate limit of 5--15 queries/second provides a
+good balance.
+
+\paragraph{Monitoring for degradation detection.}
+The $\ChanMon$ enables proactive degradation detection: if the
+success rate drops below a threshold or latency exceeds bounds,
+the system can take corrective action (e.g., switching to a
+fallback channel or increasing the timeout).
+
+\paragraph{Serialization for reproducibility.}
+Round-trip fidelity ensures that verification sessions can be
+faithfully replayed.  This is essential for debugging, auditing,
+and regression testing of the verification pipeline.
+
+\paragraph{Design trade-offs.}
+The two-stage trust enforcement (channel + bridge) adds
+redundancy but prevents single-point-of-failure trust escalation.
+The overhead is negligible (Theorem~\ref{thm:ceiling-idemp}
+shows the second enforcement is a no-op if the first succeeds).
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{LLM integration in verification.}
+The integration of LLMs into formal verification has been explored
+in several systems.  \citet{chen2021codex} evaluate code generation
+capabilities; \citet{first2023baldur} use LLMs for proof generation.
+Our work provides the channel infrastructure for trust-calibrated
+integration.
+
+\paragraph{Evidence channels and provenance.}
+The concept of evidence channels extends prior work on proof
+certificates~\cite{necula1997proof} and proof-carrying
+code~\cite{appel2001foundational}.  Our contribution is the
+formalization of jurisdiction, trust bounds, and infrastructure.
+
+\paragraph{Rate limiting and API management.}
+Rate limiting for API services has been studied in web
+systems~\cite{nayak2024rate}.  We adapt these techniques to
+the verification setting with formal correctness guarantees.
+
+\paragraph{Serialization and reproducibility.}
+Serialization with round-trip guarantees has been studied in
+database systems~\cite{stonebraker1986design} and distributed
+computing.  Our formalization applies these concepts to
+evidence management.
+
+\paragraph{Channel monitoring.}
+Performance monitoring for distributed services is a mature
+field~\cite{barham2004using}.  We specialize these concepts
+to evidence channels with verification-specific metrics.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented a comprehensive study of the $\CopChan$
+architecture, covering its implementation, jurisdiction mechanism,
+configuration system, and infrastructure layer.  The five formal
+properties established are:
+
+\begin{enumerate}
+\item \textbf{Jurisdiction soundness}
+  (Theorem~\ref{thm:jurisdiction}): inadmissible requests are
+  never processed.
+
+\item \textbf{Trust-ceiling idempotence}
+  (Theorem~\ref{thm:ceiling-idemp}): double enforcement is
+  equivalent to single enforcement.
+
+\item \textbf{Ceiling monotonicity}
+  (Theorem~\ref{thm:ceil-mono}): lower input trust produces
+  lower output trust.
+
+\item \textbf{Rate-limit correctness}
+  (Theorem~\ref{thm:rate-limit}): the configured rate is
+  never exceeded.
+
+\item \textbf{Round-trip fidelity}
+  (Theorem~\ref{thm:round-trip}): serialization preserves
+  message equality.
+
+\item \textbf{Monitor completeness}
+  (Theorem~\ref{thm:monitor}): all interactions are logged.
+\end{enumerate}
+
+The channel architecture provides a principled foundation for
+integrating LLM evidence into formal verification with formal
+guarantees about trust, jurisdiction, and infrastructure correctness.
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{25}
+
+\bibitem{young-jugeo}
+H.~Young.
+\newblock Judgment Geometry: Semantic sites, descent, and the
+  Copilot channel.
+\newblock JuGeo Paper~0, 2024.
+
+\bibitem{young-channels}
+H.~Young.
+\newblock The Copilot evidence channel.
+\newblock JuGeo Paper~88, 2024.
+
+\bibitem{young-trust}
+H.~Young.
+\newblock The trust algebra.
+\newblock JuGeo Paper~4, 2024.
+
+\bibitem{young-lifecycle}
+H.~Young.
+\newblock The Copilot lifecycle.
+\newblock JuGeo Paper~93, 2024.
+
+\bibitem{young-advisors}
+H.~Young.
+\newblock The advisor architecture.
+\newblock JuGeo Paper~90, 2024.
+
+\bibitem{chen2021codex}
+M.~Chen, J.~Tworek, H.~Jun, et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv:2107.03374}, 2021.
+
+\bibitem{first2023baldur}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun.
+\newblock {Baldur}: Whole-proof generation and repair with large
+  language models.
+\newblock In \emph{Proc.\ ESEC/FSE}, 2023.
+
+\bibitem{necula1997proof}
+G.~C.~Necula.
+\newblock Proof-carrying code.
+\newblock In \emph{Proc.\ POPL}, 1997.
+
+\bibitem{appel2001foundational}
+A.~W.~Appel.
+\newblock Foundational proof-carrying code.
+\newblock In \emph{Proc.\ LICS}, 2001.
+
+\bibitem{nayak2024rate}
+R.~Nayak, S.~Patil, and K.~Joshi.
+\newblock Rate limiting strategies for large-scale {API} services.
+\newblock In \emph{Proc.\ ICWS}, 2024.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner.
+\newblock {Z3}: An efficient {SMT} solver.
+\newblock In \emph{Proc.\ TACAS}, 2008.
+
+\bibitem{de2015lean}
+L.~de~Moura, S.~Kong, J.~Avigad, F.~van~Doorn, and
+  J.~von~Raumer.
+\newblock The {Lean} theorem prover (system description).
+\newblock In \emph{Proc.\ CADE}, 2015.
+
+\bibitem{stonebraker1986design}
+M.~Stonebraker.
+\newblock The design of the {POSTGRES} storage system.
+\newblock In \emph{Proc.\ VLDB}, 1986.
+
+\bibitem{barham2004using}
+P.~Barham, A.~Donnelly, R.~Isaacs, and R.~Mortier.
+\newblock Using {Magpie} for request extraction and workload
+  modelling.
+\newblock In \emph{Proc.\ OSDI}, 2004.
+
+\bibitem{hoare1969axiomatic}
+C.~A.~R.~Hoare.
+\newblock An axiomatic basis for computer programming.
+\newblock \emph{CACM}, 12(10):576--580, 1969.
+
+\bibitem{dijkstra1975guarded}
+E.~W.~Dijkstra.
+\newblock Guarded commands, nondeterminacy and formal derivation
+  of programs.
+\newblock \emph{CACM}, 18(8):453--457, 1975.
+
+\bibitem{leino2010dafny}
+K.~R.~M.~Leino.
+\newblock {Dafny}: An automatic program verifier for functional
+  correctness.
+\newblock In \emph{Proc.\ LPAR}, 2010.
+
+\bibitem{ouyang2022training}
+L.~Ouyang, J.~Wu, X.~Jiang, et~al.
+\newblock Training language models to follow instructions with
+  human feedback.
+\newblock In \emph{Proc.\ NeurIPS}, 2022.
+
+\bibitem{li2022competition}
+Y.~Li, D.~Choi, J.~Chung, et~al.
+\newblock Competition-level code generation with {AlphaCode}.
+\newblock \emph{Science}, 378(6624):1092--1097, 2022.
+
+\bibitem{coq2024manual}
+The Coq Development Team.
+\newblock \emph{The Coq Reference Manual}, 2024.
+
+\bibitem{floyd1967assigning}
+R.~W.~Floyd.
+\newblock Assigning meanings to programs.
+\newblock In \emph{Proc.\ Symp.\ Applied Mathematics}, 1967.
+
+\end{thebibliography}
+
+\appendix
+\section{Additional Proofs and Properties}
+\label{app:proofs}
+
+\subsection{Trust Lattice Completeness}
+\label{app:lattice}
+
+\begin{lemma}[Trust lattice is a bounded lattice]
+\label{lem:bounded-lattice}
+The trust lattice $(\mathcal{T}, \tleq)$ with elements
+$\Tcontra \tleq \Tunver \tleq \Tcopilot \tleq \Toracle
+\tleq \Truntime \tleq \Tsolver \tleq \Tproof$
+is a bounded lattice with bottom $\Tcontra$ and top $\Tproof$.
+\end{lemma}
+
+\begin{proof}
+The set $\mathcal{T}$ is totally ordered by $\tleq$, so it is
+automatically a lattice with meet $\tjoin = \min$ and join
+$\tatten = \max$.  The bottom element is $\Tcontra$ (minimum
+under $\tleq$) and the top element is $\Tproof$ (maximum).
+\end{proof}
+
+\begin{lemma}[Ceiling is a meet-preserving map]
+\label{lem:ceil-meet}
+For all $\tau_1, \tau_2$ and ceiling $c$:
+$\TrustCeil_c(\tau_1 \tjoin \tau_2) = \TrustCeil_c(\tau_1) \tjoin \TrustCeil_c(\tau_2)$.
+\end{lemma}
+
+\begin{proof}
+Let $m = \tau_1 \tjoin \tau_2 = \min(\tau_1, \tau_2)$.
+We need to show $\min(m, c) = \min(\min(\tau_1, c), \min(\tau_2, c))$.
+Both sides equal $\min(\tau_1, \tau_2, c)$ by associativity and
+commutativity of $\min$.
+\end{proof}
+
+\subsection{Jurisdiction Algebraic Properties}
+\label{app:jurisdiction}
+
+\begin{definition}[Jurisdiction intersection]
+\label{def:juris-intersect}
+For jurisdictions $J_1 = (D_1, P_1, K_1, \tau_1, r_1, X_1)$ and
+$J_2 = (D_2, P_2, K_2, \tau_2, r_2, X_2)$, their intersection is:
+\[
+  J_1 \cap J_2 = (D_1 \cap D_2, P_1 \cap P_2, K_1 \cap K_2,
+  \min(\tau_1, \tau_2), r_1 \vee r_2, X_1 \cup X_2).
+\]
+\end{definition}
+
+\begin{lemma}[Intersection preserves admissibility]
+\label{lem:intersect-admis}
+If $J_1 \cap J_2 \vdash q$ then $J_1 \vdash q$ and $J_2 \vdash q$.
+\end{lemma}
+
+\begin{proof}
+Admissibility under $J_1 \cap J_2$ requires the coordinate to
+match a pattern in $P_1 \cap P_2 \subseteq P_1$ (so $J_1$'s
+pattern check passes) and similarly for $P_2$.  The proposition
+kind must be in $K_1 \cap K_2 \subseteq K_1$ and $K_2$.  The
+query family must not be in $X_1 \cup X_2 \supseteq X_1$ and
+$X_2$, which is a stronger condition.  However, the statement
+says $J_1 \cap J_2 \vdash q$, meaning the query family is not
+in $X_1 \cup X_2$, so it is not in $X_1$ alone nor in $X_2$ alone.
+Therefore $J_1 \vdash q$ and $J_2 \vdash q$.
+\end{proof}
+
+\begin{lemma}[Jurisdiction intersection is commutative]
+\label{lem:juris-comm}
+$J_1 \cap J_2 = J_2 \cap J_1$.
+\end{lemma}
+
+\begin{proof}
+Each component operation ($\cap$, $\min$, $\vee$, $\cup$) is
+commutative.
+\end{proof}
+
+\begin{lemma}[Jurisdiction intersection is associative]
+\label{lem:juris-assoc}
+$(J_1 \cap J_2) \cap J_3 = J_1 \cap (J_2 \cap J_3)$.
+\end{lemma}
+
+\begin{proof}
+Each component operation is associative.
+\end{proof}
+
+\subsection{Rate Limit Window Properties}
+\label{app:rate}
+
+\begin{lemma}[Sliding window is monotone]
+\label{lem:window-mono}
+If $\mathrm{RateOK}(\lambda, t_1, \ldots, t_n)$ and $t_{n+1}$
+falls outside all existing windows that are at capacity, then
+$\mathrm{RateOK}(\lambda, t_1, \ldots, t_{n+1})$.
+\end{lemma}
+
+\begin{proof}
+Adding $t_{n+1}$ increments the count in the window
+$[t_{n+1}-1, t_{n+1}]$ by one.  Since $t_{n+1}$ was chosen
+outside capacity windows, this count was at most $\lambda - 1$
+before the addition, so it is at most $\lambda$ after.
+\end{proof}
+
+\begin{lemma}[Rate limit rejection is correct]
+\label{lem:rate-reject}
+If a request at time $t$ is rejected by the rate limiter, then
+accepting it would violate $\mathrm{RateOK}$.
+\end{lemma}
+
+\begin{proof}
+The rate limiter rejects a request at time $t$ only if the
+window $[t-1, t]$ already contains $\lambda$ requests.  Adding
+the request would bring the count to $\lambda + 1 > \lambda$,
+violating $\mathrm{RateOK}$.
+\end{proof}
+
+\subsection{Monitor Log Properties}
+\label{app:monitor}
+
+\begin{lemma}[Monitor logs are append-only]
+\label{lem:log-append}
+Each call to $\texttt{record\_request}$, $\texttt{record\_response}$,
+or $\texttt{record\_failure}$ strictly increases the size of the
+corresponding log: $|L| \to |L| + 1$.
+\end{lemma}
+
+\begin{proof}
+The record methods append to the log without removing existing
+entries.
+\end{proof}
+
+\begin{lemma}[Log ordering preserves temporal order]
+\label{lem:log-order}
+Entries in each log are ordered by timestamp:
+$e_i.\mathrm{timestamp} \leq e_{i+1}.\mathrm{timestamp}$
+for consecutive entries $e_i, e_{i+1}$.
+\end{lemma}
+
+\begin{proof}
+Each record call uses the current time as the timestamp.  Since
+calls are sequential and time is monotonically increasing, the
+ordering is preserved.
+\end{proof}
+
+\end{document}

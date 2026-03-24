@@ -8,6 +8,7 @@
 \input{jugeo-common}
 \input{experiment-data}
 \input{subsystem-data}
+\input{data-paper35}
 
 % ── Additional packages ────────────────────────────────────────────────
 \usepackage{array}
@@ -90,9 +91,11 @@ The main theorem (\emph{Soundness of \PMR{}}) states that the
 reconstruction never asserts termination for an input that could diverge,
 guaranteed by the bottom-propagation property of flat domains and
 mechanized in \LEAN{} without \texttt{sorry}.
-Experiments on 300 Python functions across five partiality categories
-confirm soundness (\expAccuracy{} on the universal benchmark), elimination of false-termination
-claims over a total-by-default baseline, and sub-millisecond median reconstruction time.
+Experiments on the repository benchmark cover \ppXXXVTotalPrograms{}
+programs across five partiality categories.  The audited comparison is
+between a total-by-default baseline and the repository's PMR analysis:
+the mean baseline false-termination rate is \ppXXXVMeanBaseFtr, while the
+mean PMR false-termination rate is \ppXXXVMeanPmrFtr.
 \end{abstract}
 % ─────────────────────────────────────────────────────────────────────
 
@@ -135,12 +138,11 @@ functions violate totality in at least four distinct ways:
         domain.
 \end{enumerate}
 
-These four partiality sources are the norm, not the exception.  A study
-of the CPython 3.12 standard library (4\,200 public functions) found
-that most exhibit at least one partiality source.  Treating them as
-total in a verification context leads to \emph{false termination
-claims}: the verifier asserts that an expression evaluates to a value
-when the underlying computation may diverge or raise.
+These four partiality sources appear frequently in the repository
+benchmark as well: exception-style partiality appears in
+\ppXXXVExceptPct{} of the modelled functions and implicit partiality in
+\ppXXXVImplicitPct{}.  Treating them as total in a verification context
+leads to \emph{false termination claims}.
 
 \subsection{Our approach: domain-theoretic reconstruction}
 
@@ -260,11 +262,11 @@ the absence of contrary evidence.
 \toprule
 Category & Functions & Percentage \\
 \midrule
-Non-termination (possible)   & — & — \\
-Uncaught exceptions          & — & — \\
-Implicit \texttt{None}       & — & — \\
-Precondition violation       & — & — \\
-Undefined binding            & — & — \\
+Non-termination (possible)   & \ppXXXVNontermFuncs & \ppXXXVNontermPct \\
+Uncaught exceptions          & \ppXXXVExceptFuncs & \ppXXXVExceptPct \\
+Implicit \texttt{None}       & \ppXXXVImplicitFuncs & \ppXXXVImplicitPct \\
+Precondition violation       & \ppXXXVPrecondFuncs & \ppXXXVPrecondPct \\
+Undefined binding            & \ppXXXVUndefFuncs & \ppXXXVUndefPct \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -678,6 +680,28 @@ coordinate patch $p$.  For a partial Python function $f$, verification
 yields a \emph{partial section} $\PartSec$: defined on the observed
 coordinates $\pdom(\ObsSet)$ but undefined elsewhere.
 
+\begin{lstlisting}[language=Python, caption={Using the \JuGeo{} repair semantics API to reconstruct a partial section over a site.}]
+from jugeo.geometry import SiteBuilder
+
+code = open("partial_functions.py").read()
+site = SiteBuilder(code).build()
+
+print(f"Coordinates:    {site.coordinate_count()}")
+print(f"Covering families: {len(site.covering_families())}")
+
+# Run the partiality reconstruction (PMR completion)
+repair = site.repair_semantics()
+print(f"Observed coords:    {repair['observed_coordinate_count']}")
+print(f"Reconstructed:      {repair['reconstructed_coordinate_count']}")
+print(f"Unresolved partial: {repair['unresolved_count']}")
+print(f"Obstruction classes:{repair['obstruction_class_count']}")
+print(f"False term rate:    {repair['false_termination_rate']:.4f}")
+
+for obs in repair.get("unresolved_obstructions", []):
+    print(f"  coord={obs['coordinate']}  cause={obs['cause']}"
+          f"  trust={obs['trust']}")
+\end{lstlisting}
+
 \begin{definition}[Partial section]\label{def:part-sec}
 A \emph{partial section} $\PartSec$ over $\Site$ is a section defined
 on an open sub-site $U \subseteq \Site$:
@@ -921,20 +945,41 @@ The mechanized theorems include:
 
 \subsection{Benchmark design}
 
-We evaluate \PMR{} on a benchmark of $n = 300$ Python functions drawn
-from the five partiality categories described in
-\cref{sec:partiality}.  For each function, we collect observations by
-executing it on up to 20 randomly sampled inputs and recording the
-actual output or exception raised.  We compare \PMR{}
-(\textsc{Conservative}) against two baselines:
-
+We evaluate \PMR{} on the repository benchmark produced by
+\texttt{experiments/exp35\_partiality\_models.py}: \ppXXXVTotalPrograms{}
+small programs, two in each of the five partiality categories described in
+\cref{sec:partiality}.  For each program we collect the JuGeo descent verdict,
+the number of reported obstructions, and the number of local observations
+available to the reconstruction.  The audited comparison is between:
 \begin{itemize}
-  \item \textbf{Total-by-default}: assumes every function returns a
-        type-appropriate default (0, \texttt{None}, or \texttt{""})
-        for all inputs, with no partiality handling.
-  \item \textbf{Static-only (mypy)}: uses mypy type annotations to
-        determine return types statically without executing functions.
+  \item \textbf{Total-by-default}: a baseline that treats each function as
+        total unless evidence of failure is already present.
+  \item \textbf{\PMR{}}: the repository's conservative partiality-aware
+        reconstruction, which lowers the false-termination rate by assigning
+        $\bot$ to unsupported cases.
 \end{itemize}
+
+\begin{lstlisting}[language=Python, caption={Running the \JuGeo{} partiality analysis via the CLI and comparing reconstruction quality.}]
+import subprocess, json
+
+result = subprocess.run(
+    ["python3", "-m", "jugeo", "--format", "json",
+     "partiality", "partial_functions.py"],
+    capture_output=True, text=True
+)
+data = json.loads(result.stdout)
+
+print(f"Functions analysed:    {data['function_count']}")
+print(f"False termination rate:{data['false_termination_rate']:.4f}")
+print(f"Precision:             {data['precision']:.4f}")
+print(f"Recall:                {data['recall']:.4f}")
+print(f"Median analysis time:  {data['median_time_ms']:.2f} ms")
+
+# Per-category partiality breakdown
+for cat in data.get("category_breakdown", []):
+    print(f"  {cat['category']:20s}  FTR={cat['false_termination_rate']:.2f}"
+          f"  recall={cat['recall']:.2f}")
+\end{lstlisting}
 
 \subsection{Evaluation metrics}
 
@@ -950,74 +995,70 @@ for which a non-$\bot$ output is reported).
 
 \begin{table}[ht]
 \centering
-\caption{Evaluation results on 300 Python functions.
-  \PMR{} (\textsc{Conservative}) achieves FTR~$= 0$
-  (\expAccuracy{} soundness).}
+\caption{Aggregate false-termination metrics on the
+  \ppXXXVTotalPrograms{}-program repository benchmark.}
 \label{tab:results}
-\begin{tabularx}{\textwidth}{Xrrrr}
+\begin{tabular}{lr}
 \toprule
-Method & FTR & Precision & Recall & Median time \\
+Metric & Value \\
 \midrule
-Total-by-default            & — & — & — & — \\
-Static-only (mypy)          & — & — & — & — \\
-\PMR{} (\textsc{Liberal})   & — & — & — & — \\
-\PMR{} (\textsc{Conservative}) & \textbf{0.0\,\%} & \textbf{1.00}
-  & — & \subSiteMeanTime \\
+Programs analysed & \ppXXXVTotalPrograms \\
+Mean baseline FTR & \ppXXXVMeanBaseFtr \\
+Mean PMR FTR & \ppXXXVMeanPmrFtr \\
+Mean observations/function & \ppXXXVMeanObsPerFunc \\
 \bottomrule
-\end{tabularx}
+\end{tabular}
 \end{table}
 
 The results (Table~\ref{tab:results}) show:
 
 \begin{enumerate}[label=(\roman*)]
-  \item \PMR{} (\textsc{Conservative}) achieves FTR~$= 0$ on all 300
-        functions, confirming Theorem~\ref{thm:soundness} empirically.
-  \item The reduction in FTR over total-by-default
-        (reducing FTR toward $0\,\%$) demonstrates the practical importance
-        of partiality-aware verification.
-  \item Recall of $0.82$ reflects conservative incompleteness:
-        \PMR{} correctly declines to assert facts about unobserved
-        inputs, even when those inputs terminate.
-  \item Median reconstruction time (\subSiteMeanTime) is negligible compared
-        to other \JuGeo{} verification phases (\medtime{} overall).
+  \item The audited benchmark is small but structured: each partiality
+        category contributes two programs, so the per-category rows are
+        directly comparable.
+  \item The mean false-termination rate drops from \ppXXXVMeanBaseFtr{} for
+        the total-by-default baseline to \ppXXXVMeanPmrFtr{} for \PMR{},
+        showing that the partiality-aware reconstruction is materially more
+        conservative on the repository benchmark.
+  \item Every category in Table~\ref{tab:by-cat} has the same mean observation
+        count, so the category differences come from the partiality model
+        rather than from unequal sampling depth.
 \end{enumerate}
 
 \subsection{Breakdown by partiality category}
 
 \begin{table}[ht]
 \centering
-\caption{FTR by partiality category.
-  \PMR{} (\textsc{Conservative}) achieves FTR~$= 0$ in every category.}
+\caption{False-termination rate by partiality category on the repository
+  benchmark.}
 \label{tab:by-cat}
 \begin{tabular}{lrrrr}
 \toprule
 Category & $n$ & Baseline FTR & \PMR{} FTR & Obs/function \\
 \midrule
-Non-termination         & — & — & — & — \\
-Uncaught exceptions     & — & — & — & — \\
-Implicit \texttt{None}  & — & — & — & — \\
-Precondition violation  & — & — & — & — \\
-Undefined binding       & — & — & — & — \\
-\midrule
-\textbf{Total (universal benchmark)} & \expTotalPrograms & \expAccuracy & \textbf{\expObstructionTotal{} obstr.} & \expTimeMean \\
+Non-termination         & \ppXXXVNontermN & \ppXXXVNontermBaseFtr & \ppXXXVNontermPmrFtr & \ppXXXVNontermObsPerFunc \\
+Uncaught exceptions     & \ppXXXVExceptN & \ppXXXVExceptBaseFtr & \ppXXXVExceptPmrFtr & \ppXXXVExceptObsPerFunc \\
+Implicit \texttt{None}  & \ppXXXVImplicitN & \ppXXXVImplicitBaseFtr & \ppXXXVImplicitPmrFtr & \ppXXXVImplicitObsPerFunc \\
+Precondition violation  & \ppXXXVPrecondN & \ppXXXVPrecondBaseFtr & \ppXXXVPrecondPmrFtr & \ppXXXVPrecondObsPerFunc \\
+Undefined binding       & \ppXXXVUndefN & \ppXXXVUndefBaseFtr & \ppXXXVUndefPmrFtr & \ppXXXVUndefObsPerFunc \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The non-termination category shows the highest baseline FTR
-because total-by-default always claims a value for diverging inputs.
-\PMR{} (\textsc{Conservative}) handles all five categories uniformly:
-unobserved inputs receive $\bot$ regardless of category.
+The category table shows that the baseline behaves worst on implicit
+\texttt{None} and precondition-violation cases, while PMR reduces the
+false-termination rate to a uniform \ppXXXVMeanPmrFtr{} across the audited
+programs.  The observation count remains constant at
+\ppXXXVMeanObsPerFunc{} per program, so the primary effect is the
+reconstruction policy rather than additional evidence.
 
 \subsection{Scalability}
 
-We ran the reconstruction pipeline on functions of increasing
-observation-set size (5 to 500 observations per function) to assess
-scalability.  Reconstruction time grows linearly with observation-set
-size (as expected from the hash-map implementation of
-Algorithm~\ref{alg:pmr}), growing linearly with observation-set size.
-Even at large observation counts per function, reconstruction
-completes in sub-millisecond time.
+The current repository benchmark is too small for a meaningful scalability
+study.  What it does show is that, with
+\ppXXXVMeanObsPerFunc{} observations per program, the PMR pass is lightweight
+enough to be embedded inside the broader JuGeo verification workflow without
+dominating the experiment.
 
 %% ═══════════════════════════════════════════════════════════════════
 \section{Conclusion}\label{sec:conclusion}

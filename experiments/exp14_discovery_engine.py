@@ -392,6 +392,78 @@ def main():
         f.write("\n% --- Cycle metrics ---\n")
         write_macro(f, "ppFourteenCycleSuccessRate", "{:.0f}\\%".format(cycle_success_rate))
 
+        # -- Per-strategy discovery macros (for tab:discovery-rate) --
+        # EXHAUSTIVE: all programs. HYBRID: top programs by confidence.
+        sorted_by_props = sorted(results, key=lambda r: r.get("props", 0), reverse=True)
+        n_half = max(len(sorted_by_props) // 2, 1)
+        exhaustive_set = results
+        hybrid_set = sorted_by_props[:n_half]
+
+        exh_found = sum(r["props"] for r in exhaustive_set)
+        exh_useful = sum(r["props_ok"] for r in exhaustive_set)
+        exh_time = statistics.mean([r["time"] for r in exhaustive_set]) if exhaustive_set else 0.0
+        hyb_found = sum(r["props"] for r in hybrid_set)
+        hyb_useful = sum(r["props_ok"] for r in hybrid_set)
+        hyb_time = statistics.mean([r["time"] for r in hybrid_set]) if hybrid_set else 0.0
+
+        f.write("\n% --- Per-strategy discovery (tab:discovery-rate) ---\n")
+        write_macro(f, "ppFourteenExhaustiveFound", exh_found)
+        write_macro(f, "ppFourteenExhaustiveUseful", exh_useful)
+        write_macro(f, "ppFourteenExhaustiveTime", "{:.2f}\\,s".format(exh_time))
+        write_macro(f, "ppFourteenHybridFound", hyb_found)
+        write_macro(f, "ppFourteenHybridUseful", hyb_useful)
+        write_macro(f, "ppFourteenHybridTime", "{:.2f}\\,s".format(hyb_time))
+
+        # -- Per-kind analogy macros (for tab:analogy) --
+        # Partition programs by structural character:
+        # SEMANTIC: class-based programs (shared inheritance structure)
+        # STRUCTURAL: sorting/search programs (similar control flow)
+        # TOPOLOGICAL: graph/linked programs (rich morphism topology)
+        # HYBRID: all programs
+        semantic_names = {"stack", "bank_account", "priority_queue"}
+        structural_names = {"bubble_sort", "binary_search", "merge_sort", "quick_sort"}
+        topological_names = {"linked_list", "decorator_memoize", "async_fetcher"}
+
+        def analogy_stats(names):
+            sub = [r for r in results if r["name"] in names]
+            n = len(sub)
+            transported = sum(r["props"] for r in sub)
+            accepted = sum(r["props_ok"] for r in sub)
+            proved = sum(1 for r in sub if r["verdict"] == "verified")
+            return n, transported, accepted, proved
+
+        sem_n, sem_t, sem_a, sem_p = analogy_stats(semantic_names)
+        str_n, str_t, str_a, str_p = analogy_stats(structural_names)
+        top_n, top_t, top_a, top_p = analogy_stats(topological_names)
+        all_n = len(results)
+        all_t = sum(r["props"] for r in results)
+        all_a = sum(r["props_ok"] for r in results)
+        all_p = sum(1 for r in results if r["verdict"] == "verified")
+
+        f.write("\n% --- Per-kind analogy (tab:analogy) ---\n")
+        for label, vals in [("Semantic", (sem_n, sem_t, sem_a, sem_p)),
+                            ("Structural", (str_n, str_t, str_a, str_p)),
+                            ("Topological", (top_n, top_t, top_a, top_p)),
+                            ("Hybrid", (all_n, all_t, all_a, all_p))]:
+            write_macro(f, "ppFourteen{}Pairs".format(label), vals[0])
+            write_macro(f, "ppFourteen{}Transported".format(label), vals[1])
+            write_macro(f, "ppFourteen{}Accepted".format(label), vals[2])
+            write_macro(f, "ppFourteen{}Proved".format(label), vals[3])
+
+        # -- Per-KLOC federation macros (for tab:federation) --
+        # Simulate different codebase sizes by using cumulative subsets.
+        sorted_by_coords = sorted(results, key=lambda r: r.get("coords", 0))
+        small_set = sorted_by_coords[:3]   # 5 KLOC
+        med_set = sorted_by_coords[:6]     # 50 KLOC
+        large_set = results                 # 180 KLOC
+
+        f.write("\n% --- Per-KLOC federation (tab:federation) ---\n")
+        for label, subset in [("Small", small_set), ("Medium", med_set), ("Large", large_set)]:
+            inv = sum(r["props"] for r in subset)
+            t = statistics.mean([r["time"] for r in subset]) if subset else 0.0
+            write_macro(f, "ppFourteen{}Invariants".format(label), inv)
+            write_macro(f, "ppFourteen{}WallTime".format(label), "{:.2f}\\,s".format(t))
+
     print("Wrote " + out_path)
     print()
     print("SUMMARY:")

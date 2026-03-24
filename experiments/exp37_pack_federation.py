@@ -200,77 +200,140 @@ def cleanup(path):
 
 def main():
     from jugeo.encodings.pack_federation import compute_sheaf_condition
+    from jugeo.encodings.pack_federation.models import BridgeTheoremEncoding
     from jugeo.maturity import CyclicSystemCoordinator
 
-    # Per-pack analysis
+    # Per-pack analysis: run encode, descend, and bugs for each program
     pack_data = {}
     for prog in PROGRAMS:
         tmp = write_temp(prog["code"])
 
+        t0 = time.perf_counter()
         enc = run_jugeo("encode", tmp)
+        encode_wall = time.perf_counter() - t0
         if isinstance(enc, list):
             enc = enc[0] if enc else {}
+
+        t0 = time.perf_counter()
         desc = run_jugeo("descend", tmp)
+        descend_wall = time.perf_counter() - t0
         if isinstance(desc, list):
             desc = desc[0] if desc else {}
 
+        t0 = time.perf_counter()
+        bugs_out = run_jugeo("bugs", tmp)
+        bugs_wall = time.perf_counter() - t0
+        if isinstance(bugs_out, list):
+            bugs_out = bugs_out[0] if bugs_out else {}
+
+        t0 = time.perf_counter()
         coord = CyclicSystemCoordinator.create(prog["id"])
-        coord.run_full_cycle({"source": prog["code"]})
+        record, _ = coord.run_full_cycle({"source": prog["code"]})
+        coord_wall = time.perf_counter() - t0
 
         n_coords = enc.get("totals", {}).get("coordinates", 0)
+        n_declarations = enc.get("totals", {}).get("declarations", 0)
+        n_assertions = enc.get("totals", {}).get("assertions", 0)
         sections = desc.get("local_sections", 0)
         verdict = desc.get("verdict", "unknown")
+        obstruction_list = desc.get("obstructions", [])
+        n_obstructions = len(obstruction_list) if isinstance(obstruction_list, list) else 0
+        overlap_checked = desc.get("overlap_conditions_checked", 0)
+        eff_ratio = desc.get("effective_descent", {}).get("effectiveness_ratio", 0.0)
+        bug_count = bugs_out.get("count", 0)
+        if bug_count == 0 and isinstance(bugs_out.get("bugs"), list):
+            bug_count = len(bugs_out["bugs"])
+        bug_obstruction_count = bugs_out.get("obstruction_count", 0)
+        trust_score = record.trust_score
+        n_functions = len([l for l in prog["code"].splitlines()
+                          if l.strip().startswith("def ")])
+        n_lines = len(prog["code"].strip().splitlines())
+
+        # Evidence dict derived from actual JuGeo analysis.
+        # All packs share the same coordinate keys so bridges can compare them.
+        evidence = {
+            "coord_count": n_coords,
+            "declaration_count": n_declarations,
+            "assertion_count": n_assertions,
+            "section_count": sections,
+            "overlap_checked": overlap_checked,
+            "effectiveness_pct": round(eff_ratio * 100),
+            "verified": 1 if verdict == "verified" else 0,
+            "obstruction_count": n_obstructions,
+            "bug_count": bug_count,
+            "bug_obstruction_count": bug_obstruction_count,
+            "trust_pct": round(trust_score * 100),
+            "function_count": n_functions,
+            "code_lines": n_lines,
+        }
 
         pack_data[prog["id"]] = {
             "coords": n_coords,
             "sections": sections,
             "verified": verdict == "verified",
+            "n_obstructions": n_obstructions,
+            "bug_count": bug_count,
+            "trust_score": trust_score,
+            "coord_wall": coord_wall,
+            "evidence": evidence,
         }
 
         cleanup(tmp)
-        print(f"  pack {prog['id']:18s}  coords={n_coords}  sections={sections}  "
-              f"verdict={verdict}")
+        print(f"  pack {prog['id']:18s}  coords={n_coords}  decls={n_declarations}  "
+              f"asserts={n_assertions}  sections={sections}  verdict={verdict}  "
+              f"bugs={bug_count}  funcs={n_functions}  lines={n_lines}")
 
-    # Bridge discovery between pairs
+    # Bridge discovery between pairs using actual BridgeTheoremEncoding objects
     pair_results = []
     for p1, p2 in PAIRS:
-        d1 = pack_data.get(p1, {"coords": 3, "sections": 2, "verified": True})
-        d2 = pack_data.get(p2, {"coords": 3, "sections": 2, "verified": True})
+        d1 = pack_data[p1]
+        d2 = pack_data[p2]
+        ev1 = d1["evidence"]
+        ev2 = d2["evidence"]
 
-        # Exported coords = min of each pack's coordinates
-        exported = min(d1["coords"], d2["coords"]) + 2
-        if exported < 3:
-            exported = 3
-
-        # Bridges discovered
-        bridges = max(exported - 1, 2)
-
-        # Check sheaf condition
-        packs = {
-            p1: {"coords": {f"c{i}": i for i in range(d1["coords"])}, "verified": d1["verified"]},
-            p2: {"coords": {f"c{i}": i for i in range(d2["coords"])}, "verified": d2["verified"]},
-        }
-        sheaf_ok, violations = compute_sheaf_condition(packs, [])
-
-        # Validity rate
-        valid = bridges if sheaf_ok else max(bridges - 1, 1)
-        valid_pct = round(valid / bridges * 100, 1)
+        # Create one bridge per shared coordinate key
+        coord_keys = sorted(set(ev1.keys()) & set(ev2.keys()))
 
         t0 = time.perf_counter()
-        # Simulate discovery time based on pack sizes
-        _ = compute_sheaf_condition(packs, [])
-        disc_time_ms = round((time.perf_counter() - t0) * 1000 + 0.5, 1)
+        bridges = []
+        for i, key in enumerate(coord_keys):
+            bridges.append(BridgeTheoremEncoding(
+                bridge_id=f"br_{p1}_{p2}_{i}",
+                source_pack_id=p1,
+                target_pack_id=p2,
+                overlap_region=frozenset({key}),
+                source_formula=str(ev1[key]),
+                target_formula=str(ev2[key]),
+                trust_ceiling=min(d1["trust_score"], d2["trust_score"]),
+                morphism_type="bijective" if ev1[key] == ev2[key] else "injective",
+            ))
+
+        total_bridges = max(len(bridges), 1)
+        exported = len(coord_keys)
+
+        # Check sheaf condition with real bridges
+        packs_dict = {p1: ev1, p2: ev2}
+        sheaf_ok, violations = compute_sheaf_condition(packs_dict, bridges)
+        bridge_wall = time.perf_counter() - t0
+
+        valid_count = total_bridges - len(violations)
+        valid_pct = round(valid_count / total_bridges * 100, 1)
+
+        # Discovery time: in-process coordination + bridge construction + sheaf check
+        disc_time_ms = round(
+            (d1["coord_wall"] + d2["coord_wall"] + bridge_wall) * 1000, 1)
 
         pair_results.append({
             "pair": f"{p1}--{p2}",
             "exported": exported,
-            "bridges": bridges,
+            "bridges": total_bridges,
             "valid_pct": valid_pct,
             "disc_time_ms": disc_time_ms,
         })
 
-        print(f"  {p1:18s}--{p2:18s}  exported={exported}  bridges={bridges}  "
-              f"valid={valid_pct:.1f}%  time={disc_time_ms}ms")
+        print(f"  {p1:18s}--{p2:18s}  exported={exported}  bridges={total_bridges}  "
+              f"valid={valid_pct:.1f}%  violations={len(violations)}  "
+              f"time={disc_time_ms}ms")
 
     # Aggregates
     total_bridges = sum(r["bridges"] for r in pair_results)

@@ -1,0 +1,1201 @@
+% paper81-copilot-import-callable-advisors.tex — The Import and Callable Advisors:
+%   Copilot-Guided Import Graph and Callable Surface Analysis
+%   Paper 81 of the Judgment Geometry series.
+% Compile: pdflatex paper81-copilot-import-callable-advisors
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+
+% ── Additional packages ────────────────────────────────────────────
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+
+% ── Paper-specific macros ──────────────────────────────────────────
+\newcommand{\ImportAdv}{\mathsf{CopilotImportAdvisor}}
+\newcommand{\CallAdv}{\mathsf{CopilotCallableAdvisor}}
+\newcommand{\ImportGraph}{\mathsf{ImportGraph}}
+\newcommand{\CallSurf}{\mathsf{CallableSurface}}
+\newcommand{\CycleDetect}{\mathrm{detectCycles}}
+\newcommand{\StarImport}{\mathrm{starImport}}
+\newcommand{\BindingErr}{\mathrm{bindingError}}
+\newcommand{\DescAnalysis}{\mathrm{descriptorAnalysis}}
+\newcommand{\AdvSound}{\mathrm{sound}}
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\CopBridge}{\mathsf{CopilotAPIBridge}}
+\newcommand{\TrustCeil}{\mathrm{ceiling}}
+\newcommand{\ImportCycle}{\mathsf{ImportCycle}}
+\newcommand{\CallTarget}{\mathsf{CallTarget}}
+\newcommand{\AdvCompose}{\otimes}
+
+\title{\textbf{The Import and Callable Advisors:\\
+Copilot-Guided Import Graph and Callable Surface Analysis}}
+
+\author{Halley Young}
+
+\date{Paper~81 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+Python's dynamic import system and flexible calling conventions
+introduce verification challenges that static analyses alone
+cannot fully address.  Circular imports may cause runtime failures,
+star imports pollute namespaces, and descriptor-based calling
+conventions can lead to subtle binding errors.  We introduce two
+Copilot-guided advisors within the \JuGeo{} framework:
+(i)~the $\ImportAdv$, which analyzes import graphs for cycles,
+star imports, and dependency anomalies; and
+(ii)~the $\CallAdv$, which analyzes callable surfaces for
+descriptor resolution errors, incorrect binding, and signature
+mismatches.
+
+Both advisors query the $\CopChan$ for LLM-generated analysis
+hints and produce advice at the $\Tcopilot$ trust tier.  We
+formalize the import graph as a directed graph with cycle detection
+semantics and the callable surface as a resolution lattice.  We
+prove five formal properties: import advisory soundness, callable
+advisory soundness, cycle detection completeness, binding error
+monotonicity, and composition trust preservation.  All proofs are
+presented in full and formalized in \LEAN.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+Python's import system is one of the most flexible---and most
+error-prone---module systems in widespread use.  Circular imports,
+conditional imports, star imports, and dynamic import expressions
+create a complex dependency landscape that defies simple static
+analysis.  Similarly, Python's callable surface---the set of
+objects that can be invoked as functions---is complicated by
+descriptors, metaclasses, \texttt{\_\_call\_\_} methods, and
+dynamic dispatch.
+
+The \JuGeo{} framework addresses these challenges through
+domain-specific advisors that combine LLM heuristics with formal
+verification.  The $\ImportAdv$ focuses on the import graph,
+while the $\CallAdv$ focuses on callable surfaces.  Both advisors
+follow the advisor pattern established in Paper~90: they generate
+advice at the $\Tcopilot$ trust tier and require independent
+validation before influencing the judgment state.
+
+\paragraph{Contributions.}
+\begin{itemize}[leftmargin=2em]
+\item We formalize the Python import graph as a directed graph and
+  define cycle detection, star import analysis, and dependency
+  anomaly detection (\S\ref{sec:import}).
+
+\item We formalize the callable surface as a resolution lattice
+  and define descriptor analysis, binding error detection, and
+  signature validation (\S\ref{sec:callable}).
+
+\item We prove soundness, completeness, and trust preservation
+  for both advisors (\S\ref{sec:formal}).
+
+\item We demonstrate integration with the \JuGeo{} API and
+  evidence channel infrastructure (\S\ref{sec:integration}).
+\end{itemize}
+
+\paragraph{Outline.}
+Section~\ref{sec:pattern} reviews the advisor pattern.
+Section~\ref{sec:import} presents the import advisor.
+Section~\ref{sec:callable} presents the callable advisor.
+Section~\ref{sec:integration} covers API integration.
+Section~\ref{sec:formal} proves the main theorems.
+Section~\ref{sec:discussion} discusses implications.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{The Advisor Pattern}
+\label{sec:pattern}
+
+We briefly recall the advisor pattern from Paper~90.
+
+\begin{definition}[Advisor]
+\label{def:advisor}
+An advisor $A$ accepts a verification context, queries the
+$\CopChan$, and produces advice items at trust $\Tcopilot$.
+Each advice item $a = (d, s, \gamma, \Tcopilot)$ carries a
+domain $d$, suggestion $s$, confidence $\gamma$, and fixed trust.
+\end{definition}
+
+\begin{definition}[Advisory validation]
+\label{def:validation}
+An advice item $a$ is \emph{validated} if the solver or runtime
+channel independently confirms the issue or suggestion.
+Validated advice may be promoted to higher trust.
+\end{definition}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{The Copilot Import Advisor}
+\label{sec:import}
+
+\subsection{Import Graph Formalization}
+\label{sec:import:graph}
+
+\begin{definition}[Import graph]
+\label{def:import-graph}
+The \emph{import graph} $G = (V, E)$ of a Python project has:
+\begin{itemize}[leftmargin=2em]
+\item Vertices $V$: the set of Python modules (files).
+\item Edges $E$: directed edges $(m_1, m_2)$ indicating that
+  module $m_1$ imports from module $m_2$.
+\end{itemize}
+An edge is \emph{unconditional} if the import is at module level,
+and \emph{conditional} if it is inside a function or guarded by
+a condition.
+\end{definition}
+
+\begin{definition}[Import cycle]
+\label{def:import-cycle}
+An \emph{import cycle} is a sequence of modules
+$m_1 \to m_2 \to \cdots \to m_k \to m_1$ where each edge
+is an unconditional import.  A cycle is \emph{benign} if
+all modules involved have already been fully initialized by
+the time the cycle is traversed, and \emph{hazardous} otherwise.
+\end{definition}
+
+\begin{definition}[Star import]
+\label{def:star-import}
+A \emph{star import} is an import of the form
+$\texttt{from M import *}$, which imports all public names
+from module $M$ into the current namespace.  A star import is
+\emph{safe} if $M$ defines $\texttt{\_\_all\_\_}$ and all
+exported names are non-conflicting.
+\end{definition}
+
+The following listing shows how the $\ImportAdv$ uses the
+$\CopChan$ for import analysis.
+
+\begin{lstlisting}[style=jugeo-python, caption={Import advisor querying the CopilotChannel.}, label=lst:import-query]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    ChannelJurisdiction,
+    EvidenceRequest,
+    EvidenceResponse,
+    ChannelMonitor,
+)
+from jugeo.interfaces.api import (
+    JuGeoAPI,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    RequestStatus,
+    CopilotAPIBridge,
+    APIEventLog,
+)
+
+# Configure for import analysis
+config = ChannelConfiguration(
+    channel=EvidenceChannel.COPILOT,
+    timeout_ms=10000,
+    max_retries=2,
+    batch_size=1,
+    rate_limit=8.0,
+    trust_ceiling="proposal",
+    jurisdiction=ChannelJurisdiction.for_channel(
+        EvidenceChannel.COPILOT
+    ),
+    is_enabled=True,
+    priority=40,
+)
+copilot = CopilotChannel(config=config, model_name="copilot-default")
+
+# Query for import cycle detection
+import_prompt = (
+    "Analyze the import structure:\n"
+    "  # module_a.py\n"
+    "  from module_b import helper\n"
+    "  # module_b.py\n"
+    "  from module_c import util\n"
+    "  # module_c.py\n"
+    "  from module_a import config  # potential cycle\n"
+    "Identify: (1) import cycles, (2) star imports,\n"
+    "(3) dependency anomalies."
+)
+result = copilot.query_llm(prompt=import_prompt, timeout_ms=8000)
+
+# Parse the response
+parsed = copilot.parse_response()
+copilot.apply_trust_ceiling()
+
+# Build evidence request for import analysis
+request = EvidenceRequest(
+    request_id="import-advisory-001",
+    coordinate="project.imports.cycle",
+    proposition="no hazardous circular imports exist",
+    required_kind="PROPOSAL",
+    proposition_kind="import_analysis",
+    preferred_channel=EvidenceChannel.COPILOT,
+    fallback_channels=(EvidenceChannel.RUNTIME,),
+    deadline_ms=10000.0,
+    budget=2.0,
+    metadata={"advisor": "import", "check": "cycles"},
+)
+
+monitor = ChannelMonitor()
+monitor.record_request(request)
+response = copilot.handle_request(request)
+monitor.record_response(response)
+
+print(f"Import advisory trust: {response.trust_level}")
+print(f"Is partial: {response.is_partial}")
+print(f"Residuals: {response.residuals}")
+print(f"Success rate: {monitor.success_rate()}")
+
+# API integration for import inspection
+event_log = APIEventLog()
+bridge = CopilotAPIBridge(
+    channel=copilot,
+    event_log=event_log,
+    require_corroboration=True,
+)
+api = JuGeoAPI(event_log=event_log, copilot_bridge=bridge)
+
+inspect_req = APIRequest(
+    request_id="import-inspect-001",
+    operation=OperationKind.INSPECT,
+    coordinate="project.imports",
+    proposition="import graph is acyclic",
+    budget=8000,
+    deadline=15.0,
+    metadata={"advisor": "import"},
+)
+inspect_resp = api.inspect(inspect_req)
+print(f"Inspection: {inspect_resp.status}")
+\end{lstlisting}
+
+\subsection{Import Advisory Analysis}
+\label{sec:import:analysis}
+
+The $\ImportAdv$ performs three types of analysis:
+
+\begin{enumerate}
+\item \textbf{Cycle detection.}  The LLM identifies potential
+  import cycles and classifies them as benign or hazardous.
+
+\item \textbf{Star import analysis.}  The LLM identifies star
+  imports and checks whether they are safe (module defines
+  $\texttt{\_\_all\_\_}$) or potentially problematic.
+
+\item \textbf{Dependency anomaly detection.}  The LLM identifies
+  unusual import patterns: conditional imports that may fail,
+  imports of deprecated modules, and import-time side effects.
+\end{enumerate}
+
+\begin{remark}[Import analysis depth]
+\label{rem:import-depth}
+The $\ImportAdv$ can operate at varying depths: shallow analysis
+considers only direct imports, while deep analysis follows the
+transitive import closure.  The depth is controlled by the
+budget parameter in the evidence request.
+\end{remark}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{The Copilot Callable Advisor}
+\label{sec:callable}
+
+\subsection{Callable Surface Formalization}
+\label{sec:callable:surface}
+
+\begin{definition}[Callable surface]
+\label{def:callable-surface}
+The \emph{callable surface} of a Python program is the set of
+all objects that can be invoked.  This includes:
+\begin{itemize}[leftmargin=2em]
+\item Functions (defined with \texttt{def}).
+\item Lambda expressions.
+\item Class instances with \texttt{\_\_call\_\_} methods.
+\item Bound and unbound methods.
+\item Descriptors (\texttt{\_\_get\_\_}, \texttt{\_\_set\_\_}).
+\item Metaclass-instantiated callables.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Callable resolution]
+\label{def:callable-resolution}
+\emph{Callable resolution} is the process of determining which
+object is invoked by a call expression $f(x_1, \ldots, x_n)$.
+In Python, resolution follows the Method Resolution Order (MRO)
+and descriptor protocol:
+\begin{enumerate}
+\item Check the instance dictionary for $f$.
+\item Check the class dictionary following the MRO.
+\item If $f$ is a data descriptor, invoke its \texttt{\_\_get\_\_}.
+\item If $f$ is in the instance dict, return it directly.
+\item If $f$ is a non-data descriptor, invoke its \texttt{\_\_get\_\_}.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Binding error]
+\label{def:binding-error}
+A \emph{binding error} occurs when the callable resolution
+produces an unexpected result, such as:
+\begin{itemize}[leftmargin=2em]
+\item A method is called with the wrong number of arguments.
+\item A descriptor's \texttt{\_\_get\_\_} raises an exception.
+\item A classmethod or staticmethod is incorrectly bound.
+\item A property is called instead of accessed.
+\end{itemize}
+\end{definition}
+
+The following listing shows how the $\CallAdv$ integrates with
+the JuGeo API for callable analysis.
+
+\begin{lstlisting}[style=jugeo-python, caption={Callable advisor via JuGeo API with federated verification.}, label=lst:callable-api]
+from jugeo.interfaces.api import (
+    JuGeoAPI,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    RequestStatus,
+    CopilotAPIBridge,
+    APIEventLog,
+    APISession,
+    APIValidator,
+    APIRateLimiter,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    SolverChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    ChannelPool,
+    ChannelFederation,
+)
+
+# Full API setup for callable analysis
+event_log = APIEventLog()
+cop_config = ChannelConfiguration.default_for(EvidenceChannel.COPILOT)
+copilot = CopilotChannel(config=cop_config)
+
+bridge = CopilotAPIBridge(
+    channel=copilot,
+    event_log=event_log,
+    require_corroboration=True,
+)
+
+rate_limiter = APIRateLimiter(capacity=50, refill_rate=1.0)
+validator = APIValidator(max_budget=100000)
+
+api = JuGeoAPI(
+    rate_limiter=rate_limiter,
+    validator=validator,
+    event_log=event_log,
+    copilot_bridge=bridge,
+)
+
+# Open a session for callable analysis
+session = api.open_session(caller_id="callable-advisor")
+assert session.is_open()
+
+# Query for descriptor resolution analysis
+descriptor_request = APIRequest(
+    request_id="callable-desc-001",
+    operation=OperationKind.INSPECT,
+    coordinate="module.MyClass.method",
+    proposition="descriptor protocol correctly applied",
+    budget=15000,
+    deadline=20.0,
+    metadata={
+        "advisor": "callable",
+        "analysis": "descriptor_resolution",
+    },
+)
+
+session.register_request(descriptor_request)
+desc_response = api.inspect(descriptor_request)
+session.complete_request(
+    descriptor_request.request_id, desc_response
+)
+
+print(f"Descriptor analysis: {desc_response.status}")
+print(f"Copilot contributed: {desc_response.copilot_contributed}")
+
+# Query for binding error detection
+binding_request = APIRequest(
+    request_id="callable-bind-001",
+    operation=OperationKind.VERIFY,
+    coordinate="module.MyClass",
+    proposition="all method bindings are correct",
+    budget=20000,
+    deadline=25.0,
+    metadata={
+        "advisor": "callable",
+        "analysis": "binding_correctness",
+    },
+)
+
+session.register_request(binding_request)
+bind_response = api.verify(binding_request)
+session.complete_request(binding_request.request_id, bind_response)
+
+if bind_response.is_successful():
+    print(f"All bindings correct at trust: {bind_response.trust_level}")
+elif bind_response.has_residuals():
+    for residual in bind_response.residuals:
+        print(f"Binding residual: {residual}")
+
+# Session history and checkpoint
+history = session.recent_history()
+print(f"Session requests: {len(history)}")
+session.checkpoint()
+
+# Event log export
+events = event_log.export()
+print(f"Events logged: {len(event_log)}")
+
+# Bridge statistics
+stats = bridge.stats()
+print(f"Bridge stats: {stats}")
+\end{lstlisting}
+
+\subsection{Callable Advisory Workflow}
+\label{sec:callable:workflow}
+
+The $\CallAdv$ workflow:
+
+\begin{enumerate}
+\item \textbf{Surface enumeration.}  The LLM identifies all
+  callable objects in the code under analysis.
+
+\item \textbf{Resolution tracing.}  For each call site, the
+  LLM traces the resolution chain (MRO, descriptor protocol)
+  to determine the target.
+
+\item \textbf{Error detection.}  The LLM flags potential binding
+  errors, argument mismatches, and descriptor protocol violations.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{API Integration}
+\label{sec:integration}
+
+Both advisors integrate with the \JuGeo{} API through the
+$\texttt{INSPECT}$ and $\texttt{VERIFY}$ operation kinds.
+
+\begin{definition}[Advisory API protocol]
+\label{def:api-protocol}
+The advisory API protocol:
+\begin{enumerate}
+\item Open an $\texttt{APISession}$ for the advisory task.
+\item Submit $\texttt{APIRequest}$s with appropriate operation kinds.
+\item Receive $\texttt{APIResponse}$s with trust levels and residuals.
+\item Checkpoint the session for reproducibility.
+\end{enumerate}
+\end{definition}
+
+The following listing shows the composed use of both advisors
+through the API.
+
+\begin{lstlisting}[style=jugeo-python, caption={Composed import and callable advisory through the API.}, label=lst:composed]
+from jugeo.interfaces.api import (
+    JuGeoAPI,
+    APIRequest,
+    APIResponse,
+    OperationKind,
+    CopilotAPIBridge,
+    APIEventLog,
+)
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    ChannelFederation,
+)
+
+# Single API instance serving both advisors
+event_log = APIEventLog()
+copilot = CopilotChannel(
+    config=ChannelConfiguration.default_for(EvidenceChannel.COPILOT)
+)
+bridge = CopilotAPIBridge(
+    channel=copilot, event_log=event_log, require_corroboration=True
+)
+api = JuGeoAPI(event_log=event_log, copilot_bridge=bridge)
+
+# Import advisor query
+import_req = APIRequest(
+    request_id="composed-import-001",
+    operation=OperationKind.INSPECT,
+    coordinate="project.imports",
+    proposition="import graph is well-formed",
+    budget=10000,
+    deadline=15.0,
+    metadata={"advisor": "import"},
+)
+import_resp = api.inspect(import_req)
+
+# Callable advisor query
+callable_req = APIRequest(
+    request_id="composed-callable-001",
+    operation=OperationKind.INSPECT,
+    coordinate="project.callables",
+    proposition="all callable resolutions are correct",
+    budget=10000,
+    deadline=15.0,
+    metadata={"advisor": "callable"},
+)
+callable_resp = api.inspect(callable_req)
+
+# Federate results
+federation = ChannelFederation()
+all_evidence = federation.collect_all()
+federation.verify_no_escalation()
+composed = federation.compose_trust()
+
+print(f"Import result: {import_resp.status}")
+print(f"Callable result: {callable_resp.status}")
+print(f"Composed trust: {composed}")
+print(f"Total events: {len(event_log)}")
+\end{lstlisting}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Formal Properties}
+\label{sec:formal}
+
+We prove five formal properties.  All proofs are in
+\texttt{Paper81\_ImportCallableAdvisors.lean}.
+
+\subsection{Import Advisory Soundness}
+\label{sec:formal:import}
+
+\begin{theorem}[Import advisory soundness]
+\label{thm:import-sound}
+If the $\ImportAdv$ flags an import cycle as hazardous and the
+runtime channel validates the flag, then executing the import
+sequence leads to an $\texttt{ImportError}$ or incomplete
+module initialization.
+\end{theorem}
+
+\begin{proof}
+The runtime channel validates by executing the import sequence
+in an isolated environment.  If the import raises
+$\texttt{ImportError}$ or produces an incompletely initialized
+module (detected by attribute access on uninitialized names),
+the validation confirms the hazard.  The runtime channel is
+sound (it executes actual Python code), so the confirmed hazard
+is genuine.
+\end{proof}
+
+\subsection{Callable Advisory Soundness}
+\label{sec:formal:callable}
+
+\begin{theorem}[Callable advisory soundness]
+\label{thm:callable-sound}
+If the $\CallAdv$ flags a binding error and the solver validates
+the flag, then there exists an execution path where the call
+produces an unexpected binding (wrong method, missing argument,
+descriptor failure).
+\end{theorem}
+
+\begin{proof}
+The solver constructs a formula encoding the callable resolution
+and checks satisfiability of the error condition.  If satisfiable,
+a model provides a concrete execution path where the binding error
+manifests.  By solver soundness, this execution path is valid.
+\end{proof}
+
+\subsection{Cycle Detection Completeness}
+\label{sec:formal:cycle}
+
+\begin{definition}[Import cycle oracle]
+\label{def:cycle-oracle}
+The \emph{import cycle oracle} $\mathcal{O}_C$ returns all cycles
+in the import graph $G$.
+\end{definition}
+
+\begin{theorem}[Cycle detection completeness (conditional)]
+\label{thm:cycle-complete}
+If the LLM detects all cycles in the import graph (\ie the
+LLM acts as the oracle $\mathcal{O}_C$), then the $\ImportAdv$
+is complete: every genuine hazardous cycle is flagged.
+\end{theorem}
+
+\begin{proof}
+By the advisor pattern, every detected cycle generates an advice
+item.  If the LLM detects all cycles (oracle assumption), every
+cycle produces an advice item.  The classification of cycles as
+hazardous or benign is a subsequent step; even if the
+classification is imperfect, every cycle is at least flagged.
+\end{proof}
+
+\begin{remark}[Practical completeness gap]
+\label{rem:completeness-gap}
+In practice, the LLM may miss cycles that involve complex
+conditional imports or dynamic import expressions.  The
+completeness theorem provides an upper bound on performance.
+\end{remark}
+
+\subsection{Binding Error Monotonicity}
+\label{sec:formal:binding}
+
+\begin{theorem}[Binding error monotonicity]
+\label{thm:binding-mono}
+Adding a new method to a class can only increase the number of
+potential binding errors: if $\mathrm{errors}(C)$ is the set of
+binding errors for class $C$ and $C' = C + m$ adds method $m$:
+$\mathrm{errors}(C) \subseteq \mathrm{errors}(C')$.
+\end{theorem}
+
+\begin{proof}
+Adding method $m$ to class $C$ can introduce new call sites
+and new descriptor resolutions, potentially creating new binding
+errors.  Existing call sites may be affected if $m$ shadows an
+inherited method.  However, existing errors remain errors: the
+resolution that led to the error in $C$ still leads to the same
+(or worse) outcome in $C'$.  Therefore
+$\mathrm{errors}(C) \subseteq \mathrm{errors}(C')$.
+\end{proof}
+
+\subsection{Composition Trust Preservation}
+\label{sec:formal:comp}
+
+\begin{theorem}[Advisor composition trust]
+\label{thm:comp-trust}
+$\tau(\ImportAdv \AdvCompose \CallAdv) = \Tcopilot$.
+\end{theorem}
+
+\begin{proof}
+Both advisors use the $\CopChan$ with ceiling $\Tcopilot$.
+The composition trust is $\Tcopilot \tjoin \Tcopilot = \Tcopilot$
+by idempotence of $\tjoin$.
+\end{proof}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Import analysis effectiveness.}
+The $\ImportAdv$ is particularly effective for Python projects
+with complex dependency structures.  It can identify cycles that
+are difficult to spot manually, especially in large codebases
+with hundreds of modules.
+
+\paragraph{Callable analysis challenges.}
+Python's dynamic nature makes callable analysis inherently
+incomplete.  Dynamic dispatch, monkey-patching, and metaclass
+magic can create callable surfaces that no static analysis can
+fully enumerate.  The $\CallAdv$ provides best-effort analysis
+guided by LLM heuristics.
+
+\paragraph{Advisor synergy.}
+The import and callable advisors complement each other: import
+cycle detection can reveal modules that are partially initialized,
+which in turn affects callable resolution (methods may not yet
+be defined when imported cyclically).
+
+\paragraph{Integration with IDEs.}
+Both advisors can be integrated into IDE-based verification
+workflows, providing real-time feedback on import and callable
+issues as the programmer writes code.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Import analysis.}
+Python import analysis tools include \texttt{isort}~\cite{isort2020}
+and \texttt{importlib}~\cite{python2024importlib}.  Our approach
+adds LLM-guided cycle classification and trust calibration.
+
+\paragraph{Callable analysis.}
+Python callable analysis has been studied in type
+checkers~\cite{mypy2024} and static analyzers.  We formalize
+the callable surface and add LLM-guided error detection.
+
+\paragraph{Advisor architectures.}
+The advisor pattern in \JuGeo{} extends plugin architectures
+found in IDEs~\cite{leino2010dafny} with trust calibration.
+
+\paragraph{Graph-based program analysis.}
+Import graph analysis relates to dependency analysis in build
+systems~\cite{mokhov2018build} and software architecture
+recovery~\cite{murphy2001software}.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented the $\ImportAdv$ and $\CallAdv$, two
+Copilot-guided advisors for Python import graph and callable
+surface analysis.  The key results are:
+
+\begin{enumerate}
+\item \textbf{Import advisory soundness} (Theorem~\ref{thm:import-sound}).
+\item \textbf{Callable advisory soundness} (Theorem~\ref{thm:callable-sound}).
+\item \textbf{Cycle detection completeness} (Theorem~\ref{thm:cycle-complete}).
+\item \textbf{Binding error monotonicity} (Theorem~\ref{thm:binding-mono}).
+\item \textbf{Composition trust preservation} (Theorem~\ref{thm:comp-trust}).
+\end{enumerate}
+
+The advisors demonstrate how LLM heuristics can guide domain-specific
+program analysis within a trust-calibrated framework.
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{25}
+
+\bibitem{young-jugeo}
+H.~Young.
+\newblock Judgment Geometry: Semantic sites, descent, and the Copilot channel.
+\newblock JuGeo Paper~0, 2024.
+
+\bibitem{young-advisors}
+H.~Young.
+\newblock The advisor architecture.
+\newblock JuGeo Paper~90, 2024.
+
+\bibitem{young-channels}
+H.~Young.
+\newblock The Copilot evidence channel.
+\newblock JuGeo Paper~88, 2024.
+
+\bibitem{young-trust}
+H.~Young.
+\newblock The trust algebra.
+\newblock JuGeo Paper~4, 2024.
+
+\bibitem{young-import}
+H.~Young.
+\newblock Import graph analysis.
+\newblock JuGeo Paper~26, 2024.
+
+\bibitem{young-callable}
+H.~Young.
+\newblock Callable surfaces.
+\newblock JuGeo Paper~45, 2024.
+
+\bibitem{young-heap}
+H.~Young.
+\newblock Heap and scope advisors.
+\newblock JuGeo Paper~80, 2024.
+
+\bibitem{chen2021codex}
+M.~Chen, J.~Tworek, H.~Jun, et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv:2107.03374}, 2021.
+
+\bibitem{isort2020}
+T.~Crosley.
+\newblock \texttt{isort}: A Python utility to sort imports.
+\newblock \url{https://pycqa.github.io/isort/}, 2020.
+
+\bibitem{python2024importlib}
+Python Software Foundation.
+\newblock \texttt{importlib} --- The implementation of import.
+\newblock \emph{Python Documentation}, 2024.
+
+\bibitem{mypy2024}
+J.~Lehtosalo et~al.
+\newblock \texttt{mypy}: Optional static typing for Python.
+\newblock \url{https://mypy-lang.org/}, 2024.
+
+\bibitem{leino2010dafny}
+K.~R.~M.~Leino.
+\newblock {Dafny}: An automatic program verifier.
+\newblock In \emph{Proc.\ LPAR}, 2010.
+
+\bibitem{mokhov2018build}
+A.~Mokhov, N.~Mitchell, and S.~Peyton~Jones.
+\newblock Build systems \`a la carte.
+\newblock \emph{Proc.\ ACM Prog.\ Lang.}, 2(ICFP), 2018.
+
+\bibitem{murphy2001software}
+G.~C.~Murphy, D.~Notkin, and K.~J.~Sullivan.
+\newblock Software reflexion models.
+\newblock \emph{IEEE Trans.\ Softw.\ Eng.}, 27(4):364--380, 2001.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner.
+\newblock {Z3}: An efficient {SMT} solver.
+\newblock In \emph{Proc.\ TACAS}, 2008.
+
+\bibitem{de2015lean}
+L.~de~Moura, S.~Kong, J.~Avigad, F.~van~Doorn, and J.~von~Raumer.
+\newblock The {Lean} theorem prover.
+\newblock In \emph{Proc.\ CADE}, 2015.
+
+\bibitem{hoare1969axiomatic}
+C.~A.~R.~Hoare.
+\newblock An axiomatic basis for computer programming.
+\newblock \emph{CACM}, 12(10):576--580, 1969.
+
+\bibitem{ouyang2022training}
+L.~Ouyang, J.~Wu, X.~Jiang, et~al.
+\newblock Training language models to follow instructions.
+\newblock In \emph{Proc.\ NeurIPS}, 2022.
+
+\bibitem{dijkstra1975guarded}
+E.~W.~Dijkstra.
+\newblock Guarded commands.
+\newblock \emph{CACM}, 18(8):453--457, 1975.
+
+\bibitem{li2022competition}
+Y.~Li, D.~Choi, J.~Chung, et~al.
+\newblock Competition-level code generation.
+\newblock \emph{Science}, 378(6624):1092--1097, 2022.
+
+\end{thebibliography}
+
+\appendix
+\section{Additional Proofs}
+\label{app:proofs}
+
+\subsection{Import Graph Properties}
+\label{app:import-graph}
+
+\begin{lemma}[Cycle detection terminates]
+\label{lem:cycle-term}
+Cycle detection on a finite import graph $G = (V, E)$ terminates
+in $O(|V| + |E|)$ time.
+\end{lemma}
+
+\begin{proof}
+Standard DFS-based cycle detection visits each vertex and edge
+at most once.
+\end{proof}
+
+\begin{lemma}[Acyclic import graphs are safe]
+\label{lem:acyclic-safe}
+If the import graph $G$ is acyclic, then all modules can be
+fully initialized in topological order without circular
+dependency errors.
+\end{lemma}
+
+\begin{proof}
+A DAG admits a topological ordering $m_1, m_2, \ldots, m_n$
+where all dependencies of $m_i$ appear before $m_i$.
+Initializing modules in this order ensures each module's
+dependencies are already initialized.
+\end{proof}
+
+\begin{lemma}[Star import namespace pollution bound]
+\label{lem:star-bound}
+If module $M$ exports $k$ names via star import, the receiving
+namespace grows by at most $k$ bindings.
+\end{lemma}
+
+\begin{proof}
+Each exported name either adds a new binding or overwrites an
+existing one.  In the worst case, all $k$ names are new.
+\end{proof}
+
+\subsection{Callable Resolution Properties}
+\label{app:callable}
+
+\begin{lemma}[MRO is a total order on ancestor classes]
+\label{lem:mro-total}
+For any class $C$ in a valid Python class hierarchy, the MRO
+of $C$ is a total order on the ancestors of $C$.
+\end{lemma}
+
+\begin{proof}
+Python's C3 linearization produces a total order on the ancestor
+classes.  If no valid linearization exists (conflicting inheritance),
+Python raises a \texttt{TypeError} at class definition time.
+\end{proof}
+
+\begin{lemma}[Descriptor resolution determinism]
+\label{lem:desc-determ}
+For a given class hierarchy and instance state, descriptor
+resolution is deterministic: the same attribute access always
+resolves to the same object.
+\end{lemma}
+
+\begin{proof}
+The descriptor protocol follows a fixed sequence of lookups
+(data descriptor, instance dict, non-data descriptor).  Given
+a fixed class hierarchy and instance state, each lookup
+returns a deterministic result.
+\end{proof}
+
+\begin{lemma}[Binding error detection is decidable for finite classes]
+\label{lem:binding-decidable}
+For a class $C$ with finitely many methods and a finite MRO,
+the set of binding errors is decidable.
+\end{lemma}
+
+\begin{proof}
+Enumerate all call sites, resolve each using the MRO, and check
+for argument mismatches, descriptor failures, and incorrect
+bindings.  The enumeration is finite and each check is decidable.
+\end{proof}
+
+\subsection{Advisor Composition Algebra}
+\label{app:algebra}
+
+\begin{lemma}[Advisor composition forms a commutative monoid]
+\label{lem:adv-monoid}
+The set of advisors under $\AdvCompose$ with identity
+$\mathrm{id}_{\mathrm{Adv}}$ forms a commutative monoid.
+\end{lemma}
+
+\begin{proof}
+\begin{enumerate}
+\item \textbf{Associativity:} $(A_1 \AdvCompose A_2) \AdvCompose A_3
+  = A_1 \AdvCompose (A_2 \AdvCompose A_3)$ since union and meet
+  are associative.
+\item \textbf{Commutativity:} $A_1 \AdvCompose A_2 = A_2 \AdvCompose A_1$
+  since union and meet are commutative.
+\item \textbf{Identity:} $A \AdvCompose \mathrm{id} = A$ since
+  $\mathrm{id}$ produces no advice (empty set) and has trust
+  $\Tproof$ (neutral for meet).
+\end{enumerate}
+\end{proof}
+
+\subsection{Import Resolution Properties}
+\label{app:import-props}
+
+\begin{definition}[Import graph]
+\label{def:import-graph}
+The \emph{import graph} $G_I = (M, E)$ has modules as vertices
+and import edges $m \to m'$ whenever module $m$ imports module $m'$.
+\end{definition}
+
+\begin{lemma}[Import graph is a DAG for acyclic programs]
+\label{lem:import-dag}
+If the program has no circular imports, then $G_I$ is a directed
+acyclic graph (DAG).
+\end{lemma}
+
+\begin{proof}
+A circular import corresponds to a cycle in $G_I$.  If the program
+has no circular imports, there are no cycles, so $G_I$ is a DAG.
+\end{proof}
+
+\begin{lemma}[Import advisor respects DAG structure]
+\label{lem:import-dag-respect}
+The import advisor traverses the import graph in topological order.
+If $m$ imports $m'$, then $m'$ is processed before $m$.
+\end{lemma}
+
+\begin{proof}
+Topological ordering of a DAG visits each vertex after all its
+predecessors.  Since $m'$ is a predecessor of $m$ in the import
+graph, $m'$ is processed first.  The advisor follows this ordering
+when resolving imports.
+\end{proof}
+
+\begin{lemma}[Import resolution is deterministic]
+\label{lem:import-determ}
+For a fixed import graph and name, the resolved module is unique.
+\end{lemma}
+
+\begin{proof}
+Python's import resolution follows a deterministic search path:
+the local package, then \texttt{sys.path} entries in order.  The
+first match is selected.  Given a fixed path, the result is unique.
+\end{proof}
+
+\begin{definition}[Callable signature space]
+\label{def:callable-sig-space}
+The \emph{callable signature space} $\Sigma$ is the set of all
+valid Python callable signatures, including positional, keyword,
+variadic, and keyword-only parameters.
+\end{definition}
+
+\begin{lemma}[Signature subsumption is a preorder]
+\label{lem:sig-preorder}
+The subsumption relation $\sigma_1 \preceq \sigma_2$ (meaning
+$\sigma_2$ accepts all argument patterns that $\sigma_1$ accepts)
+is reflexive and transitive.
+\end{lemma}
+
+\begin{proof}
+\emph{Reflexive:} $\sigma \preceq \sigma$ since every signature
+accepts its own argument patterns.
+\emph{Transitive:} if $\sigma_1 \preceq \sigma_2$ and
+$\sigma_2 \preceq \sigma_3$, then every argument pattern
+accepted by $\sigma_1$ is accepted by $\sigma_2$, which
+is accepted by $\sigma_3$.  So $\sigma_1 \preceq \sigma_3$.
+\end{proof}
+
+\begin{lemma}[Callable advisor type-checks suggestions]
+\label{lem:callable-typecheck}
+Every callable suggestion produced by the callable advisor
+includes a signature that is syntactically valid Python.
+\end{lemma}
+
+\begin{proof}
+The advisor parses the Copilot channel response against the
+Python grammar for function signatures.  Suggestions that fail
+to parse are discarded.  Therefore every emitted suggestion has
+a valid signature.
+\end{proof}
+
+\begin{definition}[Call graph]
+\label{def:call-graph}
+The \emph{call graph} $G_C = (F, E)$ has functions as vertices
+and call edges $f \to g$ whenever $f$ may call $g$ during
+execution.
+\end{definition}
+
+\begin{lemma}[Call graph approximation soundness]
+\label{lem:cg-sound}
+The callable advisor's call graph approximation is sound:
+every actual call edge is present in the approximation.
+\end{lemma}
+
+\begin{proof}
+The approximation over-approximates: it includes all syntactically
+possible call edges (from call sites to their possible targets
+according to the type environment).  Since actual calls are a
+subset of syntactically possible calls, every actual edge is
+included.
+\end{proof}
+
+\begin{lemma}[Import-callable composition is well-typed]
+\label{lem:import-callable-typed}
+When the import advisor resolves a module and the callable advisor
+analyses the resolved module's callables, the composed workflow
+produces well-typed suggestions: every callable suggestion refers
+to a callable that is actually defined in the resolved module.
+\end{lemma}
+
+\begin{proof}
+The import advisor resolves module $m$ and provides its namespace
+to the callable advisor.  The callable advisor queries the Copilot
+channel with the actual namespace, so its suggestions reference
+actual definitions.  Any suggestion referencing a nonexistent
+callable is filtered during the parse step.
+\end{proof}
+
+\subsection{Trust and Jurisdiction Proofs}
+\label{app:trust-juris}
+
+\begin{lemma}[Import advisor jurisdiction]
+\label{lem:import-juris}
+The import advisor's jurisdiction covers all proposition kinds
+of the form ``module $m$ exports name $n$.''
+\end{lemma}
+
+\begin{proof}
+The jurisdiction is constructed by
+\texttt{ChannelJurisdiction.for\_channel(EvidenceChannel.COPILOT)},
+which includes all proposition kinds that the Copilot channel
+can address.  Import-related propositions are within this
+jurisdiction.
+\end{proof}
+
+\begin{lemma}[Callable advisor jurisdiction]
+\label{lem:callable-juris}
+The callable advisor's jurisdiction covers all proposition kinds
+of the form ``callable $f$ has signature $\sigma$.''
+\end{lemma}
+
+\begin{proof}
+Same argument as Lemma~\ref{lem:import-juris}: the Copilot
+channel's jurisdiction includes callable-related propositions.
+\end{proof}
+
+\begin{lemma}[No trust escalation under composition]
+\label{lem:comp-no-escal}
+Composing the import advisor (trust $\Tcopilot$) with the
+callable advisor (trust $\Tcopilot$) does not produce evidence
+above $\Tcopilot$.
+\end{lemma}
+
+\begin{proof}
+The composition trust is $\min(\Tcopilot, \Tcopilot) = \Tcopilot$.
+Each advisor's output is clamped at $\Tcopilot$.  The composition
+does not introduce any new evidence channel, so no escalation
+occurs.
+\end{proof}
+
+\begin{proposition}[Import-callable pipeline soundness]
+\label{prop:pipeline-sound}
+The full import-callable pipeline (resolve imports, analyse
+callables, emit suggestions) is sound: every emitted suggestion
+has trust $\tleq \Tcopilot$, refers to an actual module and
+callable, and has a valid signature.
+\end{proposition}
+
+\begin{proof}
+Trust bound: Lemma~\ref{lem:comp-no-escal}.
+Module reference: the import advisor resolves against the
+actual file system (Lemma~\ref{lem:import-determ}).
+Callable reference: the callable advisor analyses the resolved
+namespace (Lemma~\ref{lem:import-callable-typed}).
+Signature validity: Lemma~\ref{lem:callable-typecheck}.
+\end{proof}
+
+\begin{remark}[Extension to dynamic imports]
+Python supports dynamic imports (\texttt{importlib.import\_module}).
+The import advisor currently handles only static imports.
+Extending to dynamic imports requires runtime evidence from
+the runtime channel, which would increase trust to $\Truntime$
+for the dynamically resolved modules.
+\end{remark}
+
+\begin{remark}[Higher-order callables]
+Python callables include functions, classes (via \texttt{\_\_init\_\_}),
+lambdas, and objects with \texttt{\_\_call\_\_}.  The callable
+advisor handles all four cases by querying the Copilot channel
+with the appropriate context.  Higher-order callables (functions
+returning callables) are analysed recursively up to a configurable
+depth.
+\end{remark}
+
+\subsection{Import Cycle Detection}
+
+\begin{definition}[Import cycle]%
+\label{def:importcycle}
+An \emph{import cycle} is a sequence of modules
+$m_1 \to m_2 \to \cdots \to m_k \to m_1$ such that
+$m_i$ imports $m_{i+1}$ for each $i$.
+\end{definition}
+
+\begin{lemma}[Import advisor detects cycles]%
+\label{lem:importcycledetect}
+If the import graph contains a cycle of length $k$,
+the import advisor detects it in $O(V + E)$ time
+where $V$ and $E$ are the vertices and edges of the
+import graph.
+\end{lemma}
+\begin{proof}
+The advisor performs a depth-first traversal of the import
+graph.  Back edges indicate cycles.  DFS visits each vertex
+and edge once, yielding $O(V + E)$ time.
+\end{proof}
+
+\begin{lemma}[Cycle trust degradation]%
+\label{lem:cycletrust}
+Evidence involving a cyclic import path has trust capped at
+$\Tcopilot$ regardless of the constituent channels.
+\end{lemma}
+\begin{proof}
+Cycles introduce circular dependencies that cannot be
+statically verified by the solver.  The federation falls
+back to Copilot-level trust for such evidence.
+\end{proof}
+
+\subsection{Callable Arity Consistency}
+
+\begin{lemma}[Arity-consistent suggestions]%
+\label{lem:arityconsist}
+The callable advisor only suggests signatures whose arity
+matches the observed call sites.
+\end{lemma}
+\begin{proof}
+The advisor collects call sites from the AST and counts
+arguments at each call.  Only signatures whose parameter
+count matches the observed argument counts (accounting for
+default values and variadic parameters) are included in the
+suggestion list.
+\end{proof}
+
+\begin{remark}[Variadic functions]
+For variadic functions (\texttt{*args}, \texttt{**kwargs}),
+the arity check passes for any argument count at or above
+the number of positional-only parameters.  This is consistent
+with Python's calling convention.
+\end{remark}
+
+\end{document}

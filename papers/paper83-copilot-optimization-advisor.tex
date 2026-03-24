@@ -1,0 +1,1201 @@
+% paper83-copilot-optimization-advisor.tex — Copilot Optimization Advisor
+%   Advisor for Suggesting and Validating Optimization Strategies
+%   Paper 83 of the Judgment Geometry series.
+% Compile: pdflatex paper83-copilot-optimization-advisor
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+
+% ——— Paper-specific macros ———
+\newcommand{\OptAdv}{\mathsf{CopilotOptimizationAdvisor}}
+\newcommand{\OptStrat}{\mathrm{optimizationStrategy}}
+\newcommand{\PerfPred}{\mathrm{performancePredict}}
+\newcommand{\NonReg}{\mathrm{nonRegression}}
+\newcommand{\OptValid}{\mathrm{optimizationValid}}
+\newcommand{\TrustPres}{\mathrm{trustPreserve}}
+\newcommand{\SearchRed}{\mathrm{searchSpaceReduce}}
+\newcommand{\ValComp}{\mathrm{validationComplete}}
+\newcommand{\CopChan}{\mathsf{CopilotChannel}}
+\newcommand{\ChanMon}{\mathsf{ChannelMonitor}}
+\newcommand{\TrustCeil}{\mathrm{ceiling}}
+\newcommand{\HealthInd}{\mathsf{HealthIndicator}}
+\newcommand{\JuGeoAPI}{\mathsf{JuGeoAPI}}
+
+\title{\textbf{Copilot Optimization Advisor:\\ Advisor for Suggesting and Validating Optimization Strategies}}
+\author{Halley Young}
+\date{Paper~83 --- Judgment Geometry Series}
+
+\begin{document}
+\maketitle
+
+% ——— Abstract ———
+\begin{abstract}
+We present the $\OptAdv$, a Copilot-guided advisor for suggesting and validating optimization strategies in the \JuGeo{} verification framework. The advisor proposes optimizations, predicts performance, and checks for non-regression, all within a trust-calibrated evidence architecture. We formalize the validation workflow, prove soundness, non-regression, search space reduction, trust preservation, and validation completeness, and provide full proofs. Code listings demonstrate $\CopChan$ for strategy suggestion, $\ChanMon$ for performance tracking, $\JuGeoAPI$ for verification, and $\HealthInd$ for subsystem health. The appendix contains additional proofs and technical details.
+\end{abstract}
+
+% ============================================================
+%  Section 1 — Introduction
+% ============================================================
+\section{Introduction}\label{sec:intro}
+
+Verification tasks in the \JuGeo{} framework involve searching
+large proof spaces under tight resource budgets.  Choosing
+the right verification strategy---which lemmas to inline,
+which sub-goals to split, which channel to route evidence
+requests through---can reduce verification time by orders
+of magnitude.  Yet the space of possible optimisations is
+itself large, and a na\"{\i}ve search over strategies is
+often as expensive as the verification it aims to accelerate.
+
+This paper introduces the $\OptAdv$, a Copilot-guided
+advisor that suggests optimisation strategies and validates
+them against a correctness preservation invariant.  The
+advisor operates at the $\Tcopilot$ trust tier: its
+suggestions are proposals that the kernel may accept or
+reject.  Validation is delegated to higher-trust channels
+(solver, runtime) that independently confirm that the
+optimised verification yields the same result as the
+original.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item A formal model of verification optimisation as a
+      rewriting system on proof obligations (\S\ref{sec:model}).
+\item The design of $\OptAdv$ with three phases:
+      strategy suggestion, performance prediction, and
+      non-regression checking (\S\ref{sec:advisor}).
+\item A validation framework that uses the solver channel
+      to confirm correctness preservation (\S\ref{sec:validation}).
+\item Five theorems: optimisation soundness, non-regression,
+      search-space reduction, trust preservation, and
+      validation completeness (\S\ref{sec:formal}).
+\item Full \Python{} code illustrating integration with
+      $\CopChan$, $\ChanMon$, $\JuGeoAPI$, and
+      $\HealthInd$ (\S\ref{sec:code}).
+\end{enumerate}
+
+\paragraph{Paper outline.}
+Section~\ref{sec:background} recalls background material.
+Section~\ref{sec:model} formalises verification optimisation.
+Section~\ref{sec:advisor} presents the advisor design.
+Section~\ref{sec:validation} describes validation.
+Section~\ref{sec:code} gives implementation details.
+Section~\ref{sec:formal} contains the main theorems.
+Section~\ref{sec:discussion} discusses limitations.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:conclusion} concludes.
+Appendix~\ref{app:proofs} collects auxiliary proofs.
+
+% ============================================================
+%  Section 2 — Background
+% ============================================================
+\section{Background}\label{sec:background}
+
+\subsection{Trust lattice recap}
+
+Recall the trust ordering from earlier papers:
+\[
+  \Tcontra \;\tleq\; \Tunver \;\tleq\; \Tcopilot
+  \;\tleq\; \Toracle \;\tleq\; \Truntime
+  \;\tleq\; \Tsolver \;\tleq\; \Tproof.
+\]
+The optimisation advisor operates at $\Tcopilot$; its
+suggestions are not trusted until validated by a
+higher-trust channel.
+
+\subsection{Evidence channels and monitoring}
+
+Evidence channels are the conduits through which the
+kernel obtains evidence.  The \texttt{ChannelMonitor}
+records request--response pairs and computes summary
+statistics: success rate, latency percentiles, and
+throughput.  These statistics are the raw material
+for the optimisation advisor's performance predictions.
+
+\subsection{Proof obligations and rewriting}
+
+A \emph{proof obligation} is a pair $(c, \varphi)$
+where $c$ is a coordinate in the proof tree and
+$\varphi$ is a proposition to be verified.  A
+\emph{verification strategy} is a sequence of
+rewriting steps that transforms a proof obligation
+into a (possibly empty) set of simpler obligations.
+
+\begin{definition}[Rewriting system]\label{def:rewrite}
+A \emph{verification rewriting system} is a pair
+$(\mathcal{O}, \Rightarrow)$ where $\mathcal{O}$
+is the set of proof obligations and
+$\Rightarrow \;\subseteq \mathcal{O} \times
+\mathcal{P}(\mathcal{O})$ is the rewriting relation.
+We write $o \Rightarrow O'$ to mean that obligation~$o$
+can be rewritten into the set $O'$ of sub-obligations.
+\end{definition}
+
+\begin{definition}[Optimisation]\label{def:optimisation}
+An \emph{optimisation} is a pair $(\rho, \pi)$ where
+$\rho \colon \mathcal{O} \to \mathcal{O}$ is a
+transformation on obligations and $\pi$ is a proof
+that $\rho$ preserves validity:
+$\mathrm{valid}(o) \iff \mathrm{valid}(\rho(o))$.
+\end{definition}
+
+% ============================================================
+%  Section 3 — The Optimisation Advisor
+% ============================================================
+\section{The Optimisation Advisor}\label{sec:advisor}
+
+\subsection{Strategy suggestion}
+
+The $\OptAdv$ receives the current proof obligation,
+the rewriting history, and the monitor statistics.
+It queries the Copilot channel for a ranked list of
+optimisation strategies.
+
+\begin{definition}[Strategy space]\label{def:stratspace}
+The \emph{strategy space} $\mathcal{S}$ is the set of
+all valid optimisations.  A strategy $s \in \mathcal{S}$
+is a named rewriting rule together with estimated cost
+and benefit metrics:
+\[
+  s = (\mathsf{name}, \rho, \mathsf{cost}, \mathsf{benefit}).
+\]
+The \emph{net benefit} is $\mathsf{benefit} - \mathsf{cost}$.
+\end{definition}
+
+\begin{definition}[Suggestion ranking]\label{def:sugrank}
+The advisor ranks strategies by expected net benefit.
+Given monitor data~$d$ and obligation~$o$, the ranking
+function is:
+\[
+  \mathrm{rank}(s, o, d) =
+    \frac{\mathsf{benefit}(s, o)}{\mathsf{cost}(s, o)}
+    \times \mathrm{success\_rate}(d, s.\mathsf{name}).
+\]
+\end{definition}
+
+\subsection{Performance prediction}
+
+Before suggesting an optimisation, the advisor predicts
+its effect on verification time.  The prediction model
+uses the monitor's latency percentiles and success rates.
+
+\begin{definition}[Performance model]\label{def:perfmodel}
+A \emph{performance model} is a function
+$M \colon \mathcal{S} \times \mathcal{O} \times
+\mathsf{MonitorData} \to \mathbb{R}_{\geq 0}$
+that estimates the verification time under strategy~$s$
+for obligation~$o$ given historical data~$d$.  We require:
+\begin{enumerate}
+\item $M$ is monotone in cost: if $s$ has higher cost
+      than $s'$, then $M(s, o, d) \geq M(s', o, d)$.
+\item $M$ is calibrated: the mean prediction error
+      over the last $n$ verifications is below a
+      threshold~$\epsilon$.
+\end{enumerate}
+\end{definition}
+
+\subsection{Non-regression checking}
+
+After suggesting an optimisation, the advisor checks
+that the optimised obligation has the same validity
+status as the original.  This check is delegated to
+the solver channel.
+
+\begin{definition}[Non-regression check]\label{def:nonreg}
+A \emph{non-regression check} for optimisation~$\rho$
+on obligation~$o$ is a verification that:
+\[
+  \mathrm{verify}(\rho(o)) = \mathrm{verify}(o).
+\]
+The check succeeds if both sides agree (both valid or
+both invalid).  It fails if the optimisation changes
+the verification outcome.
+\end{definition}
+
+\begin{remark}
+Non-regression checking is the key safety mechanism.
+Even though the Copilot channel suggests optimisations
+at $\Tcopilot$, the solver channel validates them at
+$\Tsolver$.  This two-phase approach prevents unsound
+optimisations from being applied.
+\end{remark}
+
+% ============================================================
+%  Section 4 — Validation Framework
+% ============================================================
+\section{Optimisation Validation}\label{sec:validation}
+
+\subsection{Correctness preservation}
+
+\begin{definition}[Correctness-preserving optimisation]%
+\label{def:corrpres}
+An optimisation $\rho$ is \emph{correctness-preserving}
+if for every obligation~$o$:
+\[
+  \mathrm{valid}(o) \iff \mathrm{valid}(\rho(o)).
+\]
+Equivalently, $\rho$ is a validity-preserving endomorphism
+on $(\mathcal{O}, \mathrm{valid})$.
+\end{definition}
+
+\subsection{Solver-checked validation}
+
+The validation protocol proceeds as follows:
+\begin{enumerate}
+\item The advisor suggests optimisation~$\rho$ for obligation~$o$.
+\item The kernel submits both $o$ and $\rho(o)$ to the solver
+      channel.
+\item The solver returns verdicts $v$ and $v'$.
+\item If $v = v'$, the optimisation is accepted.
+\item If $v \neq v'$, the optimisation is rejected.
+\end{enumerate}
+
+\begin{definition}[Validation oracle]\label{def:valoracle}
+A \emph{validation oracle} is a function
+$V \colon \mathcal{O} \times \mathcal{O} \to \{
+\mathsf{accept}, \mathsf{reject}, \mathsf{unknown}\}$
+defined by:
+\[
+  V(o, o') = \begin{cases}
+    \mathsf{accept} & \text{if } \mathrm{verify}(o) =
+      \mathrm{verify}(o'), \\
+    \mathsf{reject} & \text{if } \mathrm{verify}(o) \neq
+      \mathrm{verify}(o'), \\
+    \mathsf{unknown} & \text{if either verification times out.}
+  \end{cases}
+\]
+\end{definition}
+
+\subsection{Incremental validation}
+
+For large optimisations that transform many sub-obligations,
+incremental validation checks each sub-obligation individually.
+
+\begin{definition}[Incremental validation]\label{def:incval}
+Given an optimisation $\rho$ and a set of sub-obligations
+$\{o_1, \ldots, o_n\}$, the incremental validator computes
+$V(o_i, \rho(o_i))$ for each~$i$ and returns:
+\[
+  V_{\mathrm{inc}}(\rho, \{o_1, \ldots, o_n\}) =
+  \begin{cases}
+    \mathsf{accept} & \text{if all } V(o_i, \rho(o_i)) =
+      \mathsf{accept}, \\
+    \mathsf{reject} & \text{if any } V(o_i, \rho(o_i)) =
+      \mathsf{reject}, \\
+    \mathsf{unknown} & \text{otherwise.}
+  \end{cases}
+\]
+\end{definition}
+
+\begin{lemma}[Incremental validation soundness]%
+\label{lem:incvalsound}
+If $V_{\mathrm{inc}}(\rho, O) = \mathsf{accept}$, then
+$\rho$ is correctness-preserving on~$O$.
+\end{lemma}
+\begin{proof}
+Each sub-obligation $o_i \in O$ has been individually
+validated: $\mathrm{verify}(o_i) = \mathrm{verify}(\rho(o_i))$.
+Therefore $\rho$ preserves validity on each element of~$O$.
+Since $O$ is the complete set of sub-obligations, $\rho$
+is correctness-preserving on~$O$.
+\end{proof}
+
+% ============================================================
+%  Section 5 — Implementation
+% ============================================================
+\section{Implementation}\label{sec:code}
+
+\subsection{Strategy suggestion via CopilotChannel}
+
+The following listing shows how the $\OptAdv$ queries
+the Copilot channel for optimisation strategies.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Optimisation strategy suggestion via CopilotChannel},
+  label={lst:optstrat}]
+from jugeo.evidence.channels import (
+    CopilotChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+    ChannelJurisdiction,
+    ChannelMonitor,
+)
+
+class CopilotOptimizationAdvisor:
+    """Advisor for suggesting and validating optimisation strategies."""
+
+    def __init__(self, channel: CopilotChannel, monitor: ChannelMonitor):
+        self.channel = channel
+        self.monitor = monitor
+        self.trust_ceiling = channel.TRUST_CEILING
+        self.jurisdiction = ChannelJurisdiction.for_channel(
+            EvidenceChannel.COPILOT
+        )
+
+    def suggest_strategies(self, obligation, rewrite_history, k=5):
+        stats = self.monitor.summary()
+        latencies = self.monitor.latency_percentiles()
+        success = self.monitor.success_rate()
+
+        prompt = self._build_strategy_prompt(
+            obligation, rewrite_history, stats, latencies, success
+        )
+        raw = self.channel.query_llm(prompt, timeout_ms=10000)
+        parsed = self.channel.parse_response()
+        clamped = self.channel.apply_trust_ceiling()
+
+        strategies = self._rank_strategies(clamped, obligation, stats)
+        return strategies[:k]
+
+    def predict_performance(self, strategy, obligation):
+        stats = self.monitor.summary()
+        latencies = self.monitor.latency_percentiles()
+        p50 = latencies.get("p50", 1000)
+        p99 = latencies.get("p99", 5000)
+        success = self.monitor.success_rate()
+        estimated_time = p50 * strategy.get("cost_factor", 1.0)
+        return {
+            "estimated_ms": estimated_time,
+            "confidence": success,
+            "p99_bound": p99 * strategy.get("cost_factor", 1.0),
+        }
+
+    def _build_strategy_prompt(self, obl, hist, stats, lat, succ):
+        return (
+            f"Obligation: {obl}\n"
+            f"History length: {len(hist)}\n"
+            f"Success rate: {succ:.2f}\n"
+            f"P50 latency: {lat.get('p50', 'N/A')}ms\n"
+            f"Suggest optimization strategies."
+        )
+
+    def _rank_strategies(self, strategies, obligation, stats):
+        if not isinstance(strategies, list):
+            return []
+        ranked = sorted(
+            strategies,
+            key=lambda s: s.get("benefit", 0) / max(s.get("cost", 1), 1),
+            reverse=True,
+        )
+        return ranked
+\end{lstlisting}
+
+\subsection{Performance tracking with ChannelMonitor}
+
+The next listing shows how the $\ChanMon$ tracks
+performance during optimisation experiments.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Performance monitoring during optimisation},
+  label={lst:perfmon}]
+from jugeo.evidence.channels import (
+    ChannelMonitor,
+    ChannelPool,
+    ChannelRouter,
+    CopilotChannel,
+    SolverChannel,
+    ChannelConfiguration,
+    EvidenceChannel,
+    EvidenceRequest,
+    EvidenceResponse,
+)
+
+class OptimizationPerformanceTracker:
+    """Track performance metrics across optimization experiments."""
+
+    def __init__(self, pool: ChannelPool, monitor: ChannelMonitor):
+        self.pool = pool
+        self.monitor = monitor
+        self.experiments = []
+
+    def run_baseline(self, obligation, channel_name="solver"):
+        channel = self.pool.get_channel(channel_name)
+        request = EvidenceRequest(
+            request_id="opt-baseline-001",
+            coordinate=obligation,
+            proposition=obligation,
+            required_kind=None,
+            proposition_kind="verification",
+            preferred_channel=EvidenceChannel.SOLVER,
+            fallback_channels=[],
+            deadline_ms=30000,
+            budget=50000,
+            metadata={"phase": "baseline"},
+        )
+        self.monitor.record_request(request)
+        response = channel.handle_request(request)
+        self.monitor.record_response(response)
+        return {
+            "request": request,
+            "response": response,
+            "latency_p50": self.monitor.latency_percentiles().get("p50"),
+            "success_rate": self.monitor.success_rate(),
+        }
+
+    def run_optimized(self, obligation, strategy, channel_name="solver"):
+        optimized_obl = self._apply_strategy(obligation, strategy)
+        channel = self.pool.get_channel(channel_name)
+        request = EvidenceRequest(
+            request_id="opt-test-001",
+            coordinate=optimized_obl,
+            proposition=optimized_obl,
+            required_kind=None,
+            proposition_kind="verification",
+            preferred_channel=EvidenceChannel.SOLVER,
+            fallback_channels=[],
+            deadline_ms=30000,
+            budget=50000,
+            metadata={"phase": "optimized", "strategy": strategy},
+        )
+        self.monitor.record_request(request)
+        response = channel.handle_request(request)
+        self.monitor.record_response(response)
+        return {
+            "request": request,
+            "response": response,
+            "latency_p50": self.monitor.latency_percentiles().get("p50"),
+            "success_rate": self.monitor.success_rate(),
+        }
+
+    def compare(self, baseline, optimized):
+        baseline_lat = baseline.get("latency_p50", 0)
+        opt_lat = optimized.get("latency_p50", 0)
+        speedup = baseline_lat / max(opt_lat, 1)
+        return {
+            "speedup": speedup,
+            "baseline_success": baseline.get("success_rate"),
+            "optimized_success": optimized.get("success_rate"),
+            "summary": self.monitor.summary(),
+        }
+
+    def _apply_strategy(self, obligation, strategy):
+        return f"optimized({obligation}, {strategy})"
+\end{lstlisting}
+
+\subsection{Verification via JuGeoAPI}
+
+The following listing demonstrates using $\JuGeoAPI$
+to verify both the original and optimised obligations.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Non-regression verification via JuGeoAPI},
+  label={lst:nonreg}]
+from jugeo.interfaces.api import (
+    JuGeoAPI,
+    OperationKind,
+    APIRequest,
+    APIResponse,
+    APISession,
+    APIEventLog,
+    APIValidator,
+    APIRateLimiter,
+    APIAuthenticator,
+    CopilotAPIBridge,
+    RequestStatus,
+)
+
+class NonRegressionChecker:
+    """Check that optimisations preserve verification outcomes."""
+
+    def __init__(self, api: JuGeoAPI, event_log: APIEventLog):
+        self.api = api
+        self.event_log = event_log
+
+    def check(self, original_obligation, optimized_obligation):
+        session = self.api.open_session("non-regression")
+
+        orig_request = APIRequest(
+            request_id="nonreg-orig-001",
+            operation=OperationKind.VERIFY,
+            coordinate=original_obligation,
+            proposition=original_obligation,
+            budget=30000,
+            deadline=60000,
+            metadata={"phase": "non-regression-original"},
+        )
+        session.register_request(orig_request)
+        orig_result = self.api.verify(
+            coordinate=original_obligation,
+            proposition=original_obligation,
+        )
+
+        opt_request = APIRequest(
+            request_id="nonreg-opt-001",
+            operation=OperationKind.VERIFY,
+            coordinate=optimized_obligation,
+            proposition=optimized_obligation,
+            budget=30000,
+            deadline=60000,
+            metadata={"phase": "non-regression-optimized"},
+        )
+        session.register_request(opt_request)
+        opt_result = self.api.verify(
+            coordinate=optimized_obligation,
+            proposition=optimized_obligation,
+        )
+
+        self.event_log.record({
+            "original": str(orig_result),
+            "optimized": str(opt_result),
+        })
+
+        if orig_result.is_successful() == opt_result.is_successful():
+            verdict = "accept"
+        else:
+            verdict = "reject"
+
+        session.checkpoint()
+        session.close()
+        return {
+            "verdict": verdict,
+            "original_success": orig_result.is_successful(),
+            "optimized_success": opt_result.is_successful(),
+        }
+
+    def batch_check(self, pairs):
+        results = []
+        for orig, opt in pairs:
+            result = self.check(orig, opt)
+            results.append(result)
+        all_accept = all(r["verdict"] == "accept" for r in results)
+        return {"all_accept": all_accept, "details": results}
+\end{lstlisting}
+
+\subsection{Health monitoring for optimisation subsystem}
+
+The final listing shows how $\HealthInd$ monitors
+the health of the optimisation subsystem.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Health monitoring for the optimisation subsystem},
+  label={lst:opthealth}]
+from jugeo.kernel.health import (
+    HealthStatus,
+    HealthDimension,
+    HealthIndicator,
+    HealthReport,
+)
+from jugeo.evidence.channels import (
+    ChannelPool,
+    ChannelMonitor,
+    CopilotChannel,
+)
+
+class OptimizationHealthMonitor:
+    """Monitor health of the optimisation advisory subsystem."""
+
+    def __init__(self, pool: ChannelPool, monitor: ChannelMonitor):
+        self.pool = pool
+        self.monitor = monitor
+
+    def check_copilot_health(self):
+        copilot = self.pool.get_channel("copilot")
+        if copilot is None:
+            return HealthIndicator(
+                dimension=HealthDimension.COPILOT_CONNECTIVITY,
+                status=HealthStatus.UNHEALTHY,
+                message="Copilot channel not registered",
+                value=0.0,
+                timestamp=None,
+                details={"channel": "copilot"},
+            )
+        health = copilot.health_check()
+        status = (HealthStatus.HEALTHY if health
+                  else HealthStatus.DEGRADED)
+        return HealthIndicator(
+            dimension=HealthDimension.COPILOT_CONNECTIVITY,
+            status=status,
+            message="Copilot channel operational" if health
+                    else "Copilot channel degraded",
+            value=1.0 if health else 0.5,
+            timestamp=None,
+            details={"health_check": health},
+        )
+
+    def check_evidence_flow(self):
+        success = self.monitor.success_rate()
+        if success >= 0.9:
+            status = HealthStatus.HEALTHY
+        elif success >= 0.5:
+            status = HealthStatus.DEGRADED
+        else:
+            status = HealthStatus.UNHEALTHY
+        return HealthIndicator(
+            dimension=HealthDimension.EVIDENCE_FLOW,
+            status=status,
+            message=f"Evidence flow success rate: {success:.2%}",
+            value=success,
+            timestamp=None,
+            details=self.monitor.summary(),
+        )
+
+    def full_report(self):
+        copilot_ind = self.check_copilot_health()
+        flow_ind = self.check_evidence_flow()
+        indicators = [copilot_ind, flow_ind]
+        if all(i.is_healthy() for i in indicators):
+            overall = HealthStatus.HEALTHY
+        elif any(i.status == HealthStatus.UNHEALTHY for i in indicators):
+            overall = HealthStatus.UNHEALTHY
+        else:
+            overall = HealthStatus.DEGRADED
+        report = HealthReport(
+            overall_status=overall,
+            indicators=indicators,
+            generated_at=None,
+            report_id="opt-health-001",
+            degradation_reasons=[],
+            recovery_suggestions=[],
+        )
+        return report
+\end{lstlisting}
+
+% ============================================================
+%  Section 6 — Formal Properties
+% ============================================================
+\section{Formal Properties}\label{sec:formal}
+
+\begin{theorem}[Optimisation soundness]\label{thm:optsound}
+If the advisor suggests optimisation~$\rho$ and the
+non-regression check accepts it, then $\rho$ is
+correctness-preserving on the tested obligations.
+\end{theorem}
+\begin{proof}
+The non-regression checker (Listing~\ref{lst:nonreg})
+submits both the original and optimised obligations
+to the solver channel via \texttt{JuGeoAPI.verify()}.
+Acceptance requires that both verifications yield the
+same outcome (\ie{} both succeed or both fail).
+Since the solver channel operates at $\Tsolver$ trust,
+its verdicts are reliable up to solver soundness.
+Therefore, if the check accepts, then
+$\mathrm{verify}(o) = \mathrm{verify}(\rho(o))$,
+which by definition means $\rho$ is correctness-preserving
+on~$o$.
+
+For the batch case, Lemma~\ref{lem:incvalsound} extends
+this to all sub-obligations.
+\end{proof}
+
+\begin{theorem}[Non-regression guarantee]\label{thm:nonreg}
+No optimisation accepted by the non-regression checker
+changes the verification outcome of any tested obligation.
+\end{theorem}
+\begin{proof}
+This is the contrapositive of soundness.  Suppose an
+accepted optimisation~$\rho$ changes the outcome of some
+obligation~$o$: $\mathrm{verify}(o) \neq
+\mathrm{verify}(\rho(o))$.  Then the checker would have
+returned ``reject'' for the pair $(o, \rho(o))$.
+Contradiction with the assumption that the optimisation
+was accepted.
+\end{proof}
+
+\begin{theorem}[Search-space reduction]\label{thm:searchred}
+If optimisation~$\rho$ reduces the number of sub-obligations
+from~$n$ to~$m < n$, then the verification cost decreases
+by at least a factor of $n/m$ (assuming linear cost per
+sub-obligation).
+\end{theorem}
+\begin{proof}
+Under the linear cost model, verification time is
+$T = c \cdot k$ where $c$ is the per-obligation cost and
+$k$ is the number of obligations.  The original time is
+$T_{\mathrm{orig}} = c \cdot n$ and the optimised time is
+$T_{\mathrm{opt}} = c \cdot m$.  The speedup factor is
+\[
+  \frac{T_{\mathrm{orig}}}{T_{\mathrm{opt}}}
+  = \frac{c \cdot n}{c \cdot m}
+  = \frac{n}{m}.
+\]
+Since $m < n$, this factor is greater than~1.
+
+The linear cost assumption holds when all sub-obligations
+have comparable complexity.  For heterogeneous obligations,
+the actual speedup may differ, but the theorem provides a
+lower bound under the stated assumption.
+\end{proof}
+
+\begin{theorem}[Trust preservation]\label{thm:trustpres}
+The optimisation advisor preserves trust:
+$\mathrm{trust}(\OptAdv(\Gamma)) \tleq \Tcopilot$.
+\end{theorem}
+\begin{proof}
+The advisor queries the Copilot channel, which has
+trust ceiling $\Tcopilot$.  The \texttt{apply\_trust\_ceiling}
+call ensures the response trust does not exceed this
+ceiling.  The advisor does not escalate trust:
+strategy suggestions inherit the channel's trust.
+
+Note that the non-regression check uses the solver channel
+at $\Tsolver$, but this evidence is separate from the
+advisor's suggestion.  The suggestion itself remains at
+$\Tcopilot$; only the validation result has higher trust.
+\end{proof}
+
+\begin{theorem}[Validation completeness]\label{thm:valcomp}
+If the solver channel is complete (\ie{} it returns a
+definitive verdict for every decidable obligation within
+the deadline), then the non-regression checker correctly
+classifies every decidable optimisation.
+\end{theorem}
+\begin{proof}
+A decidable obligation is one for which the solver
+returns either ``valid'' or ``invalid'' within the
+deadline.  Given two decidable obligations $o$ and
+$\rho(o)$, the solver returns definitive verdicts
+$v$ and $v'$.  The checker compares them:
+\begin{itemize}
+\item If $v = v'$, the optimisation is accepted (correctly,
+      since validity is preserved).
+\item If $v \neq v'$, the optimisation is rejected
+      (correctly, since validity changed).
+\end{itemize}
+The only case where the checker returns ``unknown'' is
+when one or both verifications time out, which happens
+only for undecidable obligations.  Therefore the checker
+is complete for decidable obligations.
+\end{proof}
+
+% ============================================================
+%  Section 7 — Discussion
+% ============================================================
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{Undecidable obligations.}
+When the solver times out, the non-regression checker
+returns ``unknown.''  In this case, the advisor falls
+back to a conservative strategy: reject the optimisation.
+This ensures safety at the cost of missing valid
+optimisations for undecidable obligations.
+
+\paragraph{Cost of validation.}
+Validating an optimisation requires running the solver
+twice (on the original and optimised obligations).
+This doubles the solver cost.  In practice, the
+optimisation should provide a speedup that more than
+compensates for this overhead.  If the predicted
+speedup is less than~2, the advisor does not suggest
+the optimisation.
+
+\paragraph{Interaction with other advisors.}
+The optimisation advisor can be composed with the
+research and experiment advisors (Paper~82).  The
+research advisor suggests hypotheses, the experiment
+advisor designs a verification plan, and the
+optimisation advisor suggests how to execute the
+plan efficiently.
+
+\paragraph{Stochastic strategies.}
+The Copilot channel may suggest different strategies
+on different invocations for the same obligation.
+The advisor mitigates this by caching responses and
+by requiring that any accepted optimisation pass the
+deterministic non-regression check.
+
+\paragraph{Health monitoring.}
+Listing~\ref{lst:opthealth} shows how the optimisation
+subsystem monitors its own health.  If the Copilot
+channel is degraded, the advisor reduces its suggestion
+rate.  If the evidence flow success rate drops below
+50\%, the advisor enters a conservative mode where
+only previously validated optimisations are suggested.
+
+% ============================================================
+%  Section 8 — Related Work
+% ============================================================
+\section{Related Work}\label{sec:related}
+
+\paragraph{Automated strategy selection.}
+Portfolio solvers~\cite{xu2008satzilla} select among
+verification strategies based on problem features.
+Our advisor differs in using a language model for
+strategy suggestion and a trust lattice for validation.
+
+\paragraph{Compiler optimisation verification.}
+Translation validation~\cite{pnueli1998translation}
+checks that compiler optimisations preserve semantics.
+Our non-regression checker is analogous, applied to
+verification strategies rather than compiler passes.
+
+\paragraph{AI for code optimisation.}
+Recent work uses language models for code
+optimisation~\cite{chen2023codeoptimize}.  We apply
+similar ideas to verification optimisation, with the
+additional constraint of formal correctness preservation.
+
+\paragraph{Proof search heuristics.}
+Ripple~\cite{basin1993rippling}, heuristic
+instantiation~\cite{claessen2000quickcheck}, and
+learned proof strategies~\cite{bansal2019holist}
+all guide proof search.  Our contribution is the
+integration with a trust-calibrated advisory framework.
+
+\paragraph{Performance prediction.}
+Machine-learning models for runtime
+prediction~\cite{hutter2011sequential} and algorithm
+selection~\cite{kotthoff2016algorithm} share goals
+with our performance model.  We focus on integration
+with the \JuGeo{} monitor rather than building a
+standalone predictor.
+
+\paragraph{Copilot advisors in \JuGeo{}.}
+Papers~80--82 of this series introduce advisors for
+heap analysis, scope management, import resolution,
+callable analysis, research, and experiment design.
+The optimisation advisor complements these by
+providing performance-focused guidance.
+
+% ============================================================
+%  Section 9 — Conclusion
+% ============================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We have introduced the $\OptAdv$, a Copilot-guided
+advisor that suggests and validates verification
+optimisation strategies in the \JuGeo{} framework.
+The advisor operates at $\Tcopilot$ trust and relies
+on the solver channel for non-regression validation.
+Five theorems establish soundness, non-regression,
+search-space reduction, trust preservation, and
+validation completeness.
+
+Future work includes: (a)~extending the performance
+model with learned features from the monitor's time
+series, (b)~supporting multi-objective optimisation
+(time vs.\ trust level), and (c)~integrating the
+advisor with the lifecycle manager for phase-aware
+optimisation.
+
+% ============================================================
+%  Bibliography
+% ============================================================
+\begin{thebibliography}{25}
+
+\bibitem{xu2008satzilla}
+L.~Xu, F.~Hutter, H.~Hoos, and K.~Leyton-Brown,
+``SATzilla: portfolio-based algorithm selection for SAT,''
+\emph{JAIR}, vol.~32, pp.~565--606, 2008.
+
+\bibitem{pnueli1998translation}
+A.~Pnueli, M.~Siegel, and E.~Singerman,
+``Translation validation,''
+\emph{TACAS}, 1998.
+
+\bibitem{chen2023codeoptimize}
+M.~Chen \etal{},
+``Evaluating large language models trained on code,''
+\emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem{basin1993rippling}
+D.~Basin and T.~Walsh,
+``A calculus for and termination of rippling,''
+\emph{Journal of Automated Reasoning}, vol.~16,
+pp.~147--180, 1996.
+
+\bibitem{claessen2000quickcheck}
+K.~Claessen and J.~Hughes,
+``QuickCheck: a lightweight tool for random testing of
+Haskell programs,''
+\emph{ICFP}, 2000.
+
+\bibitem{bansal2019holist}
+K.~Bansal, S.~Loos, M.~Rabe, C.~Szegedy, and S.~Wilcox,
+``HOList: an environment for machine learning of higher-order
+logic theorem proving,''
+\emph{ICML}, 2019.
+
+\bibitem{hutter2011sequential}
+F.~Hutter, H.~Hoos, and K.~Leyton-Brown,
+``Sequential model-based optimization for general algorithm
+configuration,''
+\emph{LION}, 2011.
+
+\bibitem{kotthoff2016algorithm}
+L.~Kotthoff,
+``Algorithm selection for combinatorial search problems:
+a survey,''
+\emph{AI Magazine}, vol.~35, no.~3, pp.~48--60, 2014.
+
+\bibitem{young2024jugeo}
+H.~Young,
+``Judgment geometry: a framework for trust-calibrated
+verification,''
+\emph{JuGeo Technical Reports}, Paper~1, 2024.
+
+\bibitem{young2024channels}
+H.~Young,
+``Evidence channels in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~88, 2024.
+
+\bibitem{young2024advisors}
+H.~Young,
+``Copilot advisors for heap, scope, import, and callable
+analysis,''
+\emph{JuGeo Technical Reports}, Papers~80--81, 2024.
+
+\bibitem{young2024research}
+H.~Young,
+``Copilot research and experiment advisors,''
+\emph{JuGeo Technical Reports}, Paper~82, 2024.
+
+\bibitem{young2024lifecycle}
+H.~Young,
+``Kernel lifecycle and health monitoring in judgment geometry,''
+\emph{JuGeo Technical Reports}, Paper~93, 2024.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner,
+``Z3: an efficient SMT solver,''
+\emph{TACAS}, 2008.
+
+\bibitem{moura2021lean4}
+L.~de~Moura and S.~Ullrich,
+``The Lean~4 theorem prover and programming language,''
+\emph{CADE}, 2021.
+
+\bibitem{polu2020gptf}
+S.~Polu and I.~Sutskever,
+``Generative language modeling for automated theorem proving,''
+\emph{arXiv preprint arXiv:2009.03393}, 2020.
+
+\bibitem{first2022diversity}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun,
+``Diversity-driven automated formal verification,''
+\emph{ICSE}, 2022.
+
+\bibitem{jiang2022thor}
+A.~Q.~Jiang, W.~Li, S.~Tworber, and Y.~Wu,
+``Thor: wielding hammers to integrate language models and
+automated theorem provers,''
+\emph{NeurIPS}, 2022.
+
+\bibitem{lample2022hypertree}
+G.~Lample \etal{},
+``HyperTree proof search for neural theorem proving,''
+\emph{NeurIPS}, 2022.
+
+\bibitem{yang2019learning}
+K.~Yang and J.~Deng,
+``Learning to prove theorems via interacting with proof
+assistants,''
+\emph{ICML}, 2019.
+
+\end{thebibliography}
+
+% ============================================================
+%  Appendix
+% ============================================================
+\appendix
+
+\section{Auxiliary Definitions and Proofs}\label{app:proofs}
+
+\begin{lemma}[Rewriting preserves obligation count bound]%
+\label{lem:rewritebound}
+If $o \Rightarrow O'$ and $|O'| \leq b$ for branching
+factor~$b$, then after $d$ rewriting steps the total
+number of obligations is at most $b^d$.
+\end{lemma}
+\begin{proof}
+By induction on~$d$.  The base case $d = 0$ gives one
+obligation.  For the inductive step, each of the at most
+$b^{d-1}$ obligations rewrites into at most $b$ sub-obligations,
+giving at most $b^d$ total.
+\end{proof}
+
+\begin{lemma}[Optimisation composition]%
+\label{lem:optcomp}
+If $\rho_1$ and $\rho_2$ are correctness-preserving
+optimisations, then $\rho_2 \circ \rho_1$ is
+correctness-preserving.
+\end{lemma}
+\begin{proof}
+For any obligation~$o$:
+\begin{align*}
+  \mathrm{valid}(o)
+  &\iff \mathrm{valid}(\rho_1(o))
+    && \text{(by correctness of $\rho_1$)} \\
+  &\iff \mathrm{valid}(\rho_2(\rho_1(o)))
+    && \text{(by correctness of $\rho_2$)} \\
+  &= \mathrm{valid}((\rho_2 \circ \rho_1)(o)).
+\end{align*}
+\end{proof}
+
+\begin{lemma}[Optimisation identity]%
+\label{lem:optid}
+The identity function $\mathrm{id}$ is a
+correctness-preserving optimisation.
+\end{lemma}
+\begin{proof}
+$\mathrm{valid}(o) \iff \mathrm{valid}(\mathrm{id}(o))$
+since $\mathrm{id}(o) = o$.
+\end{proof}
+
+\begin{corollary}[Optimisation monoid]%
+\label{cor:optmonoid}
+The set of correctness-preserving optimisations forms a
+monoid under composition, with $\mathrm{id}$ as the identity.
+\end{corollary}
+\begin{proof}
+Closure: Lemma~\ref{lem:optcomp}.
+Identity: Lemma~\ref{lem:optid}.
+Associativity: function composition is associative.
+\end{proof}
+
+\begin{lemma}[Performance model calibration]%
+\label{lem:perfcalib}
+If the monitor collects at least $n \geq 30$ data points,
+then the performance model's mean prediction error is
+bounded by $\epsilon = 2 \sigma / \sqrt{n}$ with 95\%
+confidence, where $\sigma$ is the standard deviation
+of observed latencies.
+\end{lemma}
+\begin{proof}
+By the central limit theorem, the sample mean of $n$
+i.i.d.\ latency observations has standard error
+$\sigma / \sqrt{n}$.  The 95\% confidence interval
+for the mean is $\bar{x} \pm 1.96 \sigma / \sqrt{n}$.
+Since $1.96 < 2$, the mean prediction error is bounded
+by $2 \sigma / \sqrt{n}$.
+\end{proof}
+
+\begin{lemma}[Non-regression checker termination]%
+\label{lem:nonregterm}
+The non-regression checker terminates for every pair
+of obligations, provided the solver has a finite timeout.
+\end{lemma}
+\begin{proof}
+Each verification call to the solver is bounded by the
+deadline parameter.  If the solver does not respond within
+the deadline, the checker records a timeout and returns
+``unknown.''  Therefore the checker makes at most two
+bounded calls and always terminates.
+\end{proof}
+
+\begin{lemma}[Batch validation is sound]%
+\label{lem:batchsound}
+If \texttt{batch\_check} returns \texttt{all\_accept = True},
+then every tested pair satisfies non-regression.
+\end{lemma}
+\begin{proof}
+\texttt{batch\_check} iterates over all pairs and returns
+\texttt{all\_accept = True} only if every individual check
+returns ``accept.''  By Theorem~\ref{thm:optsound}, each
+accepted pair is correctness-preserving.  Therefore all
+tested pairs satisfy non-regression.
+\end{proof}
+
+\begin{lemma}[Health indicator actionability]%
+\label{lem:healthaction}
+A \texttt{HealthIndicator} with status
+\texttt{DEGRADED} or \texttt{UNHEALTHY} is actionable.
+\end{lemma}
+\begin{proof}
+By the implementation in Listing~\ref{lst:opthealth},
+the \texttt{is\_actionable()} method returns \texttt{True}
+when the status is not \texttt{HEALTHY}.  \texttt{DEGRADED}
+and \texttt{UNHEALTHY} are both not \texttt{HEALTHY}, hence
+actionable.
+\end{proof}
+
+\begin{proposition}[Optimisation advisor safety]%
+\label{prop:optsafety}
+The full optimisation pipeline (suggest, validate, apply)
+never installs an unsound optimisation, provided the solver
+is sound and the non-regression checker is executed.
+\end{proposition}
+\begin{proof}
+Suppose an optimisation~$\rho$ is suggested by the Copilot
+channel.  Before application, the non-regression checker
+verifies that $\mathrm{verify}(o) = \mathrm{verify}(\rho(o))$
+using the solver.  If the solver is sound, then equal verdicts
+imply equal validity.  The optimisation is applied only if the
+checker accepts.  Therefore, no unsound optimisation is applied.
+\end{proof}
+
+\begin{lemma}[Rate-limit compliance for optimisation]%
+\label{lem:optratelimit}
+The optimisation advisor respects the global rate limit
+enforced by \texttt{APIRateLimiter}.
+\end{lemma}
+\begin{proof}
+All API calls go through \texttt{JuGeoAPI}, which enforces
+the rate limit.  The advisor does not bypass the API.
+Therefore, the advisor's request rate is bounded by the
+global rate limit.
+\end{proof}
+
+\begin{lemma}[Trust does not accumulate through repeated optimisation]%
+\label{lem:trustnoaccum}
+Applying $k$ successive optimisations, each suggested at
+$\Tcopilot$, does not elevate the overall trust above
+$\Tcopilot$ for the suggestions.
+\end{lemma}
+\begin{proof}
+Each optimisation suggestion has trust $\tleq \Tcopilot$
+by Theorem~\ref{thm:trustpres}.  Composing $k$ suggestions
+yields trust $\min(\Tcopilot, \ldots, \Tcopilot) = \Tcopilot$.
+The validated evidence (from the solver) has trust $\Tsolver$,
+but this is independent of the suggestion trust.
+\end{proof}
+
+\begin{remark}[Extension to multi-objective optimisation]
+The strategy space can be extended with a Pareto
+ordering over multiple objectives (time, trust, cost).
+The ranking function then selects from the Pareto front.
+We leave the formal treatment to future work.
+\end{remark}
+
+\begin{lemma}[Optimisation advisor is stateless per invocation]%
+\label{lem:optstateless}
+Each invocation of the optimisation advisor depends only on the
+current obligation, the rewrite history, and the monitor data.
+No hidden state is carried between invocations.
+\end{lemma}
+\begin{proof}
+The advisor reads the obligation and history from its arguments,
+queries the monitor for statistics, and queries the Copilot channel.
+The Copilot channel maintains no conversation state between calls.
+Therefore each invocation is independent.
+\end{proof}
+
+\begin{lemma}[Search-space reduction is composable]%
+\label{lem:searchcomp}
+If optimisation $\rho_1$ reduces the obligation count from $n$ to $m$,
+and $\rho_2$ reduces from $m$ to $k$, then $\rho_2 \circ \rho_1$
+reduces from $n$ to $k$.
+\end{lemma}
+\begin{proof}
+$\rho_1$ maps $n$ obligations to $m$, and $\rho_2$ maps $m$ to $k$.
+The composition $\rho_2 \circ \rho_1$ maps $n$ to $k$ directly.
+The speedup factor is $n/k = (n/m) \cdot (m/k)$, the product of the
+individual speedups.
+\end{proof}
+
+\begin{proposition}[Complete optimisation pipeline safety]%
+\label{prop:optpipelinesafe}
+The complete optimisation pipeline (suggest strategy, predict
+performance, validate non-regression, apply) is safe: no
+unsound optimisation is applied, trust is preserved, and
+the pipeline terminates.
+\end{proposition}
+\begin{proof}
+Safety: Theorem~\ref{thm:optsound} and Proposition~\ref{prop:optsafety}.
+Trust: Theorem~\ref{thm:trustpres}.
+Termination: Lemma~\ref{lem:nonregterm} (checker terminates) and
+the finite number of obligations (at most one optimisation per
+obligation).
+\end{proof}
+
+\begin{remark}[Interaction with lowering hints]
+The optimisation advisor operates at the proof-obligation level,
+before lowering to IR.  Its suggestions may affect which lowering
+hints are applicable.  The two advisors compose: optimisation
+rewrites are applied first, then lowering hints operate on the
+optimised obligation.  Trust is propagated correctly since both
+advisors are bounded by $\Tcopilot$.
+\end{remark}
+
+\end{document}

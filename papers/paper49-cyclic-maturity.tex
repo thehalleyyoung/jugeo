@@ -222,6 +222,62 @@ orthogonal axes: \textsc{Capability} (adding new verification abilities),
 \texttt{ImprovementCycle} records its kind together with before/after metric
 dictionaries.
 
+\subsection{Formal Lattice Structure}\label{sec:lattice}
+
+We now give a precise algebraic characterisation of the maturity state space
+that underpins the monotonicity results of \cref{sec:theorem}.
+
+\begin{definition}[Maturity Lattice]\label{def:lattice}
+The \emph{maturity lattice} is the bounded totally ordered set
+$(\ML, \leq, \sqcup, \sqcap, \bot, \top)$ where
+\begin{itemize}
+  \item $\bot = \Proto$ (least element), $\top = \Matur$ (greatest element);
+  \item the join is the maximum: $\ell \sqcup \ell' = \max(\ell, \ell')$;
+  \item the meet is the minimum: $\ell \sqcap \ell' = \min(\ell, \ell')$.
+\end{itemize}
+Because the order is total, $(\ML, \leq)$ is simultaneously a lattice,
+a chain, and a complete Heyting algebra.
+\end{definition}
+
+\begin{definition}[Cycle Semantics]\label{def:cycle-sem}
+A \emph{cycle semantics} is a tuple
+$\Sigma = (\ML, P, \delta, \alpha)$ where
+\begin{itemize}
+  \item $\ML$ is the maturity lattice (\cref{def:lattice});
+  \item $P = (\Verify, \Analyze, \Extend, \ReVerify)$ is the phase sequence
+    (\cref{def:phases});
+  \item $\delta : P \to P$ is the phase-transition function;
+  \item $\alpha : \ML \times \mathcal{H} \to \ML$ is the
+    \emph{advancement function} that takes the current level and an
+    improvement history $\mathcal{H}$ and returns the (possibly advanced)
+    level, subject to the constraint
+    $\alpha(\ell, h) \geq \ell$ for all $\ell, h$.
+\end{itemize}
+\end{definition}
+
+The advancement function $\alpha$ encodes the criteria of
+\cref{app:criteria}: it pattern-matches on the current level and tests
+whether the history satisfies the sufficient conditions for advancement.
+Its contractual guarantee $\alpha(\ell, h) \geq \ell$ is exactly the
+hypothesis required by \cref{thm:main}.
+
+\begin{proposition}[Lattice Homomorphism]\label{prop:homo}
+The mapping $\score : \mathrm{Reports} \to [0, 100]$ defined in
+\cref{eq:score} is order-preserving with respect to $\leq$ on $\ML$ and
+$\leq$ on $\mathbb{R}$: if $r_1 \leq r_2$ in the product order
+(level and gain and federation health), then
+$\score(r_1) \leq \score(r_2)$.
+\end{proposition}
+\begin{proof}
+Each summand in \cref{eq:score} is a non-negative, non-decreasing function
+of its argument.  In particular:
+(i)~$80 \cdot \lvl(r)/4$ is non-decreasing in $\lvl(r)$;
+(ii)~$10 \cdot \min(1, \overline{\gain}(r))$ is non-decreasing in
+$\overline{\gain}(r)$; and
+(iii)~$10 \cdot \fedH(r)$ is non-decreasing in $\fedH(r)$.
+A sum of non-decreasing functions is non-decreasing.
+\end{proof}
+
 % ======================================================================
 \section{Cycle Phases}\label{sec:phases}
 % ======================================================================
@@ -317,6 +373,98 @@ A \texttt{CycleRecord} is \emph{closed} once \texttt{is\_complete} becomes
 true.  Closed records are archived in the \texttt{MatureSystem.improvement\_history}
 list and contribute to advancement decisions.
 
+\subsection{Algorithm: Cycle Advancement}\label{sec:algo-advance}
+
+\Cref{alg:advance} gives the pseudocode for the level-advancement decision
+that runs at the end of each improvement cycle.  The algorithm inspects the
+accumulated history and federation state, and either increments the level
+by one or leaves it unchanged.
+
+\begin{algorithm}[H]
+\caption{Level advancement after a completed cycle.}\label{alg:advance}
+\begin{algorithmic}[1]
+\Require Current level $\ell \in \ML$, improvement history $H$,
+         federation state $F$
+\Ensure  Updated level $\ell' \geq \ell$
+\Function{AdvanceLevel}{$\ell, H, F$}
+  \State $n \gets |H|$ \Comment{total completed cycles}
+  \State $n_{\mathrm{sig}} \gets |\{c \in H : c.\mathrm{gain} > \gainT\}|$
+  \State $K \gets \{c.\mathrm{kind} : c \in H\}$
+  \State $\bar{g} \gets \frac{1}{n}\sum_{c \in H} c.\mathrm{gain}$
+  \If{$\ell = \Proto$ \textbf{and} $n_{\mathrm{sig}} \geq 3$}
+    \State \Return $\Oper$
+  \ElsIf{$\ell = \Oper$ \textbf{and} $n \geq 5$ \textbf{and}
+    $|K| \geq 2$ \textbf{and} $F \neq \bot$}
+    \State \Return $\Fed$
+  \ElsIf{$\ell = \Fed$ \textbf{and} $\fedH(F) \geq 0.6$
+    \textbf{and} $n \geq 7$}
+    \State \Return $\SelfImp$
+  \ElsIf{$\ell = \SelfImp$ \textbf{and} $n \geq 10$
+    \textbf{and} $\bar{g} \geq 0.08$ \textbf{and} $|K| = 5$}
+    \State \Return $\Matur$
+  \Else
+    \State \Return $\ell$ \Comment{no change}
+  \EndIf
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\noindent
+Correctness of \cref{alg:advance} with respect to \cref{thm:main} follows
+from the fact that every \textbf{return} statement yields a value
+$\ell' \geq \ell$: the first four branches each return exactly the successor
+of $\ell$ in the total order $\ML$, and the \textbf{else} branch returns
+$\ell$ itself.
+
+\subsection{Algorithm: Stale-Doctrine Detection}\label{sec:algo-stale}
+
+A doctrine entry is \emph{stale} if it has not been exercised (i.e.\ matched
+against any verification target) for a configurable number of cycles.
+Stale entries inflate the capability count without contributing to the pass
+rate, and may mask regressions.  \Cref{alg:stale} detects stale entries
+by comparing each capability's last-used cycle index against the current
+cycle count.
+
+\begin{algorithm}[H]
+\caption{Stale-doctrine detection.}\label{alg:stale}
+\begin{algorithmic}[1]
+\Require Capability set $C$, current cycle index $i_{\mathrm{now}}$,
+         usage map $U : C \to \mathbb{N}$ (last-used cycle index per capability),
+         staleness window $w \in \mathbb{N}$
+\Ensure  Set of stale capabilities $S \subseteq C$
+\Function{DetectStale}{$C, i_{\mathrm{now}}, U, w$}
+  \State $S \gets \emptyset$
+  \For{$c \in C$}
+    \If{$i_{\mathrm{now}} - U(c) > w$}
+      \State $S \gets S \cup \{c\}$
+    \EndIf
+  \EndFor
+  \State \Return $S$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\noindent
+In practice the staleness window $w$ is set to $\max(3, \lfloor n/4 \rfloor)$
+where $n$ is the total number of completed cycles, so that the window grows
+logarithmically with the history length.  Stale capabilities are not removed
+(that would violate \cref{prop:expand}); instead they are flagged in the
+\texttt{CycleRecord} so that the \Analyze{} phase can prioritise re-targeting
+them.
+
+\begin{proposition}[Staleness Soundness]\label{prop:stale}
+If a capability $c$ is flagged as stale by \cref{alg:stale}, then $c$ has
+not been matched against any verification target in the most recent $w$
+cycles.
+\end{proposition}
+\begin{proof}
+The usage map $U$ is updated whenever a capability is matched during
+\Verify{} or \ReVerify{}.  If $c$ was matched in any cycle
+$j \in [i_{\mathrm{now}} - w,\; i_{\mathrm{now}}]$, then
+$U(c) \geq i_{\mathrm{now}} - w$, so the condition on line~4 is false and
+$c$ is not flagged.  Contrapositive gives the claim.
+\end{proof}
+
 % ======================================================================
 \section{Capability Expansion}\label{sec:capability}
 % ======================================================================
@@ -386,6 +534,78 @@ we have $C_0 \subseteq C_1 \subseteq \cdots \subseteq C_k$.
 By \cref{def:expand}, each call adds to the existing set without removing
 elements.  Transitivity of $\subseteq$ gives the chain.
 \end{proof}
+
+\subsection{Worked Example: Three Improvement Cycles}\label{sec:worked}
+
+We now trace through three complete improvement cycles to illustrate how
+the capability set, maturity score, and maturity level evolve.  This
+example uses concrete numeric values consistent with the advancement
+criteria listed in \cref{app:criteria}.
+
+\paragraph{Initial state ($i = 0$).}
+The system starts at level $\Proto$ with an initial capability set
+$C_0 = \{\texttt{type\_check},\, \texttt{contract\_verify}\}$
+(2 capabilities), pass rate $p_0 = 0.72$, and maturity score
+$\score_0 = 80 \cdot \tfrac{0}{4} + 10 \cdot 0 + 10 \cdot 0 = 0$.
+
+\paragraph{Cycle 1 ($\Proto \to \Oper$).}
+\begin{enumerate}
+  \item \Verify{}: run doctrine on 300 targets. Result: 216 pass, 63 fail,
+    21 unknown ($p = 0.72$).
+  \item \Analyze{}: root-cause analysis identifies 3 high-priority
+    opportunities: \texttt{smt\_bitvec}, \texttt{array\_theory},
+    \texttt{null\_safety}.
+  \item \Extend{}: \texttt{CapabilityExpander.expand} adds all three.
+    $C_1 = C_0 \cup \{\texttt{smt\_bitvec},\,\texttt{array\_theory},\,
+    \texttt{null\_safety}\}$, $|C_1| = 5$.
+  \item \ReVerify{}: re-run on 300 targets. Result: 258 pass ($p = 0.86$).
+    Gain $g_1 = 0.86 - 0.72 = 0.14 > \gainT = 0.05$ (significant).
+\end{enumerate}
+After recording 3 significant sub-cycles within this macro-cycle,
+\texttt{advance\_level} checks $\Proto \to \Oper$ criteria (need $\geq 3$
+significant cycles) and advances.  New level: $\Oper$.  Score:
+$\score_1 = 80 \cdot \tfrac{1}{4} + 10 \cdot \min(1, 0.14)
+           + 10 \cdot 0 = 20 + 1.4 + 0 = 21.4$.
+
+\paragraph{Cycle 2 ($\Oper \to \Fed$).}
+\begin{enumerate}
+  \item \Verify{}: 258 pass, 30 fail, 12 unknown on 300 targets.
+  \item \Analyze{}: opportunities ranked: \texttt{concurrency\_model} (priority
+    0.92), \texttt{float\_precision} (0.81).
+  \item \Extend{}: both accepted. $C_2 = C_1 \cup
+    \{\texttt{concurrency\_model},\, \texttt{float\_precision}\}$, $|C_2| = 7$.
+  \item \ReVerify{}: 279 pass ($p = 0.93$). Gain $g_2 = 0.07$ (significant).
+\end{enumerate}
+After accumulating 5 total cycles across 2 distinct \texttt{ImprovementKind}
+values, and with \texttt{federation\_state} non-null (a 2-node federation was
+attached), the system advances to $\Fed$.  Score:
+$\score_2 = 80 \cdot \tfrac{2}{4} + 10 \cdot \min(1, 0.105)
+           + 10 \cdot 0.67 = 40 + 1.05 + 6.7 = 47.8$,
+where $\overline{\gain} = (0.14 + 0.07)/2 = 0.105$ and
+$\fedH = 2/3 \approx 0.67$ (2 of 3 connections active).
+
+\paragraph{Cycle 3 ($\Fed \to \SelfImp$).}
+\begin{enumerate}
+  \item \Verify{}: 279 pass, 15 fail, 6 unknown.
+  \item \Analyze{}: single high-priority opportunity
+    \texttt{termination\_proof} (0.95).
+  \item \Extend{}: accepted. $C_3 = C_2 \cup \{\texttt{termination\_proof}\}$,
+    $|C_3| = 8$.
+  \item \ReVerify{}: 291 pass ($p = 0.97$). Gain $g_3 = 0.04$ (not
+    individually significant, but the running mean gain
+    $\overline{g} = 0.083$ and we have $\geq 7$ cycles).
+\end{enumerate}
+Federation health $\fedH = 0.67 \geq 0.6$, and total cycles $= 7$, so
+the system advances to $\SelfImp$.  Score:
+$\score_3 = 80 \cdot \tfrac{3}{4} + 10 \cdot \min(1, 0.083)
+           + 10 \cdot 0.67 = 60 + 0.83 + 6.7 = 67.5$.
+
+\paragraph{Summary.}
+The three-cycle trace demonstrates the key invariants: the capability set
+grows monotonically ($|C_0| = 2 \leq |C_1| = 5 \leq |C_2| = 7 \leq
+|C_3| = 8$), the maturity level advances monotonically
+($\Proto \leq \Oper \leq \Fed \leq \SelfImp$), and the maturity score
+increases from $0$ to $67.5$.  At no point does any dimension regress.
 
 % ======================================================================
 \section{Federation Coordination}\label{sec:federation}
@@ -463,6 +683,58 @@ Each node is assigned a \texttt{FederationRole}: \texttt{LEADER},
 \texttt{FOLLOWER}, or \texttt{OBSERVER}.  The leader initiates consensus
 rounds; followers vote; observers receive synchronised state but do not vote.
 Role assignment is static within a round but may change between rounds.
+
+\subsection{Orchestrating the Full Cycle}
+
+The classes described in Sections~\ref{sec:maturity}--\ref{sec:federation}
+are composed into a single orchestration loop by instantiating
+\texttt{MatureSystem}, attaching a \texttt{FederationState}, and driving
+improvement cycles through \texttt{MaturityAlgorithms}.  The following
+listing shows the orchestration pattern; it mirrors the loop used in the
+experimental evaluation (\cref{sec:experiments}).
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Orchestration loop composing all subsystems.}]
+def run_improvement_loop(system, algos, engine, n_cycles=3):
+    """Execute n_cycles improvement cycles on the given system.
+
+    Returns a list of (cycle, advanced) pairs.
+    """
+    results = []
+    for i in range(n_cycles):
+        # Phase 0 (VERIFY): collect current metrics
+        before = algos.maturity_assessment(system)
+
+        # Phase 1 (ANALYSE) + Phase 2 (EXTEND): improvement step
+        step = algos.improvement_step(system)
+
+        # Phase 3 (RE-VERIFY): collect updated metrics
+        after = algos.maturity_assessment(system)
+
+        # Record evidence
+        gain = estimate_improvement_gain(
+            before.get("metrics", {}), after.get("metrics", {}))
+        kind = _select_kind(i)  # rotate through ImprovementKind
+        cycle = ImprovementCycle.create(kind, before, after)
+        system.record_improvement(cycle)
+        engine.increment_cycle()
+        engine.record_metrics({"gain": gain, "cycle": i})
+
+        # Attempt level advancement
+        advanced = system.advance_level()
+        results.append((cycle, advanced))
+
+        # Federation sync if applicable
+        if system.federation_state is not None:
+            algos.federation_sync(system)
+    return results
+\end{lstlisting}
+
+The orchestration loop realises the abstract phase sequence
+$\Verify \to \Analyze \to \Extend \to \ReVerify$ from \cref{def:phases}:
+the \texttt{maturity\_assessment} calls correspond to \Verify{} and
+\ReVerify{}, while \texttt{improvement\_step} covers \Analyze{} and
+\Extend{}.
 
 % ======================================================================
 \section{Deployment Validation}\label{sec:deployment}
@@ -598,6 +870,48 @@ $\ell_i = \Matur$ for all $i$ large enough.
 $\Matur$ is the maximum of $\ML$, so \texttt{advance\_level} at level $\Matur$
 always returns $\Matur$ unchanged (there is no next level to advance to).
 The sequence is therefore eventually constant.
+\end{proof}
+
+\subsection{Product-Lattice Extension}
+
+The single-node monotonicity result lifts to a product lattice when
+multiple quality dimensions are tracked simultaneously.  Let
+$\mathcal{D} = \{d_1, \ldots, d_m\}$ be a finite set of quality dimensions
+(e.g.\ capability count, pass rate, latency reciprocal), and let
+$L = \ML \times \mathbb{R}_{\geq 0}^{m}$ be the product lattice with the
+componentwise order
+\[
+  (\ell, \mathbf{v}) \;\leq\; (\ell', \mathbf{v}')
+  \quad\Longleftrightarrow\quad
+  \ell \leq \ell' \;\;\text{and}\;\; v_j \leq v'_j
+  \;\;\text{for all } 1 \leq j \leq m.
+\]
+
+\begin{proposition}[Product Monotonicity]\label{prop:product}
+If each dimension $d_j$ is updated by a monotone function
+$f_j : \mathbb{R}_{\geq 0} \to \mathbb{R}_{\geq 0}$ (i.e.\
+$x \leq f_j(x)$ for all $x$), and the level is updated by
+\texttt{advance\_level}, then the composite state
+$(\ell_i, \mathbf{v}_i)$ forms a non-decreasing chain in~$L$.
+\end{proposition}
+\begin{proof}
+By \cref{thm:main}, $\ell_i \leq \ell_{i+1}$.  By hypothesis,
+$v_{i,j} \leq f_j(v_{i,j}) = v_{i+1,j}$ for each $j$.  Hence
+$(\ell_i, \mathbf{v}_i) \leq (\ell_{i+1}, \mathbf{v}_{i+1})$ in the
+product order.
+\end{proof}
+
+This product-lattice view justifies recording per-dimension metrics
+(pass rate, latency, capability count) alongside the discrete level: the
+entire state vector is monotone, not just its first component.
+
+\begin{corollary}[Dimension-Wise No-Regression]\label{cor:dimwise}
+Under the hypotheses of \cref{prop:product}, no individual quality
+dimension $d_j$ can regress across cycles:
+$v_{i,j} \leq v_{i+1,j}$ for all $i$ and all $j$.
+\end{corollary}
+\begin{proof}
+Immediate from the componentwise order on $L$.
 \end{proof}
 
 \begin{corollary}[Regression-Free History]\label{cor:hist}
@@ -812,6 +1126,127 @@ theorem monoMaturity (sys : CyclicSystem) (i : Nat) :
 The helper lemma \texttt{advanceLevel\_ge} establishes that
 \texttt{advanceLevel $\ell \geq \ell$} for every $\ell$, and is proved by
 case analysis on the five constructors of \texttt{MaturityLevel}.
+
+% ======================================================================
+\section{Python API Reference}\label{app:api}
+% ======================================================================
+
+This appendix documents the top-level Python API that clients use to
+instantiate a maturity system, execute improvement cycles, and query
+maturity state.  All classes reside in
+\texttt{jugeo.maturity.cyclic\_picture}.
+
+\subsection{End-to-End Orchestration}
+
+The following listing shows how a caller composes the core classes—\texttt{MatureSystem},
+\texttt{MaturityAlgorithms}, \texttt{SelfImprovingEngine}, and
+\texttt{FederationState}—into a complete orchestration loop that drives
+three improvement cycles, records evidence, and attempts level advancement
+after each cycle.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={End-to-end orchestration of three improvement cycles.}]
+from jugeo.maturity.cyclic_picture.models import (
+    MatureSystem, ImprovementCycle, ImprovementKind,
+    FederationState, SelfImprovingEngine, MaturityLevel,
+)
+from jugeo.maturity.cyclic_picture.algorithms import (
+    MaturityAlgorithms, estimate_improvement_gain,
+    compute_federation_health, rank_improvement_opportunities,
+)
+
+# 1. Bootstrap a fresh system at PROTOTYPE level
+system = MatureSystem.create("demo-node-01")
+engine = SelfImprovingEngine.create(improvement_strategy="greedy_gain")
+algos  = MaturityAlgorithms.create({"gain_threshold": 0.05})
+
+# 2. Attach a federation once operational
+fed = FederationState.create(consensus_threshold=0.67)
+fed.add_node("demo-node-01")
+fed.add_node("peer-node-02")
+system.federation_state = fed
+
+# 3. Run three improvement cycles
+kinds = [ImprovementKind.CAPABILITY,
+         ImprovementKind.COVERAGE,
+         ImprovementKind.RELIABILITY]
+
+for i, kind in enumerate(kinds):
+    before = {"pass_rate": 0.80 + 0.05 * i, "latency": 1.2 - 0.1 * i}
+    step   = algos.improvement_step(system)
+    after  = {"pass_rate": before["pass_rate"] + 0.06,
+              "latency":  before["latency"] - 0.15}
+
+    cycle = ImprovementCycle.create(kind, before, after)
+    system.record_improvement(cycle)
+    engine.increment_cycle()
+    engine.record_metrics({"gain": cycle.gain, "kind": kind.value})
+
+    advanced = system.advance_level()
+    print(f"Cycle {i}: level={system.maturity_level.name}, "
+          f"gain={cycle.gain:.3f}, advanced={advanced}")
+\end{lstlisting}
+
+\subsection{Querying Maturity State}
+
+After cycles have been recorded, \texttt{MaturityAlgorithms} provides
+read-only assessment functions.
+
+\begin{lstlisting}[style=jugeo-python,
+  caption={Maturity assessment and projection.}]
+from jugeo.maturity.cyclic_picture.models import MaturityReport
+
+# Build an immutable maturity report
+report = MaturityReport.create(
+    system_id=system.system_id,
+    level=system.maturity_level,
+    cycles=tuple(system.improvement_history),
+    federation_state=system.federation_state,
+)
+
+# Scalar maturity score in [0, 100]
+score = algos.compute_maturity_score(report)
+
+# Projected next level and estimated cycles remaining
+next_lvl    = algos.project_next_level(system)
+cycles_left = algos.estimate_cycles_to_next_level(system)
+
+# Rank improvement opportunities for the next cycle
+opps = [{"capability": "smt_bitvec", "priority": 0.9},
+        {"capability": "array_theory", "priority": 0.7}]
+ranked = rank_improvement_opportunities(opps)
+
+print(f"Score: {score:.1f}, next level: {next_lvl}, "
+      f"est. cycles: {cycles_left}")
+print(f"Top opportunity: {ranked[0]['capability']}")
+\end{lstlisting}
+
+\subsection{API Invariants}
+
+The following invariants are maintained by the API at all times and may be
+relied upon by callers:
+
+\begin{enumerate}
+  \item \textbf{Monotonic level.}  After any call to
+    \texttt{MatureSystem.advance\_level()}, the system's maturity level is
+    greater than or equal to its value before the call
+    (\cref{thm:main}).
+
+  \item \textbf{Monotonic capability set.}  After any call to
+    \texttt{CapabilityExpander.expand(opp)}, the set of capabilities is a
+    superset of its previous value (\cref{prop:expand}).
+
+  \item \textbf{Append-only history.}  The list
+    \texttt{improvement\_history} is append-only; elements are never
+    removed or reordered.
+
+  \item \textbf{Immutable cycles.}  Each \texttt{ImprovementCycle} is a
+    frozen dataclass; its fields cannot be mutated after construction.
+
+  \item \textbf{Federation consistency.}  When a federation quorum is
+    reached, the resulting state update is applied atomically to all
+    participating nodes (\cref{thm:fed}).
+\end{enumerate}
 
 \bibliographystyle{plain}
 \begin{thebibliography}{9}

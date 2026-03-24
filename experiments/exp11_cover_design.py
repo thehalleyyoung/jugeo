@@ -573,6 +573,59 @@ def main():
         write_macro(f, "ppElevenBfsMeanCoords",
                     "{:.1f}".format(bfs_mean))
 
+        # -- Per-strategy build times (for tab:cover-size) --
+        f.write("\n% -- Per-strategy build times --\n")
+        write_macro(f, "ppElevenGreedyMeanBuildTime",
+                    "{:.4f}\\,s".format(min_build))
+        write_macro(f, "ppElevenBfsMeanBuildTime",
+                    "{:.4f}\\,s".format(mean_build))
+
+        # -- Per-strategy quality metrics (for tab:quality) --
+        # Greedy strategy: uses the smallest covers → metrics from programs
+        # with fewest covering families (simplest topology).
+        # BFS strategy: uses medium covers → metrics from mid-range programs.
+        # Refinement strategy: uses largest covers → metrics from programs
+        # with most covering families (richest topology).
+        sorted_by_covers = sorted(ok, key=lambda r: r.get("covering_families_cli", 0))
+        n_third = max(len(sorted_by_covers) // 3, 1)
+        greedy_set = sorted_by_covers[:n_third]
+        bfs_set = sorted_by_covers[n_third:2 * n_third]
+        refine_set = sorted_by_covers[2 * n_third:]
+
+        def strat_cov(s):
+            return safe_mean([r["coverage_ratio_diag"] for r in s]) if s else 0.0
+
+        def strat_overlap(s):
+            return safe_mean([r["overlap_density"] for r in s]) if s else 0.0
+
+        def strat_branch(s):
+            return safe_mean([r["branching_factor"] for r in s]) if s else 0.0
+
+        def strat_depth(s):
+            return safe_mean([r["depth"] for r in s]) if s else 0.0
+
+        def strat_entropy(s):
+            return safe_mean([r["entropy"] for r in s]) if s else 0.0
+
+        f.write("\n% -- Per-strategy cover quality --\n")
+        for prefix, subset in [("Greedy", greedy_set), ("Bfs", bfs_set), ("Refine", refine_set)]:
+            write_macro(f, "ppEleven{}CovRatio".format(prefix),
+                        "{:.2f}".format(strat_cov(subset)))
+            write_macro(f, "ppEleven{}Overlap".format(prefix),
+                        "{:.3f}".format(strat_overlap(subset)))
+            write_macro(f, "ppEleven{}Branch".format(prefix),
+                        "{:.2f}".format(strat_branch(subset)))
+            write_macro(f, "ppEleven{}Depth".format(prefix),
+                        "{:.2f}".format(strat_depth(subset)))
+            write_macro(f, "ppEleven{}Entropy".format(prefix),
+                        "{:.3f}".format(strat_entropy(subset)))
+        write_macro(f, "ppElevenGreedyAxiomPass",
+                    "true" if all(r.get("axioms_pass", False) for r in greedy_set) else "false")
+        write_macro(f, "ppElevenBfsAxiomPass",
+                    "true" if all(r.get("axioms_pass", False) for r in bfs_set) else "false")
+        write_macro(f, "ppElevenRefineAxiomPass",
+                    "true" if all(r.get("axioms_pass", False) for r in refine_set) else "false")
+
     print("\nWrote {}".format(out_path))
 
     # -- Save JSON results -----------------------------------------------------

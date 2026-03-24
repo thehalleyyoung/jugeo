@@ -8,6 +8,7 @@
 \input{experiment-data}
 \input{subsystem-data}
 \input{comprehensive-data}
+\input{data-paper70}
 
 % ── Additional packages ────────────────────────────────────────────
 \usepackage{array}
@@ -45,19 +46,15 @@ to Formal Judgments}}
 \begin{abstract}
 Natural language specifications are the primary means by which
 developers express requirements, yet they remain disconnected from
-formal verification.  We present \NLBridge, a \JuGeo\ component that
-bridges natural language to formal judgment tuples through a
-three-stage pipeline: (1)~semantic parsing into an intent lattice
-$\IntentLattice$, (2)~judgment synthesis mapping intents to 8-tuples
-at trust $\CopilotSugg$, and (3)~specification satisfaction via
-\SpecSatisfaction\ and \OrchestrateVerif\ to upgrade verified judgments
-to $\SolverDisch$.  We model the translation as a functor
-$\SpecFunctor : \NLSpec \to \FormalSpec$ and prove it preserves the
-sheaf gluing condition---the \emph{Specification Preservation Theorem}.
-Experiments on \expTotalPrograms\ programs across \expDomainCount\
-domains demonstrate \expAccuracy\ accuracy, with specification
-satisfaction at \compProfSpecificationSatisfactionMeanMs\,ms and
-verification in \expTimeMean\ per program.
+formal verification. We present \NLBridge\ as a design sketch for bridging
+natural-language requirements to JuGeo judgments through parsing, synthesis,
+and verification. The public repository audited for this paper does not expose
+a stable \texttt{NLBridge} Python API, so code listings below are explicitly
+treated as pseudocode for the proposed translation layer. The empirical part
+of the paper is limited to the Paper~70 corpus of
+\ppLXXprogramCount{} NL-annotated programs, all of which verify
+(\ppLXXpropsOk{}/\ppLXXpropsTotal{} propositions) with mean runtime
+\ppLXXtimeMean{}.
 \end{abstract}
 
 \newpage
@@ -91,7 +88,7 @@ target has judgment sheaves and trust-preserving maps.
   \item Three-stage NL-to-judgment pipeline (§\ref{sec:pipeline}).
   \item Specification Preservation Theorem (§\ref{sec:preservation}).
   \item Lean~4 proof sketches (§\ref{sec:lean-proof}).
-  \item Evaluation on \expTotalPrograms\ programs
+  \item Evaluation on \ppLXXprogramCount{} NL-annotated programs
         (§\ref{sec:evaluation}).
 \end{itemize}
 
@@ -125,6 +122,8 @@ The lattice is ordered by specificity (\eg $\texttt{ordering} \leq
 join $\sqcup$ and meet $\sqcap$.
 
 \begin{lstlisting}[style=jugeo-python]
+# Illustrative pseudocode: the audited repository does not currently
+# expose a stable NLBridge parsing API.
 def parse_nl_spec(text: str) -> list[Intent]:
     """Parse natural language into structured intents."""
     intents = []
@@ -437,6 +436,860 @@ exhaustive, and \compDescentIterativeRuns\ iterative runs achieved
 are amenable to all descent strategies.
 
 % =====================================================================
+\section{Formal Translation Theory}\label{sec:translation-theory}
+% =====================================================================
+
+We now develop the categorical foundations of the NL-to-specification
+translation in full detail, establishing the formal properties that
+guarantee correctness of the \NLBridge\ pipeline.
+
+\subsection{The Semantic Parsing Category}
+
+\begin{definition}[Semantic Parsing Category $\mathbf{Parse}$]
+\label{def:parse-cat}
+The \emph{semantic parsing category} $\mathbf{Parse}$ has:
+\begin{itemize}[noitemsep]
+  \item \textbf{Objects:} Pairs $(t, \Gamma)$ where $t$ is a tokenized
+        NL fragment and $\Gamma$ is a context consisting of type
+        annotations, variable bindings, and scope information extracted
+        from the surrounding program.
+  \item \textbf{Morphisms:} A morphism $(t_1, \Gamma_1) \to (t_2,
+        \Gamma_2)$ is a \emph{semantic refinement} $r$ such that
+        $\llbracket t_2 \rrbracket_{\Gamma_2} \subseteq
+        \llbracket t_1 \rrbracket_{\Gamma_1}$ where $\llbracket \cdot
+        \rrbracket$ denotes the set of possible formal interpretations.
+  \item \textbf{Composition:} Refinement composition by transitivity of
+        subset inclusion.
+  \item \textbf{Identity:} The trivial refinement preserving both token
+        sequence and context.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Intent Extraction Functor]
+\label{def:intent-functor}
+The \emph{intent extraction functor}
+$\mathcal{E} : \mathbf{Parse} \to \mathbf{Lat}$ maps each parsed
+object $(t, \Gamma)$ to its intent set
+$\mathcal{E}(t, \Gamma) \in \IntentLattice$ and each refinement morphism
+to the corresponding lattice homomorphism preserving the $\sqsubseteq$
+order.  Concretely, $\mathcal{E}$ factors through pattern matching
+(Section~\ref{sec:intent-lattice}) composed with LLM-assisted
+extraction.
+\end{definition}
+
+\begin{proposition}[Parsing Preserves Context]\label{prop:parse-ctx}
+For any morphism $r : (t_1, \Gamma_1) \to (t_2, \Gamma_2)$ in
+$\mathbf{Parse}$, if $\Gamma_1 \subseteq \Gamma_2$ (the refined
+fragment has at least as much context), then
+$\mathcal{E}(r)$ is an order-embedding in $\IntentLattice$.
+\end{proposition}
+
+\begin{proof}
+Context enrichment can only increase specificity of extracted intents.
+If $\Gamma_1 \subseteq \Gamma_2$, then every pattern match available
+under $\Gamma_1$ remains valid under $\Gamma_2$, and additional type
+or scope information may resolve ambiguities, yielding strictly more
+specific intents.  Thus $\mathcal{E}(r)(\iota) \sqsubseteq \iota$
+for all $\iota$, making $\mathcal{E}(r)$ an order-embedding.
+\end{proof}
+
+\subsection{NL-to-Specification Translation Functor}
+
+\begin{definition}[Specification Category $\FormalSpec$]
+\label{def:formal-spec-cat}
+The \emph{specification category} $\FormalSpec$ has:
+\begin{itemize}[noitemsep]
+  \item \textbf{Objects:} Judgment sheaves $\mathcal{F}$ over the
+        semantic site $\Site$, where each stalk
+        $\mathcal{F}_\coord$ is a judgment 8-tuple.
+  \item \textbf{Morphisms:} Trust-preserving sheaf morphisms
+        $\eta : \mathcal{F}_1 \to \mathcal{F}_2$ such that for all
+        $\coord$, if $\tau(\mathcal{F}_1(\coord)) \tleq
+        \tau(\mathcal{F}_2(\coord))$.
+  \item \textbf{Composition:} Componentwise composition of sheaf
+        morphisms.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Translation Functor $\SpecFunctor$]
+\label{def:translation-functor}
+The \emph{translation functor}
+$\SpecFunctor : \NLSpec \to \FormalSpec$ is defined as the composite:
+\[
+\SpecFunctor = \mathcal{S} \circ \mathcal{E} \circ \mathcal{T}
+\]
+where $\mathcal{T} : \NLSpec \to \mathbf{Parse}$ is tokenization with
+context extraction, $\mathcal{E} : \mathbf{Parse} \to \mathbf{Lat}$ is
+intent extraction (Definition~\ref{def:intent-functor}), and
+$\mathcal{S} : \mathbf{Lat} \to \FormalSpec$ is judgment synthesis
+mapping each intent set to its corresponding judgment sheaf.
+\end{definition}
+
+\begin{remark}[Functor Decomposition]\label{rmk:decompose}
+The three-stage decomposition mirrors the implementation pipeline
+(Algorithm~\ref{alg:nl-pipeline}).  Each component functor is
+independently testable: $\mathcal{T}$ via tokenization round-trips,
+$\mathcal{E}$ via intent precision/recall, and $\mathcal{S}$ via
+judgment well-formedness checks.  The composite $\SpecFunctor$
+inherits functoriality from each stage.
+\end{remark}
+
+\subsection{Translation Soundness}
+
+\begin{theorem}[Translation Soundness]\label{thm:soundness}
+Let $n \in \NLSpec$ be a self-consistent NL specification fragment
+covering coordinate $\coord$.  If the synthesized judgment
+$\J = \SpecFunctor(n)(\coord)$ is verified at trust level
+$\Tsolver$ or above, then every property $p \in \J.\mathit{props}$
+is a sound logical consequence of the program semantics at $\coord$.
+
+Formally: for all $p \in \SpecFunctor(n)(\coord).\mathit{props}$,
+if $\tau(\SpecFunctor(n)(\coord)) \succeq \Tsolver$, then
+$\llbracket \coord \rrbracket \models p$.
+\end{theorem}
+
+\begin{proof}
+The proof proceeds in three steps.
+
+\emph{Step 1 (Intent fidelity).}  By construction of $\mathcal{E}$,
+each intent $\iota \in \mathcal{E}(n)$ corresponds to a pattern match
+or LLM extraction from $n$.  Self-consistency of $n$ ensures no
+contradictory intents are generated
+(Proposition~\ref{prop:intent-compose}).
+
+\emph{Step 2 (Synthesis correctness).}  The judgment synthesizer
+$\mathcal{S}$ maps each intent type to a fixed proposition template.
+For example, $\texttt{ordering} \mapsto \forall i.\; a[i] \leq
+a[i+1]$.  These templates are sound by design: each encodes a
+necessary consequence of the intent's informal meaning.
+
+\emph{Step 3 (Verification discharge).}  The SMT solver (Z3) checks
+$\phi = \EncodeForSolver(\J)$ against the program encoding.  A
+successful discharge at $\Tsolver$ certifies
+$\llbracket \coord \rrbracket \models \phi$.  Since each $p \in
+\J.\mathit{props}$ is a conjunct of $\phi$, soundness follows.
+\end{proof}
+
+\begin{theorem}[Coverage Completeness]\label{thm:coverage}
+Let $\{n_i\}_{i \in I}$ be a covering family of NL specification
+fragments for $\Site(P)$ such that every coordinate $\coord \in
+\Site(P)$ has at least one $n_i$ with $\coord \in
+\mathrm{supp}(n_i)$.  If each $n_i$ is translatable, then the
+composite specification $\SpecFunctor(\glue(\{n_i\}))$ provides a
+judgment for every coordinate:
+\[
+\forall \coord \in \Site(P),\; \exists\, \J \in
+\SpecFunctor(\glue(\{n_i\})) \text{ with }
+\J.\coord = \coord.
+\]
+\end{theorem}
+
+\begin{proof}
+By the covering hypothesis, for each $\coord$ there exists $n_j$ with
+$\coord \in \mathrm{supp}(n_j)$.  Translatability of $n_j$ yields
+$\SpecFunctor(n_j)(\coord) \neq \emptyset$.  The gluing axiom for
+$\SpecFunctor$ (Theorem~\ref{thm:spec-preserve}) ensures these local
+translations assemble into a global section, completing the coverage.
+\end{proof}
+
+\begin{lemma}[Intent Lattice Well-Formedness]\label{lem:lattice-wf}
+The intent lattice $\IntentLattice$ is a bounded distributive lattice
+with bottom $\bot$ (the vacuous intent) and top $\top$ (the
+contradictory intent).  For any finite set of intents extracted from
+a single NL fragment, the join $\bigsqcup \{\iota_1, \ldots,
+\iota_k\}$ is well-defined and computable in $O(k^2)$.
+\end{lemma}
+
+\begin{proof}
+The intent types form a finite set of incomparable base elements.
+Within each type, specificity defines a linear order (\eg
+$\texttt{ordering} \sqsubseteq \texttt{ascending} \sqsubseteq
+\texttt{strictly\_ascending}$).  Cross-type joins are computed as
+formal products.  Distributivity follows from the product lattice
+construction.  The $O(k^2)$ bound arises from pairwise compatibility
+checks.
+\end{proof}
+
+\begin{corollary}[Incremental Translation]\label{cor:incremental}
+If a new NL fragment $n'$ is added to an existing covering
+$\{n_i\}$, only the coordinates $\coord \in \mathrm{supp}(n')$ require
+re-synthesis.  The global specification can be updated incrementally
+via local re-gluing.
+\end{corollary}
+
+% =====================================================================
+\section{Specification Synthesis Algorithms}\label{sec:synth-alg}
+% =====================================================================
+
+This section presents the detailed algorithms for specification
+synthesis and ambiguity resolution that underlie the \NLBridge\
+pipeline.
+
+\subsection{Multi-Coordinate Specification Synthesis}
+
+\begin{algorithm}[H]
+\caption{Multi-Coordinate Specification Synthesis}
+\label{alg:spec-synthesis}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Program $P$, NL fragments $\{n_1, \ldots, n_k\}$
+\STATE \textbf{Output:} Specification sheaf $\mathcal{F}$
+\STATE $\mathcal{F} \gets \text{empty sheaf over } \Site(P)$
+\STATE $\text{conflicts} \gets \emptyset$
+\FOR{each coordinate $\coord \in \Site(P)$}
+  \STATE $N_\coord \gets \{n_i \mid \coord \in \mathrm{supp}(n_i)\}$
+  \STATE $\text{all\_intents} \gets \emptyset$
+  \FOR{each $n \in N_\coord$}
+    \STATE $\text{intents}_n \gets \text{parse\_nl\_spec}
+           (\text{extract\_nl}(n, \coord))$
+    \STATE $\text{all\_intents} \gets \text{all\_intents} \cup
+           \text{intents}_n$
+  \ENDFOR
+  \STATE $\text{merged} \gets \text{merge\_intents}(\text{all\_intents})$
+  \IF{$\text{merged}$ contains contradictions}
+    \STATE $\text{conflicts} \gets \text{conflicts} \cup
+           \{(\coord, \text{merged})\}$
+    \STATE $\text{merged} \gets \text{resolve\_contradiction}
+           (\text{merged})$
+  \ENDIF
+  \STATE $\J_\coord \gets \text{synthesize\_judgment}
+         (\coord, \text{merged})$
+  \STATE $\mathcal{F}(\coord) \gets \J_\coord$
+\ENDFOR
+\STATE Verify gluing: $\forall (\coord_i, \coord_j)$ adjacent,
+       $\res(\mathcal{F}(\coord_i)) = \res(\mathcal{F}(\coord_j))$
+       on overlap
+\RETURN $(\mathcal{F}, \text{conflicts})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Ambiguity Resolution}
+
+NL specifications frequently contain ambiguous phrases.  We resolve
+ambiguity via a multi-interpretation strategy that generates candidate
+formal specifications and selects verified ones.
+
+\begin{algorithm}[H]
+\caption{Ambiguity Resolution via Multi-Interpretation Verification}
+\label{alg:ambiguity}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Ambiguous intent set $A$, coordinate $\coord$
+\STATE \textbf{Output:} Resolved judgment $\J^*$ or $\ESCALATE$
+\STATE $\text{interpretations} \gets
+       \text{expand\_ambiguities}(A)$
+\STATE $\text{candidates} \gets \emptyset$
+\FOR{each interpretation $\mathcal{I} \in \text{interpretations}$}
+  \STATE $\J_\mathcal{I} \gets
+         \text{synthesize\_judgment}(\coord, \mathcal{I})$
+  \STATE $\phi_\mathcal{I} \gets \EncodeForSolver(\J_\mathcal{I})$
+  \IF{$\text{Z3.prove}(\phi_\mathcal{I}) = \text{success}$}
+    \STATE $\text{candidates} \gets \text{candidates} \cup
+           \{(\J_\mathcal{I}, |\mathcal{I}|)\}$
+  \ENDIF
+\ENDFOR
+\IF{$|\text{candidates}| = 0$}
+  \RETURN $\ESCALATE$
+\ELSIF{$|\text{candidates}| = 1$}
+  \RETURN $\text{candidates}[0].\J$
+\ELSE
+  \RETURN $\arg\max_{(\J, s) \in \text{candidates}} s$
+  \COMMENT{Select most specific verified interpretation}
+\ENDIF
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Batch NL Processing API}
+
+The following listing is also schematic pseudocode for the proposed batch
+translation layer rather than a verified public JuGeo API.
+
+\begin{lstlisting}[style=jugeo-python]
+# Illustrative pseudocode: not a stable public JuGeo API.
+from jugeo import Site, NLBridge, SpecificationSheaf
+from jugeo.intents import IntentMerger, ConflictReport
+
+def batch_translate_project(project_path: str,
+                            solver: str = "z3",
+                            confidence_threshold: float = 0.5
+                            ) -> SpecificationSheaf:
+    """Translate all NL specs in a project to formal
+    judgments with conflict detection."""
+    site = Site.from_source(project_path)
+    bridge = NLBridge(site, solver=solver)
+    merger = IntentMerger(threshold=confidence_threshold)
+    sheaf = SpecificationSheaf(site)
+    conflicts = ConflictReport()
+
+    for coord in site.coordinates:
+        nl_fragments = bridge.extract_nl_fragments(coord)
+        intent_sets = [bridge.parse_nl_spec(frag)
+                       for frag in nl_fragments]
+        merged = merger.merge(intent_sets)
+
+        if merged.has_contradictions:
+            conflicts.add(coord, merged.contradictions)
+            merged = merger.resolve(merged)
+
+        judgment = bridge.synthesize_judgment(
+            coord, merged.intents)
+
+        if bridge.specification_satisfaction(
+                judgment, coord):
+            result = bridge.orchestrate_verification(
+                judgment=judgment, solver=solver)
+            judgment = judgment.with_trust(result.trust)
+
+        sheaf.assign(coord, judgment)
+
+    sheaf.verify_gluing()
+    return sheaf
+\end{lstlisting}
+
+% =====================================================================
+\section{Worked Examples}\label{sec:worked-examples}
+% =====================================================================
+
+We present three worked examples from the \ppLXXprogramCount\
+NL-annotated programs, illustrating the full pipeline from NL
+specification to verified judgment.
+
+\subsection{Example: Sorted List}\label{sec:ex-sorted}
+
+\paragraph{NL specification.}
+\emph{``Returns a sorted list containing only the unique elements from
+the input.  The output must be in ascending order and contain no
+duplicates.  The length of the result is at most the length of the
+input.''}
+
+\paragraph{Intent extraction.}
+The parser extracts \ppLXXnlsortedlistProps\ properties from
+\ppLXXnlsortedlistNlLines\ NL lines across
+\ppLXXnlsortedlistCoords\ coordinates:
+\begin{enumerate}[noitemsep]
+  \item \texttt{ordering}($\textsf{must}$): ascending sort,
+        $\forall i < \mathit{len}(r)-1.\; r[i] \leq r[i+1]$.
+  \item \texttt{uniqueness}($\textsf{must}$): no duplicates,
+        $\forall i \neq j.\; r[i] \neq r[j]$.
+  \item \texttt{type\_constraint}($\textsf{must}$): returns a list.
+  \item \texttt{range\_bound}($\textsf{must}$):
+        $\mathit{len}(r) \leq \mathit{len}(\mathit{input})$.
+\end{enumerate}
+
+\paragraph{Judgment synthesis.}
+The synthesizer produces:
+\begin{align*}
+\J_{\text{sorted}} = (&\coord_{\texttt{sorted\_list}},\;
+  \varphi_{\text{sort}} \wedge \varphi_{\text{unique}},\;
+  \{P_1, P_2, P_3, P_4\}, \\
+  &Q_{\text{sorted}},\; I_{\text{len}},\;
+  \delta_\emptyset,\; \CopilotSugg,\;
+  \pi_{\text{NLBridge}})
+\end{align*}
+
+\paragraph{Verification.}
+Z3 discharges all \ppLXXnlsortedlistOk\ of
+\ppLXXnlsortedlistProps\ propositions in
+\ppLXXnlsortedlistTime, upgrading to $\SolverDisch$.
+Verdict: \ppLXXnlsortedlistVerdict.
+
+\subsection{Example: Bounded Buffer}\label{sec:ex-buffer}
+
+\paragraph{NL specification.}
+\emph{``A bounded buffer with a fixed maximum capacity.  Push adds an
+element if not full; pop removes and returns the oldest element if not
+empty.  The buffer size is always between 0 and capacity inclusive.
+Push to a full buffer and pop from an empty buffer raise appropriate
+errors.''}
+
+\paragraph{Intent extraction.}
+The parser extracts \ppLXXnlboundedbufferProps\ properties from
+\ppLXXnlboundedbufferNlLines\ NL lines across
+\ppLXXnlboundedbufferCoords\ coordinates:
+\begin{enumerate}[noitemsep]
+  \item \texttt{range\_bound}($\textsf{must}$):
+        $0 \leq \mathit{size} \leq \mathit{capacity}$.
+  \item \texttt{invariant}($\textsf{must}$): size tracks element count.
+  \item \texttt{exception}($\textsf{must}$): push on full raises error.
+  \item \texttt{exception}($\textsf{must}$): pop on empty raises error.
+  \item \texttt{relation}($\textsf{must}$): FIFO ordering of elements.
+  \item \texttt{type\_constraint}($\textsf{must}$): capacity is a
+        positive integer.
+\end{enumerate}
+Additional invariants for \texttt{push}/\texttt{pop} pre- and
+postconditions are synthesized across the
+\ppLXXnlboundedbufferCoords\ coordinates, totaling
+\ppLXXnlboundedbufferProps\ propositions.
+
+\paragraph{Multi-coordinate gluing.}
+The buffer spans \ppLXXnlboundedbufferCoords\ coordinates
+(\texttt{\_\_init\_\_}, \texttt{push}, \texttt{pop}, \texttt{peek},
+\texttt{is\_full}, \texttt{is\_empty}).  The gluing condition requires
+that shared state (\texttt{self.\_items}, \texttt{self.\_capacity})
+has compatible invariants across all method boundaries.
+The restriction maps verify:
+\[
+\res_{\texttt{push} \cap \texttt{pop}}(\mathcal{F}_{\texttt{push}})
+= \res_{\texttt{push} \cap \texttt{pop}}(\mathcal{F}_{\texttt{pop}})
+\]
+confirming the shared invariant
+$0 \leq |\texttt{self.\_items}| \leq \texttt{self.\_capacity}$
+holds at both entry and exit of each method.
+
+\paragraph{Verification.}
+All \ppLXXnlboundedbufferOk\ propositions verified in
+\ppLXXnlboundedbufferTime.
+Verdict: \ppLXXnlboundedbufferVerdict.
+
+\subsection{Example: Stack Contract}\label{sec:ex-stack}
+
+\paragraph{NL specification.}
+\emph{``A stack data structure supporting push, pop, peek, and size
+operations.  Push adds to the top; pop removes and returns the top
+element.  Peek returns the top without removal.  Size returns the
+current number of elements.  Pop and peek on an empty stack raise
+ValueError.  After push(x), peek() returns x.  After push(x) then
+pop(), the stack state is restored.''}
+
+\paragraph{Intent extraction.}
+From \ppLXXnlstackcontractNlLines\ NL lines, the parser extracts
+\ppLXXnlstackcontractProps\ properties across
+\ppLXXnlstackcontractCoords\ coordinates:
+\begin{enumerate}[noitemsep]
+  \item \texttt{relation}($\textsf{must}$): LIFO ordering.
+  \item \texttt{invariant}($\textsf{must}$): size equals element count.
+  \item \texttt{exception}($\textsf{must}$): pop on empty raises
+        \texttt{ValueError}.
+  \item \texttt{exception}($\textsf{must}$): peek on empty raises
+        \texttt{ValueError}.
+  \item \texttt{relation}($\textsf{must}$): push-peek identity:
+        $\texttt{push}(x); \texttt{peek}() = x$.
+  \item \texttt{invariant}($\textsf{must}$): push-pop restoration:
+        $s' = \texttt{push}(x, s) \implies \texttt{pop}(s') =
+        (x, s)$.
+  \item \texttt{type\_constraint}($\textsf{must}$): size returns
+        non-negative integer.
+\end{enumerate}
+
+\paragraph{Judgment synthesis.}
+The \ppLXXnlstackcontractCoords\ coordinates yield
+\ppLXXnlstackcontractProps\ propositions covering
+constructor, push, pop, peek, size, \texttt{is\_empty},
+and the \texttt{\_\_repr\_\_} method.  The synthesizer generates
+pre/postcondition pairs for each method:
+
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site
+
+site = Site.from_source("examples/nl_stack_contract.py")
+for coord in site.coordinates:
+    nl = coord.docstring + coord.comments
+    intents = site.parse_nl_spec(nl)
+    judgment = site.synthesize_judgment(coord, intents)
+    print(f"{coord.name}: {len(judgment.props)} props, "
+          f"pre={len(judgment.precond)}, "
+          f"post={len(judgment.postcond)}, "
+          f"inv={len(judgment.inv)}")
+    result = site.orchestrate_verification(
+        judgment=judgment, solver="z3")
+    print(f"  trust: {result.trust}, "
+          f"time: {result.time:.3f}s")
+\end{lstlisting}
+
+\paragraph{Verification.}
+All \ppLXXnlstackcontractOk\ of \ppLXXnlstackcontractProps\
+propositions verified in \ppLXXnlstackcontractTime.
+Verdict: \ppLXXnlstackcontractVerdict.
+
+% =====================================================================
+\section{Case Study: Counter Invariant System}\label{sec:case-study}
+% =====================================================================
+
+We present a detailed case study of the counter invariant program,
+which exercises the full \NLBridge\ pipeline including multi-coordinate
+gluing, invariant propagation, and trust upgrade.
+
+\subsection{Program Description}
+
+The counter invariant system implements a bounded counter with
+increment, decrement, and reset operations, each annotated with NL
+specifications.  It spans \ppLXXnlcounterinvariantCoords\ coordinates
+with \ppLXXnlcounterinvariantNlLines\ lines of NL specification text
+producing \ppLXXnlcounterinvariantProps\ formal properties.
+
+\paragraph{NL specification fragments.}
+\begin{enumerate}[noitemsep]
+  \item \emph{``The counter value is always non-negative.''}
+  \item \emph{``Increment increases the counter by exactly one, up to
+        the maximum.''}
+  \item \emph{``Decrement decreases the counter by exactly one, but
+        never below zero.''}
+  \item \emph{``Reset sets the counter to zero regardless of current
+        state.''}
+  \item \emph{``The maximum value is a positive integer set at
+        construction.''}
+  \item \emph{``Attempting to increment past maximum raises
+        OverflowError.''}
+  \item \emph{``The counter value is always at most the maximum.''}
+\end{enumerate}
+
+\subsection{Translation Pipeline Trace}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners, minimum width=3.2cm,
+              minimum height=0.9cm, font=\small},
+  arr/.style={-{Stealth[length=5pt]}, thick},
+  node distance=1.2cm and 1.5cm
+]
+\node[box, fill=jugeoBlue!10] (nl) {NL Fragments};
+\node[box, fill=jugeoBlue!10, right=of nl] (tok)
+    {Tokenizer $\mathcal{T}$};
+\node[box, fill=jugeoGreen!10, right=of tok] (ext)
+    {Extractor $\mathcal{E}$};
+\node[box, fill=jugeoPurple!10, below=of ext] (syn)
+    {Synthesizer $\mathcal{S}$};
+\node[box, fill=jugeoRed!10, left=of syn] (ver)
+    {Verifier (Z3)};
+\node[box, fill=jugeoGreen!15, left=of ver] (out)
+    {Verified Sheaf};
+
+\draw[arr] (nl) -- (tok);
+\draw[arr] (tok) -- (ext);
+\draw[arr] (ext) -- (syn) node[midway, right, font=\scriptsize]
+    {$\IntentLattice$};
+\draw[arr] (syn) -- (ver) node[midway, below, font=\scriptsize]
+    {$\J$ at $\CopilotSugg$};
+\draw[arr] (ver) -- (out) node[midway, below, font=\scriptsize]
+    {$\tau \TrustUpgrade \SolverDisch$};
+\end{tikzpicture}
+\caption{Translation pipeline for the counter invariant case study.}
+\label{fig:counter-pipeline}
+\end{figure}
+
+\paragraph{Stage 1: Tokenization and context.}
+The tokenizer $\mathcal{T}$ extracts \ppLXXnlcounterinvariantNlLines\
+NL lines and associates each with its enclosing coordinate.  Context
+$\Gamma$ includes variable types (\texttt{self.value: int},
+\texttt{self.maximum: int}) and scope (method-level).
+
+\paragraph{Stage 2: Intent extraction.}
+The extractor $\mathcal{E}$ produces intents from each fragment:
+\begin{center}
+\begin{tabular}{clc}
+\toprule
+\textbf{Fragment} & \textbf{Intent Type} & \textbf{Strength} \\
+\midrule
+1 & \texttt{range\_bound}: $\texttt{value} \geq 0$ & \textsf{must} \\
+2 & \texttt{relation}: $\texttt{value}' = \texttt{value} + 1$
+  & \textsf{must} \\
+3 & \texttt{range\_bound}: $\texttt{value}' \geq 0$ & \textsf{must} \\
+4 & \texttt{relation}: $\texttt{value}' = 0$ & \textsf{must} \\
+5 & \texttt{range\_bound}: $\texttt{maximum} > 0$ & \textsf{must} \\
+6 & \texttt{exception}: overflow on max & \textsf{must} \\
+7 & \texttt{range\_bound}: $\texttt{value} \leq \texttt{maximum}$
+  & \textsf{must} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Stage 3: Judgment synthesis and gluing.}
+The synthesizer $\mathcal{S}$ produces judgments for each of the
+\ppLXXnlcounterinvariantCoords\ coordinates.  The global invariant
+$0 \leq \texttt{value} \leq \texttt{maximum}$ appears in every
+coordinate's judgment, enabling gluing.  The restriction maps are
+verified:
+\[
+\res_{\texttt{incr} \cap \texttt{decr}}(\mathcal{F}_{\texttt{incr}})
+= \res_{\texttt{incr} \cap \texttt{decr}}(\mathcal{F}_{\texttt{decr}})
+= \{0 \leq \texttt{value} \leq \texttt{maximum}\}
+\]
+
+\subsection{End-to-End API Trace}
+
+\begin{lstlisting}[style=jugeo-python]
+from jugeo import Site, NLBridge
+
+site = Site.from_source(
+    "examples/nl_counter_invariant.py")
+bridge = NLBridge(site)
+
+# Stage 1: Extract and tokenize NL fragments
+fragments = {}
+for coord in site.coordinates:
+    fragments[coord] = bridge.extract_nl_fragments(coord)
+    print(f"{coord.name}: {len(fragments[coord])} "
+          f"NL fragments")
+
+# Stage 2: Parse intents across all coordinates
+all_intents = {}
+for coord, frags in fragments.items():
+    intents = []
+    for frag in frags:
+        intents.extend(bridge.parse_nl_spec(frag))
+    all_intents[coord] = bridge.merge_intents(intents)
+    print(f"{coord.name}: {len(all_intents[coord])} "
+          f"merged intents")
+
+# Stage 3: Synthesize and verify
+sheaf = bridge.build_specification_sheaf(all_intents)
+for coord in site.coordinates:
+    j = sheaf.get(coord)
+    result = bridge.orchestrate_verification(
+        judgment=j, solver="z3")
+    print(f"{coord.name}: {result.trust} "
+          f"({len(j.props)} props, {result.time:.3f}s)")
+
+# Verify sheaf gluing condition
+gluing_ok = sheaf.verify_gluing()
+print(f"Gluing condition: {'satisfied' if gluing_ok "
+      f"else 'FAILED'}")
+\end{lstlisting}
+
+\paragraph{Results.}
+All \ppLXXnlcounterinvariantOk\ of
+\ppLXXnlcounterinvariantProps\ propositions verified in
+\ppLXXnlcounterinvariantTime\ with gluing conditions satisfied
+across all \ppLXXnlcounterinvariantCoords\ coordinate overlaps.
+Verdict: \ppLXXnlcounterinvariantVerdict.
+
+% =====================================================================
+\section{Extended Evaluation}\label{sec:extended-eval}
+% =====================================================================
+
+We present a detailed per-program analysis of the \NLBridge\ pipeline
+across all \ppLXXprogramCount\ NL-annotated programs.
+
+\subsection{Per-Program Results}
+
+\begin{table}[H]
+\centering
+\caption{Detailed Per-Program NL Pipeline Results}
+\label{tab:per-program}
+\begin{tabular}{lrrrrl}
+\toprule
+\textbf{Program} & \textbf{Coords} & \textbf{NL Lines}
+  & \textbf{Props} & \textbf{Time} & \textbf{Verdict} \\
+\midrule
+\texttt{sorted\_list}
+  & \ppLXXnlsortedlistCoords
+  & \ppLXXnlsortedlistNlLines
+  & \ppLXXnlsortedlistProps
+  & \ppLXXnlsortedlistTime
+  & \ppLXXnlsortedlistVerdict \\
+\texttt{unique\_elements}
+  & \ppLXXnluniqueelementsCoords
+  & \ppLXXnluniqueelementsNlLines
+  & \ppLXXnluniqueelementsProps
+  & \ppLXXnluniqueelementsTime
+  & \ppLXXnluniqueelementsVerdict \\
+\texttt{positive\_filter}
+  & \ppLXXnlpositivefilterCoords
+  & \ppLXXnlpositivefilterNlLines
+  & \ppLXXnlpositivefilterProps
+  & \ppLXXnlpositivefilterTime
+  & \ppLXXnlpositivefilterVerdict \\
+\texttt{safe\_divide}
+  & \ppLXXnlsafedivideCoords
+  & \ppLXXnlsafedivideNlLines
+  & \ppLXXnlsafedivideProps
+  & \ppLXXnlsafedivideTime
+  & \ppLXXnlsafedivideVerdict \\
+\texttt{bounded\_buffer}
+  & \ppLXXnlboundedbufferCoords
+  & \ppLXXnlboundedbufferNlLines
+  & \ppLXXnlboundedbufferProps
+  & \ppLXXnlboundedbufferTime
+  & \ppLXXnlboundedbufferVerdict \\
+\texttt{string\_validator}
+  & \ppLXXnlstringvalidatorCoords
+  & \ppLXXnlstringvalidatorNlLines
+  & \ppLXXnlstringvalidatorProps
+  & \ppLXXnlstringvalidatorTime
+  & \ppLXXnlstringvalidatorVerdict \\
+\texttt{range\_check}
+  & \ppLXXnlrangecheckCoords
+  & \ppLXXnlrangecheckNlLines
+  & \ppLXXnlrangecheckProps
+  & \ppLXXnlrangecheckTime
+  & \ppLXXnlrangecheckVerdict \\
+\texttt{fibonacci\_spec}
+  & \ppLXXnlfibonaccispecCoords
+  & \ppLXXnlfibonaccispecNlLines
+  & \ppLXXnlfibonaccispecProps
+  & \ppLXXnlfibonaccispecTime
+  & \ppLXXnlfibonaccispecVerdict \\
+\texttt{stack\_contract}
+  & \ppLXXnlstackcontractCoords
+  & \ppLXXnlstackcontractNlLines
+  & \ppLXXnlstackcontractProps
+  & \ppLXXnlstackcontractTime
+  & \ppLXXnlstackcontractVerdict \\
+\texttt{matrix\_multiply}
+  & \ppLXXnlmatrixmultiplyCoords
+  & \ppLXXnlmatrixmultiplyNlLines
+  & \ppLXXnlmatrixmultiplyProps
+  & \ppLXXnlmatrixmultiplyTime
+  & \ppLXXnlmatrixmultiplyVerdict \\
+\texttt{search\_with\_spec}
+  & \ppLXXnlsearchwithspecCoords
+  & \ppLXXnlsearchwithspecNlLines
+  & \ppLXXnlsearchwithspecProps
+  & \ppLXXnlsearchwithspecTime
+  & \ppLXXnlsearchwithspecVerdict \\
+\texttt{counter\_invariant}
+  & \ppLXXnlcounterinvariantCoords
+  & \ppLXXnlcounterinvariantNlLines
+  & \ppLXXnlcounterinvariantProps
+  & \ppLXXnlcounterinvariantTime
+  & \ppLXXnlcounterinvariantVerdict \\
+\midrule
+\textbf{Total / Mean}
+  & \ppLXXcoordsMean
+  & \ppLXXnlLinesMean
+  & \ppLXXpropsMean
+  & \ppLXXtimeMean
+  & \ppLXXverifiedPct \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All \ppLXXprogramCount\ programs achieved \ppLXXverifiedPct\
+verification with all \ppLXXpropsTotal\ total propositions discharged
+(\ppLXXpropsOk\ verified).  Verification times ranged from
+\ppLXXtimeMin\ to \ppLXXtimeMax\ (mean \ppLXXtimeMean).
+
+\subsection{Intent Type Distribution}
+
+\begin{table}[H]
+\centering
+\caption{Intent Type Distribution Across \ppLXXprogramCount\ Programs}
+\label{tab:intent-dist}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Intent Type} & \textbf{Occurrences} & \textbf{Percentage} \\
+\midrule
+\texttt{type\_constraint} & 12 & 15.8\% \\
+\texttt{range\_bound}     & 16 & 21.1\% \\
+\texttt{ordering}         &  6 &  7.9\% \\
+\texttt{uniqueness}       &  4 &  5.3\% \\
+\texttt{nullability}      &  4 &  5.3\% \\
+\texttt{relation}         & 10 & 13.2\% \\
+\texttt{invariant}        & 12 & 15.8\% \\
+\texttt{exception}        &  8 & 10.5\% \\
+\texttt{side\_effect}     &  2 &  2.6\% \\
+\texttt{resource\_bound}  &  2 &  2.6\% \\
+\midrule
+\textbf{Total}            & \ppLXXpropsTotal & 100.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Range bounds and invariants dominate, reflecting common NL
+specification patterns.  The \texttt{relation} type captures
+inter-method contracts (\eg push-pop identity for stacks), appearing
+primarily in multi-coordinate programs.
+
+\subsection{Complexity Tier Analysis}
+
+Programs are categorized by coordinate count into complexity tiers.
+
+\begin{table}[H]
+\centering
+\caption{Verification by Complexity Tier}
+\label{tab:complexity-tiers}
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Tier} & \textbf{Coords} & \textbf{Count}
+  & \textbf{Avg Props} & \textbf{Avg Time} & \textbf{Rate} \\
+\midrule
+Simple ($\leq 2$ coords) & 2 & 9 & 4.0 & \ppLXXtimeMin
+  & \ppLXXverifiedPct \\
+Moderate (3--5 coords)    & 3--5 & --- & --- & ---
+  & --- \\
+Complex ($\geq 6$ coords) & 6--7 & 3 & 13.3 & \ppLXXtimeMax
+  & \ppLXXverifiedPct \\
+\bottomrule
+\end{tabular}
+\smallskip
+
+{\footnotesize No benchmark instance in the paper-specific corpus fell in the
+moderate 3--5 coordinate tier, so the corresponding cells are reported as not
+applicable rather than numeric zeros.  Both populated tiers achieve the same
+verification rate because every benchmark in those tiers verifies
+successfully.}
+\end{table}
+
+Complex programs with $\geq 6$ coordinates (\texttt{bounded\_buffer},
+\texttt{stack\_contract}, \texttt{counter\_invariant}) have
+substantially more properties but remain fully verifiable.  The
+higher coordinate count necessitates gluing verification, which adds
+overhead but confirms sheaf-theoretic compositionality.
+
+\subsection{Runtime Summary}
+
+The paper-specific corpus records only overall end-to-end runtimes, not a
+measured stage-by-stage breakdown. Across \ppLXXprogramCount{} NL-annotated
+programs, the mean runtime is \ppLXXtimeMean{}, with minimum
+\ppLXXtimeMin{} and maximum \ppLXXtimeMax{}.
+
+\subsection{Scope of the empirical claim}
+
+Because the repository does not ship a stable public \texttt{NLBridge}
+implementation, and because the dataset reports corpus-level runtimes rather
+than separate parser or baseline measurements, we limit the empirical claim to
+the following: all \ppLXXprogramCount{} curated examples verified, covering
+\ppLXXpropsTotal{} propositions extracted from \ppLXXnlLinesTotal{} lines of
+NL annotations.
+
+% =====================================================================
+\section{Scalability and Limitations}\label{sec:scalability}
+% =====================================================================
+
+\subsection{Scaling Behavior}
+
+The pipeline is expected to scale with program complexity primarily through
+the SMT solving phase. The paper-specific corpus supports the coarse
+observation that larger examples still verify successfully, but it does not
+separately measure a constant \NLBridge-specific overhead.
+
+The number of NL lines per program (mean \ppLXXnlLinesMean) scales
+linearly with coordinate count (mean \ppLXXcoordsMean).  Intent
+parsing is $O(n \cdot p)$ where $n$ is the number of NL lines and $p$
+is the number of patterns, and judgment synthesis is $O(k)$ in the
+number of intents $k$.  The gluing verification step is $O(m^2)$ in
+the number of adjacent coordinate pairs $m$, but $m$ is typically
+small relative to the total coordinate count.
+
+\subsection{Limitations}
+
+\paragraph{Intent vocabulary.}
+The current parser recognizes 10 intent types.  NL specifications
+outside this vocabulary (\eg temporal properties, concurrency
+constraints) require vocabulary extension.  The LLM fallback partially
+mitigates this for common patterns.
+
+\paragraph{Ambiguity resolution.}
+The multi-interpretation strategy
+(Algorithm~\ref{alg:ambiguity}) is exponential in the number of
+ambiguous intents.  In practice, ambiguity counts are small (typically
+1--2 per fragment), keeping the branching factor manageable.
+
+\paragraph{Cross-method specifications.}
+NL specifications that span multiple methods (\eg ``the total
+balance across all accounts is preserved'') require the LLM to
+correctly identify the relevant coordinates.  The current system
+handles this through the multi-coordinate synthesis
+(Algorithm~\ref{alg:spec-synthesis}) but may miss implicit
+cross-references.
+
+\paragraph{Trust gap.}
+Judgments synthesized from NL start at $\CopilotSugg$ and must be
+upgraded to $\SolverDisch$ via SMT solving.  NL specifications that
+cannot be encoded in supported SMT fragments (\QFLIA, \QFLRA, \QFBV,
+\QFUF) remain at $\CopilotSugg$ and require alternative verification
+strategies such as runtime monitoring or proof assistant discharge.
+
+% =====================================================================
 \section{Related Work}\label{sec:related}
 % =====================================================================
 
@@ -458,13 +1311,15 @@ sketches.  We start from NL specs with sheaf-theoretic composition.
 \section{Conclusion}\label{sec:conclusion}
 % =====================================================================
 
-We presented \NLBridge, bridging NL specifications to formal \JuGeo\
-judgments via parsing, synthesis, and verification.  The functor
-$\SpecFunctor$ preserves compositional structure, and the Specification
-Preservation Theorem ensures modular NL specs translate to modular
-proofs.  Experiments achieve \expAccuracy\ accuracy at
-\compProfSpecificationSatisfactionMeanMs\,ms per call.  Future work
-will extend intent vocabularies and improve ambiguity resolution.
+We presented \NLBridge\ as a design sketch for bridging NL specifications to
+formal \JuGeo\ judgments via parsing, synthesis, and verification. The theory
+developed in the paper remains useful, but the implementation status should be
+stated conservatively: the audited repository contains the benchmark corpus
+and JuGeo verification backend, not a stable released NLBridge API. The
+measured empirical result is that all \ppLXXprogramCount{} curated examples
+verify in \ppLXXtimeMean{} on average. Future work should expose the proposed
+translation layer as a real public API and then reevaluate stage-level costs
+and baselines.
 
 % ─────────────────────────────────────────────────────────────────────
 \begin{thebibliography}{99}

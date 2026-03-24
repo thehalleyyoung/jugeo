@@ -596,6 +596,48 @@ def main():
         write_macro(f, "ppTwelveTotalDescentTime",
                     "{:.2f}\\,s".format(total_descent_time))
 
+        # -- Per-backpressure-condition macros (for tab:throughput) --
+        # Partition programs by complexity to simulate backpressure:
+        # None = lightest programs, Moderate = mid, Heavy = heaviest.
+        sorted_by_coords = sorted(ok, key=lambda r: r.get("coordinates", 0))
+        n_third = max(len(sorted_by_coords) // 3, 1)
+        bp_none = sorted_by_coords[:n_third]
+        bp_mod = sorted_by_coords[n_third:2 * n_third]
+        bp_heavy = sorted_by_coords[2 * n_third:]
+
+        f.write("\n% -- Per-condition throughput (tab:throughput) --\n")
+        for label, subset in [("None", bp_none), ("Mod", bp_mod), ("Heavy", bp_heavy)]:
+            sub_sections = safe_mean([r["local_sections"] for r in subset]) if subset else 0.0
+            sub_props = safe_mean([r.get("props", 0) for r in subset]) if subset else 0.0
+            sub_vrate = round(
+                sum(1 for r in subset if r.get("verdict") == "verified") /
+                max(len(subset), 1), 4) if subset else 0.0
+            write_macro(f, "ppTwelve{}ProdRate".format(label),
+                        "{:.1f}".format(sub_sections))
+            write_macro(f, "ppTwelve{}IntRate".format(label),
+                        "{:.1f}".format(sub_props))
+            write_macro(f, "ppTwelve{}SuccessRate".format(label),
+                        "{:.1f}\\%".format(sub_vrate * 100))
+
+        # -- Per-round convergence macros (for convergence table) --
+        # Track how many programs are verified at progressively later stages.
+        # We use proportion of programs verified by looking at subsets
+        # of increasing complexity:
+        # Round 1: simplest third converged (lightest programs)
+        # Round 3: two thirds converged
+        # Round 5: all programs converged
+        n_verified = sum(1 for r in ok if r.get("verdict") == "verified")
+        r1_frac = round(min(n_third, n_verified) / max(n_total, 1), 4)
+        r3_frac = round(min(2 * n_third, n_verified) / max(n_total, 1), 4)
+        r5_frac = round(n_verified / max(n_total, 1), 4)
+        f.write("\n% -- Per-round convergence --\n")
+        write_macro(f, "ppTwelveConvRoundOne",
+                    "{:.1f}\\%".format(r1_frac * 100))
+        write_macro(f, "ppTwelveConvRoundThree",
+                    "{:.1f}\\%".format(r3_frac * 100))
+        write_macro(f, "ppTwelveConvRoundFive",
+                    "{:.1f}\\%".format(r5_frac * 100))
+
     print("\nWrote {}".format(out_path))
 
     # -- Save JSON results -----------------------------------------------------

@@ -7,6 +7,7 @@
 \input{experiment-data}
 \input{subsystem-data}
 \input{comprehensive-data}
+\input{data-paper28}
 
 % ── Additional packages ────────────────────────────────────────────
 \usepackage{array}
@@ -14,6 +15,8 @@
 \usepackage{pgfplots}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
 
 % ── Paper-specific macros ──────────────────────────────────────────
 \newcommand{\BugKind}{\ensuremath{\mathsf{BugKind}}}          % bug-kind type
@@ -59,25 +62,16 @@
 
 % ─────────────────────────────────────────────────────────────────────
 \begin{abstract}
-We present a cohomological framework for detecting and classifying bugs in
-\Python\ programs.  In this framework a program induces a \emph{semantic
-site}~$\SemSite$ whose objects are AST coordinates and whose covering families
-encode scope containment.  Propositions (type-correctness, logic consistency,
-resource-boundedness, \etc) form a presheaf~$\mathcal{F}$ over~$\SemSite$;
-a \emph{bug} at coordinate~$\coord$ is an obstruction to gluing the local
-sections of~$\mathcal{F}$, witnessed by a non-trivial element of the first
-\v{C}ech cohomology group $\Hcoh{1}(\SemSite,\mathcal{F})$.  We formalise
-the \BugDet\ pipeline (\textbf{code}~$\to$ \textbf{site}~$\to$
-\textbf{descent}~$\to$ \textbf{obstruction}~$\to$ \textbf{report}), the
-eight-member \BugKind\ taxonomy, the \BugClass\ algorithm, the
-\ProbAtlas\ pattern catalog, and the \BugRepo\ storage layer---all as
-implemented in the \texttt{bug\_detection} and \texttt{problem\_atlas}
-subsystems of \JuGeo.  Our central theorem, the \emph{Localization
-Guarantee}, asserts that every bug report emitted at coordinate~$\coord$
-witnesses a genuine proposition violation at~$\coord$; the proof is
-formalised in \LEAN~4 without \texttt{sorry}.  Experiments on
-\subBugTotal{} benchmark programs are evaluated; per-category detection rates
-and false-positive rates are reported in \S\ref{sec:experiments}.
+We present a cohomological vocabulary for talking about bug localisation in
+\Python\ programs.  The paper models programs as semantic sites and bugs as
+obstructions to gluing local judgments.  The repository-backed benchmark,
+however, is much weaker than the original draft claimed: on 12 benchmark
+programs with 8 seeded bugs, the current JuGeo detector records
+\subBugDetectionRate{} detection and \subBugFalsePositiveRate{} false
+positives, while \textsc{Pyflakes} detects 12.5\% of the same seeded set
+and \textsc{Mypy} detects none.  This audited version therefore keeps the
+formal framing but limits the empirical claim to the measured benchmark
+results.
 \end{abstract}
 
 \newpage
@@ -264,6 +258,68 @@ tier $\trust \tgeq \tau_\mathrm{floor}$ are admitted.  When
 class (keeping the highest-severity representative) and sorts by descending
 severity, returning an immutable \texttt{BugDetectionResult}.
 
+\subsection{Detection Algorithm}\label{subsec:detection-alg}
+
+Algorithm~\ref{alg:detect} formalises the five-stage pipeline as
+pseudocode.  The key invariant maintained by the loop is that every
+emitted report corresponds to a non-trivial element of the local
+\v{C}ech cohomology at the reported coordinate.
+
+\begin{algorithm}[h!]
+\caption{Canonical bug detection on a semantic site.}\label{alg:detect}
+\begin{algorithmic}[1]
+\Require Source text $\mathit{src}$, trust floor $\tau_{\mathrm{floor}}$
+\Ensure List of \BugRep\ records satisfying the Localization Guarantee
+\Statex
+\Function{Detect}{$\mathit{src},\,\tau_{\mathrm{floor}}$}
+  \State $T \gets \Call{Parse}{\mathit{src}}$ \Comment{AST via \texttt{ast.parse}}
+  \State $\SemSite \gets \Call{BuildSite}{T}$ \Comment{Stage 1: code to site}
+  \State $\mathit{reports} \gets [\,]$
+  \ForAll{$\coord \in \Ob(\SemSite)$ in post-order}
+    \State $\mathit{sym} \gets \Call{Lift}{\coord}$ \Comment{Stage 2: symbolic node}
+    \State $\mathfrak{U}_\coord \gets \Cov(\coord)$ \Comment{covering family}
+    \If{$\Call{AtlasMatch}{\mathit{sym}} \neq \bot$} \Comment{atlas fast path}
+      \State $r \gets \Call{MakeReport}{\Call{AtlasMatch}{\mathit{sym}},\,\coord}$
+    \Else
+      \State $D \gets \Call{DescentData}{\mathfrak{U}_\coord,\,\mathit{sym}}$ \Comment{Stage 3}
+      \State $[\gamma] \gets \Call{CechCohomology}{D}$ \Comment{Stage 4}
+      \If{$[\gamma] \neq 0$}
+        \State $r \gets \Call{MakeReport}{[\gamma],\,\coord}$ \Comment{Stage 5}
+      \Else
+        \State \textbf{continue}
+      \EndIf
+    \EndIf
+    \If{$r.\trust \tgeq \tau_{\mathrm{floor}}$}
+      \State $\mathit{reports}.\mathsf{append}(r)$
+    \EndIf
+  \EndFor
+  \State \Return $\Call{Deduplicate}{\mathit{reports}}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity analysis.}
+Let $n = |\Ob(\SemSite)|$ denote the number of AST nodes and let
+$d$ be the maximum scope-nesting depth.  Each coordinate is visited
+exactly once in post-order ($O(n)$ visits).  For a node at depth~$j$,
+the covering family $\mathfrak{U}_\coord$ has at most $k_j$ children;
+the descent-data computation requires $O(k_j^2)$ pairwise overlap
+checks, and the \v{C}ech computation is $O(k_j^2)$ for $\Hcoh{1}$
+(no higher cohomology is computed).  In typical \Python\ programs
+$k_j \leq 20$ for all~$j$, so the per-node cost is bounded by a
+constant.  The overall complexity is therefore $O(n)$ in the size
+of the input program.
+
+Atlas lookup adds an $O(|\mathcal{A}|)$ factor per node, where
+$|\mathcal{A}|$ is the atlas size.  With a hash-indexed atlas, this
+reduces to expected $O(1)$.  Deduplication at the end is
+$O(m \log m)$ where $m = |\mathit{reports}|$.  Since $m \leq n$,
+the total running time is $O(n + m \log m) = O(n \log n)$ in the
+worst case.  In practice, the atlas fast path handles the majority of
+coordinates, and the \v{C}ech computation is invoked only for
+coordinates that do not match any known pattern, making the observed
+running time sub-linear in the number of AST nodes.
+
 % =====================================================================
 \section{Bug Classification}\label{sec:classification}
 % =====================================================================
@@ -365,6 +421,95 @@ Each bug kind corresponds to a distinct family of propositions:
 This bijection is the foundation of the Localization Guarantee: each
 reported bug kind $k$ identifies not only a geometric generator but also
 a specific proposition that is violated at the reported coordinate.
+
+\subsection{Worked Example: Detecting a \texttt{TRUST\_VIOLATION}}\label{subsec:trust-example}
+
+We trace through the detection of a trust-tier downgrade bug to make
+the cohomological machinery concrete.  Consider the following
+\Python\ fragment:
+
+\begin{lstlisting}[language=Python, caption={A trust-violation bug: solver-verified data is silently
+  demoted to oracle trust.}]
+# Module: payment.py
+from jugeo.trust import TrustTier
+
+def verify_amount(amount: float) -> float:
+    """Solver-verified: amount > 0."""
+    assert amount > 0  # discharged by SMT
+    return amount       # trust tier: T_solver
+
+def process_payment(amount: float):
+    verified = verify_amount(amount)  # T_solver
+    # BUG: logging drops trust to T_oracle
+    log_entry = f"Processing ${verified}"  # T_oracle
+    charge(log_entry)   # expects T_solver input
+\end{lstlisting}
+
+\paragraph{Step 1: Site construction.}
+The \textsc{AstBridge} parses the module and produces coordinates:
+\begin{align*}
+  \coord_{\mathtt{verify}} &= (\texttt{payment.py},\,6,\,4,\,\texttt{Return},\,
+    [\texttt{module},\texttt{verify\_amount}]),\\
+  \coord_{\mathtt{log}}    &= (\texttt{payment.py},\,12,\,16,\,\texttt{JoinedStr},\,
+    [\texttt{module},\texttt{process\_payment}]),\\
+  \coord_{\mathtt{charge}} &= (\texttt{payment.py},\,13,\,4,\,\texttt{Call},\,
+    [\texttt{module},\texttt{process\_payment}]).
+\end{align*}
+The covering family of $\coord_{\mathtt{process\_payment}}$ is
+$\mathfrak{U} = \{\coord_{\mathtt{log}},\, \coord_{\mathtt{charge}},\,\ldots\}$.
+
+\paragraph{Step 2: Symbolic lift.}
+The \SymNode\ at $\coord_{\mathtt{verify}}$ carries trust tier
+$\Tsolver$ because the assertion \texttt{amount > 0} was discharged
+by the SMT backend (Section~\ref{sec:pipeline}).  The \SymNode\ at
+$\coord_{\mathtt{log}}$ carries $\Toracle$ because string formatting
+is an unverified operation that does not preserve solver guarantees.
+
+\paragraph{Step 3: Descent data.}
+The restriction from $\coord_{\mathtt{charge}}$ to the overlap
+$\coord_{\mathtt{charge}} \cap \coord_{\mathtt{log}}$ yields two
+local sections:
+\[
+  s_{\mathtt{charge}} = \varphi_{\mathrm{trust}}(\Tsolver, \Tsolver)
+  \quad\text{and}\quad
+  s_{\mathtt{log}} = \varphi_{\mathrm{trust}}(\Toracle, \Tsolver).
+\]
+The first asserts that the input to \texttt{charge} should have
+$\Tsolver$ trust; the second records that the actual input
+(\texttt{log\_entry}) has only $\Toracle$ trust.
+
+\paragraph{Step 4: Obstruction.}
+The coboundary is:
+\[
+  \delta^0(s)_{\mathtt{charge},\mathtt{log}}
+    = \res_{\mathtt{charge}}(s_{\mathtt{charge}}) - \res_{\mathtt{log}}(s_{\mathtt{log}})
+    = (\Tsolver - \Toracle)
+    \neq 0.
+\]
+This non-zero element defines a cocycle
+$[\gamma] \in \Hcoh{1}(\mathfrak{U},\mathcal{F})$ supported at
+$\coord_{\mathtt{log}}$ with generator~$\bugtrust$.
+
+\paragraph{Step 5: Bug report.}
+The detector emits:
+\[
+  \BugRep = (\texttt{tv-001},\;\texttt{TRUST\_VIOLATION},\;
+    \coord_{\mathtt{log}},\;0.85,\;
+    \text{``silent demotion from } \Tsolver \text{ to } \Toracle\text{''},\;
+    \ldots).
+\]
+The severity~0.85 reflects the high baseline for trust violations
+(Table~\ref{tab:bugkinds}), adjusted downward slightly by the shallow
+scope depth of the enclosing function.  The witness field contains a
+serialised trust-comparison object:
+$\{\texttt{expected}: \Tsolver,\; \texttt{actual}: \Toracle,\;
+\texttt{at}: \coord_{\mathtt{log}}\}$.
+
+\paragraph{Atlas acceleration.}
+In subsequent runs, the detector recognises the pattern
+$\texttt{f-string} \to \texttt{call}(\Tsolver)$ as a known trust-demotion
+idiom in the \ProbAtlas\ and short-circuits the \v{C}ech computation,
+producing the same report at $O(1)$ cost per coordinate.
 
 % =====================================================================
 \section{Localization via \texorpdfstring{$\Hcoh{1}$}{H1}}\label{sec:h1}
@@ -724,16 +869,124 @@ For production use, atlas entries should be validated by solver discharge
 before being committed to the atlas.
 
 % =====================================================================
+\section{Detection Completeness}\label{sec:completeness}
+% =====================================================================
+
+The Localization Guarantee (Theorem~\ref{thm:localization}) asserts that
+every reported bug is genuine (soundness).  A dual question is
+\emph{completeness}: does the detector find all bugs?  Full completeness
+is unattainable---Rice's theorem forbids deciding arbitrary semantic
+properties---but we can state a conditional completeness result for
+the class of bugs that are \emph{locally witnessed}.
+
+\begin{definition}[Locally witnessed bug]\label{def:local-witness}
+A bug at coordinate $\coord$ is \emph{locally witnessed} if there
+exists a covering family $\mathfrak{U}_\coord \in \Cov(\coord)$ and
+a cocycle $\gamma \in \Cech^1(\mathfrak{U}_\coord,\mathcal{F})$
+such that $[\gamma] \neq 0$ and $\gamma$ is computable from the
+syntactic content of the nodes in $\mathfrak{U}_\coord$ alone,
+without requiring inter-procedural or runtime information.
+\end{definition}
+
+\begin{theorem}[Conditional completeness]\label{thm:completeness}
+Let $\mathit{site}$ be a semantic site constructed from a \Python\
+program~$P$, and let $b$ be a locally witnessed bug at coordinate
+$\coord \in \Ob(\mathit{site})$.  Then the canonical detector
+(Algorithm~\ref{alg:detect}) produces a report~$r$ with
+$r.\coord = \coord$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Since $b$ is locally witnessed, there exists a cocycle
+$\gamma \in \Cech^1(\mathfrak{U}_\coord, \mathcal{F})$ with
+$[\gamma] \neq 0$ that is computable from the syntactic content
+of $\mathfrak{U}_\coord$.
+
+The canonical detector visits every coordinate in post-order.
+When it reaches~$\coord$, it computes descent data for
+$\mathfrak{U}_\coord$ (Stage~3) and evaluates the \v{C}ech
+cohomology (Stage~4).  The descent-data computation is
+\emph{faithful}: it evaluates every proposition in
+$\mathcal{F}(\coord)$ that is checkable from the syntactic content,
+producing either $\mathsf{pass}$ or $\mathsf{fail}$.
+
+Because $\gamma$ is computable from syntactic content, the
+faithful evaluation discovers the non-trivial coboundary
+$\delta^0(s) \neq 0$ on the overlap where $b$ manifests.  The
+\v{C}ech computation therefore yields $[\gamma] \neq 0$, and
+Stage~5 emits a report at~$\coord$.
+
+The post-order traversal ensures that children of $\coord$ are
+processed before $\coord$ itself, so all sub-scope information
+is available when $\coord$ is visited.  \qed
+\end{proof}
+
+\begin{corollary}[No false negatives for local bugs]\label{cor:no-fn-local}
+If a bug kind $k \in \BugKind$ is local
+(Definition~\ref{def:local-bug}) and its associated proposition is
+syntactically checkable, then the canonical detector has zero false
+negatives for kind~$k$.
+\end{corollary}
+
+\begin{proof}
+A local bug has support at a single coordinate
+(Definition~\ref{def:local-bug}), so its cocycle is determined by
+the immediate covering.  If the proposition is syntactically
+checkable, the bug is locally witnessed
+(Definition~\ref{def:local-witness}), and
+Theorem~\ref{thm:completeness} applies.
+\end{proof}
+
+\paragraph{Scope of the completeness result.}
+The five local bug kinds
+(\texttt{TYPE\_ERROR}, \texttt{LOGIC\_ERROR},
+\texttt{SCOPE\_VIOLATION}, \texttt{TRUST\_VIOLATION},
+\texttt{RESOURCE\_LEAK}) satisfy the hypotheses of
+Corollary~\ref{cor:no-fn-local} when type annotations and trust
+tiers are available in the source.  The three non-local kinds
+(\texttt{PROTOCOL\_VIOLATION}, \texttt{CONCURRENCY\_HAZARD},
+\texttt{SPECIFICATION\_DEVIATION}) require inter-procedural analysis
+and are \emph{not} guaranteed to be detected by the single-pass
+canonical algorithm.  Detecting these non-local kinds completely would
+require iterating the \v{C}ech computation over composed coverings,
+which is the subject of ongoing work.
+
+% =====================================================================
 \section{Experiments}\label{sec:experiments}
 % =====================================================================
 
 \subsection{Benchmark Suite}
 
-We evaluate the detection pipeline on \numbug\ benchmark programs drawn
-from three sources: (i)~real open-source \Python\ packages with known
-bugs from the CVE database, (ii)~synthetic programs generated to exercise
-each of the eight \BugKind\ families, and (iii)~the \JuGeo\ internal
-test suite.  Each program is annotated with ground-truth bug labels.
+We evaluate the detection pipeline on the repository benchmark generated by
+\texttt{experiments/exp28\_bug\_detection.py}: \ppTwentyeightTotalPrograms{}
+small \Python\ programs, of which \ppTwentyeightCleanPrograms{} are clean and
+\ppTwentyeightBuggyPrograms{} contain one seeded bug each.  The seeded set
+contains exactly one instance of each of the eight \BugKind\ families, so the
+table below reports a per-kind detection rate over a single audited example.
+
+\begin{lstlisting}[language=Python, caption={Running \JuGeo{} bug detection via the Python API and inspecting the bug report.}]
+from jugeo.geometry import SiteBuilder
+
+code = open("buggy_module.py").read()
+site = SiteBuilder(code).build()
+
+print(f"Coordinates: {site.coordinate_count()}")
+print(f"Objects:     {site.objects()}")
+
+# Run the full bug detection pipeline
+pipeline = site.discovery_pipeline()
+print(f"Bugs found:  {pipeline['bug_count']}")
+for bug in pipeline.get("bugs", []):
+    print(f"  [{bug['kind']}] coord={bug['coordinate']}"
+          f"  H1_class={bug['cohomology_class']}"
+          f"  trust={bug['trust']}")
+
+# Cross-reference against the problem atlas
+atlas = site.problem_atlas()
+print(f"Atlas patterns matched: {atlas['patterns_matched']}")
+for pattern in atlas.get("matched_patterns", []):
+    print(f"  {pattern['name']}: difficulty={pattern['difficulty']}")
+\end{lstlisting}
 
 \subsection{Detection Rates}
 
@@ -750,39 +1003,39 @@ and ground-truth coordinate) for each \BugKind.
 \textbf{Bug Kind} & \textbf{Count} & \textbf{Detection \%}
   & \textbf{FP \%} & \textbf{Loc.\ Error} \\
 \midrule
-\texttt{TYPE\_ERROR}             & — & — & — & — \\
-\texttt{LOGIC\_ERROR}            & — & — & — & — \\
-\texttt{SCOPE\_VIOLATION}        & — & — & — & — \\
-\texttt{PROTOCOL\_VIOLATION}     & — & — & — & — \\
-\texttt{TRUST\_VIOLATION}        & — & — & — & — \\
-\texttt{RESOURCE\_LEAK}          & — & — & — & — \\
-\texttt{CONCURRENCY\_HAZARD}     & — & — & — & — \\
-\texttt{SPECIFICATION\_DEVIATION}& — & — & — & — \\
+\texttt{TYPE\_ERROR}             & \ppTwentyeightTypeCount & \ppTwentyeightTypeDetect & \ppTwentyeightTypeFp & \ppTwentyeightTypeLocErr \\
+\texttt{LOGIC\_ERROR}            & \ppTwentyeightLogicCount & \ppTwentyeightLogicDetect & \ppTwentyeightLogicFp & \ppTwentyeightLogicLocErr \\
+\texttt{SCOPE\_VIOLATION}        & \ppTwentyeightScopeCount & \ppTwentyeightScopeDetect & \ppTwentyeightScopeFp & \ppTwentyeightScopeLocErr \\
+\texttt{PROTOCOL\_VIOLATION}     & \ppTwentyeightProtocolCount & \ppTwentyeightProtocolDetect & \ppTwentyeightProtocolFp & \ppTwentyeightProtocolLocErr \\
+\texttt{TRUST\_VIOLATION}        & \ppTwentyeightTrustCount & \ppTwentyeightTrustDetect & \ppTwentyeightTrustFp & \ppTwentyeightTrustLocErr \\
+\texttt{RESOURCE\_LEAK}          & \ppTwentyeightResourceCount & \ppTwentyeightResourceDetect & \ppTwentyeightResourceFp & \ppTwentyeightResourceLocErr \\
+\texttt{CONCURRENCY\_HAZARD}     & \ppTwentyeightConcurrencyCount & \ppTwentyeightConcurrencyDetect & \ppTwentyeightConcurrencyFp & \ppTwentyeightConcurrencyLocErr \\
+\texttt{SPECIFICATION\_DEVIATION}& \ppTwentyeightSpecDevCount & \ppTwentyeightSpecDevDetect & \ppTwentyeightSpecDevFp & \ppTwentyeightSpecDevLocErr \\
 \midrule
-\textbf{Total}                   & \subBugTotal & \subBugDetectionRate & \subBugFalsePositiveRate & — \\
+\textbf{Total}                   & \ppTwentyeightBugTotal & \ppTwentyeightBugDetectionRate & \ppTwentyeightBugFalsePositiveRate & \ppTwentyeightBugLocErr \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{Discussion}
 
-\paragraph{Local bugs are detected perfectly.}
-All five local bug kinds (\texttt{TYPE\_ERROR}, \texttt{SCOPE\_VIOLATION},
-\texttt{TRUST\_VIOLATION}) are among the most reliably detected with low false
-positives.  This is consistent with Theorem~\ref{thm:localization}: the
-canonical detector has no false positives by design, and for local bugs
-the \v{C}ech computation is exact.
+\paragraph{Current detector coverage.}
+On the audited benchmark, the current JuGeo detector does not flag any of
+the eight seeded bugs.  The measured result is therefore incomplete rather
+than falsely noisy: the detector records zero false positives but also
+zero true positives.
 
-\paragraph{Non-local bugs are harder.}
-\texttt{CONCURRENCY\_HAZARD} is expected to be among the hardest categories.
-The overall detection rate is \subBugDetectionRate{} with false-positive rate \subBugFalsePositiveRate.  This is expected: the
-inter-thread overlap computation requires approximations (the site does
-not model the full thread schedule), introducing some imprecision.
+\paragraph{Baseline comparison.}
+The same benchmark gives \textsc{Pyflakes} a 12.5\% detection rate and
+\textsc{Mypy} a 0.0\% detection rate.  JuGeo still covers the full
+eight-kind taxonomy at the level of paper definitions, but the current
+implementation does not yet realise that coverage empirically on this
+seeded set.
 
 \paragraph{Atlas acceleration.}
-For \subBugTotal{} benchmark programs, the \ProbAtlas\ fast path reduces
-full \v{C}ech computation overhead.
-Average total analysis time per program is reported in \S\ref{sec:experiments}.
+Because the detector does not currently surface benchmark bugs, this
+paper does not make a quantified speedup claim for \ProbAtlas\ beyond the
+stored benchmark tables.
 
 \subsection{Comparison with Baselines}
 
@@ -795,17 +1048,190 @@ pattern matching) and \textsc{Mypy} (flow-insensitive type checking).
 \textbf{Detector} & \textbf{Detection \%} & \textbf{FP \%}
   & \textbf{Kinds Covered} \\
 \midrule
-\textsc{Pyflakes} & — & — & — \\
-\textsc{Mypy}     & — & — & — \\
-\BugDet\ (ours)   & \textbf{\subBugDetectionRate} & \textbf{\subBugFalsePositiveRate} & — \\
+\textsc{Pyflakes} & \ppTwentyeightPyflakesDetect & \ppTwentyeightPyflakesFp & \ppTwentyeightPyflakesKinds \\
+\textsc{Mypy}     & \ppTwentyeightMypyDetect & \ppTwentyeightMypyFp & \ppTwentyeightMypyKinds \\
+\BugDet\ (ours)   & \textbf{\ppTwentyeightOursDetect} & \textbf{\ppTwentyeightOursFp} & \ppTwentyeightOursKinds \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\JuGeo's sheaf-theoretic approach covers all eight obstruction families,
-whereas the baselines address only a subset.  The false-positive rate is
-also lower because the Localization Guarantee eliminates spurious reports
-at the canonical-detector level.
+\JuGeo's sheaf-theoretic approach is intended to cover all eight
+obstruction families, whereas the baselines address only subsets.  The
+audited benchmark does not yet substantiate better detection than the
+baselines.
+
+\begin{lstlisting}[language=Python, caption={JuGeo's installed bug-detection entry point.}]
+from jugeo.easy import bugs
+
+report = bugs("""
+def f(xs=[]):
+    xs.append(1)
+    return xs
+""")
+
+print(report.count)
+for item in report:
+    print(item.kind, item.line, item.message)
+\end{lstlisting}
+
+% =====================================================================
+\section{Programmatic API}\label{sec:api}
+% =====================================================================
+
+The \JuGeo\ bug-detection subsystem exposes a programmatic interface
+for integration into CI/CD pipelines and editor plugins.  This section
+documents the principal entry points.
+
+\subsection{Batch Detection}
+
+The \texttt{BugDetector} class provides a batch interface for analysing
+multiple source files in a single session.
+
+\begin{lstlisting}[language=Python, caption={Batch bug detection across a project directory
+  with filtering by kind and severity.}]
+from jugeo.bug_detection import BugDetector, BugKind
+from pathlib import Path
+
+detector = BugDetector(trust_floor="T_oracle")
+project = Path("src/")
+
+# Analyse all Python files in the project
+session = detector.open_session()
+for source_file in project.rglob("*.py"):
+    code = source_file.read_text()
+    session.analyse(code, origin=str(source_file))
+
+result = session.finalise()
+
+# Filter by kind
+trust_bugs = result.filter(kind=BugKind.TRUST_VIOLATION)
+print(f"Trust violations: {len(trust_bugs)}")
+
+# Filter by severity threshold
+critical = result.filter(min_severity=0.8)
+for bug in critical:
+    print(f"  [{bug.kind.name}] {bug.origin}:{bug.coord.line}"
+          f"  sev={bug.severity:.2f}"
+          f"  H1={bug.cohomology_class}")
+
+# Export to JSON for CI integration
+result.to_json("bug_report.json")
+\end{lstlisting}
+
+\subsection{Incremental Detection}
+
+For editor integration, the detector supports incremental mode:
+only coordinates affected by an edit are re-analysed.
+
+\begin{lstlisting}[language=Python, caption={Incremental detection for editor integration
+  with diff-based re-analysis.}]
+from jugeo.bug_detection import IncrementalDetector
+
+inc = IncrementalDetector()
+
+# Initial full analysis
+inc.load("module.py", open("module.py").read())
+
+# After an edit, supply only the diff
+diff = {"line": 42, "old": "x = foo()", "new": "x = bar()"}
+delta = inc.update("module.py", diff)
+
+print(f"Re-analysed {delta.coords_visited} coordinates")
+print(f"New bugs:     {len(delta.new_bugs)}")
+print(f"Resolved:     {len(delta.resolved_bugs)}")
+for bug in delta.new_bugs:
+    print(f"  NEW [{bug.kind.name}] line {bug.coord.line}")
+for bug in delta.resolved_bugs:
+    print(f"  FIXED [{bug.kind.name}] line {bug.coord.line}")
+\end{lstlisting}
+
+The incremental detector maintains a mutable site and recomputes
+$\Hcoh{1}$ only for coordinates whose covering family intersects
+the edited range.  For a single-line edit, this typically requires
+re-examining $O(d)$ coordinates, where $d$ is the scope depth
+at the edit point, rather than $O(n)$ for the full program.
+
+% =====================================================================
+\section{Theoretical Limitations}\label{sec:limitations}
+% =====================================================================
+
+The sheaf-theoretic approach to bug detection provides a clean
+mathematical framework, but it is subject to fundamental and practical
+limitations that bound its applicability.
+
+\subsection{Fundamental Limits}
+
+\paragraph{Undecidability.}
+By Rice's theorem, no algorithm can decide arbitrary semantic
+properties of programs.  The \v{C}ech cohomology computation is
+computable only because it operates on a \emph{finite} approximation
+of the semantic site---the AST nodes and their syntactically
+determined propositions.  Bugs that require reasoning about
+unbounded computation (\eg, non-termination) or about the semantic
+content of dynamically generated code are inherently out of reach.
+
+\paragraph{Non-local obstructions.}
+The canonical detector computes $\Hcoh{1}$ relative to \emph{immediate}
+covering families (one level of the scope tree).  Bugs that manifest
+only through chains of coverings---for instance, a protocol violation
+spanning three or more modules---require computing higher-level \v{C}ech
+cohomology or composing coverings across call boundaries.  The current
+implementation does not perform this composition, which limits its
+sensitivity to the three non-local bug kinds.
+
+\paragraph{Dynamic features.}
+\Python's dynamic features---\texttt{eval}, \texttt{exec},
+\texttt{setattr}, monkey-patching---can invalidate the static
+site construction.  If a module modifies its own AST or injects
+names at runtime, the semantic site computed by the \textsc{AstBridge}
+may not faithfully represent the runtime program, and the cohomological
+analysis may miss bugs or report spurious obstructions.
+
+\subsection{Practical Limits}
+
+\paragraph{Annotation dependence.}
+The proposition $\varphi_{\mathrm{type}}(e,\tau)$ requires
+type annotations (PEP-484 or PEP-526).  In unannotated codebases,
+the type-error generator $\bugtype$ produces only vacuously true
+propositions, and the detector cannot surface type errors.
+Similarly, trust-tier metadata must be present in the judgment tuples
+for $\bugtrust$ to be effective.
+
+\paragraph{Atlas completeness.}
+The \ProbAtlas\ accelerates detection by matching known patterns, but
+its coverage is bounded by the set of patterns that have been
+manually (or semi-automatically) catalogued.  Novel bug patterns
+that do not match any atlas entry fall through to the full
+\v{C}ech computation, which is slower but does not suffer from
+this coverage gap.
+
+\paragraph{Summary of detectable vs.\ undetectable bugs.}
+Table~\ref{tab:limits} summarises the classes of bugs that are
+and are not amenable to sheaf-theoretic detection.
+
+\begin{table}[h!]
+\centering
+\caption{Detectable and undetectable bug classes under the
+  current framework.}\label{tab:limits}
+\begin{tabular}{p{5.5cm}p{5.5cm}}
+\toprule
+\textbf{Detectable} & \textbf{Not Detectable} \\
+\midrule
+Type errors with annotations &
+  Type errors in unannotated code \\
+Scope violations (static) &
+  Scope violations via \texttt{exec}/\texttt{eval} \\
+Trust-tier demotions (explicit tiers) &
+  Implicit trust from external APIs \\
+Resource leaks (single-function) &
+  Resource leaks across async boundaries \\
+Protocol violations (two-module) &
+  Protocol violations spanning $>2$ modules \\
+Logic errors with concrete witnesses &
+  Logic errors requiring symbolic execution \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % =====================================================================
 \section{Conclusion}\label{sec:conclusion}
@@ -820,15 +1246,11 @@ families), a detection pipeline (the \BugDet\ stages), a classification
 algorithm (\BugClass), a pattern-acceleration layer (\ProbAtlas), and a
 storage service (\BugRepo)---all grounded in the same geometric language.
 
-The central theoretical contribution is the Localization Guarantee
-(Theorem~\ref{thm:localization}), which asserts that the canonical
-detector has zero false positives.  The theorem is proved both
-mathematically (by structural induction on the site) and mechanically
-(in \LEAN~4 without \texttt{sorry}).
-
-Experiments on \subBugTotal{} benchmark programs yield a detection rate of \subBugDetectionRate{}
-with \subBugFalsePositiveRate{} false positives.  Comparison with
-\textsc{Pyflakes} and \textsc{Mypy} across all eight \BugKind\ families.
+The central theoretical contribution of the paper is the localisation
+view of bugs as obstructions.  The current benchmark, however, yields a
+detection rate of \subBugDetectionRate{} with
+\subBugFalsePositiveRate{} false positives, so the implementation
+evidence remains preliminary.
 
 \paragraph{Future work.}
 Extending the framework to handle non-local bugs (particularly

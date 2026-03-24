@@ -303,6 +303,77 @@ The \texttt{SolverRouter} (§6) supports both strategies via the
 \texttt{RoutingStrategyKind} enumeration and selects between them based
 on latency budgets and available oracle jurisdictions.
 
+\subsection{Oracle selection algorithm}\label{sec:selection-alg}
+
+The oracle selection phase determines which backends to query for a given
+obligation.  Selection proceeds in three stages: eligibility filtering,
+priority ordering, and dispatch.
+
+\begin{definition}[Eligible oracle set]\label{def:eligible}
+  Given obligation $\phi$ in domain $d$ and minimum required trust
+  $\tau_{\mathrm{req}}$, the \emph{eligible set} is
+  \[
+    E(\OrcSet, d, \tau_{\mathrm{req}}) \;=\;
+    \bigl\{\, \Orcl{i} \in \OrcSet \;\bigm|\;
+       d \in \mathit{jur}(\Orcl{i}) \;\wedge\;
+       \tau_{\mathrm{req}} \tleq \tau_i^{\max} \;\wedge\;
+       \mathit{avail}(\Orcl{i}) \,\bigr\}.
+  \]
+\end{definition}
+
+\noindent\textbf{Algorithm} (\textsc{OracleSelectAndDispatch}).\\
+\textit{Input:} Oracle set $\OrcSet$, obligation $\phi$ in domain $d$,
+requested trust $\tau_{\mathrm{req}}$, strategy
+$\sigma \in \{\textsc{Seq}, \textsc{Par}\}$.\\
+\textit{Output:} Federated evidence or $\bot$.
+\begin{enumerate}[label=\textbf{\arabic*.}, nosep, leftmargin=2em]
+  \item Compute eligible set
+        $E \gets E(\OrcSet, d, \tau_{\mathrm{req}})$.
+        If $E = \emptyset$, return $\bot$.
+  \item Sort $E$ by priority $p_i$ descending, breaking ties by
+        latency $\lambda_i$ ascending.
+  \item \textbf{If} $\sigma = \textsc{Seq}$:
+    \begin{enumerate}[label=\textbf{\alph*.}, nosep, leftmargin=1.5em]
+      \item For each $\Orcl{i}$ in sorted order, compute
+            $R_i \gets \Resp(\Orcl{i}, \phi)$.
+      \item If $R_i \neq \bot$, return
+            $\bigl(\{\Ceil{R_i, \Orcl{i}}\},\;
+             \tlev{\Ceil{R_i, \Orcl{i}}}\bigr)$.
+      \item If all oracles return $\bot$, return $\bot$.
+    \end{enumerate}
+  \item \textbf{If} $\sigma = \textsc{Par}$:
+    \begin{enumerate}[label=\textbf{\alph*.}, nosep, leftmargin=1.5em]
+      \item Dispatch all $\Orcl{i} \in E$ concurrently; collect
+            responses $\{R_i\}$.
+      \item Let $S = \{\Orcl{i} \mid R_i \neq \bot\}$.  If
+            $S = \emptyset$, return $\bot$.
+      \item Compute $\tau_{\Fed} = \bigsqcap_{\Orcl{i} \in S}
+            \tlev{\Ceil{R_i, \Orcl{i}}}$.
+      \item Return $\bigl(\{\Ceil{R_i, \Orcl{i}} \mid \Orcl{i} \in S\},\;
+            \tau_{\Fed}\bigr)$.
+    \end{enumerate}
+\end{enumerate}
+
+\begin{proposition}[Selection complexity]\label{prop:selection-complexity}
+  The time complexity of \textsc{OracleSelectAndDispatch} is
+  $O(|E| \log |E|)$ for sorting the eligible set, plus $O(|E|)$ oracle
+  invocations in the parallel strategy or $O(k)$ in the sequential
+  strategy, where $k \leq |E|$ is the index of the first responding oracle.
+\end{proposition}
+
+\begin{proposition}[Eligibility preserves soundness]\label{prop:eligible-sound}
+  If $E(\OrcSet, d, \tau_{\mathrm{req}}) \neq \emptyset$ and a single
+  oracle $\Orcl{j} \in E$ responds, then the output trust satisfies
+  $\tlev{\Ceil{R_j, \Orcl{j}}} \tleq \tau_j^{\max}$.
+\end{proposition}
+\begin{proof}
+  By ceiling enforcement (Definition~\ref{def:ceil-enforce}),
+  $\tlev{\Ceil{R_j, \Orcl{j}}} = \tau_j \tmin \tau_j^{\max}
+  \tleq \tau_j^{\max}$.  Since $\Orcl{j} \in E$, we have
+  $\tau_{\mathrm{req}} \tleq \tau_j^{\max}$, so the output trust
+  is bounded by the oracle's ceiling.
+\end{proof}
+
 \subsection{Compositional obligation splitting}
 
 When $\phi = \phi_1 \wedge \phi_2$ the protocol may split the
@@ -311,6 +382,96 @@ federate the results.  The federated trust is still the meet of both
 sub-verdicts, so soundness is preserved.  The
 \texttt{obligation\_splitting} module implements this via a
 \texttt{SplitStrategy} that respects oracle jurisdiction.
+
+\subsection{Worked example: federated verification across three backends}
+\label{sec:worked-example}
+
+We trace a complete federation cycle for a concrete obligation.  Consider
+a function \texttt{merge\_sorted(a, b)} whose post-condition requires
+$\texttt{len(result)} = \texttt{len(a)} + \texttt{len(b)}$ and that the
+output is sorted.  The obligation $\phi$ is the conjunction
+$\phi_{\mathrm{len}} \wedge \phi_{\mathrm{sort}}$.
+
+\paragraph{Step 1: Oracle registration.}
+Three oracles are registered:
+\begin{itemize}[nosep]
+  \item $\Orcl{Z3}$: kind $= \BK.\texttt{Z3}$, ceiling $= \Tsolver$,
+        jurisdiction $= \{\textsc{Arithmetic}, \textsc{Equality}\}$,
+        priority $= 10$.
+  \item $\Orcl{RT}$: kind $= \BK.\texttt{RUNTIME}$, ceiling $= \Truntime$,
+        jurisdiction $= \{\textsc{Heap}, \textsc{Behavioral}\}$,
+        priority $= 5$.
+  \item $\Orcl{CPL}$: kind $= \BK.\texttt{COPILOT}$, ceiling $= \Tcopilot$,
+        jurisdiction $= \{\textsc{Arithmetic}, \textsc{Heap},
+        \textsc{Behavioral}, \textsc{Equality}\}$,
+        priority $= 1$.
+\end{itemize}
+
+\paragraph{Step 2: Obligation splitting.}
+The \texttt{obligation\_splitting} module decomposes $\phi$ into two
+sub-obligations:
+\begin{align}
+  \phi_{\mathrm{len}} &: \texttt{len(result)} = \texttt{len(a)} + \texttt{len(b)},
+  \label{eq:phi-len}\\
+  \phi_{\mathrm{sort}} &: \forall\, i < j.\;
+  \texttt{result}[i] \leq \texttt{result}[j].
+  \label{eq:phi-sort}
+\end{align}
+Domain analysis assigns $\phi_{\mathrm{len}}$ to \textsc{Arithmetic}
+and $\phi_{\mathrm{sort}}$ to \textsc{Behavioral}.
+
+\paragraph{Step 3: Eligible set computation.}
+With $\tau_{\mathrm{req}} = \Toracle$ (we want at least oracle-tier
+trust):
+\begin{itemize}[nosep]
+  \item For $\phi_{\mathrm{len}}$: $E = \{\Orcl{Z3}\}$ (only Z3 covers
+        \textsc{Arithmetic} with ceiling $\Tsolver$; since
+        $\Toracle \tleq \Tsolver$, Z3 is eligible).
+        $\Orcl{CPL}$ is excluded because $\Tcopilot$ does not satisfy
+        $\Toracle \tleq \Tcopilot$.
+  \item For $\phi_{\mathrm{sort}}$: $E = \{\Orcl{RT}\}$ (runtime covers
+        \textsc{Behavioral} with ceiling $\Truntime$; since
+        $\Toracle \tleq \Truntime$, the runtime oracle is eligible).
+\end{itemize}
+
+\paragraph{Step 4: Dispatch and response.}
+\begin{itemize}[nosep]
+  \item $\Resp(\Orcl{Z3}, \phi_{\mathrm{len}}) =
+        \varepsilon_{\mathrm{len}}$
+        with claimed trust $\Tsolver$.  After ceiling enforcement:
+        $\Ceil{\varepsilon_{\mathrm{len}}, \Orcl{Z3}}$ has trust
+        $\Tsolver \tmin \Tsolver = \Tsolver$.
+  \item $\Resp(\Orcl{RT}, \phi_{\mathrm{sort}}) =
+        \varepsilon_{\mathrm{sort}}$
+        with claimed trust $\Truntime$.  After ceiling enforcement:
+        $\Ceil{\varepsilon_{\mathrm{sort}}, \Orcl{RT}}$ has trust
+        $\Truntime \tmin \Truntime = \Truntime$.
+\end{itemize}
+
+\paragraph{Step 5: Federation.}
+The overall federated evidence for $\phi = \phi_{\mathrm{len}} \wedge
+\phi_{\mathrm{sort}}$ carries trust:
+\[
+  \tau_{\Fed} = \tmeet{\Tsolver}{\Truntime} = \Truntime.
+\]
+The meet picks the lower tier ($\Truntime \tleq \Tsolver$), which
+correctly reflects that the sorted-order property was verified only by
+runtime testing, not formal proof.  The evidence bundle retains both
+items, so a consumer requiring $\Tsolver$ trust can extract the
+$\phi_{\mathrm{len}}$ certificate separately.
+
+\paragraph{Step 6: Copilot fallback (what-if).}
+If instead $\Orcl{RT}$ had returned $\bot$ for $\phi_{\mathrm{sort}}$,
+the \texttt{CopilotFallbackPolicy} would activate $\Orcl{CPL}$
+(Definition~\ref{def:cpact}).  Suppose $\Orcl{CPL}$ returns evidence at
+trust $\Tcopilot$.  Then:
+\[
+  \tau_{\Fed} = \tmeet{\Tsolver}{\Tcopilot} = \Tcopilot.
+\]
+The verdict is tagged \texttt{PENDING\_CORROBORATION} and enqueued
+for subsequent Z3 re-verification.  Trust cannot silently rise above
+$\Tcopilot$ until corroboration succeeds
+(Corollary~\ref{cor:copilot-safe}).
 
 %% ═══════════════════════════════════════════════════════════════════════
 \section{Conflict Resolution}\label{sec:conflict}
@@ -372,6 +533,90 @@ Every conflict is recorded in an \emph{audit ledger} attached to the
 evidence bundle.  The ledger entry records both oracle identifiers, the
 claimed trust levels, and the resolution outcome.  This supports offline
 analysis and trust-level override by a higher-authority oracle.
+
+\subsection{Formal model of oracle agreement}\label{sec:agreement}
+
+When multiple oracles respond to the same obligation, we require a formal
+characterisation of when they \emph{agree}.  Agreement is stronger than
+the absence of positive-negative conflict: it requires that the evidence
+items are logically compatible and that the trust levels are consistent
+with the trust lattice ordering.
+
+\begin{definition}[Oracle agreement]\label{def:agreement}
+  Two evidence items $\varepsilon_i = (\mathit{src}_i, \phi_i, \tau_i,
+  \prov_i)$
+  and $\varepsilon_j = (\mathit{src}_j, \phi_j, \tau_j, \prov_j)$ are in
+  \emph{agreement} on obligation $\phi$, written
+  $\varepsilon_i \sim_\phi \varepsilon_j$, if:
+  \begin{enumerate}[label=(\roman*),nosep]
+    \item $\phi_i$ and $\phi_j$ both entail $\phi$ (both constitute
+          positive evidence);
+    \item the evidence is logically compatible: $\phi_i \wedge \phi_j$ is
+          satisfiable; and
+    \item the provenance traces are independent:
+          $\prov_i \cap \prov_j = \emptyset$ (no circular derivation).
+  \end{enumerate}
+\end{definition}
+
+\begin{definition}[Full agreement]\label{def:full-agreement}
+  A contributing set $S(\OrcSet, \phi)$ is in \emph{full agreement} if
+  $\varepsilon_i \sim_\phi \varepsilon_j$ for every pair
+  $\Orcl{i}, \Orcl{j} \in S$ with
+  $\varepsilon_i = \Ceil{\Resp(\Orcl{i},\phi), \Orcl{i}}$ and
+  $\varepsilon_j = \Ceil{\Resp(\Orcl{j},\phi), \Orcl{j}}$.
+\end{definition}
+
+\begin{theorem}[Agreement implies meet attainment]\label{thm:agreement-meet}
+  If $S(\OrcSet, \phi)$ is in full agreement, then
+  $\tau_{\Fed} = \bigsqcap_{i \in S} \tau_i'$ and the federated
+  evidence bundle $\bigl\{\Ceil{R_i, \Orcl{i}} \mid \Orcl{i} \in S\bigr\}$
+  is consistent.  Moreover, for any subset $T \subseteq S$, the
+  sub-federation over $T$ also yields a consistent bundle with
+  $\tau_{\Fed}(T) = \bigsqcap_{i \in T} \tau_i'$.
+\end{theorem}
+\begin{proof}[Proof sketch]
+  Full agreement guarantees condition~(ii) of
+  Definition~\ref{def:agreement} for all pairs, so the conjunction
+  $\bigwedge_{i \in S} \phi_i$ is satisfiable.  The meet
+  $\bigsqcap_{i \in S} \tau_i'$ exists by completeness of the trust
+  lattice.  For $T \subseteq S$, pairwise agreement is inherited, and
+  $\bigsqcap_{i \in T} \tau_i'$ exists by the same argument.  The
+  sub-federation trust satisfies
+  $\bigsqcap_{i \in S} \tau_i' \tleq \bigsqcap_{i \in T} \tau_i'$
+  by anti-monotonicity of meet (Proposition~\ref{prop:monotone}).
+\end{proof}
+
+\begin{definition}[Conflict resolution function]\label{def:resolve-fn}
+  The \emph{conflict resolution function} $\mathit{resolve} : 2^S \to
+  \TierSet \cup \{\bot\}$ maps a contributing set to the federated trust:
+  \[
+    \mathit{resolve}(S) \;=\;
+    \begin{cases}
+      \Tcontra & \text{if any pair in } S \text{ has a
+                  positive-negative conflict},\\
+      \bigsqcap_{i \in S} \tau_i' & \text{if } S \text{ is in full
+                                     agreement},\\
+      \bigsqcap_{i \in A} \tau_i' & \text{otherwise, where }
+                                     A \subseteq S
+                                     \text{ is the maximal agreeing
+                                     subset}.
+    \end{cases}
+  \]
+\end{definition}
+
+\begin{proposition}[Resolution is well-defined]\label{prop:resolve-welldef}
+  The maximal agreeing subset $A$ in the third case of
+  Definition~\ref{def:resolve-fn} is unique when the agreement relation
+  $\sim_\phi$ is transitive on $S$.  In the general case, $A$ is chosen
+  as the largest subset of mutually agreeing oracles; ties are broken by
+  selecting the subset with the highest meet trust.
+\end{proposition}
+\begin{proof}
+  When $\sim_\phi$ is transitive, the agreeing subsets form a chain under
+  inclusion, so the maximum exists and is unique.  In the non-transitive
+  case, the selection criterion (largest $|A|$, then highest
+  $\bigsqcap_{i \in A} \tau_i'$) is well-defined because $S$ is finite.
+\end{proof}
 
 \begin{example}
   Suppose $\Orcl{Z3}$ (ceiling $\Tsolver$) returns evidence at
@@ -599,6 +844,129 @@ class SolverRouter:
 Line~\ref{line:dispatch} implements the parallel dispatch of
 §3.2; line~\ref{line:federate} applies the meet-resolution of §4.
 
+\subsection{Federation configuration API}\label{sec:fed-api}
+
+The \texttt{RouterConfiguration} class and its associated
+\texttt{BackendDescriptor} records provide the main entry point for
+configuring a federated verification pipeline.  Below we show a complete
+three-backend configuration session using the public API from
+\texttt{src/jugeo/solver/router.py}.
+
+\begin{lstlisting}[style=jugeo-python, caption={%
+  Configuring a three-backend oracle federation
+  (using \texttt{src/jugeo/solver/router.py}).}]
+from jugeo.solver.router import (
+    BackendDescriptor,
+    BackendKind,
+    RouterConfiguration,
+    RoutingStrategyKind,
+    SolverRouter,
+    VerificationDomain,
+    CopilotFallbackPolicy,
+)
+from jugeo.foundations.trust import TrustTier
+
+# Backend 1: Z3 SMT solver (arithmetic + equality)
+z3_backend = BackendDescriptor(
+    name="z3-primary",
+    kind=BackendKind.Z3,
+    jurisdiction=frozenset({
+        VerificationDomain.ARITHMETIC,
+        VerificationDomain.EQUALITY,
+        VerificationDomain.PROPOSITIONAL,
+    }),
+    trust_ceiling=TrustTier.VERIFIED,
+    priority=10,
+    cost_per_query=0.0,
+    average_latency_ms=50.0,
+)
+
+# Backend 2: Runtime witness collector (heap + identity)
+runtime_backend = BackendDescriptor(
+    name="runtime-witness",
+    kind=BackendKind.RUNTIME,
+    jurisdiction=frozenset({
+        VerificationDomain.HEAP,
+        VerificationDomain.IDENTITY,
+        VerificationDomain.SEMANTIC,
+    }),
+    trust_ceiling=TrustTier.RUNTIME_CHECKED,
+    priority=5,
+    cost_per_query=0.0,
+    average_latency_ms=10.0,
+)
+
+# Backend 3: Copilot fallback (all domains, low trust)
+copilot_backend = BackendDescriptor(
+    name="copilot-fallback",
+    kind=BackendKind.COPILOT,
+    jurisdiction=frozenset(VerificationDomain),
+    trust_ceiling=TrustTier.PROPOSAL,
+    priority=1,
+    cost_per_query=0.01,
+    average_latency_ms=200.0,
+)
+
+# Assemble the federation configuration
+config = RouterConfiguration(
+    backends=[z3_backend, runtime_backend, copilot_backend],
+    routing_strategy=RoutingStrategyKind.MOST_TRUSTED,
+    fallback_policy=CopilotFallbackPolicy(
+        enabled=True,
+        max_queries_per_minute=10,
+        require_corroboration_above=TrustTier.PROPOSAL,
+        copilot_trust_ceiling=TrustTier.PROPOSAL,
+    ),
+    jurisdiction_strict=True,
+    copilot_as_last_resort=True,
+    max_fallback_depth=3,
+    latency_budget_ms=500.0,
+)
+
+router = SolverRouter(config)
+\end{lstlisting}
+
+The configuration above registers three backends with disjoint primary
+jurisdictions: Z3 handles arithmetic and equality; the runtime witness
+handles heap and identity reasoning; the Copilot fallback covers all
+domains but at reduced trust.  Setting \texttt{jurisdiction\_strict=True}
+ensures that an oracle is never queried outside its declared jurisdiction.
+
+\begin{lstlisting}[style=jugeo-python, caption={%
+  Executing a federated verification query and inspecting the result.}]
+from jugeo.solver.fragments import SolverFragment
+
+# Construct the verification obligation
+fragment = SolverFragment.from_proposition(
+    proposition="len(result) == len(a) + len(b)",
+    domain=VerificationDomain.ARITHMETIC,
+)
+
+# Execute federated verification
+decision = router.route(
+    fragment,
+    domains={VerificationDomain.ARITHMETIC},
+    requested_tier=TrustTier.VERIFIED,
+)
+
+# Inspect the routing decision
+print(decision.selected_backend)       # "z3-primary"
+print(decision.trust_ceiling)          # TrustTier.VERIFIED
+print(decision.jurisdiction_check_passed)  # True
+print(decision.estimated_latency)      # ~50.0 ms
+print(decision.rationale)              # "Z3 covers ARITHMETIC at VERIFIED"
+
+# If Z3 fails, the router falls back through the chain:
+# z3-primary -> runtime-witness -> copilot-fallback
+for fb in decision.fallback_backends:
+    print(f"  fallback: {fb.name} (ceiling={fb.trust_ceiling})")
+\end{lstlisting}
+
+The \texttt{RoutingDecision} record captures the complete rationale for
+backend selection, including the jurisdiction check result, estimated cost
+and latency, and the ordered fallback chain.  This record is persisted in
+the provenance trace (§7) for auditability.
+
 %% ═══════════════════════════════════════════════════════════════════════
 \section{Federation Soundness}\label{sec:soundness}
 %% ═══════════════════════════════════════════════════════════════════════
@@ -692,6 +1060,98 @@ federation with a permanently low-trust oracle \emph{would} suppress the
 verdict.  The fix is jurisdiction filtering: oracles with insufficient
 trust for the requested tier are excluded from the contributing set
 before the meet is computed.
+
+\subsection{Federation consistency theorem}\label{sec:fed-consistency}
+
+We now prove a stronger property than soundness: \emph{consistency} of
+the federation, which states that when all backends agree on a verified
+program, the federated verdict is logically equivalent to any individual
+verdict.
+
+\begin{definition}[Federation consistency]\label{def:fed-consistency}
+  A federation over oracle set $\OrcSet$ is \emph{consistent} for
+  obligation $\phi$ if, whenever the contributing set $S(\OrcSet, \phi)$
+  is in full agreement (Definition~\ref{def:full-agreement}), the
+  federated evidence entails $\phi$ with the same logical strength as
+  any individual contributor:
+  \[
+    \forall\, \Orcl{i} \in S.\;
+    \bigl(\Ceil{\Resp(\Orcl{i},\phi),\Orcl{i}} \models \phi\bigr)
+    \;\Longrightarrow\;
+    \Fed(\OrcSet,\phi) \models \phi.
+  \]
+\end{definition}
+
+\begin{theorem}[Federation consistency]\label{thm:fed-consistency}
+  Let $\OrcSet$ be a finite oracle set and $\phi$ an obligation with
+  contributing set $S = S(\OrcSet, \phi)$ in full agreement.  Then:
+  \begin{enumerate}[label=(\alph*)]
+    \item \textbf{(Logical consistency)}
+          The federated evidence bundle is satisfiable:
+          $\bigwedge_{\Orcl{i} \in S}
+           \phi_i \text{ is satisfiable}$,
+          where $\phi_i$ is the claim in $\Ceil{R_i, \Orcl{i}}$.
+    \item \textbf{(Trust consistency)}
+          $\tau_{\Fed} = \bigsqcap_{i \in S} \tau_i'$ and for every
+          $\Orcl{j} \in S$, $\tau_{\Fed} \tleq \tau_j'$.
+    \item \textbf{(Monotone strengthening)}
+          If a new oracle $\Orcl{k} \notin S$ is added with
+          $\Resp(\Orcl{k}, \phi) \neq \bot$ and
+          $\varepsilon_k \sim_\phi \varepsilon_i$ for all
+          $\Orcl{i} \in S$,
+          then $\Fed(\OrcSet \cup \{\Orcl{k}\}, \phi) \models \phi$ and
+          $\tau_{\Fed}(\OrcSet \cup \{\Orcl{k}\})
+           \tleq \tau_{\Fed}(\OrcSet)$.
+  \end{enumerate}
+\end{theorem}
+\begin{proof}
+  (a) By full agreement (Definition~\ref{def:full-agreement}), every pair
+  $\varepsilon_i, \varepsilon_j$ has $\phi_i \wedge \phi_j$ satisfiable.
+  We show by induction on $|S|$ that $\bigwedge_{i \in S} \phi_i$ is
+  satisfiable.  The base case $|S| = 1$ is trivial.  For $|S| = n + 1$,
+  let $S = S' \cup \{\Orcl{n+1}\}$.  By induction, $\bigwedge_{i \in S'}
+  \phi_i$ is satisfiable; by agreement, $\phi_{n+1}$ is compatible with
+  each $\phi_i$.  Under the assumption that the underlying theory admits
+  the finite model property for the obligation fragment, the conjunction
+  $\bigwedge_{i \in S} \phi_i$ is satisfiable.
+
+  \noindent(b) Immediate from Definition~\ref{def:fed-evid} and the
+  meet axiom of the trust lattice.
+
+  \noindent(c) Adding $\Orcl{k}$ extends $S$ to $S' = S \cup \{\Orcl{k}\}$.
+  Full agreement is preserved by hypothesis.  By~(a), the bundle is
+  satisfiable, so $\Fed(\OrcSet \cup \{\Orcl{k}\}, \phi) \models \phi$.
+  The trust satisfies $\bigsqcap_{i \in S'} \tau_i' \tleq
+  \bigsqcap_{i \in S} \tau_i'$ by anti-monotonicity of meet
+  (Proposition~\ref{prop:monotone}).
+\end{proof}
+
+\begin{corollary}[All-solver consistency]\label{cor:all-solver}
+  If every oracle in the contributing set has kind $\BK.\texttt{Z3}$ or
+  $\BK.\texttt{PROVER}$ (ceiling $\Tsolver$ or $\Tproof$ respectively),
+  and all are in full agreement, then the federated trust is at least
+  $\Tsolver$:
+  \[
+    \tau_{\Fed} \;=\; \bigsqcap_{i \in S} \tau_i'
+    \;\text{and}\; \tau_{\Fed} \in \{\Tsolver, \Tproof\}.
+  \]
+\end{corollary}
+\begin{proof}
+  Each $\tau_i' \in \{\Tsolver, \Tproof\}$ by the ceiling mapping.
+  The meet of elements from $\{\Tsolver, \Tproof\}$ is $\Tsolver$
+  (since $\Tsolver \tleq \Tproof$).  If all oracles have ceiling
+  $\Tproof$, the meet is $\Tproof$.
+\end{proof}
+
+\begin{remark}
+  Theorem~\ref{thm:fed-consistency} assumes the finite model property
+  for the obligation fragment.  This holds for the quantifier-free
+  fragments $\QFLIA$, $\QFLRA$, $\QFBV$, and $\QFUF$ that constitute
+  the majority of obligations in our benchmark suite.  For fragments
+  with quantifier alternation, satisfiability of the conjunction is
+  undecidable in general; the federation protocol handles this by
+  treating undecidable conjunctions as $\bot$ (no evidence).
+\end{remark}
 
 %% ═══════════════════════════════════════════════════════════════════════
 \section{Experiments}\label{sec:experiments}

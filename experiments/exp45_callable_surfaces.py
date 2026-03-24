@@ -351,12 +351,14 @@ def main():
 
         if eval_objs:
             ev = eval_objs[0]
-            coverage = ev.get("coverage", ev.get("cover_quality", {}).get("score", 0.0))
-            if isinstance(coverage, dict):
-                coverage = coverage.get("score", 0.0)
-            trust_info = ev.get("trust_info", ev.get("trust", {}))
+            # per_coordinate quality is the meaningful coverage metric
+            per_coord = ev.get("per_coordinate", [])
+            if per_coord:
+                quals = [c.get("quality", 0.0) for c in per_coord]
+                coverage = safe_mean(quals)
+            trust_info = ev.get("trust", {})
             if isinstance(trust_info, dict):
-                trust = trust_info.get("aggregate_trust", trust_info.get("level", 0.0))
+                trust = trust_info.get("aggregate_trust", 0.0)
             else:
                 trust = float(trust_info) if trust_info else 0.0
 
@@ -366,6 +368,12 @@ def main():
             n_coords = len(secs)
             n_props = sum(s.get("propositions", 0) for s in secs)
             verified = len(d.get("obstructions", [])) == 0
+            # Refine coverage from descent: fraction of propositions ok
+            if n_props > 0:
+                total_ok = sum(s.get("ok", 0) for s in secs)
+                desc_cov = total_ok / n_props
+                # Use the higher of evaluate quality and descend coverage
+                coverage = max(coverage, desc_cov)
 
         all_surfaces.append(surfaces["total"])
 
@@ -413,6 +421,15 @@ def main():
     cb_coverage = cat_coverage(cb_recs)
     dec_coverage = cat_coverage(dec_recs)
 
+    def cat_med_time(recs):
+        """Median wall-clock time for programs in this category."""
+        ts = [r["time"] for r in recs]
+        return safe_median(ts)
+
+    hof_med_time = cat_med_time(hof_recs)
+    cb_med_time = cat_med_time(cb_recs)
+    dec_med_time = cat_med_time(dec_recs)
+
     med_time = safe_median(timings)
     mean_surfaces = safe_mean(all_surfaces)
 
@@ -449,6 +466,9 @@ def main():
         "",
         "% --- Timing ---",
         f"\\newcommand{{\\{P}MedTime}}{{{fmt_time(med_time)}}}",
+        f"\\newcommand{{\\{P}HofMedTime}}{{{fmt_time(hof_med_time)}}}",
+        f"\\newcommand{{\\{P}CbMedTime}}{{{fmt_time(cb_med_time)}}}",
+        f"\\newcommand{{\\{P}DecMedTime}}{{{fmt_time(dec_med_time)}}}",
         "",
         "% --- Surfaces ---",
         f"\\newcommand{{\\{P}MeanSurfaces}}{{{mean_surfaces:.1f}}}",
@@ -465,9 +485,9 @@ def main():
             "paper": 45,
             "total_programs": n_total,
             "categories": {
-                "hof": {"n": n_hof, "recall": hof_recall, "coverage": hof_coverage},
-                "cb":  {"n": n_cb,  "recall": cb_recall,  "coverage": cb_coverage},
-                "dec": {"n": n_dec, "recall": dec_recall, "coverage": dec_coverage},
+                "hof": {"n": n_hof, "recall": hof_recall, "coverage": hof_coverage, "med_time": hof_med_time},
+                "cb":  {"n": n_cb,  "recall": cb_recall,  "coverage": cb_coverage,  "med_time": cb_med_time},
+                "dec": {"n": n_dec, "recall": dec_recall, "coverage": dec_coverage, "med_time": dec_med_time},
             },
             "med_time": med_time,
             "mean_surfaces": mean_surfaces,

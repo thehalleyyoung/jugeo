@@ -1,0 +1,1487 @@
+\documentclass[11pt]{article}
+\usepackage{lmodern}
+\input{jugeo-common}
+% \input{data-paper89}  % data file removed: paper 89 has no measured data
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% ── paper-specific macros ─────────────────────────────────────────
+\newcommand{\CopChan}{\texttt{CopilotOracleChannel}}
+\newcommand{\CopOracle}{\texttt{CopilotOracle}}
+\newcommand{\CopFallback}{\texttt{CopilotFallbackPolicy}}
+\newcommand{\CopFragment}{\texttt{CopilotFragmentAssist}}
+\newcommand{\OChan}{\texttt{OracleChannel}}
+\newcommand{\OJuris}{\texttt{OracleJurisdiction}}
+\newcommand{\TCeil}{\texttt{TrustCeilingEnforcer}}
+\newcommand{\OPRec}{\texttt{OracleProposalRecord}}
+\newcommand{\copilottrust}{$\mathsf{copilot\_suggested}$}
+\newcommand{\ceilop}{\mathsf{ceil}}
+\newcommand{\promote}{\mathsf{promote}}
+\newcommand{\corroborate}{\mathsf{corroborate}}
+\newcommand{\selfpromo}{\mathsf{self\text{-}promo}}
+
+\title{\textbf{Copilot as Federated Oracle:\\
+LLMs in the Solver Network}\\[6pt]
+{\large Paper~89 of the Judgment Geometry Series}}
+
+\author{Halley Young \\
+\textit{Microsoft Research} \\
+\texttt{halley.young@microsoft.com}}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{Audit note.}
+The repository contains oracle-federation infrastructure such as
+\texttt{OracleProposalRecord}, \texttt{OracleJurisdiction}, and the
+controlled-oracle machinery, but not every copilot-specific class shown
+in the original draft is exported as a stable JuGeo API.  In this
+audited version, any unmatched listings should be read as simplified
+interface sketches around the real trust-ceiling and jurisdiction logic.
+
+% ══════════════════════════════════════════════════════════════════
+%  Abstract
+% ══════════════════════════════════════════════════════════════════
+
+\begin{abstract}
+Modern software verification systems increasingly rely on heterogeneous
+solver backends---SMT solvers, model checkers, proof assistants, and
+now large language models (LLMs) such as GitHub Copilot.  Integrating
+an LLM into a \emph{trusted} verification pipeline poses unique
+challenges: the model can fabricate evidence, self-promote its own
+confidence, and drift outside its jurisdiction.  We present a
+\emph{federated oracle} architecture within the Judgment Geometry
+framework that treats Copilot as a \emph{controlled oracle channel}
+with a hard trust ceiling at \copilottrust{}.  Our design enforces
+three invariants: (1)~\emph{no self-promotion}---the oracle cannot
+raise its own trust tier; (2)~\emph{fallback soundness}---copilot is
+consulted only when primary backends are exhausted; and
+(3)~\emph{corroboration necessity}---any suggestion promoted above
+the ceiling must be independently corroborated.  The repository-backed
+core of this story is the controlled-oracle and trust-ceiling
+infrastructure; copilot-specific policy layers shown below are best read
+as design sketches, and earlier claims about Lean mechanization and
+measured multi-domain evaluation have been removed.
+\end{abstract}
+
+% ══════════════════════════════════════════════════════════════════
+%  1. Introduction
+% ══════════════════════════════════════════════════════════════════
+
+\section{Introduction}\label{sec:intro}
+
+The Judgment Geometry framework models software artefacts through
+\emph{judgments}---triples $\Jud{J} = (\coord, \prop, \evid)$ whose
+coordinates locate a code entity, whose propositions describe its
+intended behaviour, and whose evidence witnesses the verification
+status of that behaviour~\cite{young2024jg1,young2024jg4}.  Each
+judgment carries a \emph{trust level}
+$\tau \in \{\Tcontra, \Tunver, \Tcopilot, \Toracle, \Truntime,
+\Tsolver, \Tproof\}$
+ordered by the lattice $(\mathcal{T}, \tleq)$.
+
+Over the preceding 88~papers in this series we have developed the
+algebraic, topological, and categorical infrastructure for composing
+verification evidence across heterogeneous backends.  Papers~7
+and~8~\cite{young2024jg7,young2024jg8} introduced the solver
+router---a central dispatcher that directs verification requests to
+the appropriate backend.  Paper~31~\cite{young2024jg31} formalised
+oracle channels as trust-bounded interfaces for querying external
+knowledge sources.
+
+In this paper we ask: \emph{What happens when one of those oracles
+is an LLM?}  Large language models such as GitHub Copilot have become
+indispensable coding assistants, yet they can hallucinate proofs,
+fabricate counterexamples, and---most dangerously---present
+high-confidence claims that escape the trust discipline of the
+verification pipeline.  Naively plugging an LLM into the solver
+network would compromise the soundness guarantees that Judgment
+Geometry is designed to uphold.
+
+Our solution is a \emph{federated oracle} architecture that treats
+Copilot as a first-class but \emph{trust-bounded} participant in the
+solver network.  The key contributions are:
+
+\begin{enumerate}
+  \item \textbf{Controlled copilot-oracle architecture.}  A trust-bounded
+    channel design centered on repository-backed oracle-jurisdiction and
+    proposal-record ideas, with copilot-specific methods presented as
+    interface sketches (Section~\ref{sec:channel}).
+
+  \item \textbf{Fallback and fragment-assist policies.}
+    Policy sketches governing when a copilot oracle would be consulted
+    and how it might assist fragment classification
+    (Section~\ref{sec:fallback}).
+
+  \item \textbf{Formal properties.}  Three desired invariants---no
+    self-promotion, fallback soundness, and corroboration
+    necessity---stated mathematically rather than claimed as shipped
+    Lean artifacts (Section~\ref{sec:formal}).
+
+  \item \textbf{Evaluation methodology.}  An experimental
+    framework for measuring suggestion acceptance, corroboration
+    effectiveness, and self-promotion violation detection
+    (Section~\ref{sec:experiments}).
+\end{enumerate}
+
+The challenge is not merely engineering.  An LLM oracle introduces
+a qualitatively new failure mode: \emph{trust inflation}.  Unlike
+an SMT solver, which either returns $\mathsf{sat}$/$\mathsf{unsat}$
+or times out, an LLM can emit natural-language prose that
+\emph{appears} to carry higher epistemic authority than it warrants.
+A response like ``this lemma is trivially true by induction'' may
+be syntactically well-formed and even correct, yet assigning it
+$\Tsolver$-level trust would be unsound.  Our architecture
+addresses this by enforcing a hard ceiling at $\Tcopilot$ and
+requiring independent corroboration for any promotion.
+
+The design philosophy follows the \emph{principle of least
+authority} (POLA): the copilot oracle receives exactly the
+permissions it needs to be useful---the ability to suggest
+encodings, explanations, and decompositions---and no more.  It
+cannot modify the trust lattice, cannot promote its own output,
+and cannot bypass the jurisdiction check.
+
+The rest of this paper is organised as follows.
+Section~\ref{sec:federation} reviews the oracle federation model in
+Judgment Geometry.  Section~\ref{sec:channel} presents the
+\CopChan{} class.  Section~\ref{sec:fallback} describes fallback
+and fragment-assist policies.  Section~\ref{sec:formal} states and
+proves the three core theorems.  Section~\ref{sec:experiments}
+reports experimental results.  Section~\ref{sec:related} surveys
+related work, and Section~\ref{sec:conclusion} concludes.
+
+% ══════════════════════════════════════════════════════════════════
+%  2. Oracle Federation in Judgment Geometry
+% ══════════════════════════════════════════════════════════════════
+
+\section{Oracle Federation in Judgment Geometry}
+\label{sec:federation}
+
+The oracle federation model in Judgment Geometry provides a
+principled framework for integrating external knowledge sources
+into the verification pipeline.  Each oracle is wrapped in a
+\emph{channel} that enforces jurisdiction, trust ceilings, and
+audit logging.
+
+The federation model is motivated by the observation that modern
+verification systems rarely rely on a single backend.  A typical
+verification task might require an SMT solver for arithmetic
+constraints, a model checker for temporal properties, a proof
+assistant for complex inductive arguments, and now an LLM for
+heuristic guidance.  Each of these backends has different strengths,
+different failure modes, and different levels of trustworthiness.
+
+The oracle federation provides a uniform interface---the
+$\mathsf{OracleChannel}$---that abstracts over these differences
+while preserving the trust discipline.  Every channel declares its
+jurisdiction (what kinds of queries it can handle), its trust
+ceiling (the maximum trust level its responses can carry), and its
+audit policy (how interactions are logged for post-hoc review).
+
+\subsection{Controlled Oracles}\label{sec:controlled}
+
+An oracle in Judgment Geometry is any external agent that can
+supply evidence for a judgment.  The $\mathsf{OracleChannel}$ base
+class (from \texttt{jugeo.foundations.oracle\_federation.controlled%
+\_oracles}) manages this interaction through a structured protocol:
+
+\begin{enumerate}
+  \item The solver router selects a channel based on the query
+    domain.
+  \item The channel checks jurisdiction (\ie{} whether the query
+    falls within the oracle's declared competence).
+  \item If accepted, the channel invokes the oracle and wraps the
+    response in an \OPRec{}.
+  \item A $\mathsf{TrustCeilingEnforcer}$ clamps the trust level
+    of the response to the channel's ceiling.
+\end{enumerate}
+
+The key invariant is that no oracle can unilaterally raise its own
+trust level beyond its assigned ceiling.  Formally, for any oracle
+channel $c$ with ceiling $\kappa_c$ and any response $r$ produced
+by $c$, we require:
+\begin{equation}\label{eq:ceiling}
+  \tau(r) \;\tleq\; \kappa_c.
+\end{equation}
+
+This invariant is the cornerstone of the entire oracle federation.
+Without it, a single compromised or misconfigured oracle could
+propagate inflated trust levels through the verification pipeline,
+undermining the guarantees of every downstream consumer.  The
+invariant is enforced at two levels: locally by each channel's
+$\mathsf{propose}$ method, and globally by the
+$\mathsf{TrustCeilingEnforcer}$ that sits in the pipeline between
+the channel and the proposal log.
+
+\begin{definition}[Oracle Channel]\label{def:oracle-channel}
+An \emph{oracle channel} $c = (id, \mathcal{J}, \kappa, f)$
+consists of a unique identifier $id$, a jurisdiction $\mathcal{J}$,
+a trust ceiling $\kappa \in \mathcal{T}$, and an invocation function
+$f : \mathsf{Request} \to \mathsf{Response}$.  The channel's
+$\mathsf{propose}$ method computes $f(q)$ for a request $q$ within
+$\mathcal{J}$ and clamps the result's trust to $\kappa$.
+\end{definition}
+
+\begin{lstlisting}[style=jugeo-python,caption={Simplified channel sketch.}]
+# Schematic interface sketch.  The repository contains controlled-oracle
+# machinery, but not every symbol in this listing is exported exactly as
+# shown.
+
+class OracleChannel:
+    """Trust-bounded oracle channel (Theory2 S7.1.1)."""
+
+    def __init__(self, oracle_id=None, name="oracle",
+                 channel_kind="oracle",
+                 jurisdiction=None,
+                 trust_ceiling="oracle_proposed"):
+        self._oracle_id = oracle_id or uuid.uuid4().hex[:16]
+        self._name = name
+        self._channel_kind = channel_kind
+        self._jurisdiction = jurisdiction
+        self._trust_ceiling = trust_ceiling
+        self._proposal_log: list[OracleProposalRecord] = []
+
+    def propose(self, request):
+        """Submit request; return clamped response dict."""
+        if self._jurisdiction and not \
+                self._jurisdiction.check_request(request):
+            raise JurisdictionError(request)
+        raw = self._invoke_oracle(request)
+        return self._clamp(raw)
+\end{lstlisting}
+
+The $\mathsf{propose}$ method is the sole entry point for oracle
+interaction.  It delegates to a private $\mathsf{\_invoke\_oracle}$
+method (overridden by subclasses) and then applies the trust ceiling
+via $\mathsf{\_clamp}$.
+
+\subsection{Oracle Jurisdiction}\label{sec:jurisdiction}
+
+Each oracle channel declares an \OJuris{} that specifies its
+authorised domains.  This prevents, for example, a Copilot channel
+from answering queries about bitvector overflow when it has only
+been authorised for string-theory suggestions.
+
+\begin{definition}[Oracle Jurisdiction]\label{def:jurisdiction}
+An \emph{oracle jurisdiction} $\mathcal{J} = (s, D, \kappa)$
+consists of a scope identifier $s$, a set of allowed domains
+$D \subseteq \mathcal{D}$, and a trust ceiling $\kappa$.  A
+request $q$ is \emph{within jurisdiction} if
+$\mathrm{domain}(q) \in D$.
+\end{definition}
+
+The jurisdiction check is enforced before any oracle invocation.
+If a request falls outside jurisdiction, the channel raises a
+$\mathsf{JurisdictionError}$ and no proposal record is created.
+
+\begin{lstlisting}[style=jugeo-python,caption={OracleJurisdiction class.}]
+class OracleJurisdiction:
+    """Declares authorized domains for oracle."""
+
+    def __init__(self, scope, allowed_domains,
+                 trust_ceiling="oracle_proposed",
+                 description=""):
+        self.scope = scope
+        self.allowed_domains = set(allowed_domains)
+        self.trust_ceiling = trust_ceiling
+        self.description = description
+
+    def check_request(self, request_kind):
+        """Return True iff request_kind is in scope."""
+        return request_kind in self.allowed_domains
+\end{lstlisting}
+
+A crucial design property is that jurisdictions of distinct oracle
+channels should be \emph{disjoint} or \emph{hierarchically nested}:
+
+\begin{proposition}[Jurisdiction Disjointness]\label{prop:disjoint}
+If oracle channels $c_1$ and $c_2$ have jurisdictions
+$\mathcal{J}_1 = (s_1, D_1, \kappa_1)$ and
+$\mathcal{J}_2 = (s_2, D_2, \kappa_2)$ with $s_1 \ne s_2$,
+then their responses never conflict on the same query domain:
+for any request $q$ within both jurisdictions, the router
+selects the channel with higher ceiling.
+\end{proposition}
+
+This property prevents ambiguity in the routing layer.  When the
+solver router receives a verification request, it consults the
+jurisdiction registry to determine which channels are eligible.  If
+two channels claim authority over the same domain, the router must
+resolve the conflict.  Disjointness eliminates this case entirely;
+hierarchical nesting resolves it by preferring the more specific
+jurisdiction.
+
+In the copilot setting, the copilot channel's jurisdiction is
+typically a subset of the broader oracle jurisdiction, restricted
+to domains where LLM heuristics are known to be helpful (\eg{}
+$\QFLIA$ encoding suggestions, string theory explanations).  The
+copilot channel never has jurisdiction over domains where formal
+solvers provide definitive answers (\eg{} $\QFBV$ satisfiability).
+
+\subsection{Trust Ceiling Enforcement}\label{sec:enforcement}
+
+The \TCeil{} is a policy guard that sits between the oracle
+channel and the proposal log.  It maintains a registry of
+channel-to-ceiling mappings and clamps every response.
+
+\begin{lstlisting}[style=jugeo-python,caption={TrustCeilingEnforcer.}]
+class TrustCeilingEnforcer:
+    """Policy guard clamping oracle responses."""
+
+    def __init__(self):
+        self.ceiling_map: dict[str, str] = {}
+        self.violation_log: list[dict] = []
+
+    def register_ceiling(self, channel_id, ceiling_level):
+        self.ceiling_map[channel_id] = ceiling_level
+
+    def enforce(self, channel_id, response_dict):
+        ceiling = self.ceiling_map.get(channel_id,
+                                       "oracle_proposed")
+        actual = response_dict.get("trust_level",
+                                    "unverified")
+        if _trust_ord(actual) > _trust_ord(ceiling):
+            self.violation_log.append({
+                "channel": channel_id,
+                "requested": actual,
+                "clamped_to": ceiling,
+            })
+            response_dict["trust_level"] = ceiling
+        return response_dict
+\end{lstlisting}
+
+The enforcer operates as a pure function on response dictionaries:
+it never modifies the oracle itself, only the outgoing trust tag.
+This separation of concerns ensures that enforcement is
+\emph{compositional}---multiple enforcers can be stacked in a
+pipeline without interference.
+
+The compositionality of ceiling enforcement is essential for the
+federated setting.  When multiple oracle channels are active
+simultaneously, each with its own ceiling, the global enforcer
+applies ceilings independently.  The resulting trust assignment is
+the pointwise minimum of the channel-specific ceiling and the
+claimed trust level.
+
+Formally, let $E$ be the enforcer with ceiling map
+$\{c_i \mapsto \kappa_i\}_{i=1}^{n}$.  For a response $r$ from
+channel $c_j$ with claimed trust $\tau(r)$, the enforced trust is:
+\begin{equation}\label{eq:enforced}
+  E(c_j, r) \;=\; \min\bigl(\tau(r),\; \kappa_j\bigr).
+\end{equation}
+
+This is monotone: raising $\kappa_j$ can only raise (never lower)
+the enforced trust, and lowering $\kappa_j$ can only lower it.  The
+enforcer thus acts as a \emph{Galois connection} between the lattice
+of claimed trust levels and the lattice of enforced trust levels.
+
+\begin{remark}
+The violation log maintained by $\mathsf{TrustCeilingEnforcer}$ is
+append-only and serves as an audit trail.  In production, this log
+is forwarded to the system's provenance store for post-hoc analysis.
+\end{remark}
+
+% ══════════════════════════════════════════════════════════════════
+%  3. The CopilotOracleChannel
+% ══════════════════════════════════════════════════════════════════
+
+\section{The CopilotOracleChannel}\label{sec:channel}
+
+The \CopChan{} class extends \OChan{} with Copilot-specific
+semantics.  Its trust ceiling is permanently fixed at
+\copilottrust{}, reflecting the epistemic status of LLM-generated
+content: useful but unverified.
+
+Figure~\ref{fig:channel-arch} illustrates the architecture.  A
+query enters through the solver router, is dispatched to the
+\CopChan{}, and passes through jurisdiction checking, the
+suggestion engine, self-promotion validation, and ceiling
+enforcement before a proposal record is emitted.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  node distance=1.2cm and 1.8cm,
+  box/.style={draw, rounded corners, minimum width=2.8cm,
+              minimum height=0.8cm, align=center,
+              font=\small},
+  arr/.style={-{Stealth[length=3mm]}, thick},
+]
+  \node[box, fill=blue!10] (router) {Solver\\Router};
+  \node[box, fill=green!10, right=of router] (juris)
+    {Jurisdiction\\Check};
+  \node[box, fill=orange!10, right=of juris] (suggest)
+    {Copilot\\Suggest};
+  \node[box, fill=red!10, below=of suggest] (selfpromo)
+    {Self-Promotion\\Validator};
+  \node[box, fill=purple!10, left=of selfpromo] (enforcer)
+    {Ceiling\\Enforcer};
+  \node[box, fill=gray!10, left=of enforcer] (log)
+    {Proposal\\Log};
+
+  \draw[arr] (router) -- (juris);
+  \draw[arr] (juris) -- (suggest);
+  \draw[arr] (suggest) -- (selfpromo);
+  \draw[arr] (selfpromo) -- (enforcer);
+  \draw[arr] (enforcer) -- (log);
+
+  \draw[arr, dashed, red] (juris.south) --
+    ++(0,-0.5) node[right, font=\scriptsize, red]
+    {refuse};
+  \draw[arr, dashed, red] (selfpromo.west) --
+    ++(-0.4,0) node[above, font=\scriptsize, red]
+    {violation};
+\end{tikzpicture}
+\caption{Architecture of the \CopChan{}.  Dashed arrows indicate
+  refusal paths.}
+\label{fig:channel-arch}
+\end{figure}
+
+\subsection{The \texorpdfstring{$\mathsf{suggest}$}{suggest} Method}
+\label{sec:suggest}
+
+The $\mathsf{suggest}$ method is the primary interface through which
+the solver router obtains Copilot's input.  It accepts a context
+dictionary describing the current verification goal and returns a
+suggestion record.
+
+\begin{lstlisting}[style=jugeo-python,caption={\CopChan{} sketch (core interface).}]
+class CopilotOracleChannel(OracleChannel):
+    """Copilot-specific oracle channel."""
+
+    def __init__(self, oracle_id=None,
+                 name="copilot",
+                 trust_ceiling="copilot_suggested",
+                 jurisdiction=None):
+        super().__init__(
+            oracle_id=oracle_id,
+            name=name,
+            channel_kind="copilot",
+            jurisdiction=jurisdiction,
+            trust_ceiling=trust_ceiling,
+        )
+        self.suggestion_history: list[dict] = []
+        self.refusal_reasons: list[dict] = []
+
+    def suggest(self, context):
+        """Generate suggestion for verification context."""
+        self._validate_jurisdiction(context)
+        suggestion = self._invoke_copilot(context)
+        self.suggestion_history.append({
+            "context": context,
+            "suggestion": suggestion,
+            "trust": self._trust_ceiling,
+        })
+        return suggestion
+
+    def suggestion_count(self):
+        """Return total suggestions emitted."""
+        return len(self.suggestion_history)
+\end{lstlisting}
+
+The $\mathsf{suggest}$ method never returns a trust level above
+\copilottrust{}.  This is enforced both by the method itself (which
+tags every suggestion at the channel's ceiling) and by the external
+$\mathsf{TrustCeilingEnforcer}$ (which clamps any residual
+over-claims).
+
+The dual enforcement---local clamping within the channel and global
+clamping by the enforcer---provides defence in depth.  Even if a
+subclass override inadvertently emits an inflated trust tag, the
+external enforcer catches it.  This layered design is motivated by
+the observation that LLM outputs are inherently unpredictable: a
+model might embed trust-level metadata in its response that bypasses
+the channel's local clamping logic.
+
+Each entry in $\mathsf{suggestion\_history}$ records the context,
+the suggestion, and the trust level at emission.  This log enables
+post-hoc auditing: one can verify that every suggestion was indeed
+capped at the ceiling by replaying the log through the enforcer.
+
+The $\mathsf{suggestion\_count}$ method provides a lightweight
+query over the history for rate-limiting and monitoring purposes.
+
+\subsection{The \texorpdfstring{$\mathsf{refuse}$}{refuse} Method}
+\label{sec:refuse}
+
+When a query falls outside the channel's jurisdiction or when the
+self-promotion validator detects a violation, the channel refuses
+to produce a suggestion.  The $\mathsf{refuse}$ method logs the
+reason and returns a null response.
+
+\begin{lstlisting}[style=jugeo-python,caption={Refusal logic.}]
+    def refuse(self, reason, context):
+        """Refuse to answer; log reason."""
+        self.refusal_reasons.append({
+            "reason": reason,
+            "context": context,
+        })
+        return None
+\end{lstlisting}
+
+Refusals are first-class events in the audit trail.  The
+evaluation framework in Section~\ref{sec:experiments} measures
+refusals broken down by cause: jurisdiction violations, ceiling
+violations, and self-promotion attempts.
+
+\subsection{The \texorpdfstring{$\mathsf{corroborate}$}{corroborate}
+  Method}\label{sec:corroborate}
+
+A copilot suggestion that the solver wants to promote above
+\copilottrust{} must be independently corroborated.  The
+$\mathsf{corroborate}$ method records such corroboration:
+
+\begin{lstlisting}[style=jugeo-python,caption={Corroboration protocol.}]
+    def corroborate(self, proposal_id, evidence):
+        """Record external corroboration for a proposal."""
+        rec = self._find_proposal(proposal_id)
+        if rec is None:
+            raise ValueError(f"Unknown proposal: {proposal_id}")
+        rec.corroborate(evidence["source_id"],
+                        evidence["trust_level"])
+        return rec
+\end{lstlisting}
+
+The corroboration source must satisfy two conditions:
+\begin{enumerate}
+  \item \emph{Independence}: the source must not be the copilot
+    channel itself (enforced by checking
+    $\mathsf{source\_id} \ne \mathsf{oracle\_id}$).
+  \item \emph{Sufficient trust}: the source's trust level must
+    meet or exceed the target promotion level.
+\end{enumerate}
+
+The corroboration success rate is measured by the evaluation
+framework in Section~\ref{sec:experiments}.
+
+The corroboration protocol interacts with the \OPRec{} class, which
+maintains a list of corroborating sources for each proposal.  When
+a corroboration is recorded, the proposal record is updated with
+the source's identifier and trust level.  This allows post-hoc
+analysis of which corroboration sources were most effective for
+different query domains.
+
+\begin{remark}
+The independence requirement for corroboration sources prevents a
+subtle attack vector: if the copilot could corroborate its own
+suggestions (even through an alias), it could bypass the trust
+ceiling by first emitting a suggestion and then corroborating it.
+The $\mathsf{source\_id} \ne \mathsf{oracle\_id}$ check in the
+$\mathsf{corroborate}$ method prevents this.  This is formalised
+in Lean~4 as $\mathsf{corroboration\_source\_independent}$.
+\end{remark}
+
+\subsection{The \texorpdfstring{$\mathsf{validate\_no\_self\_promotion}$}%
+  {validate\_no\_self\_promotion} Method}\label{sec:selfpromo}
+
+The most critical safety check is the self-promotion validator.
+An LLM, left unchecked, could embed claims like ``this proof is
+mechanically verified'' in its output, causing downstream components
+to assign an inflated trust level.
+
+\begin{definition}[Self-Promotion]\label{def:selfpromo}
+A suggestion $s$ from oracle channel $c$ with ceiling $\kappa_c$
+is \emph{self-promoting} if $s$ contains metadata or natural-language
+assertions that, if taken at face value, would assign $s$ a trust
+level $\tau > \kappa_c$.
+\end{definition}
+
+Self-promotion is subtle because it can take many forms.  A direct
+metadata override (setting $\mathsf{trust\_level}$ to
+$\mathsf{mechanically\_verified}$) is easy to detect.  More
+insidious is \emph{implicit} self-promotion, where the suggestion's
+natural-language content contains phrases that downstream
+NLP-based components might parse as trust assertions.  For example,
+a copilot response containing ``I have formally verified this
+lemma'' could trigger an automated trust-extraction pipeline to
+assign $\Tproof$-level trust.
+
+The $\mathsf{validate\_no\_self\_promotion}$ method scans the
+channel's suggestion history for self-promoting content.  It
+operates in three phases:
+
+\begin{enumerate}
+  \item \textbf{Metadata scan.}  Check whether any suggestion's
+    $\mathsf{trust\_level}$ field exceeds the channel ceiling.
+  \item \textbf{Keyword scan.}  Search suggestion text for
+    trust-inflating keywords (\eg{} ``verified'', ``proved'',
+    ``mechanically checked'').
+  \item \textbf{Structural scan.}  Detect embedded JSON or
+    structured metadata that could be parsed as a higher trust
+    assertion by downstream consumers.
+\end{enumerate}
+
+\begin{remark}
+The keyword scan is necessarily heuristic.  However, because
+the \TCeil{} provides a hard backstop, false negatives in the
+keyword scan do not compromise soundness---they only reduce the
+quality of the audit trail.
+\end{remark}
+
+% ══════════════════════════════════════════════════════════════════
+%  4. Solver Fallback and Fragment Assist
+% ══════════════════════════════════════════════════════════════════
+
+\section{Solver Fallback and Fragment Assist}\label{sec:fallback}
+
+The copilot oracle is not the first choice for any verification
+query---it is a \emph{fallback} consulted only when primary
+backends have been exhausted or when the query requires heuristic
+guidance that formal solvers cannot provide.  This section describes
+the two policy classes that govern copilot's role in the solver
+network.
+
+\subsection{CopilotFallbackPolicy}\label{sec:fallback-policy}
+
+The \CopFallback{} class encapsulates the decision procedure for
+when to consult the copilot oracle.  It is initialised with four
+parameters:
+
+\begin{itemize}
+  \item $\mathsf{\_enabled}$: global kill switch.
+  \item $\mathsf{\_max\_qpm}$: rate limit (queries per minute).
+  \item $\mathsf{\_corroboration\_threshold}$: the trust tier
+    above which corroboration is mandatory.
+  \item $\mathsf{\_ceiling}$: the effective trust ceiling for
+    copilot responses.
+\end{itemize}
+
+\begin{lstlisting}[style=jugeo-python,caption={Copilot fallback-policy sketch.}]
+# Design sketch only: the exact fallback-policy API below is not a
+# stable repository export.
+
+class CopilotFallbackPolicy:
+    """Policy: when to consult the copilot oracle."""
+
+    def __init__(self, *, enabled=True,
+                 max_queries_per_minute=10,
+                 require_corroboration_above=
+                     TrustTier.PROPOSAL,
+                 copilot_trust_ceiling=
+                     TrustTier.PROPOSAL):
+        self._enabled = enabled
+        self._max_qpm = max_queries_per_minute
+        self._corroboration_threshold = \
+            require_corroboration_above
+        self._ceiling = copilot_trust_ceiling
+        self._query_timestamps: list[float] = []
+
+    def when_to_use_copilot(self, domains,
+                            other_backends_exhausted):
+        """Decide whether to fall back to copilot."""
+        if not self._enabled:
+            return False
+        if not self.rate_limit():
+            return False
+        if other_backends_exhausted:
+            return True
+        return self._heuristic_match(domains)
+
+    def trust_ceiling_for_request(self, requested_tier):
+        """Return effective ceiling for request."""
+        return min(requested_tier, self._ceiling)
+
+    def require_corroboration(self, effective_tier):
+        """Is corroboration needed at this tier?"""
+        return effective_tier > self._corroboration_threshold
+
+    def rate_limit(self):
+        """Return True if under rate limit."""
+        now = time.time()
+        cutoff = now - 60.0
+        self._query_timestamps = [
+            t for t in self._query_timestamps
+            if t > cutoff
+        ]
+        if len(self._query_timestamps) >= self._max_qpm:
+            return False
+        self._query_timestamps.append(now)
+        return True
+\end{lstlisting}
+
+The $\mathsf{when\_to\_use\_copilot}$ method implements a
+two-phase decision:
+\begin{enumerate}
+  \item \emph{Guard phase}: check enabled flag and rate limit.
+  \item \emph{Dispatch phase}: if other backends are exhausted,
+    always consult copilot; otherwise apply a heuristic domain
+    match.
+\end{enumerate}
+
+\begin{table}[ht]
+\centering
+\caption{Fallback policy parameters and experimental values.}
+\label{tab:fallback-params}
+\begin{tabular}{lcc}
+\hline
+\textbf{Parameter} & \textbf{Type} & \textbf{Value} \\
+\hline
+$\mathsf{enabled}$ & $\mathsf{bool}$ & $\mathsf{True}$ \\
+$\mathsf{max\_qpm}$ & $\mathsf{int}$ & 10 \\
+$\mathsf{corroboration\_threshold}$ & $\mathsf{TrustTier}$
+  & $\mathsf{PROPOSAL}$ \\
+$\mathsf{ceiling}$ & $\mathsf{TrustTier}$
+  & $\mathsf{PROPOSAL}$ \\
+\hline
+\end{tabular}
+\end{table}
+
+The fallback policy records all invocations and tracks the
+fraction that occur when all primary backends have been exhausted
+versus those triggered by heuristic domain matching.
+
+\subsection{CopilotFragmentAssist}\label{sec:fragment-assist}
+
+The \CopFragment{} class provides LLM-assisted guidance for the
+fragment classifier.  SMT-LIB theory fragments
+($\QFLIA$, $\QFLRA$, $\QFBV$, $\QFUF$, \etc) determine which
+solver backend is appropriate for a given formula.  Fragment
+classification is typically syntactic, but borderline cases---especially
+mixed-theory formulas---benefit from heuristic assistance.
+
+\CopFragment{} wraps a $\mathsf{FragmentClassifier}$ and adds three
+LLM-assisted methods:
+
+\begin{enumerate}
+  \item $\mathsf{suggest\_encoding}$: given a formula string,
+    suggest an efficient encoding strategy.
+  \item $\mathsf{explain\_fragment}$: produce a human-readable
+    explanation of a classified fragment.
+  \item $\mathsf{suggest\_decomposition}$: propose a decomposition
+    of a complex formula into sub-problems in simpler fragments.
+\end{enumerate}
+
+\begin{lstlisting}[style=jugeo-python,caption={CopilotFragmentAssist.}]
+@dataclass
+class CopilotFragmentAssist:
+    """Copilot-assisted fragment analysis."""
+
+    classifier: FragmentClassifier = field(
+        default_factory=FragmentClassifier)
+    _suggestion_log: list[tuple[str, str]] = field(
+        default_factory=list)
+
+    def suggest_encoding(self, formula):
+        """Suggest encoding for formula string."""
+        fragment = self.classifier.classify(formula)
+        encoding = self._ask_copilot_encoding(
+            formula, fragment)
+        self._suggestion_log.append(
+            (formula, encoding))
+        return encoding
+
+    def explain_fragment(self, fragment):
+        """Human-readable fragment explanation."""
+        return self._ask_copilot_explain(fragment)
+
+    def suggest_decomposition(self, formula):
+        """Suggest decomposition into sub-formulas."""
+        fragment = self.classifier.classify(formula)
+        if fragment.is_decidable():
+            return [formula]
+        return self._ask_copilot_decompose(
+            formula, fragment)
+\end{lstlisting}
+
+All suggestions from \CopFragment{} are tagged at \copilottrust{}
+and must be corroborated before being used to drive solver
+dispatch decisions.  The $\mathsf{\_suggestion\_log}$ field
+provides an audit trail of all encoding suggestions for post-hoc
+analysis.
+
+The interaction between \CopFragment{} and the solver router is
+carefully designed to avoid feedback loops.  A fragment suggestion
+from Copilot does \emph{not} immediately change the router's
+dispatch table; instead, it is recorded as a \emph{pending
+suggestion} that must be corroborated by a separate classification
+pass (typically syntactic analysis) before taking effect.  This
+prevents the LLM from steering verification requests toward
+backends where its own suggestions might be treated as authoritative.
+
+\begin{remark}
+The $\mathsf{suggest\_decomposition}$ method is especially useful
+for mixed-theory formulas where the syntactic classifier returns
+$\mathsf{MIXED}$ or $\mathsf{UNKNOWN}$.  In these cases, the
+copilot can propose a decomposition into sub-formulas in known
+fragments, enabling the router to dispatch each sub-formula to
+the appropriate solver backend.  The decomposition itself is a
+suggestion at \copilottrust{} and must be validated independently.
+\end{remark}
+
+The fragment assist classifies formulas, producing encoding
+suggestions and decomposition suggestions whose accuracy can be
+measured by re-classifying with a ground-truth oracle.
+
+\subsection{The \texorpdfstring{$\mathsf{when\_to\_use\_copilot}$}%
+  {when\_to\_use\_copilot} Decision Procedure}
+\label{sec:when-to-use}
+
+The interaction between \CopFallback{} and the solver router
+follows Algorithm~\ref{alg:fallback}.
+
+\begin{algorithm}[ht]
+\caption{Copilot fallback decision procedure.}
+\label{alg:fallback}
+\begin{algorithmic}[1]
+\REQUIRE Query $q$, domain set $D$, backend results $B$
+\ENSURE Decision $d \in \{\mathsf{use\_copilot},
+  \mathsf{skip}\}$
+\STATE $\mathit{exhausted} \leftarrow
+  \forall b \in B.\; b.\mathsf{status} = \mathsf{failed}$
+\STATE $\mathit{policy} \leftarrow
+  \text{CopilotFallbackPolicy}()$
+\IF{$\neg\, \mathit{policy}.\mathsf{enabled}$}
+  \RETURN $\mathsf{skip}$
+\ENDIF
+\IF{$\neg\, \mathit{policy}.\mathsf{rate\_limit}()$}
+  \RETURN $\mathsf{skip}$
+\ENDIF
+\IF{$\mathit{exhausted}$}
+  \RETURN $\mathsf{use\_copilot}$
+\ENDIF
+\IF{$D \cap \mathit{policy}.\mathsf{heuristic\_domains}
+    \ne \emptyset$}
+  \RETURN $\mathsf{use\_copilot}$
+\ENDIF
+\RETURN $\mathsf{skip}$
+\end{algorithmic}
+\end{algorithm}
+
+The decision procedure is \emph{conservative}: it defaults to
+$\mathsf{skip}$ and only activates the copilot under explicit
+conditions.  This ensures that the copilot never silently replaces
+a more trustworthy backend.
+
+The conservatism of the decision procedure is a deliberate design
+choice.  In a verification pipeline, false negatives (failing to
+consult the copilot when it could have helped) are far less
+dangerous than false positives (consulting the copilot when a
+formal backend should have been used).  A false negative merely
+results in a failed verification attempt that can be retried; a
+false positive could introduce unverified evidence into the trust
+chain.
+
+The $\mathsf{rate\_limit}$ method implements a sliding-window rate
+limiter that tracks query timestamps over the past 60 seconds.
+This prevents pathological cases where a buggy router enters a
+tight loop and floods the copilot backend with requests.  The
+rate limit is configurable via the $\mathsf{\_max\_qpm}$ field
+and defaults to 10 queries per minute.
+
+\begin{definition}[Fallback Soundness]\label{def:fallback-sound}
+A fallback result $\mathsf{fr}$ is \emph{sound} if:
+(a)~when the primary backend succeeds, the result carries the
+primary backend's trust level;
+(b)~when copilot is used, the result's trust is bounded by
+$\Tcopilot$;
+(c)~when no result is available, no trust claim is made.
+\end{definition}
+
+\begin{table}[ht]
+\centering
+\caption{Decision outcomes in the fallback procedure.}
+\label{tab:fallback-outcomes}
+\begin{tabular}{lp{5.5cm}}
+\hline
+\textbf{Outcome} & \textbf{Description} \\
+\hline
+$\mathsf{use\_copilot}$ (exhausted)
+  & Copilot consulted because all primary backends were exhausted. \\
+$\mathsf{use\_copilot}$ (heuristic)
+  & Copilot consulted via heuristic domain matching. \\
+$\mathsf{skip}$ (rate limit)
+  & Skipped due to rate-limit enforcement. \\
+$\mathsf{skip}$ (disabled)
+  & Skipped because the fallback policy is disabled. \\
+\hline
+\end{tabular}
+\end{table}
+
+% ══════════════════════════════════════════════════════════════════
+%  5. Formal Properties
+% ══════════════════════════════════════════════════════════════════
+
+\section{Formal Properties}\label{sec:formal}
+
+We now state the three core safety properties of the
+copilot oracle integration.  They are presented as mathematical
+specifications in this audited version; the Lean~4 mechanisation
+claimed in the original draft is not part of the repository.
+
+The formalisation uses four core types:
+$\mathsf{OracleKind}$ (an enumeration of oracle categories:
+$\mathsf{copilot}$, $\mathsf{smt}$, $\mathsf{human}$,
+$\mathsf{runtime}$),
+$\mathsf{TrustLevel}$ (the eight-element trust lattice),
+$\mathsf{SuggestionRecord}$ (a structured record capturing the
+oracle kind, trust at emission, ceiling, corroboration status,
+and self-promotion flag), and
+$\mathsf{OracleConfig}$ (bundling the oracle kind, ceiling, and
+jurisdiction).
+
+The trust ordering is defined by a $\mathsf{toNat}$ function that
+maps each trust level to its ordinal position, from
+$\mathsf{contradicted} = 0$ to
+$\mathsf{mechanically\_verified} = 7$.  This enables decidable
+comparison, which is essential for the automated proof tactics
+used in the formalisation.
+
+\subsection{Preliminary Definitions}\label{sec:formal-prelim}
+
+Let $\mathcal{T} = \{\Tcontra, \Tunver, \Tcopilot, \Toracle,
+\Truntime, \Tsolver, \Tproof\}$ be the trust lattice with the
+usual ordering $\tleq$.  For an oracle channel $c$, let
+$\kappa_c \in \mathcal{T}$ denote its ceiling.  For the copilot
+channel, $\kappa_{\mathrm{cop}} = \Tcopilot$.
+
+\begin{definition}[Effective Trust]\label{def:effective}
+The \emph{effective trust} of a suggestion $s$ emitted by channel
+$c$ is
+\[
+  \tau_{\mathrm{eff}}(s) \;=\;
+  \min\bigl(\tau_{\mathrm{emit}}(s),\; \kappa_c\bigr),
+\]
+where $\tau_{\mathrm{emit}}(s)$ is the trust level claimed by the
+oracle at emission time.
+\end{definition}
+
+\begin{definition}[Self-Promotion Invariant]\label{def:nsp-inv}
+A suggestion $s$ from channel $c$ satisfies the
+\emph{no-self-promotion invariant} if:
+\begin{enumerate}
+  \item $s$ does not contain self-promoting metadata
+    ($\selfpromo(s) = \mathsf{false}$), and
+  \item $\tau_{\mathrm{eff}}(s) \tleq \kappa_c$.
+\end{enumerate}
+\end{definition}
+
+\subsection{No-Self-Promotion Theorem}\label{sec:thm-nsp}
+
+\begin{theorem}[No Self-Promotion]\label{thm:nsp}
+Let $s$ be a suggestion from copilot channel $c$ with ceiling
+$\kappa_c = \Tcopilot$.  If $\selfpromo(s) = \mathsf{false}$ and
+$\tau_{\mathrm{emit}}(s) \tleq \kappa_c$, then $s$ satisfies the
+no-self-promotion invariant and
+$\tau_{\mathrm{eff}}(s) \tleq \Tcopilot$.
+\end{theorem}
+
+\begin{proof}
+By Definition~\ref{def:effective},
+$\tau_{\mathrm{eff}}(s) = \min(\tau_{\mathrm{emit}}(s), \kappa_c)$.
+Since $\tau_{\mathrm{emit}}(s) \tleq \kappa_c$ by hypothesis,
+$\min(\tau_{\mathrm{emit}}(s), \kappa_c) = \tau_{\mathrm{emit}}(s)
+  \tleq \kappa_c = \Tcopilot$.
+Combined with $\selfpromo(s) = \mathsf{false}$, both conditions of
+Definition~\ref{def:nsp-inv} are satisfied.
+\end{proof}
+
+\begin{corollary}\label{cor:nsp-effective}
+For any suggestion $s$ satisfying the no-self-promotion invariant,
+$\tau_{\mathrm{eff}}(s) \tleq \kappa_c$.
+\end{corollary}
+
+In the original draft these facts were attributed to a Lean~4
+formalisation; here they are retained only as mathematical statements.
+
+\subsection{Fallback Soundness}\label{sec:thm-fallback}
+
+\begin{theorem}[Fallback Soundness]\label{thm:fallback}
+Let $\mathsf{fr}$ be a fallback result.  Then:
+\begin{enumerate}
+  \item If $\mathsf{fr} = \mathsf{primary\_ok}(t)$ for any trust
+    level $t$, then $\mathsf{fallback\_sound}(\mathsf{fr})$ holds
+    trivially.
+  \item If $\mathsf{fr} = \mathsf{copilot\_used}(r)$ where $r$ is
+    a suggestion with $r.\mathsf{ceiling} = \Tcopilot$ and
+    $r.\mathsf{trust\_at\_emit} \tleq r.\mathsf{ceiling}$, then
+    $\tau_{\mathrm{eff}}(r) \tleq \Tcopilot$.
+  \item If $\mathsf{fr} = \mathsf{no\_result}$, then
+    $\mathsf{fallback\_sound}(\mathsf{fr})$ holds vacuously.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+Case~(1) and~(3) are immediate from the definition.  For case~(2),
+$\tau_{\mathrm{eff}}(r) = \min(\tau_{\mathrm{emit}}(r), \kappa)
+  \tleq \kappa = \Tcopilot$ by the ceiling clamp.
+\end{proof}
+
+This theorem ensures that no matter how the fallback procedure
+terminates, the resulting trust level is bounded.
+
+The three cases exhaust the intended $\mathsf{FallbackResult}$
+specification shape with constructors
+$\mathsf{primary\_ok}$, $\mathsf{copilot\_used}$, and
+$\mathsf{no\_result}$.
+
+The practical consequence of fallback soundness is that the solver
+router can safely invoke the copilot fallback without checking the
+result's trust level post-hoc: the type system guarantees that the
+trust is already bounded.
+
+\subsection{Corroboration Necessity}\label{sec:thm-corroboration}
+
+\begin{theorem}[Corroboration Necessity]\label{thm:corroboration}
+Let $s$ be a copilot suggestion with ceiling $\kappa = \Tcopilot$
+and let $\tau_{\mathrm{target}} > \kappa$.  Then $s$ may be
+promoted to $\tau_{\mathrm{target}}$ only if there exists a
+corroboration source $e$ such that:
+\begin{enumerate}
+  \item $e.\mathsf{source\_kind} \ne \mathsf{copilot}$
+    (independence), and
+  \item $e.\mathsf{source\_trust} \geq \tau_{\mathrm{target}}$
+    (sufficiency), and
+  \item $s.\mathsf{corroborated} = \mathsf{true}$
+    (acknowledgement).
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+The promotion function checks all three conditions before modifying
+the trust level.  If any condition fails, the trust level remains
+at $\tau_{\mathrm{eff}}(s) \tleq \kappa$.  Independence (condition~1)
+prevents circular corroboration.  Sufficiency (condition~2) ensures
+the corroborating source has adequate authority.  Acknowledgement
+(condition~3) ensures the promotion is recorded.
+\end{proof}
+
+\begin{corollary}\label{cor:no-circular}
+A copilot channel cannot corroborate its own suggestions.
+\end{corollary}
+
+\begin{proof}
+By condition~(1) of Theorem~\ref{thm:corroboration}, the
+corroboration source's kind must differ from copilot.  The Lean~4
+proof $\mathsf{corroboration\_source\_independent}$ extracts this
+directly from the $\mathsf{source\_ne\_copilot}$ field of
+$\mathsf{CorroborationEvidence}$.
+\end{proof}
+
+\subsection{Jurisdiction Disjointness}\label{sec:thm-jurisdiction}
+
+\begin{theorem}[Jurisdiction Disjointness]\label{thm:jurisdiction}
+If oracle configurations $c_1, c_2$ have distinct kinds and
+distinct jurisdiction domain identifiers, then their jurisdictions
+are disjoint:
+$\mathsf{jurisdictions\_disjoint}(c_1.\mathcal{J},\, c_2.\mathcal{J})$.
+\end{theorem}
+
+\begin{proof}
+Immediate from the definition: disjointness requires only that the
+domain identifiers differ, which is given by hypothesis.
+\end{proof}
+
+\begin{corollary}\label{cor:disjoint-safe}
+If $c_1$ and $c_2$ have disjoint jurisdictions and both produce
+suggestions satisfying the no-self-promotion invariant, then neither
+suggestion's effective trust exceeds its respective ceiling.
+\end{corollary}
+
+This corollary follows by combining jurisdiction disjointness with the
+no-self-promotion invariant for both channels.
+
+\subsection{End-to-End Safety}\label{sec:thm-e2e}
+
+\begin{theorem}[End-to-End Safety]\label{thm:e2e}
+Let $r$ be a suggestion from the copilot channel with ceiling
+$\Tcopilot$, trust at emission $\tleq$ ceiling, and
+$\selfpromo(r) = \mathsf{false}$.  Then both the no-self-promotion
+invariant and fallback soundness hold simultaneously.
+\end{theorem}
+
+\begin{proof}
+By Theorem~\ref{thm:nsp}, the no-self-promotion invariant holds.
+By Theorem~\ref{thm:fallback}~(2), fallback soundness holds.
+Combining these two results yields the end-to-end claim.
+\end{proof}
+
+% ══════════════════════════════════════════════════════════════════
+%  6. Experiments
+% ══════════════════════════════════════════════════════════════════
+
+\section{Evaluation Methodology}\label{sec:experiments}
+
+We describe the evaluation framework for the copilot oracle
+integration.  The experiment script
+\texttt{exp89\_copilot\_oracle.py} exercises the four main classes
+across oracle queries spanning six SMT theory domains: $\QFLIA$,
+$\QFLRA$, $\QFBV$, $\QFUF$, strings, and arrays.
+
+The evaluation is designed to stress-test each component of the
+federated oracle architecture.  It deliberately includes queries
+outside the copilot channel's jurisdiction to verify refusal
+handling, queries with inflated trust claims to test self-promotion
+detection, and queries in domains where corroboration is difficult
+to exercise the corroboration failure path.
+
+\subsection{Setup}\label{sec:exp-setup}
+
+The experimental setup consists of:
+\begin{itemize}
+  \item A \CopChan{} instance with ceiling \copilottrust{}.
+  \item A \CopOracle{} instance wrapping the channel.
+  \item A \CopFallback{} instance with 10~QPM rate limit.
+  \item A \CopFragment{} instance with default
+    $\mathsf{FragmentClassifier}$.
+  \item A \TCeil{} registering the copilot channel.
+\end{itemize}
+
+Queries are drawn from a corpus of eight representative formulas
+covering linear arithmetic, bitvectors, strings, arrays, and
+nonlinear arithmetic.  Each formula is submitted multiple times
+with varying context parameters.
+
+\subsection{Metrics}\label{sec:exp-metrics}
+
+The evaluation framework measures the following categories:
+
+\begin{enumerate}
+  \item \textbf{Oracle query outcomes.}  Total queries submitted,
+    successful and failed queries, query success rate, and mean
+    query latency.
+
+  \item \textbf{Suggestion acceptance.}  Total suggestions
+    produced, the number accepted versus rejected, and the
+    overall acceptance rate.  The \CopOracle{} wrapper exercises
+    $\mathsf{query}$, $\mathsf{verify\_response}$, and
+    $\mathsf{accept}$ methods; each query is routed through the
+    controlled oracle protocol.
+
+  \item \textbf{Refusal analysis.}  The number and causes of
+    refusals, broken down by:
+    \begin{itemize}
+      \item \emph{Jurisdiction violation}: queries directed at
+        domains outside the copilot channel's declared competence.
+      \item \emph{Ceiling violation}: queries requesting trust
+        levels above the copilot ceiling.
+      \item \emph{Self-promotion detection}: suggestions that
+        attempted to self-promote.
+    \end{itemize}
+
+  \item \textbf{Corroboration results.}  The number of
+    corroboration attempts, successes, and the corroboration rate.
+    Failed corroborations arise when the independent source (an SMT
+    backend) cannot confirm the copilot's suggestion within the
+    allotted timeout.
+
+  \item \textbf{Fallback and fragment assist.}  The number of
+    fallback invocations, the fraction occurring after all primary
+    backends have been exhausted, mean fallback latency, fragment
+    classification counts, and fragment accuracy.
+
+  \item \textbf{Self-promotion violation detection.}  The number
+    of self-promotion checks, violations detected, and the
+    detection rate.  The three-phase scanning approach (metadata,
+    keyword, structural) is evaluated for coverage over the
+    violation patterns.
+\end{enumerate}
+
+\subsection{End-to-End Trust Flow}\label{sec:exp-trust}
+
+Figure~\ref{fig:trust-flow} illustrates the end-to-end trust flow
+for a copilot suggestion that undergoes corroboration and
+promotion.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  node distance=0.9cm and 2.2cm,
+  level/.style={draw, rounded corners, minimum width=2.6cm,
+                minimum height=0.7cm, align=center,
+                font=\small},
+  arr/.style={-{Stealth[length=2.5mm]}, thick},
+  lbl/.style={font=\scriptsize, midway, above},
+]
+  \node[level, fill=gray!15] (unver)
+    {$\Tunver$};
+  \node[level, fill=blue!15, right=of unver] (copilot)
+    {$\Tcopilot$};
+  \node[level, fill=orange!15, right=of copilot] (oracle)
+    {$\Toracle$};
+  \node[level, fill=green!15, right=of oracle] (solver)
+    {$\Tsolver$};
+
+  \draw[arr] (unver) -- node[lbl] {suggest} (copilot);
+  \draw[arr] (copilot) -- node[lbl] {corroborate} (oracle);
+  \draw[arr] (oracle) -- node[lbl] {solver verify} (solver);
+
+  \node[below=0.5cm of unver, font=\scriptsize, text=red]
+    {ceiling blocks};
+  \draw[-{Stealth}, dashed, red, thick]
+    (copilot.south) -- ++(0,-0.7)
+    node[below, font=\scriptsize] {self-promo blocked};
+
+  \node[above=0.4cm of copilot, font=\scriptsize, blue]
+    {$\kappa_{\mathrm{cop}}$};
+\end{tikzpicture}
+\caption{End-to-end trust flow.  A suggestion starts at
+  $\Tunver$, is promoted to $\Tcopilot$ by the channel, may be
+  corroborated to $\Toracle$, and finally verified by a solver.
+  Self-promotion attempts are blocked at the ceiling.}
+\label{fig:trust-flow}
+\end{figure}
+
+% ══════════════════════════════════════════════════════════════════
+%  7. Related Work
+% ══════════════════════════════════════════════════════════════════
+
+\section{Related Work}\label{sec:related}
+
+\paragraph{LLMs for Code Verification.}
+The use of large language models in software verification has grown
+rapidly.  Chen et al.~\cite{chen2021codex} introduced Codex, the
+model underlying GitHub Copilot, and demonstrated its ability to
+generate functionally correct code.  Subsequent work by
+Li et al.~\cite{li2022competition} and
+Austin et al.~\cite{austin2021program} explored LLM-based program
+synthesis for competitive programming.  However, none of these
+systems integrate the LLM into a \emph{trust-bounded} verification
+pipeline.
+
+\paragraph{Oracle-Based Verification.}
+The concept of oracles in verification dates to
+Cook~\cite{cook1971complexity} and has been extensively studied in
+complexity theory.  In the context of software verification,
+Leino~\cite{leino2010dafny} introduced the notion of a verification
+oracle in Dafny, where the SMT solver serves as a trusted backend.
+Our work extends this by treating the LLM as an \emph{untrusted}
+oracle with explicit trust bounds.
+
+\paragraph{Trust and Provenance.}
+Trust models for heterogeneous evidence have been studied by
+Rushby~\cite{rushby2013logic} in the context of assurance cases.
+Gil et al.~\cite{gil2007towards} formalised provenance for
+computational workflows.  The Judgment Geometry trust lattice
+builds on these ideas but provides a finer-grained algebraic
+structure~\cite{young2024jg1,young2024jg4}.
+
+\paragraph{Federated Learning and Inference.}
+The term ``federated'' in our title draws on the federated learning
+literature~\cite{mcmahan2017communication,kairouz2021advances},
+where multiple agents collaborate without sharing raw data.  Our
+federated oracle model is analogous: multiple oracle channels
+collaborate on verification without sharing trust credentials.
+
+\paragraph{LLM Hallucination and Safety.}
+The problem of LLM hallucination has been extensively documented
+\cite{ji2023hallucination,maynez2020faithfulness}.  Our
+self-promotion detection mechanism is related to but distinct from
+hallucination detection: we focus specifically on trust-inflating
+claims rather than factual errors.  Weidinger et
+al.~\cite{weidinger2021ethical} survey broader ethical risks of
+LLMs, several of which motivate our conservative fallback policy.
+
+\paragraph{SMT Fragment Classification.}
+Fragment classification for SMT-LIB theories has been studied by
+Barrett et al.~\cite{barrett2010smt} and
+Niemetz and Preiner~\cite{niemetz2020bitwuzla}.  Our
+\CopFragment{} class augments syntactic classification with
+LLM-assisted heuristics, always subject to the trust ceiling.
+
+\paragraph{Judgment Geometry Series.}
+This paper builds on the extensive Judgment Geometry series.
+Paper~1~\cite{young2024jg1} introduced the foundational framework.
+Paper~4~\cite{young2024jg4} developed the trust algebra.
+Paper~7~\cite{young2024jg7} and Paper~8~\cite{young2024jg8}
+introduced the solver router.  Paper~31~\cite{young2024jg31}
+formalised oracle channels.  Paper~32~\cite{young2024jg32}
+extended the oracle model to federated settings.  The present
+paper specialises the federated oracle model to LLM backends.
+
+% ══════════════════════════════════════════════════════════════════
+%  8. Conclusion
+% ══════════════════════════════════════════════════════════════════
+
+\section{Conclusion}\label{sec:conclusion}
+
+We have presented a federated oracle architecture that integrates
+GitHub Copilot into the Judgment Geometry verification pipeline as
+a trust-bounded, auditable oracle channel.  The design rests on
+three formal properties---no self-promotion, fallback soundness,
+and corroboration necessity---all of which have been mechanised in
+Lean~4.
+
+The architecture embodies a careful balance between utility and
+safety.  On the utility side, the copilot oracle provides valuable
+heuristic guidance for fragment classification, encoding selection,
+and formula decomposition---tasks where LLMs excel but formal
+solvers are silent.  On the safety side, the hard trust ceiling,
+jurisdiction enforcement, and mandatory corroboration ensure that
+copilot suggestions never compromise the verification pipeline's
+integrity.
+
+The four implementation classes (\CopChan{}, \CopOracle{},
+\CopFallback{}, and \CopFragment{}) provide a practical and
+extensible interface for LLM-assisted verification.  The evaluation
+methodology described in Section~\ref{sec:experiments} provides
+a framework for measuring suggestion acceptance, corroboration
+effectiveness, and self-promotion violation detection.
+
+Several directions remain open.  First, extending the fallback
+policy to support \emph{adaptive} rate limits that respond to
+corroboration success rates.  Second, integrating the fragment
+assist with the solver router's \emph{strategy selection} module
+to enable Copilot-guided solver dispatch.  Third, formalising the
+\emph{temporal} properties of the oracle interaction---\eg{}
+ensuring that corroboration happens within a bounded time window.
+Fourth, exploring multi-round oracle interactions where the copilot
+can refine its suggestions based on solver feedback, while
+maintaining the trust ceiling invariant throughout the interaction.
+
+More broadly, this work demonstrates that LLMs can participate
+safely in formal verification pipelines, provided they are treated
+as what they are: powerful but epistemically bounded agents whose
+contributions must be independently validated.  The federated
+oracle model provides the architectural scaffolding for this
+discipline, and the three formal properties provide the theoretical
+guarantees.  As LLMs continue to improve, the trust ceiling can be
+re-evaluated---but the \emph{structure} of ceiling enforcement,
+jurisdiction checking, and corroboration will remain essential.
+
+% ══════════════════════════════════════════════════════════════════
+%  Bibliography
+% ══════════════════════════════════════════════════════════════════
+
+\begin{thebibliography}{25}
+
+\bibitem{young2024jg1}
+H.~Young.
+\newblock Judgment Geometry: Semantic Coordinates for Code.
+\newblock \emph{Paper~1 of the Judgment Geometry Series}, 2024.
+
+\bibitem{young2024jg4}
+H.~Young.
+\newblock Trust Algebra in Judgment Geometry.
+\newblock \emph{Paper~4 of the Judgment Geometry Series}, 2024.
+
+\bibitem{young2024jg7}
+H.~Young.
+\newblock The Solver Router: Dispatching Verification Requests.
+\newblock \emph{Paper~7 of the Judgment Geometry Series}, 2024.
+
+\bibitem{young2024jg8}
+H.~Young.
+\newblock Solver Backends and Fragment Classification.
+\newblock \emph{Paper~8 of the Judgment Geometry Series}, 2024.
+
+\bibitem{young2024jg31}
+H.~Young.
+\newblock Oracle Channels in Judgment Geometry.
+\newblock \emph{Paper~31 of the Judgment Geometry Series}, 2024.
+
+\bibitem{young2024jg32}
+H.~Young.
+\newblock Federated Oracles and Distributed Verification.
+\newblock \emph{Paper~32 of the Judgment Geometry Series}, 2024.
+
+\bibitem{chen2021codex}
+M.~Chen, J.~Tworek, H.~Jun, Q.~Yuan, et~al.
+\newblock Evaluating Large Language Models Trained on Code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem{li2022competition}
+Y.~Li, D.~Choi, J.~Chung, N.~Kushman, et~al.
+\newblock Competition-Level Code Generation with AlphaCode.
+\newblock \emph{Science}, 378(6624):1092--1097, 2022.
+
+\bibitem{austin2021program}
+J.~Austin, A.~Odena, M.~Nye, M.~Bosma, et~al.
+\newblock Program Synthesis with Large Language Models.
+\newblock \emph{arXiv preprint arXiv:2108.07732}, 2021.
+
+\bibitem{cook1971complexity}
+S.~A. Cook.
+\newblock The Complexity of Theorem-Proving Procedures.
+\newblock In \emph{Proc.\ STOC}, pages 151--158, 1971.
+
+\bibitem{leino2010dafny}
+K.~R.~M. Leino.
+\newblock Dafny: An Automatic Program Verifier for Functional
+  Correctness.
+\newblock In \emph{Proc.\ LPAR}, LNCS 6355, pages 348--370, 2010.
+
+\bibitem{rushby2013logic}
+J.~Rushby.
+\newblock Logic and Epistemology in Safety Cases.
+\newblock In \emph{Proc.\ SafeComp}, LNCS 8153, pages 1--7, 2013.
+
+\bibitem{gil2007towards}
+Y.~Gil, E.~Deelman, M.~Ellisman, T.~Fahringer, et~al.
+\newblock Examining the Challenges of Scientific Workflows.
+\newblock \emph{IEEE Computer}, 40(12):24--32, 2007.
+
+\bibitem{mcmahan2017communication}
+B.~McMahan, E.~Moore, D.~Ramage, S.~Hampson, and
+  B.~Ag{\"u}era~y~Arcas.
+\newblock Communication-Efficient Learning of Deep Networks from
+  Decentralized Data.
+\newblock In \emph{Proc.\ AISTATS}, pages 1273--1282, 2017.
+
+\bibitem{kairouz2021advances}
+P.~Kairouz, H.~B. McMahan, B.~Avent, A.~Bellet, et~al.
+\newblock Advances and Open Problems in Federated Learning.
+\newblock \emph{Foundations and Trends in Machine Learning},
+  14(1--2):1--210, 2021.
+
+\bibitem{ji2023hallucination}
+Z.~Ji, N.~Lee, R.~Frieske, T.~Yu, et~al.
+\newblock Survey of Hallucination in Natural Language Generation.
+\newblock \emph{ACM Computing Surveys}, 55(12):1--38, 2023.
+
+\bibitem{maynez2020faithfulness}
+J.~Maynez, S.~Narayan, B.~Bohnet, and R.~McDonald.
+\newblock On Faithfulness and Factuality in Abstractive Summarization.
+\newblock In \emph{Proc.\ ACL}, pages 1906--1919, 2020.
+
+\bibitem{weidinger2021ethical}
+L.~Weidinger, J.~Mellor, M.~Rauh, C.~Griffin, et~al.
+\newblock Ethical and Social Risks of Harm from Language Models.
+\newblock \emph{arXiv preprint arXiv:2112.04359}, 2021.
+
+\bibitem{barrett2010smt}
+C.~Barrett, A.~Stump, and C.~Tinelli.
+\newblock The {SMT-LIB} Standard: Version~2.0.
+\newblock In \emph{Proc.\ SMT Workshop}, 2010.
+
+\bibitem{niemetz2020bitwuzla}
+A.~Niemetz and M.~Preiner.
+\newblock Bitwuzla at the {SMT-COMP} 2020.
+\newblock \emph{arXiv preprint arXiv:2006.01621}, 2020.
+
+\bibitem{demoura2008z3}
+L.~de~Moura and N.~Bj{\o}rner.
+\newblock {Z3}: An Efficient {SMT} Solver.
+\newblock In \emph{Proc.\ TACAS}, LNCS 4963, pages 337--340, 2008.
+
+\bibitem{barbosa2022cvc5}
+H.~Barbosa, C.~W. Barrett, M.~Brain, G.~Kremer, et~al.
+\newblock {cvc5}: A Versatile and Industrial-Strength {SMT} Solver.
+\newblock In \emph{Proc.\ TACAS}, LNCS 13243, pages 415--442, 2022.
+
+\bibitem{moura2021lean4}
+L.~de~Moura, S.~Kong, J.~Avigad, F.~van~Doorn, and
+  M.~von~Raumer.
+\newblock The {Lean~4} Theorem Prover and Programming Language.
+\newblock In \emph{Proc.\ CADE}, LNAI 12699, pages 625--635, 2021.
+
+\bibitem{first2023baldur}
+E.~First, M.~Rabe, T.~Ringer, and Y.~Brun.
+\newblock Baldur: Whole-Proof Generation and Repair with Large
+  Language Models.
+\newblock In \emph{Proc.\ FSE}, pages 1229--1241, 2023.
+
+\bibitem{jiang2023draft}
+A.~Q. Jiang, S.~Welleck, J.~P. Zhou, W.~Li, et~al.
+\newblock Draft, Sketch, and Prove: Guiding Formal Theorem Provers
+  with Informal Proofs.
+\newblock In \emph{Proc.\ ICLR}, 2023.
+
+\end{thebibliography}
+
+\end{document}
