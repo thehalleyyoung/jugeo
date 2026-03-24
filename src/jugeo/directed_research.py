@@ -136,8 +136,12 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
     This is THE interface between the LLM and the geometry. Every LLM
     interaction in the system goes through here. The result is always
     a section at a specific coordinate with COPILOT_SUGGESTED trust.
+
+    Long prompts are written to a temp file and copilot is told to
+    "read file X and follow the instructions inside" — this avoids
+    massive argv and makes calls much faster.
     """
-    import hashlib, shutil
+    import hashlib, shutil, tempfile
 
     t0 = time.time()
     prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
@@ -145,9 +149,19 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
 
     # 1. Copilot CLI with claude-sonnet-4.6
     if shutil.which("copilot"):
+        # Write prompt to a temp file so copilot reads it instead of
+        # receiving a huge argv (which is slow and can exceed OS limits)
+        prompt_file = tempfile.NamedTemporaryFile(
+            suffix=".md", mode="w", delete=False, prefix="jugeo_prompt_")
+        prompt_file.write(prompt)
+        prompt_file.close()
+
+        short_prompt = f"Read the file {prompt_file.name} and follow ALL the instructions inside it exactly. Return ONLY the requested output."
+
         try:
             result = subprocess.run(
-                ["copilot", "-p", prompt, "--model", "claude-sonnet-4.6", "--available-tools", ""],
+                ["copilot", "-p", short_prompt, "--model", "claude-sonnet-4.6",
+                 "--available-tools", ""],
                 capture_output=True, text=True, timeout=timeout, cwd=_ROOT,
             )
             if result.returncode == 0 and result.stdout.strip():
@@ -158,6 +172,11 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
                 text = "\n".join(cleaned).strip()
         except Exception:
             pass
+        finally:
+            try:
+                os.unlink(prompt_file.name)
+            except OSError:
+                pass
 
     # 2. Anthropic SDK (fallback if copilot unavailable)
     if not text:
