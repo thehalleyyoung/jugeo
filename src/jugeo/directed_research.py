@@ -143,21 +143,8 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
     prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
     text = ""
 
-    # 1. Anthropic SDK (fast, reliable, supports long output)
-    if not text:
-        try:
-            import anthropic
-            client = anthropic.Anthropic()
-            msg = client.messages.create(
-                model="claude-sonnet-4-6-20250514", max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = msg.content[0].text
-        except Exception:
-            pass
-
-    # 2. Copilot CLI (fallback)
-    if not text and shutil.which("copilot"):
+    # 1. Copilot CLI with claude-sonnet-4.6
+    if shutil.which("copilot"):
         try:
             result = subprocess.run(
                 ["copilot", "-p", prompt, "--model", "claude-sonnet-4.6", "--available-tools", ""],
@@ -169,6 +156,19 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
                 while cleaned and not cleaned[0].strip():
                     cleaned.pop(0)
                 text = "\n".join(cleaned).strip()
+        except Exception:
+            pass
+
+    # 2. Anthropic SDK (fallback if copilot unavailable)
+    if not text:
+        try:
+            import anthropic
+            client = anthropic.Anthropic()
+            msg = client.messages.create(
+                model="claude-sonnet-4-6-20250514", max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = msg.content[0].text
         except Exception:
             pass
 
