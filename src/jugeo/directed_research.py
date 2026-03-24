@@ -129,6 +129,43 @@ class LLMSection:
         )
 
 
+def _clean_copilot_output(raw: str) -> str:
+    """Strip copilot CLI narration, tool-failure lines, stats, and markdown fences."""
+    lines = raw.split("\n")
+    cleaned = []
+    skip = False
+    for line in lines:
+        s = line.strip()
+        # Skip tool invocation/failure blocks
+        if s.startswith(("●", "✗")):
+            skip = True
+            continue
+        if skip and (s.startswith(("│", "└")) or s == ""):
+            continue
+        skip = False
+        # Skip copilot stats
+        if any(tag in line for tag in [
+            "Total usage", "API time", "Total session", "Total code",
+            "Breakdown by AI", "claude-sonnet", "Est. ", "Premium request",
+        ]):
+            continue
+        cleaned.append(line)
+    # Strip leading/trailing empty lines
+    while cleaned and not cleaned[0].strip():
+        cleaned.pop(0)
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    text = "\n".join(cleaned).strip()
+    # Strip outermost markdown fences if present
+    if text.startswith("```") and text.endswith("```"):
+        inner = text.split("\n", 1)
+        if len(inner) > 1:
+            text = inner[1]  # skip first ```lang line
+        if text.endswith("```"):
+            text = text[:-3].rstrip()
+    return text
+
+
 def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
               max_tokens: int = 16384, timeout: int = 180) -> LLMSection:
     """Call the LLM and return a typed, trust-annotated section.
@@ -147,31 +184,15 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
     prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
     text = ""
 
-    # 1. Copilot CLI with claude-sonnet-4.6 — ALWAYS via stdin
-    #    The -p flag is unreliable for both long prompts and long outputs.
-    #    Stdin piping is fast and reliable when no orphaned copilot processes
-    #    are consuming the rate limit.
+    # 1. Copilot CLI with claude-sonnet-4.6 via stdin
     if shutil.which("copilot"):
         try:
             result = subprocess.run(
-                ["copilot", "--model", "claude-sonnet-4.6", "--available-tools", ""],
+                ["copilot", "--model", "claude-sonnet-4.6", "--available-tools"],
                 input=prompt, capture_output=True, text=True,
                 timeout=timeout, cwd=_ROOT)
             if result.returncode == 0 and result.stdout.strip():
-                lines = result.stdout.split("\n")
-                cleaned = [l for l in lines if not l.strip().startswith(("●", "✗", "│", "└"))]
-                while cleaned and not cleaned[0].strip():
-                    cleaned.pop(0)
-                # Also strip trailing copilot stats
-                while cleaned and ("Total usage" in cleaned[-1] or
-                                   "API time" in cleaned[-1] or
-                                   "Total session" in cleaned[-1] or
-                                   "Total code" in cleaned[-1] or
-                                   "Breakdown" in cleaned[-1] or
-                                   "claude-sonnet" in cleaned[-1] or
-                                   cleaned[-1].strip() == ""):
-                    cleaned.pop()
-                text = "\n".join(cleaned).strip()
+                text = _clean_copilot_output(result.stdout)
         except Exception:
             pass
 
