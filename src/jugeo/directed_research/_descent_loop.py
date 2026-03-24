@@ -62,6 +62,7 @@ import json
 import os
 import pathlib
 import re
+import sys
 import textwrap
 import time
 from typing import Any, Optional
@@ -556,63 +557,85 @@ Use this as the foundation for the domain analysis.
     #  Phase 4: HARDEN — the descent loop
     # ══════════════════════════════════════════════════════════════════
 
+    def _install_deps(self):
+        """Install the project's dependencies so benchmarks can run."""
+        self._log("  Installing dependencies...")
+        import subprocess as _sp
+        pkg = self.architecture.get("package_name", "")
+        deps = self.domain_analysis.get("standard_libraries", [])
+        # pip install deps (best-effort, ignore failures on optional ones)
+        for dep in deps:
+            try:
+                _sp.run([sys.executable, "-m", "pip", "install", dep, "-q"],
+                       capture_output=True, timeout=120)
+            except Exception:
+                pass
+        # pip install the project itself in editable mode
+        pyproject = self.output_dir / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                _sp.run([sys.executable, "-m", "pip", "install", "-e",
+                        str(self.output_dir), "-q"],
+                       capture_output=True, timeout=120)
+            except Exception:
+                pass
+
     def _phase_harden(self) -> ResearchStatus:
         """The descent-driven hardening loop.
 
-        This is where "try things until SOTA" is formally realized:
+        Restructured to fix the spinning problem:
+        1. Install deps FIRST so benchmarks can actually run
+        2. Write paper/README EARLY so quality site can check them
+        3. Each iteration inspects the quality site obstructions and
+           dispatches the SPECIFIC repair that addresses the worst one
+        4. Only re-run jg on the first and last iterations (expensive)
 
-        1. Establish the SOTA frontier (baselines to beat)
-        2. For each iteration:
-            a. Run syntax/import checks → upgrade trust to RUNTIME
-            b. Run benchmarks → get actual metrics
-            c. Update frontier with our results
-            d. Run jg prove/bugs on code → upgrade trust to SOLVER
-            e. Build workspace → run descent
-            f. Check convergence criterion:
-               - workspace_consistent (H^1 = 0) → claim is TRUE
-               - frontier_dominated (beats SOTA) → claim is USEFUL
-               - code_verified (jg passes) → claim is VERIFIED
-               - claims_grounded (no hallucination) → claim is HONEST
-            g. If ALL → CONVERGED (useful AND true)
-            h. If consistent but not competitive → refine or pivot
-            i. If obstructed → repair based on obstruction type
+        The loop terminates when:
+        - CONVERGED: all quality dimensions satisfied
+        - BUDGET_EXHAUSTED: max_iterations hit
+        - PIVOT_LIMIT: too many pivots without progress
         """
-        # Establish baselines
+        pkg = self.architecture.get("package_name", "")
+
+        # ── Step 0: install dependencies ──────────────────────────────
+        self._install_deps()
+
+        # ── Step 1: establish baselines ───────────────────────────────
         self._log("  Establishing SOTA baselines...")
         self.frontier = establish_baselines(self.domain_analysis, self.approach)
 
+        # ── Step 2: initial syntax/import check ───────────────────────
+        syntax_results = syntax_check_all(self.code_files)
+        syntax_ok = all(syntax_results.values()) if syntax_results else False
+        import_ok, _ = import_check(str(self.output_dir), pkg)
+        self._log(f"  Syntax: {sum(syntax_results.values())}/{len(syntax_results)} OK, "
+                  f"Import: {'OK' if import_ok else 'FAIL'}")
+
+        # ── Step 3: initial benchmarks ────────────────────────────────
+        self._log("  Running initial benchmarks...")
+        self.benchmark_results = run_benchmarks(
+            str(self.output_dir), pkg,
+            self.domain_analysis.get("evaluation_metrics", []))
+        if self.frontier:
+            self.frontier = update_frontier_with_results(
+                self.frontier, self.benchmark_results)
+
+        # ── Step 4: write paper + README early so they can be checked ─
+        self._log("  Writing initial paper + README (for quality site)...")
+        self._write_deliverables()
+
+        # ── Step 5: initial jg verification (once, it's expensive) ────
+        self._log("  Running jg verification...")
+        jg_results = verify_all_code_files(self.code_files, verbose=self.verbose)
+
+        # ── Step 6: the descent loop ──────────────────────────────────
         for iteration in range(self.max_iterations):
             self._log(f"  ── Iteration {iteration} ──")
 
-            # Step a: syntax/import checks
-            syntax_results = syntax_check_all(self.code_files)
-            syntax_ok = all(syntax_results.values()) if syntax_results else False
-
-            pkg = self.architecture.get("package_name", "")
-            import_ok, import_detail = import_check(str(self.output_dir), pkg)
-
-            # Step b: benchmarks
-            self._log("  Running benchmarks...")
-            self.benchmark_results = run_benchmarks(
-                str(self.output_dir), pkg,
-                self.domain_analysis.get("evaluation_metrics", []))
-
-            # Step c: update frontier
-            if self.frontier:
-                self.frontier = update_frontier_with_results(
-                    self.frontier, self.benchmark_results)
-
-            # Step d: jg verification
-            self._log("  Running jg verification...")
-            jg_results = verify_all_code_files(self.code_files, verbose=self.verbose)
-            code_verified = all(r.verified for r in jg_results) if jg_results else True
-
-            # Step e: build workspace and descent
+            # Build quality site and run descent
             self._rebuild_workspace()
             report = self.workspace.check_consistency() if self.workspace else None
 
-            # Step f: check convergence via DESCENT ON THE QUALITY SITE
-            # Every dimension of "is this good?" is a local section with trust
             criterion = ConvergenceCriterion()
             criterion.set_workspace_consistency(
                 report.consistent if report else False,
@@ -621,6 +644,8 @@ Use this as the foundation for the domain analysis.
             criterion.set_code_correctness(
                 jg_results=jg_results, syntax_ok=syntax_ok, import_ok=import_ok)
             criterion.set_claims_grounding(report.consistent if report else False)
+            criterion.set_paper_completeness(
+                str(self.output_dir / "conference_tool_track.tex"))
             criterion.set_code_scale(
                 self.benchmark_results.get("total_lines", 0), target=5000)
             criterion.set_test_coverage(
@@ -628,41 +653,219 @@ Use this as the foundation for the domain analysis.
                 tests_pass=self.benchmark_results.get("tests_passed", False))
             criterion.set_theory_code_alignment(
                 report.consistent if report else False)
+            criterion.set_reproducibility(0.5)  # conservative until README verified
 
             self._log(f"  {criterion.diagnosis()}")
 
-            # Step g: CONVERGED?
+            # CONVERGED?
             if criterion.converged:
                 self._log("  ✓ CONVERGED — useful AND true")
                 return ResearchStatus.CONVERGED
 
-            # Step h: consistent but not competitive?
-            if criterion.partially_converged:
-                self._log("  Consistent but not competitive — refining...")
-                if self.frontier:
-                    weakest = self.frontier.weakest_metric()
-                    if weakest:
-                        self._refine_for_metric(weakest)
-                        continue
-
+            # Find the worst obstruction and dispatch a targeted repair
+            repaired = self._repair_quality_obstruction(criterion, report)
+            if not repaired:
+                # No repairable obstruction — try pivot
                 if self.pivots < self.max_pivots:
                     self._execute_pivot()
-                    continue
                 else:
-                    self._log("  Pivot limit reached")
+                    self._log("  No repairs possible, pivot limit reached")
                     break
 
-            # Step i: obstructed — repair
-            if report and report.obstructions:
-                repaired = self._repair_from_obstructions(report)
-                if not repaired and self.pivots < self.max_pivots:
-                    self._execute_pivot()
-                continue
+            # After repair, re-check syntax/import (cheap)
+            syntax_results = syntax_check_all(self.code_files)
+            syntax_ok = all(syntax_results.values()) if syntax_results else False
+            import_ok, _ = import_check(str(self.output_dir), pkg)
 
-            # Nothing to do — declare partial success
-            break
+            # Re-run benchmarks (cheap)
+            self.benchmark_results = run_benchmarks(
+                str(self.output_dir), pkg,
+                self.domain_analysis.get("evaluation_metrics", []))
+            if self.frontier:
+                self.frontier = update_frontier_with_results(
+                    self.frontier, self.benchmark_results)
+
+        # Final jg pass
+        self._log("  Final jg verification...")
+        verify_all_code_files(self.code_files, verbose=self.verbose)
 
         return ResearchStatus.BUDGET_EXHAUSTED
+
+    def _write_deliverables(self):
+        """Write paper + README (called early in harden, then again in tail)."""
+        if self.no_llm:
+            return
+        try:
+            readme_path, readme_section = generate_readme(
+                approach=self.approach, prompt=self.prompt,
+                theory_text=self.theory_text, module_code=self.module_code,
+                domain_analysis=self.domain_analysis,
+                benchmark_results=self.benchmark_results,
+                output_dir=str(self.output_dir))
+            if readme_section:
+                self._record_section(readme_section)
+            if readme_path not in self.code_files:
+                self.code_files.append(readme_path)
+        except Exception as e:
+            self._log(f"  README generation failed: {e}")
+
+        try:
+            paper_path, paper_section = generate_paper(
+                approach=self.approach, prompt=self.prompt,
+                theory_text=self.theory_text, module_code=self.module_code,
+                domain_analysis=self.domain_analysis,
+                benchmark_results=self.benchmark_results,
+                ideation_metadata=self.ideation_result.metadata if self.ideation_result else {},
+                output_dir=str(self.output_dir),
+                sections=self.sections, code_files=self.code_files)
+            if paper_section:
+                self._record_section(paper_section)
+            if paper_path not in self.code_files:
+                self.code_files.append(paper_path)
+        except Exception as e:
+            self._log(f"  Paper generation failed: {e}")
+
+    def _repair_quality_obstruction(
+        self, criterion: ConvergenceCriterion, report
+    ) -> bool:
+        """Dispatch a targeted repair for the worst quality obstruction.
+
+        Inspects the quality site and fixes the obstruction with the
+        highest impact (lowest trust relative to its floor).
+        """
+        # Find the worst-obstructed quality dimension
+        worst_coord = None
+        worst_gap = 0.0
+        for coord, section in criterion.sections.items():
+            if not section.satisfied:
+                gap = section.trust_floor - section.trust
+                if gap > worst_gap:
+                    worst_gap = gap
+                    worst_coord = coord
+
+        if worst_coord is None:
+            return False
+
+        self._log(f"  REPAIR: {worst_coord} (gap={worst_gap:.2f})")
+
+        if worst_coord == "workspace_consistency":
+            # Fix workspace H^1 obstructions
+            if report and report.obstructions:
+                return self._repair_from_obstructions(report)
+            return False
+
+        elif worst_coord == "sota_domination":
+            # Need to actually run benchmarks against real baselines
+            # Ask agent to create a benchmark runner that uses real data
+            self._log("  → Creating benchmark runner with real data...")
+            self._create_real_data_benchmark()
+            return True
+
+        elif worst_coord == "code_correctness":
+            # Fix code bugs — ask agent to fix the worst file
+            self._log("  → Fixing code issues...")
+            if self.architecture.get("modules"):
+                self._move_generate_module(self.architecture["modules"][0])
+            return True
+
+        elif worst_coord == "claims_grounding":
+            # Sync claims with evidence
+            self._ground_claims()
+            return True
+
+        elif worst_coord == "paper_completeness":
+            # Regenerate paper
+            self._log("  → Regenerating paper...")
+            self._write_deliverables()
+            return True
+
+        elif worst_coord == "paper_honesty":
+            # Regenerate paper with updated evidence
+            self._log("  → Regenerating honest paper...")
+            self._write_deliverables()
+            return True
+
+        elif worst_coord == "test_coverage":
+            # Run tests, fix failures
+            self._log("  → Fixing tests...")
+            self._move_generate_tests()
+            return True
+
+        elif worst_coord == "reproducibility":
+            # Regenerate README with working examples
+            self._log("  → Regenerating README...")
+            self._write_deliverables()
+            return True
+
+        elif worst_coord == "theory_code_alignment":
+            # Code doesn't match theory — regenerate weakest module
+            self._log("  → Realigning code with theory...")
+            if self.architecture.get("modules"):
+                self._move_generate_module(self.architecture["modules"][0])
+            return True
+
+        elif worst_coord == "data_provenance":
+            # Need real data — create real data fetcher
+            self._log("  → Creating real data pipeline...")
+            self._create_real_data_benchmark()
+            return True
+
+        return False
+
+    def _create_real_data_benchmark(self):
+        """Ask agent to create a benchmark that fetches + uses real data."""
+        if self.no_llm:
+            return
+        pkg = self.architecture.get("package_name", self.approach)
+        pkg_clean = re.sub(r'[^a-zA-Z0-9_]', '_', pkg).strip('_').lower() or "output"
+        bench_path = self.output_dir / "src" / pkg_clean / "run_real_benchmark.py"
+
+        section = agent_call(
+            f"Write a benchmark script to {bench_path} that:\n\n"
+            f"1. Downloads REAL market data using yfinance (Yahoo Finance API)\n"
+            f"   - Fetch S&P 500 components or major indices\n"
+            f"   - At least 2 years of daily data\n"
+            f"2. Runs the {pkg_clean} package on this real data\n"
+            f"3. Computes standard evaluation metrics\n"
+            f"4. Prints results as JSON to stdout\n"
+            f"5. Compares against simple baselines (equal weight, market cap, etc.)\n\n"
+            f"The script must use REAL data from yfinance, NOT synthetic data.\n"
+            f"Install yfinance if needed: pip install yfinance\n\n"
+            f"Package location: {self.output_dir / 'src'}\n"
+            f"Available modules: {list(self.module_code.keys())}\n\n"
+            f"Write the complete script to {bench_path} using your file-write tool.",
+            surface=SurfaceKind.EVIDENCE,
+            coordinate="evidence.real_benchmark",
+            working_dir=str(self.output_dir),
+        )
+        self._record_section(section)
+
+        # Try running it
+        if bench_path.exists():
+            self._log("  → Running real data benchmark...")
+            import subprocess as _sp
+            try:
+                _sp.run([sys.executable, "-m", "pip", "install", "yfinance", "-q"],
+                       capture_output=True, timeout=60)
+            except Exception:
+                pass
+            try:
+                r = _sp.run(
+                    [sys.executable, str(bench_path)],
+                    capture_output=True, text=True, timeout=300,
+                    cwd=str(self.output_dir),
+                    env={**os.environ, "PYTHONPATH": str(self.output_dir / "src")})
+                if r.returncode == 0 and r.stdout.strip():
+                    try:
+                        results = json.loads(r.stdout)
+                        self.benchmark_results.update(results)
+                        self._log(f"  → Real benchmark results: {list(results.keys())}")
+                    except json.JSONDecodeError:
+                        self.benchmark_results["real_benchmark_output"] = r.stdout[:500]
+                else:
+                    self._log(f"  → Benchmark failed: {r.stderr[:200]}")
+            except Exception as e:
+                self._log(f"  → Benchmark error: {e}")
 
     def _refine_for_metric(self, metric_name: str):
         """Refine the code to improve a specific metric."""
@@ -743,41 +946,15 @@ Use this as the foundation for the domain analysis.
     # ══════════════════════════════════════════════════════════════════
 
     def _phase_tail(self):
-        """Write paper and README, then verify both with jg."""
+        """Final pass: rewrite paper/README with latest evidence, then verify."""
         self._ground_claims()
 
-        # Write README
-        self._log("  Writing README.md...")
-        readme_path, readme_section = generate_readme(
-            approach=self.approach,
-            prompt=self.prompt,
-            theory_text=self.theory_text,
-            module_code=self.module_code,
-            domain_analysis=self.domain_analysis,
-            benchmark_results=self.benchmark_results,
-            output_dir=str(self.output_dir),
-        ) if not self.no_llm else (str(self.output_dir / "README.md"), None)
-        if readme_section:
-            self._record_section(readme_section)
-        self.code_files.append(readme_path)
+        # Rewrite deliverables with final benchmark data
+        self._log("  Rewriting deliverables with final evidence...")
+        self._write_deliverables()
 
-        # Write paper
-        self._log("  Writing paper...")
-        paper_path, paper_section = generate_paper(
-            approach=self.approach,
-            prompt=self.prompt,
-            theory_text=self.theory_text,
-            module_code=self.module_code,
-            domain_analysis=self.domain_analysis,
-            benchmark_results=self.benchmark_results,
-            ideation_metadata=self.ideation_result.metadata if self.ideation_result else {},
-            output_dir=str(self.output_dir),
-            sections=self.sections,
-            code_files=self.code_files,
-        ) if not self.no_llm else (str(self.output_dir / "paper.tex"), None)
-        if paper_section:
-            self._record_section(paper_section)
-        self.code_files.append(paper_path)
+        readme_path = str(self.output_dir / "README.md")
+        paper_path = str(self.output_dir / "conference_tool_track.tex")
 
         # Verify README
         self._log("  Verifying README claims with jg...")
