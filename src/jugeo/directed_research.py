@@ -189,7 +189,7 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
         for attempt in range(3):
             try:
                 result = subprocess.run(
-                    ["copilot", "--model", "claude-sonnet-4.6", "--available-tools"],
+                    ["copilot", "--model", "claude-sonnet-4.6", "--autopilot", "--available-tools"],
                     input=prompt, capture_output=True, text=True,
                     timeout=timeout, cwd=_ROOT)
                 if result.returncode == 0 and result.stdout.strip():
