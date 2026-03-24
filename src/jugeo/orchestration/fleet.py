@@ -33,6 +33,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from itertools import combinations
 from typing import Any, Sequence
 
 from jugeo.orchestration.frontier import FrontierItem
@@ -1494,6 +1495,284 @@ class FleetState:
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Fleet Bundle Diagnostics (Judgment Fiber Bundle integration)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class FleetBundleDiagnostics:
+    """Geometric diagnostics for fleet competition using fiber bundle theory.
+
+    Models the fleet as a fiber bundle where:
+
+    - **Base space** = tasks being bid on.
+    - **Fiber** at each task = bids from different fleet members.
+    - **Connection** = trust differential between competing bids.
+    - **Curvature** = trust inconsistency across fleet member triples.
+
+    The bundle detects:
+
+    - **Echo chambers** (positive curvature) — members mutually inflating
+      trust on overlapping tasks.
+    - **Adversarial dynamics** (negative curvature) — members undermining
+      each other's trust scores.
+    - **Trust monopolies** (non-trivial holonomy) — one member dominating
+      the trust landscape, distorting fair competition.
+
+    Usage::
+
+        diag = FleetBundleDiagnostics()
+        diag.record_bid("task-1", "member-a", 0.9)
+        diag.record_bid("task-1", "member-b", 0.7)
+        diag.record_bid("task-2", "member-a", 0.8)
+        diag.record_bid("task-2", "member-b", 0.85)
+        diag.record_bid("task-2", "member-c", 0.6)
+        report = diag.diagnose()
+    """
+
+    def __init__(self) -> None:
+        # member_id → list of trust scores from their bids
+        self._member_trusts: dict[str, list[float]] = {}
+        # task_id → {member_id: trust_score}
+        self._task_bids: dict[str, dict[str, float]] = {}
+
+    # -- recording ---------------------------------------------------------
+
+    def record_bid(self, task_id: str, member_id: str, trust_score: float) -> None:
+        """Record a fleet member's bid with its trust score.
+
+        Parameters
+        ----------
+        task_id : str
+            Identifier of the task being bid on.
+        member_id : str
+            Identifier of the fleet member submitting the bid.
+        trust_score : float
+            Normalised trust score associated with the bid.
+        """
+        self._member_trusts.setdefault(member_id, []).append(trust_score)
+        self._task_bids.setdefault(task_id, {})[member_id] = trust_score
+
+    def ingest_fleet_bids(self, bids: Sequence[FleetBid]) -> None:
+        """Bulk-ingest :class:`FleetBid` objects.
+
+        Each bid's *member_id*, *task_id* (derived from the proposition),
+        and *confidence* are used as the trust score.
+        """
+        for bid in bids:
+            task_id = bid.proposition if hasattr(bid, "proposition") else str(id(bid))
+            self.record_bid(task_id, bid.member_id, bid.confidence)
+
+    # -- member statistics -------------------------------------------------
+
+    @property
+    def members(self) -> list[str]:
+        """Sorted list of known member identifiers."""
+        return sorted(self._member_trusts.keys())
+
+    @property
+    def task_count(self) -> int:
+        """Number of distinct tasks with at least one bid."""
+        return len(self._task_bids)
+
+    def member_avg_trust(self, member_id: str) -> float:
+        """Average trust score for *member_id* across all their bids."""
+        scores = self._member_trusts.get(member_id, [])
+        return sum(scores) / len(scores) if scores else 0.0
+
+    def member_bid_count(self, member_id: str) -> int:
+        """Number of bids submitted by *member_id*."""
+        return len(self._member_trusts.get(member_id, []))
+
+    # -- pairwise delta (connection) ---------------------------------------
+
+    def pairwise_delta(self, m1: str, m2: str) -> float:
+        """Average trust differential between two members on shared tasks.
+
+        Returns ``Δ = mean(score[m2] − score[m1])`` over tasks where
+        both *m1* and *m2* submitted bids.  Zero when no shared tasks.
+        """
+        shared: list[float] = []
+        for bids in self._task_bids.values():
+            if m1 in bids and m2 in bids:
+                shared.append(bids[m2] - bids[m1])
+        return sum(shared) / len(shared) if shared else 0.0
+
+    def shared_task_count(self, m1: str, m2: str) -> int:
+        """Number of tasks where both *m1* and *m2* submitted bids."""
+        return sum(
+            1 for bids in self._task_bids.values()
+            if m1 in bids and m2 in bids
+        )
+
+    # -- curvature ---------------------------------------------------------
+
+    def curvature(self, m1: str, m2: str, m3: str) -> float:
+        """Curvature at the fleet triple (*m1*, *m2*, *m3*).
+
+        Defined as::
+
+            F = Δ(m1→m2) + Δ(m2→m3) + Δ(m3→m1)
+
+        Zero curvature means trust differentials are consistent around
+        the triangle.  Positive curvature indicates an echo-chamber
+        dynamic; negative curvature indicates adversarial dynamics.
+        """
+        return (
+            self.pairwise_delta(m1, m2)
+            + self.pairwise_delta(m2, m3)
+            + self.pairwise_delta(m3, m1)
+        )
+
+    # -- holonomy ----------------------------------------------------------
+
+    def holonomy(self, loop: Sequence[str]) -> float:
+        """Trust shift around a loop of fleet members.
+
+        The loop is closed automatically: if the first and last
+        elements differ, the first element is appended to close the
+        loop.
+        """
+        closed = list(loop)
+        if len(closed) < 2:
+            return 0.0
+        if closed[0] != closed[-1]:
+            closed.append(closed[0])
+        return sum(
+            self.pairwise_delta(closed[i], closed[i + 1])
+            for i in range(len(closed) - 1)
+        )
+
+    # -- first Chern class -------------------------------------------------
+
+    def first_chern_class(self) -> float:
+        """Average curvature over all fleet member triples (*c₁*).
+
+        Returns zero when fewer than three members have recorded bids.
+        """
+        members = self.members
+        if len(members) < 3:
+            return 0.0
+        curvatures = [
+            self.curvature(*triple) for triple in combinations(members, 3)
+        ]
+        return sum(curvatures) / len(curvatures) if curvatures else 0.0
+
+    # -- pattern detection -------------------------------------------------
+
+    def detect_echo_chamber(self, threshold: float = 0.5) -> list[tuple[str, ...]]:
+        """Detect member triples with positive curvature exceeding *threshold*.
+
+        Positive curvature suggests members are mutually inflating
+        trust (an "echo chamber").
+        """
+        members = self.members
+        if len(members) < 3:
+            return []
+        return [
+            triple for triple in combinations(members, 3)
+            if self.curvature(*triple) > threshold
+        ]
+
+    def detect_adversarial(self, threshold: float = -0.5) -> list[tuple[str, ...]]:
+        """Detect member triples with negative curvature below *threshold*.
+
+        Negative curvature suggests members are undermining each
+        other's trust (adversarial dynamics).
+        """
+        members = self.members
+        if len(members) < 3:
+            return []
+        return [
+            triple for triple in combinations(members, 3)
+            if self.curvature(*triple) < threshold
+        ]
+
+    def detect_trust_monopoly(self, dominance_threshold: float = 0.3) -> list[str]:
+        """Detect members whose average trust exceeds all others by *dominance_threshold*.
+
+        A trust monopolist can distort fleet competition by
+        consistently out-trusting every competitor.
+        """
+        members = self.members
+        if len(members) < 2:
+            return []
+        monopolists: list[str] = []
+        for m in members:
+            avg = self.member_avg_trust(m)
+            others = [self.member_avg_trust(o) for o in members if o != m]
+            if others and all(avg - o >= dominance_threshold for o in others):
+                monopolists.append(m)
+        return monopolists
+
+    # -- full diagnostics --------------------------------------------------
+
+    def diagnose(self) -> dict[str, Any]:
+        """Produce a comprehensive diagnostic dictionary.
+
+        Includes member listing, curvature statistics, echo-chamber
+        and adversarial detection, holonomy, and per-member averages.
+        """
+        members = self.members
+        c1 = self.first_chern_class()
+        echo = self.detect_echo_chamber()
+        adversarial = self.detect_adversarial()
+        monopolists = self.detect_trust_monopoly()
+        hol = self.holonomy(members) if len(members) >= 3 else 0.0
+
+        all_curvatures: list[float] = []
+        if len(members) >= 3:
+            all_curvatures = [
+                self.curvature(*triple) for triple in combinations(members, 3)
+            ]
+
+        return {
+            "members": members,
+            "tasks": self.task_count,
+            "first_chern_class": c1,
+            "bundle_is_flat": abs(c1) < 1e-9,
+            "holonomy": hol,
+            "echo_chambers": echo,
+            "adversarial_triples": adversarial,
+            "trust_monopolists": monopolists,
+            "member_avg_trust": {m: self.member_avg_trust(m) for m in members},
+            "member_bid_counts": {m: self.member_bid_count(m) for m in members},
+            "curvature_stats": {
+                "count": len(all_curvatures),
+                "mean": (
+                    sum(all_curvatures) / len(all_curvatures)
+                    if all_curvatures else 0.0
+                ),
+                "max": max(all_curvatures) if all_curvatures else 0.0,
+                "min": min(all_curvatures) if all_curvatures else 0.0,
+            },
+        }
+
+    def summary_text(self) -> str:
+        """Human-readable summary of fleet bundle diagnostics."""
+        d = self.diagnose()
+        lines = [
+            "═══ Fleet Bundle Diagnostics ═══",
+            f"  Members: {', '.join(d['members'])}",
+            f"  Tasks: {d['tasks']}",
+            f"  Bundle is flat: {'Yes ✓' if d['bundle_is_flat'] else 'No ✗'}",
+            f"  First Chern class c₁ = {d['first_chern_class']:+.6f}",
+            f"  Holonomy (full loop): {d['holonomy']:+.4f}",
+        ]
+        if d["echo_chambers"]:
+            lines.append(f"  ⚠ Echo chambers: {len(d['echo_chambers'])} triples")
+        if d["adversarial_triples"]:
+            lines.append(
+                f"  ⚠ Adversarial dynamics: "
+                f"{len(d['adversarial_triples'])} triples"
+            )
+        if d["trust_monopolists"]:
+            lines.append(
+                f"  ⚠ Trust monopolists: {', '.join(d['trust_monopolists'])}"
+            )
+        return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Module exports
 # ---------------------------------------------------------------------------
@@ -1511,6 +1790,7 @@ __all__ = [
     "ChallengeRecord",
     "FleetHistory",
     "FleetDiagnostics",
+    "FleetBundleDiagnostics",
     "FleetState",
 ]
 

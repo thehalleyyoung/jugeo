@@ -1,0 +1,1 @@
+"""Scaffolds sub-package (placeholder)."""

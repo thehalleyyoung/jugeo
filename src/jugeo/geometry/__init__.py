@@ -101,6 +101,18 @@ from jugeo.geometry.supports import (  # noqa: F401
     SupportedSection,
     VerificationResult,
 )
+from jugeo.geometry.bundle import (  # noqa: F401
+    BundleCurvature,
+    BundleHolonomy,
+    CharacteristicClass,
+    EvidenceChannel,
+    Judgment,
+    JudgmentFiber,
+    TransportObservation,
+    TrustConnection,
+    TrustStratum,
+    VerificationBundle,
+)
 
 __all__ = [
     # site
@@ -167,6 +179,17 @@ __all__ = [
     "SupportVisualization",
     "SupportedSection",
     "VerificationResult",
+    # bundle
+    "BundleCurvature",
+    "BundleHolonomy",
+    "CharacteristicClass",
+    "EvidenceChannel",
+    "Judgment",
+    "JudgmentFiber",
+    "TransportObservation",
+    "TrustConnection",
+    "TrustStratum",
+    "VerificationBundle",
 ]
 
 
@@ -189,5 +212,9 @@ except Exception:
     pass
 try:
     from . import supports
+except Exception:
+    pass
+try:
+    from . import bundle
 except Exception:
     pass

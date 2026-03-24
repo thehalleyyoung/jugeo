@@ -119,6 +119,18 @@ function renderDocsSidebar(activePage) {
       ]
     },
     {
+      title: 'jugeo-agents',
+      links: [
+        { href: 'agents-overview.html', label: 'Overview', id: 'agents-overview' },
+        { href: 'agents-concepts.html', label: 'Sheaf Theory for Agents', id: 'agents-concepts' },
+        { href: 'agents-tutorial.html', label: 'Tutorial', id: 'agents-tutorial' },
+        { href: 'agents-api.html', label: 'API Reference', id: 'agents-api' },
+        { href: 'agents-examples.html', label: 'Examples Gallery', id: 'agents-examples' },
+        { href: 'agents-fusion.html', label: 'Knowledge Fusion', id: 'agents-fusion' },
+        { href: 'agents-bundle.html', label: 'Judgment Fiber Bundles', id: 'agents-bundle' },
+      ]
+    },
+    {
       title: 'Theory & Research',
       links: [
         { href: 'math.html', label: 'Math Background', id: 'math' },

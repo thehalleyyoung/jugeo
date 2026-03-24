@@ -913,6 +913,127 @@ class TrustAlgebra:
         except Exception:
             return {"level": str(level), "yield": "unavailable"}
 
+    # ── Bundle-aware methods (Judgment Fiber Bundle integration) ────────
+    #
+    # These methods expose the trust algebra's partial-order structure
+    # to the fiber-bundle machinery defined in ``jugeo.geometry.bundle``.
+    # They allow the bundle's TrustConnection to delegate delta
+    # computation, curvature evaluation, and flatness checks to the
+    # canonical algebra instance, ensuring that the same ordering
+    # semantics govern both local algebra operations and global
+    # geometric diagnostics.
+
+    def connection_observe(
+        self,
+        source: TrustLevel,
+        target: TrustLevel,
+        morphism_kind: str = '',
+    ) -> float:
+        """Record and return the trust differential for a morphism.
+
+        This implements the observation step of building a trust
+        connection on the judgment bundle.  The delta is the difference
+        in strength indices between the *target* and *source* trust
+        levels.
+
+        Each observation is appended to an internal log
+        (``_connection_log``) so that the full history of trust
+        transports is available for audit.
+
+        Parameters
+        ----------
+        source : TrustLevel
+            Trust at the morphism's source coordinate.
+        target : TrustLevel
+            Trust at the morphism's target coordinate.
+        morphism_kind : str
+            Optional label for the kind of morphism (e.g. ``"TRANSPORT"``).
+
+        Returns
+        -------
+        float
+            The trust delta ``target._strength_index() - source._strength_index()``.
+        """
+        delta = target._strength_index() - source._strength_index()
+        if not hasattr(self, '_connection_log'):
+            self._connection_log: list[dict[str, object]] = []
+        self._connection_log.append({
+            'source': source.name,
+            'target': target.name,
+            'morphism': morphism_kind,
+            'delta': delta,
+        })
+        return float(delta)
+
+    def connection_curvature(self, deltas: Sequence[float]) -> float:
+        """Compute curvature from a sequence of trust deltas around a loop.
+
+        For a triangle *(A→B, B→C, C→A)*, curvature = sum of deltas.
+        Zero curvature means trust is path-independent (flat connection).
+
+        This is a pure helper — it does not mutate state.
+
+        Parameters
+        ----------
+        deltas : Sequence[float]
+            Trust deltas around a closed loop of morphisms.
+
+        Returns
+        -------
+        float
+            The curvature (sum of deltas).
+        """
+        return sum(deltas)
+
+    def connection_holonomy(self, loop_deltas: Sequence[float]) -> float:
+        """Total trust shift around a closed loop.
+
+        Holonomy = sum of all edge deltas in the loop.  Trivial
+        holonomy (≈ 0) means the bundle is locally flat at this loop.
+
+        Parameters
+        ----------
+        loop_deltas : Sequence[float]
+            Edge deltas around the closed loop.
+
+        Returns
+        -------
+        float
+            The holonomy (total shift).
+        """
+        return sum(loop_deltas)
+
+    def is_flat_triangle(
+        self,
+        d_ab: float,
+        d_bc: float,
+        d_ca: float,
+        tolerance: float = 1e-9,
+    ) -> bool:
+        """Check if a triangle of trust transports is flat.
+
+        A triangle is flat when the sum of its three edge deltas is
+        within *tolerance* of zero, meaning trust transport around the
+        triangle is path-independent.
+
+        Parameters
+        ----------
+        d_ab : float
+            Trust delta along edge A → B.
+        d_bc : float
+            Trust delta along edge B → C.
+        d_ca : float
+            Trust delta along edge C → A.
+        tolerance : float
+            Numerical tolerance for flatness (default ``1e-9``).
+
+        Returns
+        -------
+        bool
+            ``True`` if the triangle is flat.
+        """
+        return abs(d_ab + d_bc + d_ca) < tolerance
+
 
 # ---------------------------------------------------------------------------
 # TrustComposition — rules for composing trust from multiple evidence items
