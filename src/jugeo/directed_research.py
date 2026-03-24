@@ -147,14 +147,24 @@ def _llm_call(prompt: str, *, surface: SurfaceKind, coordinate: str,
     prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
     text = ""
 
-    # 1. Copilot CLI with claude-sonnet-4.6 via stdin pipe (fast)
+    # 1. Copilot CLI with claude-sonnet-4.6
+    #    Use -p for short prompts, stdin for long ones
     if shutil.which("copilot"):
         try:
-            result = subprocess.run(
-                ["copilot", "--model", "claude-sonnet-4.6", "--available-tools", ""],
-                input=prompt, capture_output=True, text=True,
-                timeout=timeout, cwd=_ROOT,
-            )
+            if len(prompt) < 4000:
+                # Short prompt: pass via -p flag (most reliable)
+                cmd = ["copilot", "-p", prompt, "--model", "claude-sonnet-4.6",
+                       "--available-tools", ""]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=timeout, cwd=_ROOT)
+            else:
+                # Long prompt: pipe via stdin
+                cmd = ["copilot", "--model", "claude-sonnet-4.6",
+                       "--available-tools", ""]
+                result = subprocess.run(
+                    cmd, input=prompt, capture_output=True, text=True,
+                    timeout=timeout, cwd=_ROOT)
             if result.returncode == 0 and result.stdout.strip():
                 lines = result.stdout.split("\n")
                 cleaned = [l for l in lines if not l.strip().startswith(("●", "✗", "│", "└"))]
