@@ -48,6 +48,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Optional
 
 from jugeo.research_orchestration import SurfaceKind, ConsistencyReport
@@ -81,6 +82,101 @@ class MetricBaseline:
             return our_value > self.value
         else:
             return our_value < self.value
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Data provenance trust rule (real >> synthetic)
+# ═══════════════════════════════════════════════════════════════════════
+#
+#  In the trust algebra, data provenance determines the CEILING of
+#  evidence trust. This is a hard invariant, not a preference:
+#
+#    Real data (Yahoo Finance, Bloomberg, SEC filings, etc.)
+#      → Evidence trust ceiling: RUNTIME_WITNESSED (0.7)
+#      → May appear in: Evaluation, Results tables, Benchmarks
+#
+#    Synthetic data (Monte Carlo, GBM simulation, toy examples)
+#      → Evidence trust ceiling: COPILOT_SUGGESTED (0.3)
+#      → May appear in: Discussion, Methodology illustration ONLY
+#      → NEVER in Evaluation section (trust floor 0.7 blocks it)
+#
+#  This is enforced by the trust algebra's ceiling operation (↓_χ):
+#  any benchmark result from synthetic data has its trust capped at 0.3,
+#  regardless of how many times you run it. Running a simulation 10,000
+#  times doesn't make it real data.
+#
+#  The geometric content: the morphism EVAL (Code → Evidence) has a
+#  *data-provenance filter* that attenuates trust based on the data
+#  source. Real data passes through at full strength; synthetic data
+#  is attenuated to COPILOT level.
+
+class DataProvenance(str, Enum):
+    """Trust ceiling for evidence based on data source."""
+    REAL_MARKET = "real_market"       # Yahoo Finance, Bloomberg, etc. → trust ceiling 0.7
+    REAL_FILING = "real_filing"       # SEC filings, annual reports → trust ceiling 0.7
+    REAL_SURVEY = "real_survey"       # Surveys, interviews → trust ceiling 0.6
+    SYNTHETIC_CALIBRATED = "synthetic_calibrated"  # Calibrated to real data → ceiling 0.5
+    SYNTHETIC_PURE = "synthetic_pure"  # Pure simulation → ceiling 0.3
+    UNKNOWN = "unknown"               # No provenance → ceiling 0.1
+
+
+DATA_TRUST_CEILING: dict[DataProvenance, float] = {
+    DataProvenance.REAL_MARKET: TRUST_RUNTIME,      # 0.7
+    DataProvenance.REAL_FILING: TRUST_RUNTIME,       # 0.7
+    DataProvenance.REAL_SURVEY: 0.6,
+    DataProvenance.SYNTHETIC_CALIBRATED: 0.5,
+    DataProvenance.SYNTHETIC_PURE: TRUST_COPILOT,    # 0.3
+    DataProvenance.UNKNOWN: 0.1,
+}
+
+
+def classify_data_provenance(description: str) -> DataProvenance:
+    """Classify data source by provenance.
+
+    Scans the description for markers of real vs synthetic data.
+    """
+    desc_lower = description.lower()
+    real_markers = [
+        "yahoo", "bloomberg", "reuters", "quandl", "alpha vantage",
+        "sec", "edgar", "fred", "world bank", "imf", "oecd",
+        "historical", "market data", "real data", "live data",
+        "api", "download", "fetch", "yfinance",
+    ]
+    synthetic_markers = [
+        "synthetic", "simulated", "monte carlo", "gbm",
+        "random", "generated", "toy", "example", "dummy",
+        "fake", "mock", "artificial",
+    ]
+    calibrated_markers = [
+        "calibrated", "fitted to", "estimated from", "bootstrapped",
+    ]
+
+    for marker in real_markers:
+        if marker in desc_lower:
+            return DataProvenance.REAL_MARKET
+
+    for marker in calibrated_markers:
+        if marker in desc_lower:
+            return DataProvenance.SYNTHETIC_CALIBRATED
+
+    for marker in synthetic_markers:
+        if marker in desc_lower:
+            return DataProvenance.SYNTHETIC_PURE
+
+    return DataProvenance.UNKNOWN
+
+
+def apply_data_trust_ceiling(
+    trust: float,
+    data_description: str,
+) -> tuple[float, DataProvenance]:
+    """Apply the data-provenance trust ceiling.
+
+    Returns (capped_trust, provenance_classification).
+    """
+    provenance = classify_data_provenance(data_description)
+    ceiling = DATA_TRUST_CEILING[provenance]
+    return min(trust, ceiling), provenance
 
 
 @dataclass
@@ -408,6 +504,7 @@ QUALITY_COORDINATES: dict[str, tuple[str, float]] = {
     "test_coverage": ("Tests exist and pass", 0.7),
     "reproducibility": ("README instructions produce expected output", 0.7),
     "theory_code_alignment": ("Code implements the theory (T→R morphism)", 0.5),
+    "data_provenance": ("Benchmarks use real data, not synthetic (ceiling rule)", 0.7),
 }
 
 # Morphisms: (source, target) — source must be satisfied for target to be meaningful
@@ -418,6 +515,8 @@ QUALITY_MORPHISMS: list[tuple[str, str]] = [
     ("code_correctness", "reproducibility"),
     ("test_coverage", "reproducibility"),
     ("code_correctness", "theory_code_alignment"),
+    ("data_provenance", "sota_domination"),     # can't claim SOTA on synthetic data
+    ("data_provenance", "paper_honesty"),        # synthetic results in Eval = dishonest
 ]
 
 
@@ -560,6 +659,46 @@ class ConvergenceCriterion:
         s = self.sections["theory_code_alignment"]
         s.trust = 0.7 if consistent else 0.2
         s.obstructions = [] if consistent else ["T→R morphism: code does not implement theory"]
+
+    def set_data_provenance(self, data_descriptions: list[str]):
+        """Check data provenance and apply trust ceiling.
+
+        Real data (Yahoo Finance, etc.) → trust 0.7 (RUNTIME_WITNESSED)
+        Synthetic data → trust 0.3 (COPILOT_SUGGESTED)
+
+        This is a hard invariant: synthetic results can NEVER appear in
+        the Evaluation section (trust floor 0.7 blocks it).
+        """
+        s = self.sections["data_provenance"]
+        if not data_descriptions:
+            s.trust = 0.0
+            s.obstructions = ["no data source specified"]
+            return
+
+        provenances = [classify_data_provenance(d) for d in data_descriptions]
+        worst = min(DATA_TRUST_CEILING[p] for p in provenances)
+        synthetic_count = sum(1 for p in provenances
+                            if p in (DataProvenance.SYNTHETIC_PURE,
+                                     DataProvenance.SYNTHETIC_CALIBRATED))
+        real_count = sum(1 for p in provenances
+                        if p in (DataProvenance.REAL_MARKET,
+                                 DataProvenance.REAL_FILING))
+
+        s.trust = worst
+        s.evidence = f"{real_count} real sources, {synthetic_count} synthetic"
+        if synthetic_count > 0 and real_count == 0:
+            s.obstructions = [
+                f"ALL data is synthetic — trust ceiling {worst:.1f}. "
+                f"Results cannot appear in Evaluation section. "
+                f"Use real data (Yahoo Finance, etc.) for publishable benchmarks."
+            ]
+        elif worst < 0.7:
+            s.obstructions = [
+                f"Some data sources below RUNTIME trust ceiling: "
+                f"{', '.join(p.value for p in provenances if DATA_TRUST_CEILING[p] < 0.7)}"
+            ]
+        else:
+            s.obstructions = []
 
     # ── Descent on the quality site ───────────────────────────────
 
