@@ -16,10 +16,20 @@ __all__ = ["LargeRepoOptimizer"]
 
 
 class LargeRepoOptimizer:
-    """Performance optimiser for large sites (>10 000 coordinates)."""
+    """Performance optimiser for large sites (>10 000 coordinates).
 
-    def __init__(self, site_size_threshold: int = 10000) -> None:
+    Auto-activates when *either*:
+    - ``coordinate_count >= site_size_threshold``, **or**
+    - a ``desired_kloc`` target is set (indicating the user wants large output).
+    """
+
+    def __init__(
+        self,
+        site_size_threshold: int = 10000,
+        desired_kloc: float | None = None,
+    ) -> None:
         self._site_size_threshold = site_size_threshold
+        self._desired_kloc = desired_kloc
         self._frontier_prune_count: int = 0
         self._compaction_count: int = 0
         self._batch_size: int = 50
@@ -28,8 +38,19 @@ class LargeRepoOptimizer:
     # Activation
     # ------------------------------------------------------------------
 
+    @property
+    def desired_kloc(self) -> float | None:
+        """Target code volume in thousands of lines, if set."""
+        return self._desired_kloc
+
+    @desired_kloc.setter
+    def desired_kloc(self, value: float | None) -> None:
+        self._desired_kloc = value
+
     def should_activate(self, coordinate_count: int) -> bool:
-        """True if the site is large enough to warrant optimisation."""
+        """True if the site is large enough or a KLoC target is set."""
+        if self._desired_kloc is not None and self._desired_kloc > 0:
+            return True
         return coordinate_count >= self._site_size_threshold
 
     # ------------------------------------------------------------------
@@ -259,6 +280,7 @@ class LargeRepoOptimizer:
         """Return optimiser statistics."""
         return {
             "site_size_threshold": self._site_size_threshold,
+            "desired_kloc": self._desired_kloc,
             "frontier_prune_count": self._frontier_prune_count,
             "compaction_count": self._compaction_count,
             "current_batch_size": self._batch_size,

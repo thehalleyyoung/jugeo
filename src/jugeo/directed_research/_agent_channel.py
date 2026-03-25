@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -42,6 +43,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from jugeo.research_orchestration import SurfaceKind
+
+log = logging.getLogger(__name__)
 
 from jugeo.directed_research._types import (
     TRUST_COPILOT,
@@ -160,7 +163,7 @@ class AgentCallConfig:
     backend: AgentBackend = AgentBackend.COPILOT
     working_dir: Optional[str] = None
     output_file: Optional[str] = None  # If set, agent writes here
-    max_retries: int = 3
+    max_retries: int = 1  # each agent call is expensive; prefer fallthrough
     timeout: Optional[int] = None
     model: str = "claude-sonnet-4.6"
     allow_file_write: bool = True
@@ -171,9 +174,9 @@ class AgentCallConfig:
 def _call_copilot(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
     """Dispatch to GitHub Copilot CLI.
 
-    Copilot is invoked with --allow-all-tools --allow-all-paths to give it
-    full agent capabilities. The prompt is written to a temp file if large,
-    and copilot writes its output to a specified output file.
+    For text-only output (no output_file), copilot is invoked without
+    --allow-all-tools to avoid slow codebase scanning. For file-write
+    tasks, full tool access is enabled.
 
     Returns (text, files_touched, commands_run).
     """
@@ -182,71 +185,71 @@ def _call_copilot(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
     files_touched: list[str] = []
     commands_run: list[str] = []
 
-    out_path = config.output_file or os.path.join(
-        tempfile.gettempdir(), f"jugeo_out_{prompt_hash}.txt")
-
     for attempt in range(config.max_retries):
         try:
-            # Clear output file
-            with open(out_path, "w") as f:
-                f.write("")
-
-            # Build the agent prompt
             if config.output_file:
+                out_path = config.output_file
+                with open(out_path, "w") as f:
+                    f.write("")
                 file_prompt = (
                     f"Write the following content to {out_path} — write ONLY the "
                     f"requested content, no explanations:\n\n{config.prompt}"
                 )
+                cmd = [
+                    "copilot", "-p", file_prompt,
+                    "--model", config.model,
+                    "--allow-all-tools", "--allow-all-paths",
+                ]
             else:
-                file_prompt = config.prompt
+                cmd = [
+                    "copilot", "-p", config.prompt,
+                    "--model", config.model,
+                ]
 
-            # Add context files if any
             if config.context_files:
-                file_prompt = (
+                cmd[2] = (
                     f"Context files to read first: {', '.join(config.context_files)}\n\n"
-                    + file_prompt
+                    + cmd[2]
                 )
 
-            cmd = [
-                "copilot", "-p", file_prompt,
-                "--model", config.model,
-                "--allow-all-tools", "--allow-all-paths",
-            ]
-            commands_run.append(" ".join(cmd[:6]) + " ...")
+            commands_run.append("copilot -p ...")
 
+            timeout = 300
             r = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
                 cwd=config.working_dir,
+                timeout=timeout,
             )
-            time.sleep(1)
 
-            # Check output file
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 20:
-                with open(out_path, errors="replace") as f:
-                    text = f.read().strip()
-                if len(text) > 20:
-                    files_touched.append(out_path)
-                    break
-                text = ""
+            # Check output file if one was specified
+            if config.output_file:
+                if os.path.exists(config.output_file) and os.path.getsize(config.output_file) > 20:
+                    with open(config.output_file, errors="replace") as f:
+                        text = f.read().strip()
+                    if len(text) > 20:
+                        files_touched.append(config.output_file)
+                        break
+                    text = ""
 
-            # Fallback: capture stdout
+            # Capture stdout
             if r.returncode == 0 and r.stdout.strip():
                 cleaned = _clean_agent_output(r.stdout)
                 if len(cleaned) > 20:
+                    text = cleaned
+                    break
+        except subprocess.TimeoutExpired as te:
+            # Capture partial output from timed-out process
+            partial = (te.stdout or "") if isinstance(te.stdout, str) else ""
+            if partial:
+                cleaned = _clean_agent_output(partial)
+                if len(cleaned) > 100 and _looks_like_code(cleaned):
                     text = cleaned
                     break
         except Exception:
             pass
         if attempt < config.max_retries - 1:
             time.sleep(3)
-
-    # Cleanup temp output file (not user-specified ones)
-    if not config.output_file:
-        try:
-            os.unlink(out_path)
-        except OSError:
-            pass
 
     return text, files_touched, commands_run
 
@@ -275,6 +278,7 @@ def _call_claude(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
                 cmd,
                 capture_output=True, text=True,
                 cwd=config.working_dir,
+                timeout=300,
             )
 
             if r.returncode == 0 and r.stdout.strip():
@@ -283,6 +287,13 @@ def _call_claude(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
                     text = cleaned
                     break
 
+        except subprocess.TimeoutExpired as te:
+            partial = (te.stdout or "") if isinstance(te.stdout, str) else ""
+            if partial:
+                cleaned = _clean_agent_output(partial)
+                if len(cleaned) > 100 and _looks_like_code(cleaned):
+                    text = cleaned
+                    break
         except Exception:
             pass
         if attempt < config.max_retries - 1:
@@ -309,11 +320,19 @@ def _call_codex(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
                 cmd,
                 capture_output=True, text=True,
                 cwd=config.working_dir,
+                timeout=300,
             )
 
             if r.returncode == 0 and r.stdout.strip():
                 cleaned = _clean_agent_output(r.stdout)
                 if len(cleaned) > 20:
+                    text = cleaned
+                    break
+        except subprocess.TimeoutExpired as te:
+            partial = (te.stdout or "") if isinstance(te.stdout, str) else ""
+            if partial:
+                cleaned = _clean_agent_output(partial)
+                if len(cleaned) > 100 and _looks_like_code(cleaned):
                     text = cleaned
                     break
         except Exception:
@@ -387,7 +406,7 @@ def agent_call(
     backend: Optional[AgentBackend] = None,
     working_dir: Optional[str] = None,
     output_file: Optional[str] = None,
-    max_retries: int = 3,
+    max_retries: int = 1,
     timeout: Optional[int] = None,
     model: str = "claude-sonnet-4.6",
     context_files: Optional[list[str]] = None,
@@ -452,14 +471,17 @@ def agent_call(
         if not dispatcher:
             continue
 
+        log.info("agent: trying %s for %s", be.value, coordinate)
         text, files_touched, commands_run = dispatcher(config)
         # Require substantive output — not just narration or error text.
-        # A valid code response should be at least 100 chars and contain
-        # code-like tokens (function/class/var/const/def/import/return/{).
         if text and len(text) > 100 and _looks_like_code(text):
             used_backend = be
+            log.info("agent: %s succeeded: %d chars, %d lines",
+                      be.value, len(text), text.count("\n"))
             break
         # If this backend returned something short/non-code, try next
+        reason = "empty" if not text else f"too short ({len(text)})" if len(text) <= 100 else "not code"
+        log.info("agent: %s failed: %s", be.value, reason)
         text = ""
 
     # If nothing worked, produce a placeholder

@@ -147,6 +147,18 @@ from jugeo.directed_research._code_gen import (
 )
 
 from jugeo.directed_research._git_tracking import OutputRepoTracker
+from jugeo.directed_research._research_and_implement import (
+    research_and_implement,
+    ResearchAndImplementResult,
+    DeliveryObligation,
+    PageCountObligation,
+    FigureCountObligation,
+    SOTAMetricObligation,
+    MetricsScriptObligation,
+    HallucinationFreeObligation,
+    RealDataObligation,
+    CodeScaleObligation,
+)
 
 __all__ = [
     # The main class
@@ -207,4 +219,15 @@ __all__ = [
     "read_dependencies_from_pyproject",
     # Git-backed provenance tracking
     "OutputRepoTracker",
+    # Research-and-implement pipeline
+    "research_and_implement",
+    "ResearchAndImplementResult",
+    "DeliveryObligation",
+    "PageCountObligation",
+    "FigureCountObligation",
+    "SOTAMetricObligation",
+    "MetricsScriptObligation",
+    "HallucinationFreeObligation",
+    "RealDataObligation",
+    "CodeScaleObligation",
 ]

@@ -150,6 +150,7 @@ class PromptToApp:
             "html", "flask", or "both".
         """
         t0 = time.time()
+        os.makedirs(outdir, exist_ok=True)
         result = PromptToAppResult(prompt=self.prompt, concepts=self.concepts)
 
         # Phase 2: agent-driven code generation for each concept
@@ -181,7 +182,7 @@ class PromptToApp:
                     app_prompt=self.prompt,
                     concept_params=concept.params,
                     scale=scale,
-                    working_dir=outdir,
+                    
                 )
 
             # Fallback: template generators (for concepts the agent
@@ -220,7 +221,7 @@ class PromptToApp:
                 app_prompt=self.prompt,
                 concepts=[c.name for c in self.concepts.concepts],
                 scale=scale,
-                working_dir=outdir,
+                
             )
         if not shell_html and _generate_app_html is not None:
             try:
@@ -248,7 +249,7 @@ class PromptToApp:
             gap = js_target - js_lines
             print(f"  ├─ Agent JS enrichment: {js_lines} lines, need {gap} more")
             all_js = agent_enrich_js(
-                all_js, gap, self.prompt, working_dir=outdir,
+                all_js, gap, self.prompt, 
             )
             print(f"  │  After enrichment: {all_js.count(chr(10))+1} lines")
 
@@ -256,7 +257,7 @@ class PromptToApp:
             gap = css_target - css_lines
             print(f"  ├─ Agent CSS enrichment: {css_lines} lines, need {gap} more")
             all_css = agent_enrich_css(
-                all_css, gap, self.prompt, working_dir=outdir,
+                all_css, gap, self.prompt, 
             )
             print(f"  │  After enrichment: {all_css.count(chr(10))+1} lines")
 

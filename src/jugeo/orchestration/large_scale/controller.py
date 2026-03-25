@@ -79,8 +79,10 @@ class LargeScaleController:
             window_size=config.get("convergence_window", 50)
         )
         self._budget = BudgetAllocator(total_budget=budget)
+        self._desired_kloc: float | None = config.get("desired_kloc")
         self._large_repo = LargeRepoOptimizer(
-            site_size_threshold=config.get("site_size_threshold", 10000)
+            site_size_threshold=config.get("site_size_threshold", 10000),
+            desired_kloc=self._desired_kloc,
         )
 
         # Hierarchy
@@ -468,6 +470,10 @@ class LargeScaleController:
             "phase": self._current_phase.value,
             "converged": self._converged,
             "surfaces": [s.value for s in self._surfaces],
+            "desired_kloc": self._desired_kloc,
+            "large_repo_active": self._large_repo.should_activate(
+                sum(len(lc.coordinates) for lc in self._local_controllers.values())
+            ),
             "local_controllers": len(self._local_controllers),
             "regional_controllers": len(self._regional_controllers),
             "has_global_controller": self._global_controller is not None,

@@ -353,6 +353,15 @@ def _cmd_research(args: argparse.Namespace) -> int:
 
 
 # ===========================================================================
+# Subcommand: research-and-implement
+# ===========================================================================
+
+def _cmd_research_and_implement(args: argparse.Namespace) -> int:
+    from jugeo.directed_research._research_and_implement import run_cli
+    return run_cli(args)
+
+
+# ===========================================================================
 # Subcommand: descend
 # ===========================================================================
 
@@ -656,6 +665,12 @@ def _build_parser() -> argparse.ArgumentParser:
                             help="Maximum theory pivots (default: 3).")
     p_research.add_argument("--seed", type=int, default=None, help="Random seed.")
     p_research.set_defaults(func=_cmd_research)
+
+    # -- research-and-implement --
+    from jugeo.directed_research._research_and_implement import add_subparser as _add_rai
+    p_rai = _add_rai(subs)
+    p_rai.add_argument("--output", help="Output directory.")
+    p_rai.set_defaults(func=_cmd_research_and_implement)
 
     return parser
 

@@ -234,8 +234,6 @@ class CopilotGenerationDriver:
             route="/",
             kind=PageKind.INTERACTIVE,
             components=all_components,
-            custom_css="\n\n".join(all_css_parts),
-            custom_js="\n\n".join(all_js_parts),
             description=self.description,
         )
 
@@ -247,6 +245,8 @@ class CopilotGenerationDriver:
             pages=[page],
             nav_items=nav_items,
             theme=theme,
+            global_css="\n\n".join(all_css_parts),
+            global_js="\n\n".join(all_js_parts),
             meta={"version": "1.0.0", "generator": "copilot+jugeo-webapp"},
         )
 

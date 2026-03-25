@@ -378,13 +378,7 @@ Output ONLY the JavaScript code. No explanations, no markdown fences, no file op
         surface=SurfaceKind.CODE,
         coordinate=f"webapp.js.{concept}",
         backend=_preferred_backend(),
-        working_dir=working_dir,
     )
-
-    # Debug: show what the agent returned
-    print(f"  │    → agent backend={section.agent_backend.value}, "
-          f"content_len={len(section.content)}, "
-          f"first_60={section.content[:60]!r}")
 
     js = _extract_code_block(section.content, "javascript")
     if not js or len(js) < 50:
@@ -446,7 +440,6 @@ Output ONLY the CSS code. No explanations, no markdown fences, no file operation
         surface=SurfaceKind.CODE,
         coordinate=f"webapp.css.{concept}",
         backend=_preferred_backend(),
-        working_dir=working_dir,
     )
 
     css = _extract_code_block(section.content, "css")
@@ -504,7 +497,6 @@ Output ONLY the HTML code. No explanations, no markdown fences, no file operatio
         surface=SurfaceKind.CODE,
         coordinate="webapp.html.shell",
         backend=_preferred_backend(),
-        working_dir=working_dir,
     )
 
     html = _extract_code_block(section.content, "html")
@@ -579,7 +571,6 @@ Output ONLY JavaScript code. No explanations, no markdown, no file operations.""
         surface=SurfaceKind.CODE,
         coordinate="webapp.js.enrichment",
         backend=_preferred_backend(),
-        working_dir=working_dir,
     )
 
     additional_js = _extract_code_block(section.content, "javascript")
@@ -635,7 +626,6 @@ Output ONLY CSS code. No explanations, no markdown, no file operations."""
         surface=SurfaceKind.CODE,
         coordinate="webapp.css.enrichment",
         backend=_preferred_backend(),
-        working_dir=working_dir,
     )
 
     additional_css = _extract_code_block(section.content, "css")
