@@ -473,6 +473,212 @@ Respond as JSON:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Bridge elaboration — §9.5–9.8: restriction to stalks, demand pairing,
+#  covering verification, obstruction detection, filtration grading
+# ═══════════════════════════════════════════════════════════════════════
+
+def _elaborate_bridge(
+    bridge: BridgeProposition,
+    problem: str,
+    problem_locus: list[SubDomain],
+) -> BridgeProposition:
+    """Elaborate a bridge proposition per the full §9 procedure.
+
+    A raw H¹ search returns a *cohomology class* — a sketch that lives on the
+    overlap U₁₂.  Elaboration is the geometric process of turning that class
+    into a concrete, validated, implementation-ready section by:
+
+    1. **Restriction to stalks** (Def 9.4): for each D ∈ Loc(p), compute the
+       germ σ|_D — how the bridge manifests in that sub-domain.
+    2. **Demand pairing** (Def 9.5): for each D ∈ Loc(p), compute ⟨σ|_D, p|_D⟩
+       — how much of that sub-domain's demand the bridge addresses.  The pairing
+       is monotone under restriction: focusing on a facet can only increase it.
+    3. **Covering verification** (Def 10.2): check that the components actually
+       cover Supp(σ) — that no region of the overlap is left unaddressed.
+       Adjust covering_dimension to match the verified count.
+    4. **Obstruction detection**: find where local restrictions fail to glue —
+       internal contradictions, under-specified interfaces, data gaps.
+    5. **Relevance filtration** (Def 9.6): assign filtration level (1=tangential
+       → 4=transformative) per germ, take max over all stalks.
+
+    The agent is prompted with the geometric constraints directly so that its
+    output respects the sheaf conditions.
+    """
+    locus_names = [sd.name for sd in problem_locus]
+    component_list = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(bridge.components))
+
+    prompt = f"""You previously proposed the bridge idea "{bridge.title}":
+
+{bridge.description}
+
+It lives at the overlap of "{bridge.source_domain}" and "{bridge.target_domain}".
+The problem is: "{problem}"
+The problem locus (sub-domains where p ≠ 0) is: {', '.join(locus_names)}
+
+The proposed components (covering elements) are:
+{component_list}
+
+Now ELABORATE this bridge by performing the following geometric operations.
+Each operation corresponds to a precise sheaf-theoretic step.
+
+── STEP 1: RESTRICTION TO STALKS (Definition 9.4) ──
+For EACH sub-domain D in the problem locus, compute the germ σ|_D:
+how does this bridge idea look when restricted to that specific facet?
+What concrete technique or module does it become in the language of D?
+A germ is zero if the bridge has nothing to say about that sub-domain.
+
+── STEP 2: DEMAND PAIRING (Definition 9.5) ──
+For each sub-domain D, compute ⟨σ|_D, p|_D⟩ ∈ [0,1]: how much of
+sub-domain D's unmet need does this bridge address? The pairing is
+local — judge each facet independently. 0 = irrelevant, 1 = fully
+resolves that facet of the problem.
+
+── STEP 3: COVERING VERIFICATION (Definition 10.2) ──
+Check that the components (covering elements) genuinely cover Supp(σ):
+- Are there regions of the overlap that NO component addresses? (gaps)
+- Are there components that are redundant (cover the same region)? (excess)
+- Should any component be split into two independent pieces?
+- Should any two components be merged?
+Return the VERIFIED component list and the true covering dimension.
+
+── STEP 4: OBSTRUCTION DETECTION ──
+Find places where local restrictions fail to glue:
+- Do any two components assume incompatible interfaces?
+- Are there data requirements that contradict each other?
+- Are there algorithmic assumptions in one component that break another?
+These are the descent obstructions — they must be resolved before
+implementation.
+
+── STEP 5: RELEVANCE FILTRATION (Definition 9.6) ──
+For each germ σ|_D, classify its filtration level:
+  1 = tangentially relevant (same area, different problem)
+  2 = partially relevant (addresses one aspect of p)
+  3 = directly relevant (addresses p as stated)
+  4 = transformatively relevant (reframes p, dissolving the tension)
+The overall filtration level is the maximum over all stalks.
+
+── STEP 6: REFINED DESCRIPTION ──
+Based on the above analysis, write a refined description of the bridge
+that incorporates the stalk analysis, acknowledges the obstructions,
+and specifies the verified architecture.
+
+Respond as JSON:
+{{
+    "stalks": [
+        {{"sub_domain": "...", "germ": "what the bridge becomes in this sub-domain",
+          "is_zero": false, "demand_pairing": 0.75,
+          "filtration_level": 3}}
+    ],
+    "verified_components": [
+        "component_1: what it does (covers region X of the overlap)",
+        "component_2: ..."
+    ],
+    "gaps": ["any uncovered regions of the overlap"],
+    "redundancies": ["any redundant components"],
+    "obstructions": [
+        {{"location": "between component X and Y",
+          "description": "what fails to glue",
+          "severity": "high/medium/low",
+          "repair": "how to fix it"}}
+    ],
+    "covering_dimension": 10,
+    "max_filtration_level": 3,
+    "overall_demand_pairing": 0.7,
+    "refined_description": "...",
+    "refined_proof_sketch": "...",
+    "refined_obligations": ["obligation1", ...]
+}}"""
+
+    data, section = agent_json(
+        prompt,
+        surface=SurfaceKind.THEORY,
+        coordinate=f"ideation.elaborate.{bridge.source_domain}_{bridge.target_domain}",
+    )
+
+    # ── Apply elaboration results to the bridge ──────────────────────
+    stalks = data.get("stalks", [])
+    verified_components = data.get("verified_components", bridge.components)
+    obstructions = data.get("obstructions", [])
+
+    # Covering dimension from verified components
+    new_covdim = int(data.get("covering_dimension", len(verified_components)))
+
+    # Max filtration level across all non-zero germs (Def 9.6)
+    max_level = int(data.get("max_filtration_level", bridge.relevance_level.value))
+    if stalks:
+        stalk_levels = [s.get("filtration_level", 1) for s in stalks
+                        if not s.get("is_zero", False)]
+        if stalk_levels:
+            max_level = max(max_level, max(stalk_levels))
+    max_level = min(4, max(1, max_level))
+
+    # Overall demand pairing — average of non-zero germs' pairings
+    if stalks:
+        pairings = [s.get("demand_pairing", 0.0) for s in stalks
+                    if not s.get("is_zero", False)]
+        avg_pairing = sum(pairings) / len(pairings) if pairings else 0.0
+    else:
+        avg_pairing = bridge.relevance_score
+
+    # Refined description
+    refined_desc = data.get("refined_description", bridge.description)
+    refined_proof = data.get("refined_proof_sketch", bridge.proof_sketch)
+    refined_obligations = data.get("refined_obligations", bridge.open_obligations)
+
+    # Obstruction data for metadata
+    obstruction_summary = [
+        f"{o.get('location', '?')}: {o.get('description', '?')} "
+        f"[{o.get('severity', '?')}]"
+        for o in obstructions
+    ]
+
+    # Stalk summary for metadata
+    stalk_summary = {
+        s.get("sub_domain", "?"): {
+            "germ": s.get("germ", ""),
+            "is_zero": s.get("is_zero", False),
+            "demand_pairing": s.get("demand_pairing", 0.0),
+            "filtration_level": s.get("filtration_level", 1),
+        }
+        for s in stalks
+    }
+
+    # Build the elaborated bridge with updated scores
+    elaborated = BridgeProposition(
+        title=bridge.title,
+        description=refined_desc,
+        source_domain=bridge.source_domain,
+        target_domain=bridge.target_domain,
+        coordinate=bridge.coordinate,
+        assertion_type=bridge.assertion_type,
+        novelty_score=bridge.novelty_score,  # novelty doesn't change
+        relevance_score=avg_pairing,  # updated from demand pairing
+        relevance_level=RelevanceFiltrationLevel(max_level),
+        covering_dimension=new_covdim,
+        components=verified_components,
+        proof_sketch=refined_proof,
+        open_obligations=refined_obligations,
+        trust=bridge.trust,
+        metadata={
+            **bridge.metadata,
+            "elaborated": True,
+            "stalks": stalk_summary,
+            "obstructions": obstruction_summary,
+            "gaps": data.get("gaps", []),
+            "redundancies": data.get("redundancies", []),
+            "pre_elaboration": {
+                "relevance_score": bridge.relevance_score,
+                "relevance_level": bridge.relevance_level.value,
+                "covering_dimension": bridge.covering_dimension,
+                "UNS": bridge.useful_novelty_score,
+            },
+        },
+    )
+
+    return elaborated
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  The full ideation pipeline
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -533,50 +739,125 @@ Respond as JSON:
         print("IDEATION: Identifying problem locus...", flush=True)
     locus = identify_problem_locus(primary, problem)
 
-    # Step 4: Select partner domains
+    # Step 4: Select partner domains (descent-validated)
     if verbose:
         print("IDEATION: Selecting partner domains...", flush=True)
     partner_candidates = select_partner_domains(
         primary, problem, locus, n_candidates=n_partner_candidates, verbose=verbose)
 
-    best_partner_name = partner_candidates[0][0] if partner_candidates else "optimization"
-    best_enf = partner_candidates[0][1] if partner_candidates else None
-    # Get description from the candidate data (already proposed by the agent)
-    partner_desc = best_enf.domain_2 if best_enf else best_partner_name
+    if not partner_candidates:
+        partner_candidates = [("optimization", ExcessNoveltyFraction(
+            domain_1=primary.name, domain_2="optimization",
+            enf=0.5, avg_morphism_strength=0.5,
+            semantic_distance=3.0, verdict="fallback"))]
 
-    # Step 5: Discover morphisms
-    if verbose:
-        print(f"IDEATION: Discovering morphisms with '{best_partner_name}'...", flush=True)
-    morphisms = discover_cross_domain_morphisms(
-        primary, best_partner_name, partner_desc, locus)
+    # Step 5–6: For EACH surviving partner, discover morphisms and search H^1.
+    # This is the tournament: we don't commit to one partner upfront.
+    # Instead we explore the top N partners' H^1 fibers and pick the
+    # globally best bridge proposition across all of them.
+    all_propositions: list[BridgeProposition] = []
+    all_morphisms: list[MethodologicalTranslation] = []
+    partner_morphism_map: dict[str, list[MethodologicalTranslation]] = {}
+    n_explore = min(len(partner_candidates), 3)  # explore top 3
 
-    # Step 6: Search H^1
-    if verbose:
-        print("IDEATION: Searching H^1 for bridge propositions...", flush=True)
-    propositions = search_h1_fiber(
-        primary, best_partner_name, partner_desc,
-        morphisms, problem, locus, n_propositions=n_propositions)
+    for i, (partner_name, partner_enf) in enumerate(partner_candidates[:n_explore]):
+        partner_desc = partner_enf.domain_2
 
-    # Step 7: Select best approach (Theorem 10.4: useful, novel, AND substantial)
-    # Score = UNS * min(covdim, 15) — scale matters, but caps at 15 to avoid
-    # rewarding artificial inflation of components
-    if propositions:
-        propositions.sort(
+        if verbose:
+            print(f"IDEATION: [{i+1}/{n_explore}] Exploring partner "
+                  f"'{partner_name}' (ENF={partner_enf.enf:.2f}, "
+                  f"strength={partner_enf.avg_morphism_strength:.2f})...",
+                  flush=True)
+
+        # Step 5a: Discover morphisms for this partner
+        morphisms = discover_cross_domain_morphisms(
+            primary, partner_name, partner_desc, locus)
+        partner_morphism_map[partner_name] = morphisms
+        all_morphisms.extend(morphisms)
+
+        if not morphisms:
+            if verbose:
+                print(f"  ✗ No morphisms found for {partner_name}", flush=True)
+            continue
+
+        if verbose:
+            print(f"  Found {len(morphisms)} morphisms "
+                  f"(avg strength={sum(m.strength for m in morphisms)/len(morphisms):.2f})",
+                  flush=True)
+
+        # Step 6a: Search H^1 for this partner
+        propositions = search_h1_fiber(
+            primary, partner_name, partner_desc,
+            morphisms, problem, locus, n_propositions=n_propositions)
+        all_propositions.extend(propositions)
+
+        if verbose:
+            for bp in propositions[:2]:
+                print(f"  Bridge: {bp.title} "
+                      f"(UNS={bp.useful_novelty_score:.2f}, "
+                      f"covdim={bp.covering_dimension})", flush=True)
+
+    # Step 7: Tournament — select the best approach across ALL partners.
+    # Scoring: UNS * min(covdim, 15) (Theorem 10.4: useful, novel, AND substantial).
+    # This ensures we pick the globally best idea, not just the best from
+    # the highest-ENF partner.
+    if all_propositions:
+        all_propositions.sort(
             key=lambda bp: bp.useful_novelty_score * min(bp.covering_dimension, 15),
             reverse=True)
-        selected = propositions[0]
+        selected = all_propositions[0]
         if verbose:
-            for bp in propositions[:3]:
-                print(f"  Candidate: {bp.title} "
+            print(f"\nIDEATION: Tournament results ({len(all_propositions)} candidates "
+                  f"from {n_explore} partners):", flush=True)
+            for bp in all_propositions[:5]:
+                score = bp.useful_novelty_score * min(bp.covering_dimension, 15)
+                print(f"  {'→' if bp is selected else ' '} {bp.title} "
                       f"(UNS={bp.useful_novelty_score:.2f}, "
                       f"covdim={bp.covering_dimension}, "
-                      f"~{bp.estimated_loc} LOC)", flush=True)
+                      f"score={score:.2f}, ~{bp.estimated_loc} LOC)",
+                      flush=True)
     else:
         selected = None
 
-    # Build productive pairing criterion
-    avg_strength = (sum(m.strength for m in morphisms) / len(morphisms)
-                   if morphisms else 0.0)
+    # Step 8: Elaborate the selected bridge via full §9 procedure.
+    # This is NOT just "flesh out the idea." It is the geometric process of:
+    #   (a) restricting the H¹ class to stalks at each D ∈ Loc(p)  (Def 9.4)
+    #   (b) pairing each germ with the demand section ⟨σ|_D, p|_D⟩  (Def 9.5)
+    #   (c) verifying covering dimension matches Supp(σ)  (Def 10.2)
+    #   (d) detecting descent obstructions (where germs fail to glue)
+    #   (e) grading by relevance filtration (1→4)  (Def 9.6)
+    # The elaborated bridge has updated relevance_score (from demand pairing),
+    # relevance_level (from filtration), covering_dimension (from verification),
+    # and metadata recording all stalks and obstructions.
+    if selected is not None:
+        if verbose:
+            print(f"\nIDEATION: Elaborating winner '{selected.title}'...", flush=True)
+        selected = _elaborate_bridge(selected, problem, locus)
+        if verbose:
+            pre = selected.metadata.get("pre_elaboration", {})
+            print(f"  Elaborated: relevance {pre.get('relevance_score', '?'):.2f} → "
+                  f"{selected.relevance_score:.2f}, "
+                  f"filtration {pre.get('relevance_level', '?')} → "
+                  f"{selected.relevance_level.value}, "
+                  f"covdim {pre.get('covering_dimension', '?')} → "
+                  f"{selected.covering_dimension}", flush=True)
+            obs = selected.metadata.get("obstructions", [])
+            if obs:
+                print(f"  ⚠ {len(obs)} obstruction(s) detected:", flush=True)
+                for o in obs[:3]:
+                    print(f"    - {o}", flush=True)
+            gaps = selected.metadata.get("gaps", [])
+            if gaps:
+                print(f"  ⚠ {len(gaps)} covering gap(s): {', '.join(gaps[:3])}", flush=True)
+
+    # Build productive pairing criterion from the selected approach's partner
+    best_partner_name = selected.target_domain if selected else partner_candidates[0][0]
+    best_enf = next(
+        (enf for name, enf in partner_candidates if name == best_partner_name),
+        partner_candidates[0][1])
+    best_morphisms = partner_morphism_map.get(best_partner_name, all_morphisms)
+    avg_strength = (sum(m.strength for m in best_morphisms) / len(best_morphisms)
+                   if best_morphisms else 0.0)
     pairing = ProductivePairingCriterion(
         source_domain=primary.name,
         target_domain=best_partner_name,
@@ -588,9 +869,9 @@ Respond as JSON:
     return IdeationResult(
         prompt=prompt,
         primary_domain=primary,
-        partner_domain=None,  # Could decompose partner too
-        morphisms=morphisms,
-        bridge_propositions=propositions,
+        partner_domain=None,
+        morphisms=all_morphisms,
+        bridge_propositions=all_propositions,
         selected_approach=selected,
         enf=best_enf,
         pairing_criterion=pairing,
@@ -599,6 +880,8 @@ Respond as JSON:
             "domain_name": domain_name,
             "problem": problem,
             "partner": best_partner_name,
+            "partners_explored": [name for name, _ in partner_candidates[:n_explore]],
+            "tournament_size": len(all_propositions),
             "locus": [sd.name for sd in locus],
         },
     )
