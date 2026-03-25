@@ -733,7 +733,120 @@ class JuGeoAgentWrapper:
         )
 ```
 
-### 5.2 Integration with Specific Frameworks
+### 5.2 Coding-Agent CLI Adapters: Claude Code, Copilot CLI, Codex
+
+For software engineering, the most important agent surfaces are often not
+chat-only frameworks but **tool-using coding environments** such as
+**Claude Code**, **GitHub Copilot CLI**, and **Codex**. These systems do
+not merely emit text. They inspect repositories, read files, run tests,
+propose edits, and justify those edits in natural language.
+
+That makes them unusually natural objects for JuGeo. A coding-agent run is
+already close to a local section:
+
+- a **coordinate**: repository + task + files touched + tool context
+- a **section**: proposed code, explanations, and claimed properties
+- an **evidence channel**: reads, searches, test runs, command output
+- a **trust profile**: pure suggestion vs tool-executed vs test-verified
+
+In `jugeo-agents/src/jugeo_agents/adapters/coding_agents.py`, JuGeo
+implements dedicated adapters for these coding CLIs:
+
+| External system | Adapter | What JuGeo captures |
+|---|---|---|
+| **Claude Code** | `ClaudeCodeAdapter` | code edits, file operations, bash/tool calls, test results, explanations |
+| **Copilot CLI** | `CopilotCLIAdapter` | suggested edits, shell commands, repository inspection, explanations |
+| **Codex** | `CodexAdapter` | candidate implementations, reasoning text, optional tool/test metadata |
+
+The crucial point is that JuGeo does **not** treat these tools as opaque
+"models." It treats them as structured evidence producers. The adapter
+normalizes each run into a common `CodeOutput` / `AgentOutput` shape:
+
+```python
+CodeOutput(
+    agent_name="claude-code" | "copilot-cli" | "codex",
+    agent_model="claude-sonnet-4" | "gpt-4.1" | "o4-mini",
+    code="...",
+    explanation="...",
+    files_modified=["src/foo.py"],
+    tools_used=["bash:pytest", "grep", "read_file"],
+    test_results={"passed": True, "exit_code": 0},
+    citations=[...],
+    metadata={...},
+)
+```
+
+Once these systems are transported into the same judgment space, JuGeo can
+ask questions that no individual coding CLI can answer by itself:
+
+- Do Claude Code and Copilot CLI make **contradictory claims** about the
+  same function?
+- Does Codex propose a patch whose explanation conflicts with tests
+  actually executed by Claude Code?
+- Did a model claim "all tests pass" without any tool evidence showing that
+  tests were run?
+- Are multiple agents in agreement because they independently verified a
+  claim, or because they copied the same ungrounded explanation?
+
+The adapters also encode **different trust transport laws** for the three
+systems. In the current implementation:
+
+- **Claude Code** receives `TOOL_VERIFIED` when it both uses tools and
+  reports passing tests; `TOOL_EXECUTED` when it has tool evidence without
+  independent verification; and lower trust when it only explains.
+- **Copilot CLI** typically enters as `TOOL_EXECUTED`,
+  `CITATION_BACKED`, or `WEAK_MODEL_GENERATED` depending on whether it
+  actually ran shell commands / repository inspection or merely suggested.
+- **Codex** is normalized similarly, but in practice often appears as a
+  strong generative reference implementation unless paired with explicit tool
+  or test metadata.
+
+This lets JuGeo distinguish three qualitatively different coding-agent
+behaviors:
+
+1. **Executable evidence** — "I ran tests; here is the result."
+2. **Repository-grounded analysis** — "I inspected these files and infer X."
+3. **Pure proposal** — "Here is a patch that should work."
+
+Existing coding agents blur these together in a single transcript. JuGeo
+separates them because they live at different trust levels and therefore
+glue differently under descent.
+
+#### A concrete coding-agent verification loop
+
+Suppose the same refactoring task is sent to Claude Code, Copilot CLI, and
+Codex:
+
+- Claude Code edits `parser.py`, runs `pytest`, and says the new parser is
+  linear-time.
+- Copilot CLI suggests a shorter rewrite and claims it preserves behavior,
+  but does not run tests.
+- Codex proposes a third implementation with a cleaner API boundary, but no
+  tool evidence.
+
+JuGeo turns those three responses into local sections over the same coding
+site. It then:
+
+1. extracts claims such as "preserves behavior", "linear-time", "tests pass",
+   "changes API shape"
+2. checks overlaps between those claims
+3. demotes unsupported claims under the trust algebra
+4. computes a fused global section only if the coding outputs actually glue
+
+The result is not "which model do we like best?" It is a verified judgment
+of the form:
+
+- which code artifacts agree,
+- which claimed properties are tool-backed,
+- where contradictions remain,
+- and what the repair frontier is.
+
+That is the interface story for Claude Code, Copilot CLI, and Codex in
+JuGeo: they are not merely generators to be benchmarked. They are
+**agentive evidence channels** whose outputs can be compared, challenged,
+fused, and refused by the same descent machinery.
+
+### 5.3 Integration with Specific Frameworks
 
 **CrewAI integration** (callback-based):
 ```python
@@ -802,7 +915,7 @@ graph.add_node("researcher", verified_node)
 graph.add_node("analyst", verified_node)
 ```
 
-### 5.3 The Flask Dashboard Server
+### 5.4 The Flask Dashboard Server
 
 The verification results feed into a Flask web dashboard (connecting
 this to the web application theory from `GEOMETRY_OF_WEB_APPLICATIONS.md`):
@@ -1036,8 +1149,9 @@ LangGraph. This requires:
 - The convergence monitor for loop detection
 - Treaty negotiation for conflict resolution
 
-**Deliverable**: `pip install jugeo-agents` — a package that wraps any
-major agent framework with verification.
+**Deliverable**: a bundled `jugeo-agents` module inside the main JuGeo
+repository, installable through the same `pip install -e .` workflow, that
+wraps major agent frameworks and coding-agent CLIs with verification.
 
 ### 9.4 Phase 4: Calibration and Learning (Weeks 7–10)
 
@@ -1788,7 +1902,8 @@ effort:
 
 1. **Week 1**: The 30-line contradiction detector. Enough for a blog post.
 2. **Weeks 2–3**: The Flask trust dashboard. Enough for a conference talk.
-3. **Weeks 4–6**: Framework integration. Enough for `pip install jugeo-agents`.
+3. **Weeks 4–6**: Framework integration. Enough for a usable bundled
+   `jugeo-agents` module inside the main JuGeo install.
 4. **Weeks 7–10**: Calibration and learning. Enough for production use.
 
 At each stage, the tool is independently useful. A developer who uses
