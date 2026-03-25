@@ -818,24 +818,15 @@
           <span class="code-lang">Python — Creating a semantic site</span>
           <button class="copy-btn">Copy</button>
         </div>
-        <pre><code class="language-python">from jugeo import SemanticSite, CoverFamily
+        <pre><code class="language-python">from jugeo.geometry.site import Coordinate, CoordinateKind, build_site
 
-# Build the semantic site for a module
-site = SemanticSite.from_module("mypackage.core")
+base = Coordinate(("mypackage",), CoordinateKind.MODULE)
+parse_fn = Coordinate(("mypackage", "parse"), CoordinateKind.FUNCTION)
+site = build_site([base, parse_fn])
 
-# Inspect coordinates
-for coord in site.objects():
-    print(coord)
-# → Function(mypackage.core.parse)
-# → Branch(mypackage.core.parse, 0)   # happy path
-# → Branch(mypackage.core.parse, 1)   # error branch
-# → Loop(mypackage.core.parse, 0)     # main loop
-# ...
-
-# Check that branches form a control-flow cover
-cover = site.covering_family(site["Function(parse)"])
-assert cover.kind == CoverFamily.CONTROL_FLOW
-assert cover.is_exhaustive()   # covers every path</code></pre>
+print(site.coordinate_count())
+print(site.morphism_count())
+print([obj.name for obj in site.objects()])</code></pre>
       </div>
     </section>
 
@@ -935,27 +926,11 @@ assert cover.is_exhaustive()   # covers every path</code></pre>
           <span class="code-lang">Python — Descent strategies</span>
           <button class="copy-btn">Copy</button>
         </div>
-        <pre><code class="language-python">from jugeo import JuGeo, DescentStrategy
+        <pre><code class="language-python">from jugeo.geometry.descent import DescentEngine, DescentStrategy
 
-jg = JuGeo(strategy=DescentStrategy.ITERATIVE)
-
-@jg.verify
-def parse(data: bytes) -> dict:
-    """
-    @pre:  len(data) > 0
-    @post: result is not None
-    """
-    if data[0] == ord('{'):
-        return _parse_json(data)   # Branch 0
-    elif data[0] == ord('['):
-        return _parse_array(data)  # Branch 1
-    else:
-        raise ValueError("unknown format")  # Branch 2
-
-# Descent: verify each branch, check overlaps, glue
-report = jg.descend(parse)
-print(report.global_judgment.trust)   # TrustLevel.SOLVER_DISCHARGED
-print(report.descent_condition_held)  # True</code></pre>
+engine = DescentEngine()
+print(type(engine).__name__)
+print([strategy.name for strategy in DescentStrategy])</code></pre>
       </div>
     </section>
 
@@ -1127,20 +1102,10 @@ print(report.descent_condition_held)  # True</code></pre>
         <pre><code class="language-python">from jugeo.evidence.trust import TrustLevel, TrustAlgebra
 
 T = TrustAlgebra()
-
-# Conservative join: min of two levels
 combined = T.join(TrustLevel.RUNTIME_WITNESSED, TrustLevel.SOLVER_DISCHARGED)
-assert combined == TrustLevel.RUNTIME_WITNESSED   # min wins
-
-# Promotion: upgrade with solver certificate
-cert = solver.get_certificate()
-promoted = T.promote(TrustLevel.COPILOT_SUGGESTED, evidence=cert)
-assert promoted == TrustLevel.SOLVER_DISCHARGED
-
-# Demotion: counter-example found
-cx = runtime.find_counterexample()
-demoted = T.challenge(TrustLevel.RUNTIME_WITNESSED, challenge=cx)
-assert demoted == TrustLevel.CONTRADICTED</code></pre>
+print(combined)
+print(T.promote(TrustLevel.COPILOT_SUGGESTED, "solver witness"))
+print(T.demote(TrustLevel.SOLVER_DISCHARGED, TrustLevel.RUNTIME_WITNESSED))</code></pre>
       </div>
     </section>
 
@@ -1491,16 +1456,12 @@ print(cocycle.summary())</code></pre>
           <button class="copy-btn">Copy</button>
         </div>
         <pre><code class="language-python">from jugeo.evidence.trust import TrustAlgebra, TrustLevel
-from jugeo.geometry.covers import refine_cover
+from jugeo.moves import MoveKind
 
 algebra = TrustAlgebra()
 combined = algebra.meet(TrustLevel.SOLVER_DISCHARGED, TrustLevel.HUMAN_ATTESTED)
 print(combined)
-
-# Public geometry operations give you the building blocks behind VERIFY / GLUE / REPAIR
-finer_cover = refine_cover(cover, suffix="branch-split")
-print(finer_cover.patches[0].path)
-print(finer_cover.overlaps)</code></pre>
+print([move.name for move in MoveKind][:6])</code></pre>
       </div>
     </section>
 
@@ -1583,28 +1544,30 @@ print(finer_cover.overlaps)</code></pre>
           <span class="code-lang">Python — Exceptions as coordinate forks</span>
           <button class="copy-btn">Copy</button>
         </div>
-        <pre><code class="language-python">from jugeo import JuGeo, spec
+        <pre><code class="language-python">from jugeo.easy import spec
 
-jg = JuGeo()
-
-@jg.verify
-@spec(
-    pre  = "len(items) >= 0",
-    post = "result >= 0",              # normal branch
-    exc  = {ValueError: "True"},       # exception branch: any exc is fine
-)
-def sum_positive(items: list[int]) -> int:
+review = spec(
+    '''
+def sum_positive(items):
     total = 0
     for x in items:
         if x < 0:
-            raise ValueError(f"negative item: {x}")   # Branch_exc
+            raise ValueError(f"negative item: {x}")
         total += x
-    return total  # Branch_normal
-
-# JuGeo creates two coordinate forks:
-#   Branch(sum_positive, 0) — normal exit  → post: "result >= 0"
-#   Branch(sum_positive, 1) — ValueError   → exc:  "True" (trivial)
-# Then glues them: function-level judgment is SOLVER_DISCHARGED</code></pre>
+    return total
+''',
+    '''
+def spec(result, items):
+    return result >= 0
+''',
+    input_cover=[
+        {"args": [[1, 2, 3]], "kwargs": {}},
+        {"args": [[]], "kwargs": {}},
+    ],
+    entrypoint="sum_positive",
+)
+print(review)
+print(review.satisfied, review.witness_count)</code></pre>
       </div>
 
       <h3>Example: Context Manager as Covering Family</h3>
@@ -1614,27 +1577,17 @@ def sum_positive(items: list[int]) -> int:
           <span class="code-lang">Python — Context managers as covering families</span>
           <button class="copy-btn">Copy</button>
         </div>
-        <pre><code class="language-python">from jugeo import JuGeo, resource_spec
+        <pre><code class="language-python">from jugeo.easy import bugs
 
-jg = JuGeo()
+result = bugs('''
+def load_text(path):
+    fh = open(path, "r")
+    return fh.read()
+''')
 
-@resource_spec(
-    invariant = "file.is_open()",      # holds inside the 'with' block
-    cleanup   = "file.is_closed()",    # guaranteed after __exit__
-)
-class ManagedFile:
-    def __enter__(self):
-        self.fd = open(self.path, "r")
-        return self
-
-    def __exit__(self, *exc):
-        self.fd.close()    # must discharge cleanup spec on ALL exit paths
-
-# JuGeo covers the managed scope with {U_enter, U_exit}
-# and verifies:
-#   J|_{U_enter} : file.is_open()   → SOLVER_DISCHARGED
-#   J|_{U_exit}  : file.is_closed() → SOLVER_DISCHARGED
-# Gluing yields a global resource-safety judgment.</code></pre>
+print(result)
+for bug in result.items:
+    print(bug.message)</code></pre>
       </div>
 
       <h3>The Effect-Sheaf Correspondence</h3>
