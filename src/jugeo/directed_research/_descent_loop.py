@@ -155,6 +155,7 @@ class DirectedResearch:
         verbose: bool = False,
         agent_backend: AgentBackend | None = None,
         trust_floor: float = 0.5,
+        n_idea_sources: int = 3,
     ):
         self.prompt = prompt
         self.max_iterations = max_iterations
@@ -164,6 +165,7 @@ class DirectedResearch:
         self.verbose = verbose
         self.agent_backend = agent_backend
         self.trust_floor = trust_floor
+        self.n_idea_sources = n_idea_sources
 
         default_dir = pathlib.Path(_ROOT) / "outputs" / f"research_{time.strftime('%Y%m%d_%H%M%S')}"
         self.output_dir = pathlib.Path(output_dir or str(default_dir)).resolve()
@@ -297,6 +299,7 @@ class DirectedResearch:
             self.prompt,
             n_partner_candidates=3,
             n_propositions=5,
+            n_idea_sources=self.n_idea_sources,
             verbose=self.verbose,
         )
 

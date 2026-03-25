@@ -38,6 +38,7 @@ class PipelineStage(str, Enum):
 
     IDEATE = "ideate"
     SPECIFY = "specify"
+    DESCENT_CHECK = "descent_check"
     GENERATE = "generate"
     VERIFY = "verify"
     REPORT = "report"
@@ -147,6 +148,7 @@ class PipelineResult:
     generation_result: dict = field(default_factory=dict)
     verification_result: dict = field(default_factory=dict)
     ideation_result: dict = field(default_factory=dict)
+    descent_result: dict = field(default_factory=dict)
     output_dir: str = ""
     elapsed_ms: float = 0.0
 
@@ -184,6 +186,7 @@ class PipelineResult:
             "generation_result": dict(self.generation_result),
             "verification_result": dict(self.verification_result),
             "ideation_result": dict(self.ideation_result),
+            "descent_result": dict(self.descent_result),
             "output_dir": self.output_dir,
             "elapsed_ms": self.elapsed_ms,
         }
@@ -199,4 +202,5 @@ class PipelineResult:
             else:
                 stages.append(s)
         d["stages_completed"] = stages
+        d.setdefault("descent_result", {})
         return cls(**d)

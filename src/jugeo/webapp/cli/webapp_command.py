@@ -129,6 +129,22 @@ def _print_verification_report(result: dict) -> None:
     print()
 
 
+def _print_descent_check(descent_result: dict) -> None:
+    """Pretty-print theory descent check results to stdout."""
+    violations = descent_result.get("violations", [])
+    if not violations:
+        return
+    print()
+    print("+" + "-" * 58 + "+")
+    print("|" + " THEORY DESCENT CHECK".center(58) + "|")
+    print("+" + "-" * 58 + "+")
+    for v in violations:
+        severity = v.get("severity", "info").upper()
+        detail = v.get("detail", str(v))
+        print(f"  [{severity}] {detail}")
+    print()
+
+
 # ---------------------------------------------------------------------------
 # register / run
 # ---------------------------------------------------------------------------
@@ -321,6 +337,8 @@ def run_webapp_command(args) -> int:
         _print_generation_summary(result.generation_result)
     if result.verification_result:
         _print_verification_report(result.verification_result)
+    if result.descent_result and result.descent_result.get("violations"):
+        _print_descent_check(result.descent_result)
 
     return 0 if result.success else 1
 

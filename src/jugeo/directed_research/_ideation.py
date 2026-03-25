@@ -495,6 +495,183 @@ Respond as JSON:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  §10 Compositional tower — n-fold domain composition
+# ═══════════════════════════════════════════════════════════════════════
+
+def _search_compositional_overlap(
+    primary: DomainSite,
+    composed_domains: list[str],
+    new_domain_name: str,
+    new_domain_desc: str,
+    existing_bridge: BridgeProposition,
+    problem: str,
+    problem_locus: list[SubDomain],
+    *,
+    n_propositions: int = 3,
+) -> list[BridgeProposition]:
+    """Search H^n on the (n+1)-fold overlap for ideas requiring ALL domains.
+
+    Per Definition 10.1: the n-fold fiber product has sections invisible at
+    lower levels. A section σ ∈ H^{n-1}({D₁,...,D_n}, S) requires all n
+    domains — it collapses to zero if ANY domain is removed.
+
+    The agent is prompted with the existing bridge (from level n-1) and asked:
+    "what NEW components become possible when you add domain D_{n+1} that were
+    impossible with only the previous domains?"
+    """
+    domain_list = " × ".join(composed_domains)
+    locus_names = [sd.name for sd in problem_locus]
+    level = len(composed_domains) + 1
+
+    prompt = f"""You have an existing bridge idea from composing {len(composed_domains)} domains:
+
+COMPOSED DOMAINS: {domain_list}
+EXISTING BRIDGE: "{existing_bridge.title}"
+  {existing_bridge.description}
+  Components: {', '.join(existing_bridge.components[:5])}
+  Covering dimension: {existing_bridge.covering_dimension}
+
+NEW DOMAIN TO ADD: {new_domain_name} — {new_domain_desc}
+PROBLEM: {problem}
+PROBLEM LOCUS: {', '.join(locus_names)}
+
+This is LEVEL {level} of the compositional tower (Definition 10.1).
+Search H^{level-1} on the {level}-fold overlap {domain_list} × {new_domain_name}.
+
+Find {n_propositions} ENRICHED bridge propositions that:
+1. REQUIRE ALL {level} DOMAINS — removing any one domain makes the idea collapse.
+   This is the H^{level-1} condition: the section is not in the image of any
+   face map (restriction that drops one domain).
+2. Have HIGHER covering dimension than the existing bridge (covdim > {existing_bridge.covering_dimension}).
+   The new domain should add genuinely new independent components.
+3. Each new component should arise specifically from the {level}-fold interaction —
+   it needs techniques from the new domain AND at least 2 of the existing domains
+   simultaneously.
+
+For each enriched proposition:
+- title: name for the enriched system
+- description: what it does, emphasizing what the new domain enables
+- new_components: components that ONLY exist because of the {level}-fold composition
+- inherited_components: components from the existing bridge that survive
+- covering_dimension: total (inherited + new)
+- novelty_score, relevance_score, relevance_level: as before
+- why_all_domains_needed: concise argument for why dropping any domain kills the idea
+
+Respond as JSON:
+{{
+    "enriched_propositions": [
+        {{"title": "...", "description": "...",
+          "new_components": ["comp: what it does (requires domains X, Y, Z)"],
+          "inherited_components": ["comp: inherited from level {level-1}"],
+          "covering_dimension": 14,
+          "novelty_score": 0.8, "relevance_score": 0.85,
+          "relevance_level": 3,
+          "why_all_domains_needed": "..."}}
+    ]
+}}"""
+
+    data, section = agent_json(
+        prompt,
+        surface=SurfaceKind.THEORY,
+        coordinate=f"ideation.h{level-1}.{'_'.join(d[:10] for d in composed_domains)}_{new_domain_name[:10]}",
+    )
+
+    propositions = []
+    for bp in data.get("enriched_propositions", []):
+        level_val = int(bp.get("relevance_level", 3))
+        rel_level = RelevanceFiltrationLevel(min(4, max(1, level_val)))
+        new_comps = bp.get("new_components", [])
+        inherited = bp.get("inherited_components", existing_bridge.components)
+        all_comps = inherited + new_comps
+        covdim = int(bp.get("covering_dimension", len(all_comps)))
+
+        propositions.append(BridgeProposition(
+            title=bp.get("title", existing_bridge.title),
+            description=bp.get("description", ""),
+            source_domain=primary.name,
+            target_domain=" × ".join(composed_domains + [new_domain_name]),
+            coordinate=f"{primary.name} × " + " × ".join(composed_domains[1:] + [new_domain_name]),
+            novelty_score=float(bp.get("novelty_score", 0.5)),
+            relevance_score=float(bp.get("relevance_score", 0.5)),
+            relevance_level=rel_level,
+            covering_dimension=covdim,
+            components=all_comps,
+            proof_sketch=bp.get("why_all_domains_needed", ""),
+            open_obligations=existing_bridge.open_obligations,
+            trust=TRUST_COPILOT,
+            metadata={
+                "composition_level": level,
+                "domains": composed_domains + [new_domain_name],
+                "new_components_count": len(new_comps),
+                "inherited_components_count": len(inherited),
+            },
+        ))
+
+    return propositions
+
+
+def _propose_enriching_domains(
+    primary: DomainSite,
+    composed_domains: list[str],
+    existing_bridge: BridgeProposition,
+    problem: str,
+    *,
+    n_candidates: int = 4,
+) -> list[tuple[str, str, float]]:
+    """Propose domains that could enrich an existing bridge at the next level.
+
+    Per Theorem 10.3 (Compositional Saturation), the new domain should increase
+    covering dimension. We ask: "given the current composition, what domain
+    would add the most NEW independent components?"
+
+    Returns: list of (name, description, estimated_marginal_covdim).
+    """
+    domain_list = " × ".join(composed_domains)
+    prompt = f"""Given an existing cross-domain idea from composing {len(composed_domains)} domains:
+
+COMPOSED DOMAINS: {domain_list}
+BRIDGE IDEA: "{existing_bridge.title}" (covdim={existing_bridge.covering_dimension})
+  {existing_bridge.description}
+PROBLEM: {problem}
+
+Propose {n_candidates} additional domains whose techniques would ADD genuinely
+new independent components to this idea. The new domain should:
+1. Have strong analogy morphisms with at LEAST 2 of the existing domains
+2. Enable components that are impossible without the new domain
+3. Not be a sub-field of any existing domain (that would be redundant)
+
+For each candidate, estimate how many NEW independent components it would add
+(marginal covering dimension gain). Per Theorem 10.3, composition saturates
+when marginal gain < 2.
+
+Respond as JSON:
+{{
+    "enriching_domains": [
+        {{"name": "...", "description": "key techniques and why they enrich",
+          "marginal_covdim": 4,
+          "morphisms_to_existing": ["connection to domain X", "connection to domain Y"]}}
+    ]
+}}"""
+
+    data, _ = agent_json(
+        prompt,
+        surface=SurfaceKind.THEORY,
+        coordinate=f"ideation.enrich_proposal.level{len(composed_domains)+1}",
+    )
+
+    results = []
+    for d in data.get("enriching_domains", []):
+        results.append((
+            d.get("name", "unknown"),
+            d.get("description", ""),
+            float(d.get("marginal_covdim", 0)),
+        ))
+    # Sort by expected marginal gain
+    results.sort(key=lambda x: x[2], reverse=True)
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Bridge elaboration — §9.5–9.8: restriction to stalks, demand pairing,
 #  covering verification, obstruction detection, filtration grading
 # ═══════════════════════════════════════════════════════════════════════
@@ -709,20 +886,22 @@ def run_ideation(
     *,
     n_partner_candidates: int = 5,
     n_propositions: int = 5,
+    n_idea_sources: int = 3,
     verbose: bool = False,
 ) -> IdeationResult:
-    """Run the full geometry-of-ideation pipeline.
+    """Run the full geometry-of-ideation pipeline (§9–§10).
 
-    This is the master function that orchestrates all of §9:
-    1. Parse the prompt to extract domain + problem
-    2. Decompose the domain into sub-domains
-    3. Identify the problem locus
-    4. Select partner domains
-    5. Discover morphisms
-    6. Search H^1 for bridge propositions
-    7. Select the best approach
+    This is the master function that orchestrates:
+      §9: Pairwise cross-domain synthesis (H¹ on D₁ × D₂)
+      §10: Compositional tower (H^{n-1} on D₁ × … × D_n)
 
-    Returns an IdeationResult with the full trace.
+    The n_idea_sources parameter controls composition depth per §10:
+      n=2 → pairwise only (classical cross-domain ideation)
+      n=3 → triple composition (default — Theorem 10.3 sweet spot)
+      n=4+ → deeper composition (diminishing returns past n=4)
+
+    At each level, a new domain is added only if it increases covering
+    dimension (Theorem 10.3 — Compositional Saturation).
     """
     import time
     t0 = time.time()
@@ -862,6 +1041,100 @@ Respond as JSON:
     else:
         selected = None
 
+    # ═══════════════════════════════════════════════════════════════════
+    #  Steps 7b–7n: Compositional tower (§10, Theorem 10.3)
+    #
+    #  If n_idea_sources > 2, we climb the tower of domain compositions:
+    #    Level 1 (done above): H¹(D₁ × D₂, S) — pairwise
+    #    Level 2: H²(D₁ × D₂ × D₃, S) — triple, adds components
+    #             impossible without all 3 domains
+    #    Level k: H^k(D₁ × … × D_{k+1}, S) — k-fold
+    #
+    #  At each level: propose enriching domains → search H^n on the
+    #  (n+1)-fold overlap → accept if covdim increases (Compositional
+    #  Saturation: stop when marginal gain < SATURATION_THRESHOLD).
+    # ═══════════════════════════════════════════════════════════════════
+    SATURATION_THRESHOLD = 2  # min marginal covdim gain to justify a new domain
+
+    if selected is not None and n_idea_sources > 2:
+        # Track which domains are currently composed
+        composed_domains = [primary.name, selected.target_domain]
+        current_bridge = selected
+
+        for level in range(2, n_idea_sources):
+            if verbose:
+                print(f"\nIDEATION: §10 compositional tower — level {level+1} "
+                      f"({len(composed_domains)} domains, covdim={current_bridge.covering_dimension})",
+                      flush=True)
+
+            # Propose domains that could enrich the composition
+            enriching = _propose_enriching_domains(
+                primary, composed_domains, current_bridge, problem,
+                n_candidates=4)
+
+            if not enriching:
+                if verbose:
+                    print(f"  No enriching domains found — tower saturated.", flush=True)
+                break
+
+            # Try top candidates in parallel
+            best_enriched = None
+            best_covdim_gain = 0
+
+            def _try_enrichment(
+                d_name: str, d_desc: str, est_gain: float,
+            ) -> tuple[str, str, list[BridgeProposition]]:
+                return d_name, d_desc, _search_compositional_overlap(
+                    primary, composed_domains, d_name, d_desc,
+                    current_bridge, problem, locus, n_propositions=3)
+
+            with ThreadPoolExecutor(max_workers=min(len(enriching), 3)) as pool:
+                futures = {
+                    pool.submit(_try_enrichment, name, desc, gain): name
+                    for name, desc, gain in enriching[:3]
+                }
+                for future in as_completed(futures):
+                    try:
+                        d_name, d_desc, enriched_props = future.result()
+                        for ep in enriched_props:
+                            gain = ep.covering_dimension - current_bridge.covering_dimension
+                            score = ep.useful_novelty_score * min(ep.covering_dimension, 20)
+                            if gain > best_covdim_gain:
+                                best_covdim_gain = gain
+                                best_enriched = ep
+                            if verbose:
+                                print(f"  [{d_name}] {ep.title}: "
+                                      f"covdim {current_bridge.covering_dimension}→{ep.covering_dimension} "
+                                      f"(+{gain}), score={score:.2f}", flush=True)
+                    except Exception as exc:
+                        if verbose:
+                            print(f"  ✗ Enrichment failed: {exc}", flush=True)
+
+            # Compositional Saturation check (Theorem 10.3)
+            if best_enriched is None or best_covdim_gain < SATURATION_THRESHOLD:
+                if verbose:
+                    gain_str = f"+{best_covdim_gain}" if best_enriched else "none"
+                    print(f"  Marginal gain ({gain_str}) < threshold ({SATURATION_THRESHOLD}) "
+                          f"— tower saturated at level {level}.", flush=True)
+                break
+
+            # Accept the enrichment
+            new_domain = best_enriched.metadata.get("domains", composed_domains)[-1]
+            composed_domains.append(new_domain)
+            current_bridge = best_enriched
+            selected = best_enriched
+            all_propositions.append(best_enriched)
+
+            if verbose:
+                print(f"  ✓ Accepted {new_domain} — covdim now {best_enriched.covering_dimension} "
+                      f"(+{best_covdim_gain}), {len(composed_domains)} domains composed",
+                      flush=True)
+
+        if verbose and len(composed_domains) > 2:
+            print(f"\nIDEATION: Final composition: {' × '.join(composed_domains)} "
+                  f"(covdim={selected.covering_dimension}, "
+                  f"~{selected.estimated_loc} LOC)", flush=True)
+
     # Step 8: Elaborate the selected bridge via full §9 procedure.
     # This is NOT just "flesh out the idea." It is the geometric process of:
     #   (a) restricting the H¹ class to stalks at each D ∈ Loc(p)  (Def 9.4)
@@ -893,8 +1166,16 @@ Respond as JSON:
             if gaps:
                 print(f"  ⚠ {len(gaps)} covering gap(s): {', '.join(gaps[:3])}", flush=True)
 
-    # Build productive pairing criterion from the selected approach's partner
-    best_partner_name = selected.target_domain if selected else partner_candidates[0][0]
+    # Build productive pairing criterion.
+    # For composed bridges, target_domain is "D₂ × D₃ × ..." — extract the
+    # primary partner (first after primary domain) for backward compatibility.
+    if selected:
+        td = selected.target_domain
+        # For composed bridges, target_domain looks like "D₁ × D₂ × D₃"
+        _parts = [p.strip() for p in td.split("×")] if "×" in td else [td]
+        best_partner_name = _parts[0] if _parts else td
+    else:
+        best_partner_name = partner_candidates[0][0]
     best_enf = next(
         (enf for name, enf in partner_candidates if name == best_partner_name),
         partner_candidates[0][1])
@@ -907,6 +1188,16 @@ Respond as JSON:
         avg_strength=avg_strength,
         semantic_distance=best_enf.semantic_distance if best_enf else 5.0,
     )
+
+    # Determine composition level for metadata
+    composition_level = 1
+    composed = [primary.name]
+    if selected and "composition_level" in selected.metadata:
+        composition_level = selected.metadata["composition_level"]
+        composed = selected.metadata.get("domains", composed)
+    elif selected:
+        composed = [primary.name, selected.target_domain]
+        composition_level = 2
 
     elapsed = time.time() - t0
     return IdeationResult(
@@ -926,5 +1217,8 @@ Respond as JSON:
             "partners_explored": [name for name, _ in partner_candidates[:n_explore]],
             "tournament_size": len(all_propositions),
             "locus": [sd.name for sd in locus],
+            "n_idea_sources": n_idea_sources,
+            "composition_level": composition_level,
+            "composed_domains": composed,
         },
     )

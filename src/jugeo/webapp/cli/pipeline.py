@@ -19,6 +19,12 @@ from jugeo.webapp.cli.models import (
     WebappConfig,
 )
 
+try:
+    from jugeo.webapp.cli.theory_conformance import TheoryDrivenVerifier
+    _THEORY_AVAILABLE = True
+except ImportError:
+    _THEORY_AVAILABLE = False
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TemplateSpecs — canonical spec dicts for each template tier
@@ -366,6 +372,11 @@ class WebappPipeline:
         stages_completed.append(specify_res)
         result.app_spec = specify_res.details.get("spec", {})
 
+        # 2.5. Theory descent check
+        descent_res = self._stage_descent_check(config, result.app_spec)
+        stages_completed.append(descent_res)
+        result.descent_result = descent_res.details
+
         # 3. Generate
         generate_res = self._stage_generate(config, result.app_spec)
         stages_completed.append(generate_res)
@@ -373,7 +384,7 @@ class WebappPipeline:
 
         # 4. Verify (optional)
         if config.verify:
-            verify_res = self._stage_verify(config, config.outdir)
+            verify_res = self._stage_verify(config, config.outdir, result.app_spec)
             stages_completed.append(verify_res)
             result.verification_result = verify_res.details
 
@@ -424,6 +435,38 @@ class WebappPipeline:
             duration_ms=elapsed,
             details={"spec": spec},
         )
+
+    def _stage_descent_check(self, config: WebappConfig, spec: dict) -> StageResult:
+        t0 = time.monotonic()
+        if not _THEORY_AVAILABLE:
+            return StageResult(
+                stage=PipelineStage.DESCENT_CHECK,
+                success=True,
+                duration_ms=0.0,
+                details={"skipped": True, "reason": "theory_conformance module not available"},
+            )
+        try:
+            verifier = TheoryDrivenVerifier()
+            report = verifier.verify_spec(spec)
+            elapsed = (time.monotonic() - t0) * 1000
+            errors = [v["detail"] for v in report.get("violations", []) if v.get("severity") == "error"]
+            warnings = [v["detail"] for v in report.get("violations", []) if v.get("severity") == "warning"]
+            return StageResult(
+                stage=PipelineStage.DESCENT_CHECK,
+                success=True,  # advisory: violations reported but never block generation
+                duration_ms=elapsed,
+                details=report,
+                warnings=errors + warnings,  # surfaced as warnings, not blocking errors
+            )
+        except Exception as exc:
+            elapsed = (time.monotonic() - t0) * 1000
+            return StageResult(
+                stage=PipelineStage.DESCENT_CHECK,
+                success=True,  # non-fatal: theory check failure doesn't block generation
+                duration_ms=elapsed,
+                details={"error": str(exc)},
+                warnings=[f"Theory descent check failed: {exc}"],
+            )
 
     def _stage_generate(self, config: WebappConfig, spec: dict) -> StageResult:
         t0 = time.monotonic()
@@ -495,7 +538,7 @@ class WebappPipeline:
             errors=errors,
         )
 
-    def _stage_verify(self, config: WebappConfig, output_dir: str) -> StageResult:
+    def _stage_verify(self, config: WebappConfig, output_dir: str, spec=None) -> StageResult:
         t0 = time.monotonic()
         checks: list = []
         errors: list = []
@@ -520,6 +563,21 @@ class WebappPipeline:
             except SyntaxError as exc:
                 checks.append({"name": "app.py syntax valid", "passed": False})
                 errors.append(f"Syntax error: {exc}")
+
+            # Theory-based verification of generated code (advisory — never blocks)
+            if _THEORY_AVAILABLE and app_path.exists():
+                try:
+                    verifier = TheoryDrivenVerifier()
+                    gen_report = verifier.verify_generated(spec, source)
+                    gen_warnings = [v["detail"] for v in gen_report.get("violations", [])]
+                    checks.append({
+                        "name": "theory descent verification",
+                        "passed": True,  # advisory only
+                        "details": gen_report.get("summary", ""),
+                        "theory_warnings": gen_warnings,
+                    })
+                except Exception as exc:
+                    checks.append({"name": "theory descent verification", "passed": True, "details": f"skipped: {exc}"})
         else:
             checks.append({"name": "app.py exists", "passed": False})
             errors.append("app.py not found")

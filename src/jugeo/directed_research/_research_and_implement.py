@@ -698,6 +698,7 @@ def research_and_implement(
     min_pages: int = 14,
     min_figures: int = 2,
     min_kloc: int = 50,
+    n_idea_sources: int = 3,
 ) -> ResearchAndImplementResult:
     """Iterative descent on the delivery site (theory2.tex §3.4).
 
@@ -815,6 +816,7 @@ def research_and_implement(
             output_dir=iter_dir,
             verbose=verbose,
             no_llm=no_llm,
+            n_idea_sources=n_idea_sources,
         )
         result = dr.run()
         best_result = result
@@ -1126,6 +1128,8 @@ def add_subparser(subparsers) -> Any:
                    help="Minimum paper figures. Default: 2.")
     p.add_argument("--min-kloc", type=int, default=50,
                    help="Minimum code KLoC. Default: 50.")
+    p.add_argument("--n-idea-sources", type=int, default=3,
+                   help="Number of domains to compose (§10 tower depth). Default: 3.")
     return p
 
 
@@ -1142,6 +1146,7 @@ def run_cli(args) -> int:
         min_pages=getattr(args, "min_pages", 14),
         min_figures=getattr(args, "min_figures", 2),
         min_kloc=getattr(args, "min_kloc", 50),
+        n_idea_sources=getattr(args, "n_idea_sources", 3),
     )
 
     if result.success:

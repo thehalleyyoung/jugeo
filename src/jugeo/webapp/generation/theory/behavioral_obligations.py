@@ -30,7 +30,7 @@ import textwrap
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, ClassVar
 
 __all__ = [
     "BehaviorDomain",
@@ -47,10 +47,7 @@ __all__ = [
     "BaseJSGenerator",
 ]
 
-
-# ══════════════════════════════════════════════════════════════════════
-# Behavior domains — the fibres of the behavioural presheaf
-# ══════════════════════════════════════════════════════════════════════
+# ── Behavior domains — the fibres of the behavioural presheaf ──
 
 class BehaviorDomain(str, Enum):
     """Each value names a fibre of the behavioural obligation presheaf."""
@@ -71,10 +68,7 @@ class BehaviorDomain(str, Enum):
     UNDO_REDO = "undo_redo"
     REAL_TIME = "real_time"
 
-
-# ══════════════════════════════════════════════════════════════════════
-# Value objects — the stalks of each fibre
-# ══════════════════════════════════════════════════════════════════════
+# ── Value objects — the stalks of each fibre ──
 
 @dataclass
 class EventPattern:
@@ -86,16 +80,6 @@ class EventPattern:
     propagation: str = "delegate"
     requires_debounce: bool = False
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "element_selector": self.element_selector,
-            "event_type": self.event_type,
-            "handler_description": self.handler_description,
-            "propagation": self.propagation,
-            "requires_debounce": self.requires_debounce,
-        }
-
-
 @dataclass
 class StateShape:
     """Application state structure — a section of the state fibre."""
@@ -104,15 +88,6 @@ class StateShape:
     fields: dict[str, str]
     persistence: str = "memory"
     views: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "fields": dict(self.fields),
-            "persistence": self.persistence,
-            "views": list(self.views),
-        }
-
 
 @dataclass
 class RouteDefinition:
@@ -124,19 +99,7 @@ class RouteDefinition:
     requires_auth: bool = False
     preload_data: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "path": self.path,
-            "view_id": self.view_id,
-            "title": self.title,
-            "requires_auth": self.requires_auth,
-            "preload_data": list(self.preload_data),
-        }
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Loading sequence — the temporal fibre
-# ══════════════════════════════════════════════════════════════════════
+# ── Loading sequence — the temporal fibre ──
 
 @dataclass
 class LoadingPhase:
@@ -147,16 +110,6 @@ class LoadingPhase:
     description: str = ""
     weight: float = 0.2
     dependencies: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "label": self.label,
-            "description": self.description,
-            "weight": self.weight,
-            "dependencies": list(self.dependencies),
-        }
-
 
 @dataclass
 class InitializationSequence:
@@ -177,57 +130,39 @@ class InitializationSequence:
 
     def ordered(self) -> list[LoadingPhase]:
         """Return phases in dependency-respecting order (Kahn's algorithm)."""
-        by_id: dict[str, LoadingPhase] = {p.id: p for p in self.phases}
-        in_degree: dict[str, int] = {p.id: 0 for p in self.phases}
-        dependents: dict[str, list[str]] = defaultdict(list)
-
-        for phase in self.phases:
-            for dep in phase.dependencies:
+        by_id = {p.id: p for p in self.phases}
+        in_deg: dict[str, int] = {p.id: 0 for p in self.phases}
+        children: dict[str, list[str]] = defaultdict(list)
+        for p in self.phases:
+            for dep in p.dependencies:
                 if dep in by_id:
-                    in_degree[phase.id] += 1
-                    dependents[dep].append(phase.id)
-
-        queue = [pid for pid, deg in in_degree.items() if deg == 0]
+                    in_deg[p.id] += 1
+                    children[dep].append(p.id)
+        queue = sorted(pid for pid, d in in_deg.items() if d == 0)
         result: list[LoadingPhase] = []
-
         while queue:
-            queue.sort()
             pid = queue.pop(0)
             result.append(by_id[pid])
-            for child in dependents[pid]:
-                in_degree[child] -= 1
-                if in_degree[child] == 0:
-                    queue.append(child)
-
-        # Append any remaining phases (cycle-breaking fallback).
+            for c in children[pid]:
+                in_deg[c] -= 1
+                if in_deg[c] == 0:
+                    queue.append(c)
+            queue.sort()
         seen = {p.id for p in result}
-        for phase in self.phases:
-            if phase.id not in seen:
-                result.append(phase)
-
+        result.extend(p for p in self.phases if p.id not in seen)
         return result
 
     # ── JS config emission ────────────────────────────────────────
 
     def to_js_config(self) -> str:
         """Emit a JS constant consumed by the loading-screen driver."""
-        ordered = self.ordered()
-        entries: list[dict[str, Any]] = []
-        for phase in ordered:
-            entries.append({
-                "id": phase.id,
-                "label": phase.label,
-                "weight": round(phase.weight, 3),
-            })
-        return (
-            "const LOADING_PHASES = "
-            + json.dumps(entries, indent=2)
-            + ";\n"
-        )
+        entries = [{"id": p.id, "label": p.label, "weight": round(p.weight, 3)}
+                   for p in self.ordered()]
+        return "const LOADING_PHASES = " + json.dumps(entries, indent=2) + ";\n"
 
     # ── factory from concept names ────────────────────────────────
 
-    _CONCEPT_MAP: dict[str, tuple[str, str]] = {
+    _CONCEPT_MAP: ClassVar[dict[str, tuple[str, str]]] = {
         "game_engine": ("engine", "Game engine"),
         "canvas_renderer": ("canvas", "Canvas renderer"),
         "audio_system": ("audio", "Audio synthesizer"),
@@ -241,7 +176,7 @@ class InitializationSequence:
         "save_system": ("save", "Save system"),
     }
 
-    _DEFAULT_PHASES: list[tuple[str, str, float]] = [
+    _DEFAULT_PHASES: ClassVar[list[tuple[str, str, float]]] = [
         ("core", "Core", 0.30),
         ("ui", "Interface", 0.40),
         ("data", "Data", 0.30),
@@ -249,41 +184,27 @@ class InitializationSequence:
 
     @classmethod
     def from_concepts(cls, concept_names: list[str]) -> InitializationSequence:
-        """Derive loading phases from high-level concept names.
-
-        Recognised concepts get a specific phase; unrecognised concepts
-        fall through to a generic three-phase sequence.
-        """
+        """Derive loading phases from high-level concept names."""
         phases: list[LoadingPhase] = []
         matched: set[str] = set()
-
         for name in concept_names:
             key = name.lower().replace(" ", "_").replace("-", "_")
             if key in cls._CONCEPT_MAP:
                 pid, label = cls._CONCEPT_MAP[key]
                 if pid not in matched:
                     matched.add(pid)
-                    phases.append(LoadingPhase(
-                        id=pid,
-                        label=label,
-                        weight=round(1.0 / max(len(concept_names), 1), 3),
-                    ))
-
+                    w = round(1.0 / max(len(concept_names), 1), 3)
+                    phases.append(LoadingPhase(id=pid, label=label, weight=w))
         if not phases:
-            for pid, label, weight in cls._DEFAULT_PHASES:
-                phases.append(LoadingPhase(id=pid, label=label, weight=weight))
+            phases = [LoadingPhase(id=p, label=l, weight=w)
+                      for p, l, w in cls._DEFAULT_PHASES]
         else:
-            # Normalise weights so they sum to 1.
             total = sum(p.weight for p in phases) or 1.0
             for p in phases:
                 p.weight = round(p.weight / total, 3)
-
         return cls(phases=phases)
 
-
-# ══════════════════════════════════════════════════════════════════════
-# Error strategy — the error-handling fibre
-# ══════════════════════════════════════════════════════════════════════
+# ── Error strategy — the error-handling fibre ──
 
 @dataclass
 class ErrorStrategy:
@@ -294,18 +215,7 @@ class ErrorStrategy:
     recovery: str = "retry"
     logging: bool = True
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "boundary_level": self.boundary_level,
-            "user_feedback": self.user_feedback,
-            "recovery": self.recovery,
-            "logging": self.logging,
-        }
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Persistence layer — the data-permanence fibre
-# ══════════════════════════════════════════════════════════════════════
+# ── Persistence layer — the data-permanence fibre ──
 
 @dataclass
 class PersistenceLayer:
@@ -314,13 +224,6 @@ class PersistenceLayer:
     kind: str = "localStorage"
     namespace: str = "jugeo"
     entities: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "kind": self.kind,
-            "namespace": self.namespace,
-            "entities": list(self.entities),
-        }
 
     def to_js_store_class(self) -> str:
         """Generate a JS storage wrapper class."""
@@ -408,10 +311,7 @@ class PersistenceLayer:
         }};
         """)
 
-
-# ══════════════════════════════════════════════════════════════════════
-# Behavioral obligation — a single stalk of the presheaf
-# ══════════════════════════════════════════════════════════════════════
+# ── Behavioral obligation — a single stalk of the presheaf ──
 
 @dataclass
 class BehavioralObligation:
@@ -443,47 +343,32 @@ class BehavioralObligation:
         req = " (required)" if self.required else " (optional)"
         return f"/* Obligation: {self.description}{scope}{req} */"
 
-
-# ══════════════════════════════════════════════════════════════════════
-# The presheaf itself
-# ══════════════════════════════════════════════════════════════════════
+# ── The presheaf itself ──
 
 class BehavioralObligationPresheaf:
     """Presheaf B over the view site V.
 
-    Sections at a view *v* are the behavioural obligations scoped to
-    that view.  Global sections live at the terminal object and
-    restrict to every view.  The ``unsatisfied`` method checks descent
-    of a JS string against the obligation presheaf — any obligation
-    whose ``js_pattern`` is absent in the generated code is an
-    obstruction.
+    Sections at a view *v* are the obligations scoped to that view.
+    Global sections restrict to every view.  ``unsatisfied`` checks
+    descent — obligations whose ``js_pattern`` is absent are obstructions.
     """
 
     def __init__(self) -> None:
         self._global: list[BehavioralObligation] = []
         self._by_view: dict[str, list[BehavioralObligation]] = defaultdict(list)
 
-    # ── mutators ──────────────────────────────────────────────────
-
-    def add_obligation(
-        self,
-        view_id: str | None,
-        obligation: BehavioralObligation,
-    ) -> None:
+    def add_obligation(self, view_id: str | None, obligation: BehavioralObligation) -> None:
         """Add an obligation.  *view_id* ``None`` means global."""
         if view_id is None:
             self._global.append(obligation)
         else:
             self._by_view[view_id].append(obligation)
 
-    # ── queries ───────────────────────────────────────────────────
-
     def obligations_for_view(self, view_id: str) -> list[BehavioralObligation]:
         """All obligations relevant to *view_id* (view-local + global)."""
         return list(self._global) + list(self._by_view.get(view_id, []))
 
     def global_obligations(self) -> list[BehavioralObligation]:
-        """Return only the global obligations."""
         return list(self._global)
 
     def all_obligations(self) -> list[BehavioralObligation]:
@@ -494,24 +379,12 @@ class BehavioralObligationPresheaf:
         return result
 
     def views(self) -> list[str]:
-        """Return all view ids that have local obligations."""
         return sorted(self._by_view.keys())
 
-    # ── descent verification ──────────────────────────────────────
-
     def unsatisfied(self, js: str) -> list[BehavioralObligation]:
-        """Return obligations whose ``js_pattern`` is NOT found in *js*.
-
-        Obligations without a ``js_pattern`` are always considered
-        satisfied (they require manual verification).
-        """
-        missing: list[BehavioralObligation] = []
-        for ob in self.all_obligations():
-            if ob.js_pattern and ob.js_pattern not in js:
-                missing.append(ob)
-        return missing
-
-    # ── section extraction ────────────────────────────────────────
+        """Return obligations whose ``js_pattern`` is NOT found in *js*."""
+        return [ob for ob in self.all_obligations()
+                if ob.js_pattern and ob.js_pattern not in js]
 
     def section_at(self, view_id: str) -> dict[str, Any]:
         """Return the section (stalk data) at a given view."""
@@ -519,171 +392,79 @@ class BehavioralObligationPresheaf:
         by_domain: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for ob in obs:
             by_domain[ob.domain.value].append(ob.to_dict())
-        return {
-            "view_id": view_id,
-            "domains": dict(by_domain),
-            "count": len(obs),
-        }
+        return {"view_id": view_id, "domains": dict(by_domain), "count": len(obs)}
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "global": [ob.to_dict() for ob in self._global],
-            "by_view": {
-                v: [ob.to_dict() for ob in obs]
-                for v, obs in self._by_view.items()
-            },
-        }
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Preset builder — four quality tiers
-# ══════════════════════════════════════════════════════════════════════
+# ── Preset builder — four quality tiers ──
 
 class BehavioralPresetBuilder:
     """Build behavioural obligation presheaves at progressive quality tiers.
 
-    Each tier adds obligations on top of the previous one.
-
-      - **minimal** — basic click handling + error boundary.
-      - **standard** — routing, state, loading, persistence.
-      - **polished** — accessibility, keyboard nav, animations, toasts.
-      - **production** — undo/redo, real-time, drag-drop, network,
-        form validation, audio.
+    Each tier adds obligations on top of the previous one:
+    minimal → standard → polished → production.
     """
 
     @staticmethod
-    def minimal() -> BehavioralObligationPresheaf:
+    def _add(p: BehavioralObligationPresheaf, specs: list[tuple]) -> None:
+        """Add obligations from (domain, description, js_pattern[, required]) tuples."""
+        for spec in specs:
+            req = spec[3] if len(spec) > 3 else True
+            p.add_obligation(None, BehavioralObligation(
+                domain=spec[0], description=spec[1], js_pattern=spec[2], required=req,
+            ))
+
+    @classmethod
+    def minimal(cls) -> BehavioralObligationPresheaf:
         """Tier 1: the bare minimum — events + error boundary."""
         p = BehavioralObligationPresheaf()
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.EVENT_HANDLING,
-            description="Click delegation on [data-action] elements",
-            js_pattern="data-action",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.ERROR_HANDLING,
-            description="Global error boundary with console logging",
-            js_pattern="addEventListener('error'",
-        ))
+        cls._add(p, [
+            (BehaviorDomain.EVENT_HANDLING, "Click delegation on [data-action] elements", "data-action"),
+            (BehaviorDomain.ERROR_HANDLING, "Global error boundary with console logging", "addEventListener('error'"),
+        ])
         return p
 
-    @staticmethod
-    def standard() -> BehavioralObligationPresheaf:
+    @classmethod
+    def standard(cls) -> BehavioralObligationPresheaf:
         """Tier 2: routing, state management, loading, persistence."""
-        p = BehavioralPresetBuilder.minimal()
-
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.ROUTING,
-            description="Hash-based SPA router (JugeoRouter)",
-            js_pattern="JugeoRouter",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.STATE_MANAGEMENT,
-            description="View switching via data-view attributes",
-            js_pattern="data-view",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.LOADING,
-            description="Loading screen with progress phases",
-            js_pattern="loading-screen",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.PERSISTENCE,
-            description="LocalStorage wrapper (JugeoStore)",
-            js_pattern="JugeoStore",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.EVENT_HANDLING,
-            description="Tab switching via delegated click",
-            js_pattern="tab-btn",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.EVENT_HANDLING,
-            description="Accordion toggle via delegated click",
-            js_pattern="accordion-trigger",
-        ))
+        p = cls.minimal()
+        cls._add(p, [
+            (BehaviorDomain.ROUTING, "Hash-based SPA router (JugeoRouter)", "JugeoRouter"),
+            (BehaviorDomain.STATE_MANAGEMENT, "View switching via data-view attributes", "data-view"),
+            (BehaviorDomain.LOADING, "Loading screen with progress phases", "loading-screen"),
+            (BehaviorDomain.PERSISTENCE, "LocalStorage wrapper (JugeoStore)", "JugeoStore"),
+            (BehaviorDomain.EVENT_HANDLING, "Tab switching via delegated click", "tab-btn"),
+            (BehaviorDomain.EVENT_HANDLING, "Accordion toggle via delegated click", "accordion-trigger"),
+        ])
         return p
 
-    @staticmethod
-    def polished() -> BehavioralObligationPresheaf:
+    @classmethod
+    def polished(cls) -> BehavioralObligationPresheaf:
         """Tier 3: accessibility, keyboard nav, toasts, modals, animations."""
-        p = BehavioralPresetBuilder.standard()
-
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.ACCESSIBILITY_BEHAVIOR,
-            description="ARIA live regions for dynamic content",
-            js_pattern="aria-",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.KEYBOARD_NAV,
-            description="Keyboard navigation (arrow keys, Escape, Enter)",
-            js_pattern="keydown",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.ANIMATION_BEHAVIOR,
-            description="Fade-in on scroll via IntersectionObserver",
-            js_pattern="IntersectionObserver",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.ERROR_HANDLING,
-            description="Toast notifications for user feedback",
-            js_pattern="showToast",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.EVENT_HANDLING,
-            description="Modal open/close helpers",
-            js_pattern="openModal",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.EVENT_HANDLING,
-            description="Mobile nav toggle",
-            js_pattern="nav-toggle",
-        ))
+        p = cls.standard()
+        cls._add(p, [
+            (BehaviorDomain.ACCESSIBILITY_BEHAVIOR, "ARIA live regions for dynamic content", "aria-"),
+            (BehaviorDomain.KEYBOARD_NAV, "Keyboard navigation (arrow keys, Escape, Enter)", "keydown"),
+            (BehaviorDomain.ANIMATION_BEHAVIOR, "Fade-in on scroll via IntersectionObserver", "IntersectionObserver"),
+            (BehaviorDomain.ERROR_HANDLING, "Toast notifications for user feedback", "showToast"),
+            (BehaviorDomain.EVENT_HANDLING, "Modal open/close helpers", "openModal"),
+            (BehaviorDomain.EVENT_HANDLING, "Mobile nav toggle", "nav-toggle"),
+        ])
         return p
 
-    @staticmethod
-    def production() -> BehavioralObligationPresheaf:
+    @classmethod
+    def production(cls) -> BehavioralObligationPresheaf:
         """Tier 4: full production suite — undo, drag-drop, real-time, forms."""
-        p = BehavioralPresetBuilder.polished()
-
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.UNDO_REDO,
-            description="Undo/redo command stack",
-            js_pattern="UndoManager",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.DRAG_DROP,
-            description="Drag-and-drop support",
-            js_pattern="dragstart",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.REAL_TIME,
-            description="WebSocket or SSE for real-time updates",
-            js_pattern="WebSocket",
-            required=False,
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.FORM_HANDLING,
-            description="Client-side form validation",
-            js_pattern="reportValidity",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.NETWORK,
-            description="Fetch wrapper with retry and timeout",
-            js_pattern="fetch(",
-        ))
-        p.add_obligation(None, BehavioralObligation(
-            domain=BehaviorDomain.AUDIO,
-            description="AudioContext initialisation on user gesture",
-            js_pattern="AudioContext",
-            required=False,
-        ))
+        p = cls.polished()
+        cls._add(p, [
+            (BehaviorDomain.UNDO_REDO, "Undo/redo command stack", "UndoManager"),
+            (BehaviorDomain.DRAG_DROP, "Drag-and-drop support", "dragstart"),
+            (BehaviorDomain.REAL_TIME, "WebSocket or SSE for real-time updates", "WebSocket", False),
+            (BehaviorDomain.FORM_HANDLING, "Client-side form validation", "reportValidity"),
+            (BehaviorDomain.NETWORK, "Fetch wrapper with retry and timeout", "fetch("),
+            (BehaviorDomain.AUDIO, "AudioContext initialisation on user gesture", "AudioContext", False),
+        ])
         return p
 
-
-# ══════════════════════════════════════════════════════════════════════
-# Base JS generator — derives JS from the behavioural theory
-# ══════════════════════════════════════════════════════════════════════
+# ── Base JS generator — derives JS from the behavioural theory ──
 
 class BaseJSGenerator:
     """Generate the base JavaScript scaffolding from behavioural theory.
@@ -906,25 +687,20 @@ class BaseJSGenerator:
         return textwrap.dedent("""\
         /* ─── Toast system ─── */
         window.showToast = function(message, type, duration) {
-          type = type || 'info';
-          duration = duration || 3000;
+          type = type || 'info'; duration = duration || 3000;
           var container = document.getElementById('toasts');
           if (!container) {
             container = document.createElement('div');
-            container.id = 'toasts';
-            container.className = 'toast-container';
-            container.setAttribute('role', 'status');
-            container.setAttribute('aria-live', 'polite');
+            container.id = 'toasts'; container.className = 'toast-container';
+            container.setAttribute('role', 'status'); container.setAttribute('aria-live', 'polite');
             document.body.appendChild(container);
           }
           var toast = document.createElement('div');
           toast.className = 'toast toast-' + type;
-          toast.setAttribute('role', 'alert');
-          toast.textContent = message;
+          toast.setAttribute('role', 'alert'); toast.textContent = message;
           container.appendChild(toast);
           setTimeout(function() {
-            toast.style.opacity = '0';
-            toast.style.transition = 'opacity 0.3s ease';
+            toast.style.opacity = '0'; toast.style.transition = 'opacity 0.3s ease';
             setTimeout(function() { toast.remove(); }, 300);
           }, duration);
         };
@@ -972,19 +748,11 @@ class BaseJSGenerator:
     def _generate_scroll_animations() -> str:
         """Generate fade-in on scroll via IntersectionObserver."""
         return textwrap.dedent("""\
-        /* ─── Fade-in on scroll (IntersectionObserver) ─── */
         if ('IntersectionObserver' in window) {
           var obs = new IntersectionObserver(function(entries) {
-            entries.forEach(function(entry) {
-              if (entry.isIntersecting) {
-                entry.target.classList.add('visible');
-                obs.unobserve(entry.target);
-              }
-            });
+            entries.forEach(function(e) { if (e.isIntersecting) { e.target.classList.add('visible'); obs.unobserve(e.target); } });
           }, { threshold: 0.1 });
-          document.querySelectorAll('.fade-in,.animate-fade-up').forEach(function(el) {
-            obs.observe(el);
-          });
+          document.querySelectorAll('.fade-in,.animate-fade-up').forEach(function(el) { obs.observe(el); });
         }
         """)
 
@@ -1050,7 +818,6 @@ class BaseJSGenerator:
     def _generate_mobile_nav() -> str:
         """Generate mobile nav toggle."""
         return textwrap.dedent("""\
-        /* ─── Mobile nav toggle ─── */
         document.addEventListener('click', function(e) {
           if (e.target.closest('.nav-toggle')) {
             var links = document.querySelector('.nav-links');
@@ -1058,10 +825,6 @@ class BaseJSGenerator:
           }
         });
         """)
-
-    # ══════════════════════════════════════════════════════════════
-    # Main composition method
-    # ══════════════════════════════════════════════════════════════
 
     @classmethod
     def generate_all(
@@ -1072,74 +835,40 @@ class BaseJSGenerator:
     ) -> str:
         """Generate all base JS from the behavioural theory.
 
-        This is the theory-derived replacement for the hardcoded
-        ``_generate_base_js()`` in ``html_generator``.  Every JS
-        fragment is emitted only if a corresponding obligation exists
-        in the presheaf.
+        Theory-derived replacement for ``html_generator._generate_base_js()``.
+        Fragments are emitted only when a corresponding obligation exists.
         """
-        all_obs = obligations.all_obligations()
-        domains = {ob.domain for ob in all_obs}
-        parts: list[str] = []
-
-        parts.append("/* ═══ Generated by jugeo-webapp BaseJSGenerator ═══ */")
-        parts.append("'use strict';\n")
-
-        # ── loading screen driver ─────────────────────────────────
+        domains = {ob.domain for ob in obligations.all_obligations()}
+        parts: list[str] = [
+            "/* ═══ Generated by jugeo-webapp BaseJSGenerator ═══ */",
+            "'use strict';\n",
+        ]
         if BehaviorDomain.LOADING in domains:
-            sequence = InitializationSequence.from_concepts(concepts)
-            parts.append(cls.generate_loading_driver(sequence))
-
-        # ── tab / accordion ───────────────────────────────────────
+            parts.append(cls.generate_loading_driver(
+                InitializationSequence.from_concepts(concepts)))
         parts.append(cls._generate_tab_accordion())
-
-        # ── toast system ──────────────────────────────────────────
         if BehaviorDomain.ERROR_HANDLING in domains:
             parts.append(cls.generate_toast_system())
-
-        # ── modal helpers ─────────────────────────────────────────
         parts.append(cls.generate_modal_system())
-
-        # ── scroll animations ─────────────────────────────────────
         if BehaviorDomain.ANIMATION_BEHAVIOR in domains:
             parts.append(cls._generate_scroll_animations())
-
-        # ── SPA router + view manager ─────────────────────────────
         if BehaviorDomain.ROUTING in domains:
-            routes = _default_routes_for_views(views)
-            parts.append(cls.generate_router(routes))
-
+            parts.append(cls.generate_router(_default_routes_for_views(views)))
         if BehaviorDomain.STATE_MANAGEMENT in domains:
             parts.append(cls.generate_view_manager(views))
-
-        # ── button action delegation ──────────────────────────────
         if BehaviorDomain.EVENT_HANDLING in domains:
             parts.append(cls._generate_action_delegation())
-
-        # ── persistence store ─────────────────────────────────────
         if BehaviorDomain.PERSISTENCE in domains:
-            store = PersistenceLayer(kind="localStorage", namespace="jugeo")
-            parts.append(cls.generate_store(store))
-
-        # ── keyboard navigation ───────────────────────────────────
+            parts.append(cls.generate_store(PersistenceLayer()))
         if BehaviorDomain.KEYBOARD_NAV in domains:
             parts.append(cls.generate_keyboard_nav())
-
-        # ── error boundaries ──────────────────────────────────────
         if BehaviorDomain.ERROR_HANDLING in domains:
-            strategy = ErrorStrategy()
-            parts.append(cls.generate_error_boundaries(strategy))
-
-        # ── mobile nav ────────────────────────────────────────────
+            parts.append(cls.generate_error_boundaries(ErrorStrategy()))
         parts.append(cls._generate_mobile_nav())
-
         parts.append("console.log('jugeo-webapp initialized');")
-
         return "\n".join(parts)
 
-
-# ══════════════════════════════════════════════════════════════════════
-# Module-private helpers
-# ══════════════════════════════════════════════════════════════════════
+# ── Module-private helpers ──
 
 _DEFAULT_CLICK_DELEGATION = textwrap.dedent("""\
 /* ─── Default click delegation ─── */
@@ -1149,7 +878,6 @@ document.addEventListener('click', function(e) {
   /* generic action dispatch */
 });
 """)
-
 
 def _default_routes_for_views(view_ids: list[str]) -> list[RouteDefinition]:
     """Derive a default set of routes from view names."""
