@@ -146,7 +146,7 @@ from jugeo.directed_research._code_gen import (
     read_dependencies_from_pyproject,
 )
 
-from jugeo.directed_research._git_tracking import OutputRepoTracker
+from jugeo.directed_research._git_tracking import OutputRepoTracker, prompt_to_slug
 from jugeo.directed_research._research_and_implement import (
     research_and_implement,
     ResearchAndImplementResult,
@@ -213,6 +213,7 @@ __all__ = [
     "read_dependencies_from_pyproject",
     # Git-backed provenance tracking
     "OutputRepoTracker",
+    "prompt_to_slug",
     # Research-and-implement pipeline (delivery site descent)
     "research_and_implement",
     "ResearchAndImplementResult",

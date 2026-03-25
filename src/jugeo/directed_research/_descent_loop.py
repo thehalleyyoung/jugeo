@@ -119,7 +119,7 @@ from jugeo.directed_research._readme_gen import generate_readme
 from jugeo.directed_research._pivot import pivot_theory
 from jugeo.directed_research._workspace import build_workspace
 from jugeo.directed_research._provenance import ResearchProvenance
-from jugeo.directed_research._git_tracking import OutputRepoTracker
+from jugeo.directed_research._git_tracking import OutputRepoTracker, prompt_to_slug
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
@@ -173,7 +173,10 @@ class DirectedResearch:
         self.workspace: Optional[WorkspaceSite] = None
         self.trust_manager = TrustManager()
         self.provenance = ResearchProvenance(prompt=prompt)
-        self.git_tracker = OutputRepoTracker(str(self.output_dir))
+        self.git_tracker = OutputRepoTracker(
+            str(self.output_dir),
+            repo_name=prompt_to_slug(prompt),
+        )
 
         # Accumulated sections and moves
         self.sections: list[LLMSection] = []
