@@ -113,6 +113,41 @@ from jugeo.directed_research._types import (
 
 from jugeo.directed_research._descent_loop import DirectedResearch
 
+from jugeo.directed_research._data_presentation import (
+    DataKind,
+    DataPoint,
+    DataSet,
+    DataObligation,
+    ObligationManifest,
+    PresentationFormat,
+    PresentationPlan,
+    PresentationSlot,
+    plan_presentations,
+    render_booktabs_table,
+    render_comparison_table,
+    render_pgfplots_line,
+    render_pgfplots_bar,
+    render_statistical_test,
+    render_inline_number,
+)
+
+from jugeo.directed_research._parallel_research import (
+    PaperSpec,
+    DifferentiationReport,
+    ParallelResearchConfig,
+    ParallelResearchResult,
+    decompose_theme,
+    compute_differentiation,
+    parallel_research,
+)
+
+from jugeo.directed_research._code_gen import (
+    ensure_dependencies,
+    read_dependencies_from_pyproject,
+)
+
+from jugeo.directed_research._git_tracking import OutputRepoTracker
+
 __all__ = [
     # The main class
     "DirectedResearch",
@@ -143,4 +178,33 @@ __all__ = [
     "ExcessNoveltyFraction",
     "ProductivePairingCriterion",
     "RelevanceFiltrationLevel",
+    # Data presentation (multi-format LaTeX rendering)
+    "DataKind",
+    "DataPoint",
+    "DataSet",
+    "DataObligation",
+    "ObligationManifest",
+    "PresentationFormat",
+    "PresentationPlan",
+    "PresentationSlot",
+    "plan_presentations",
+    "render_booktabs_table",
+    "render_comparison_table",
+    "render_pgfplots_line",
+    "render_pgfplots_bar",
+    "render_statistical_test",
+    "render_inline_number",
+    # Parallel multi-paper research
+    "PaperSpec",
+    "DifferentiationReport",
+    "ParallelResearchConfig",
+    "ParallelResearchResult",
+    "decompose_theme",
+    "compute_differentiation",
+    "parallel_research",
+    # Shared dependency management
+    "ensure_dependencies",
+    "read_dependencies_from_pyproject",
+    # Git-backed provenance tracking
+    "OutputRepoTracker",
 ]

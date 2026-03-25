@@ -229,50 +229,34 @@
 
           <h3>CLI command</h3>
           <pre><code class="language-bash"># Basic usage
-jugeo spec --target mymodule.py::compute_price --spec specs/pricing.yaml
+jugeo spec specs/pricing.py mymodule.py
 
-# With explicit cover size
-jugeo spec --target mymodule.py::compute_price \
-           --spec specs/pricing.yaml \
-           --cover-size 8 \
-           --solver z3
+# Equivalent spelled-out flags
+jugeo spec --spec specs/pricing.py --impl mymodule.py
 
-# Generate proof-carrying Python
-jugeo spec --target mymodule.py::compute_price \
-           --spec specs/pricing.yaml \
-           --emit-pcp \
-           --output mymodule_verified.py</code></pre>
+# Strict mode fails on any residual obligation
+jugeo spec specs/pricing.py mymodule.py --strict</code></pre>
 
           <h3>Python API</h3>
-          <pre><code class="language-python">import jugeo
+          <pre><code class="language-python">from jugeo.easy import spec
 
-# Load specification from YAML
-spec = jugeo.Spec.from_yaml("specs/pricing.yaml")
-
-# Run verification
-result = jugeo.verify_spec(
-    target="mymodule:compute_price",
-    spec=spec,
-    cover_size=8,
-    solver="z3",
-)
-
-print(result.status)        # "VERIFIED" | "REFUTED" | "TIMEOUT"
-print(result.certificate)   # Certificate object
-print(result.cover)         # List of open sets used
-print(result.discharge_time_ms)
-
-# Emit proof-carrying Python
-if result.status == "VERIFIED":
-    jugeo.emit_pcp(result, output="mymodule_verified.py")
-
-# Inline decorator style
-@jugeo.spec(
-    pre=lambda x: x > 0,
-    post=lambda x, r: r >= 0 and r <= x,
-)
-def compute_price(x: float) -> float:
+review = spec(
+    """
+def compute_price(x):
+    if x <= 0:
+        return 0.0
     return x * 0.9
+""",
+    """
+def spec(result, x):
+    return result >= 0 and result <= max(x, 0)
+""",
+    input_cover=[{"args": [x], "kwargs": {}} for x in [0, 1, 10, 100]],
+)
+
+print(review.satisfied)
+print(review.witness_count)
+print(review.mode)
 </code></pre>
 
           <div class="output-block">
@@ -335,40 +319,34 @@ def compute_price(x: float) -> float:
           </p>
 
           <h3>CLI command</h3>
-          <pre><code class="language-bash"># Compare two implementations
-jugeo equiv --ref mymodule.py::sort_v1 --impl mymodule.py::sort_v2
+          <pre><code class="language-bash"># Compare two files symmetrically
+jugeo equiv sort_v1.py sort_v2.py
 
-# With input domain restriction
-jugeo equiv --ref mymodule.py::sort_v1 \
-            --impl mymodule.py::sort_v2 \
-            --domain "len(xs) <= 100 and all(0 <= x <= 1000 for x in xs)"
+# Ask only whether the left refines the right behaviorally
+jugeo equiv sort_v1.py sort_v2.py --direction left-to-right
 
-# Compare across modules
-jugeo equiv --ref legacy.py::compute \
-            --impl optimized.py::compute \
-            --emit-pcp --output equivalence_proof.py</code></pre>
+# Or only check the opposite direction
+jugeo equiv sort_v1.py sort_v2.py --direction right-to-left</code></pre>
 
           <h3>Python API</h3>
-          <pre><code class="language-python">import jugeo
+          <pre><code class="language-python">from jugeo.easy import equiv
 
-result = jugeo.verify_equiv(
-    ref="mymodule:sort_v1",
-    impl="mymodule:sort_v2",
-    domain=jugeo.Domain(
-        constraints=["len(xs) <= 100", "all(0 <= x <= 1000 for x in xs)"]
-    ),
-)
-
-print(result.status)          # "EQUIVALENT" | "NOT_EQUIVALENT" | "TIMEOUT"
-if result.status == "NOT_EQUIVALENT":
-    print(result.counterexample)  # Distinguishing input
-    print(result.witness_ref)     # Output of ref on counterexample
-    print(result.witness_impl)    # Output of impl on counterexample
-
-# Decorator style
-@jugeo.equiv_of("mymodule:sort_v1")
-def sort_v2(xs: list[int]) -> list[int]:
+left = """
+def sort_v1(xs):
     return sorted(xs)
+"""
+
+right = """
+def sort_v2(xs):
+    out = list(xs)
+    out.sort()
+    return out
+"""
+
+result = equiv(left, right)
+print(result.equivalent)
+print(result.counterexample)
+print(result.obstructions)
 </code></pre>
 
           <div class="output-block">
@@ -400,7 +378,7 @@ def sort_v2(xs: list[int]) -> list[int]:
         <div class="mode-card-header">
           <div class="mode-icon mode-icon-bug">&#128030;</div>
           <div>
-            <h2>Bug Detection <span class="mode-badge badge-bug">bug</span></h2>
+            <h2>Bug Detection <span class="mode-badge badge-bug">bugs</span></h2>
             <p>Search for reachable inputs that trigger assertion failures, exceptions, or property violations.</p>
           </div>
         </div>
@@ -421,49 +399,27 @@ def sort_v2(xs: list[int]) -> list[int]:
 
           <h3>CLI command</h3>
           <pre><code class="language-bash"># Basic bug scan
-jugeo bug --target mymodule.py::process_data
+jugeo bugs mymodule.py
 
-# With property to violate
-jugeo bug --target mymodule.py::process_data \
-          --property "result is not None" \
-          --property "len(result) == len(input)"
+# Restrict to higher-signal findings
+jugeo bugs mymodule.py --severity high
 
-# Exhaustive search with timeout
-jugeo bug --target mymodule.py::process_data \
-          --exhaustive --timeout 60s \
-          --suggest-fixes</code></pre>
+# Emit structured output for automation
+jugeo bugs mymodule.py --format json</code></pre>
 
           <h3>Python API</h3>
-          <pre><code class="language-python">import jugeo
+          <pre><code class="language-python">from jugeo.easy import bugs
 
-result = jugeo.detect_bugs(
-    target="mymodule:process_data",
-    properties=[
-        "result is not None",
-        "len(result) == len(input)",
-    ],
-    exhaustive=False,
-    timeout_s=30,
-    suggest_fixes=True,
-)
+report = bugs("""
+def append_item(item, collection=[]):
+    collection.append(item)
+    return collection
+""")
 
-print(result.status)          # "BUG_FOUND" | "CLEAN" | "TIMEOUT"
-if result.status == "BUG_FOUND":
-    for bug in result.bugs:
-        print(bug.description)
-        print(bug.triggering_input)
-        print(bug.trace)
-        print(bug.suggested_fixes)   # List of patch suggestions
-
-# Scan entire module
-results = jugeo.scan_module(
-    "mymodule",
-    depth="functions",    # "functions" | "methods" | "all"
-    suggest_fixes=True,
-)
-for fn_name, r in results.items():
-    if r.status == "BUG_FOUND":
-        print(f"{fn_name}: {len(r.bugs)} bug(s)")
+print(report.count)
+for bug in report:
+    print(bug.kind, bug.line, bug.message)
+    print(bug.fix_hint)
 </code></pre>
 
           <div class="output-block">
@@ -499,74 +455,52 @@ for fn_name, r in results.items():
       </div>
 
       <!-- ============================================================
-           MODE 4: RELATIONAL REFINEMENT
+           MODE 4: REPAIR SUGGESTIONS
            ============================================================ -->
-      <div class="mode-card" id="relational-refinement">
-        <div class="mode-card-header">
-          <div class="mode-icon mode-icon-refine">&#8849;</div>
-          <div>
-            <h2>Relational Refinement <span class="mode-badge badge-refine">refine</span></h2>
-            <p>Prove that one implementation is a relational refinement of another — a strictly stronger notion than equivalence.</p>
+        <div class="mode-card" id="relational-refinement">
+          <div class="mode-card-header">
+            <div class="mode-icon mode-icon-refine">&#128295;</div>
+            <div>
+              <h2>Repair Suggestions <span class="mode-badge badge-refine">repair</span></h2>
+              <p>Turn failing files and specification mismatches into concrete repair plans.</p>
+            </div>
           </div>
-        </div>
         <div class="mode-card-body">
 
           <h3>What it does</h3>
           <p>
-            Relational refinement constructs a <em>descent judgment</em>
-            \(\vdash_{\mathcal{D}} f \sqsubseteq_R g\) where \(R\) is a relational specification.
-            Unlike equivalence, refinement is asymmetric: \(f \sqsubseteq_R g\) means \(f\)
-            implements every observable behavior of \(g\) and possibly fewer. This is the
-            natural notion for stepwise refinement in program derivation.
+            Repair mode starts from bug reports or specification failures and ranks the
+            smallest edits that would restore compatibility. It keeps the evidence trail
+            attached to each recommendation so you can see which diagnostic, overlap, or
+            specification clause motivated the proposed change.
           </p>
           <p>
-            The mode encodes the refinement relation as a sheaf morphism \(\phi: \mathcal{S}(g) \to \mathcal{S}(f)\)
-            and checks that \(\phi\) is a valid morphism — i.e., sections descend correctly
-            through the relation.
+            By default, <span class="cmd">jugeo repair</span> previews the plan without
+            touching source files. Add <code>--auto-apply</code> only when you want JuGeo
+            to commit the safe, mechanical subset of those repairs directly.
           </p>
 
           <h3>CLI command</h3>
-          <pre><code class="language-bash"># Prove f refines g under relation R
-jugeo refine --concrete mymodule.py::sort_concrete \
-             --abstract  mymodule.py::sort_abstract \
-             --relation  "set(concrete) == set(abstract) and concrete == sorted(concrete)"
+          <pre><code class="language-bash"># Suggest repairs for a buggy file
+jugeo repair buggy.py
 
-# With domain and emit
-jugeo refine --concrete mymodule.py::sort_concrete \
-             --abstract  mymodule.py::sort_abstract \
-             --relation  specs/sort_relation.yaml \
-             --domain    "all(isinstance(x, int) for x in xs)" \
-             --emit-pcp  --output sort_proof.py</code></pre>
+# Repair against an explicit specification
+jugeo repair buggy.py --spec spec.py --max-repairs 3
+
+# Apply machine-safe repairs automatically
+jugeo repair buggy.py --spec spec.py --auto-apply</code></pre>
 
           <h3>Python API</h3>
-          <pre><code class="language-python">import jugeo
+          <pre><code class="language-python">import subprocess
 
-# Define refinement relation inline
-relation = jugeo.Relation(
-    name="sorted_refinement",
-    conditions=[
-        "set(concrete_out) == set(abstract_out)",   # same elements
-        "concrete_out == sorted(concrete_out)",       # concrete is sorted
-    ],
+completed = subprocess.run(
+    ["jugeo", "repair", "buggy.py", "--spec", "spec.py", "--format", "json"],
+    check=True,
+    capture_output=True,
+    text=True,
 )
 
-result = jugeo.verify_refinement(
-    concrete="mymodule:sort_concrete",
-    abstract="mymodule:sort_abstract",
-    relation=relation,
-    domain=jugeo.Domain(constraints=["all(isinstance(x, int) for x in xs)"]),
-)
-
-print(result.status)       # "REFINES" | "NOT_REFINES" | "TIMEOUT"
-print(result.morphism)     # The descent morphism phi
-print(result.certificate)  # Certificate object
-
-# Check refinement chain: a refines b refines c
-chain = jugeo.refinement_chain(
-    ["mymodule:impl_v3", "mymodule:impl_v2", "mymodule:impl_v1"],
-    relation=relation,
-)
-print(chain.is_transitive)  # True if all links verified
+print(completed.stdout)
 </code></pre>
 
           <div class="output-block">
@@ -628,16 +562,16 @@ print(chain.is_transitive)  # True if all links verified
             <td>You refactored or optimized a function and want to confirm the new version behaves identically.</td>
           </tr>
           <tr>
-            <td><span class="mode-badge badge-bug">bug</span> Bug Detection</td>
-            <td><span class="cmd">jugeo bug</span></td>
+            <td><span class="mode-badge badge-bug">bugs</span> Bug Detection</td>
+            <td><span class="cmd">jugeo bugs</span></td>
             <td>\(\check{H}^1(\mathcal{U},\mathcal{F}) \neq 0\)</td>
             <td>You want to find inputs that violate properties, trigger exceptions, or cause assertion failures.</td>
           </tr>
           <tr>
-            <td><span class="mode-badge badge-refine">refine</span> Relational Refinement</td>
-            <td><span class="cmd">jugeo refine</span></td>
-            <td>\(\vdash_{\mathcal{D}} f \sqsubseteq_R g\)</td>
-            <td>You are deriving a concrete implementation from an abstract specification in a stepwise fashion.</td>
+            <td><span class="mode-badge badge-refine">repair</span> Repair Suggestions</td>
+            <td><span class="cmd">jugeo repair</span></td>
+            <td>\(\mathcal{R}(\text{bugs/spec})\)</td>
+            <td>You want JuGeo to turn a failing file or specification into a concrete repair plan.</td>
           </tr>
         </tbody>
       </table>
@@ -645,11 +579,10 @@ print(chain.is_transitive)  # True if all links verified
       <div class="callout callout-tip">
         <div class="callout-icon">&#128161;</div>
         <div class="callout-body">
-          <strong>Tip:</strong> All four modes can emit proof-carrying Python via
-          <span class="cmd">--emit-pcp</span>. The emitted file contains scaffold functions
-          (<code>_coordinate</code>, <code>_support</code>, <code>_descent_profile</code>)
-          and a machine-readable certificate. See the
-          <a href="generation.html">Code Generation</a> page for details.
+          <strong>Tip:</strong> The most stable public workflow today is
+          <span class="cmd">prove</span> / <span class="cmd">bugs</span> /
+          <span class="cmd">equiv</span> / <span class="cmd">repair</span>, with
+          <span class="cmd">generate</span> and <span class="cmd">research</span> layered on top.
         </div>
       </div>
 

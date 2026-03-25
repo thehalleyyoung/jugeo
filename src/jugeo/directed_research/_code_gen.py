@@ -239,8 +239,14 @@ def write_pyproject(
     pkg_name: str,
     approach: str,
     dependencies: list[str],
+    *,
+    install: bool = False,
 ) -> str:
-    """Write pyproject.toml."""
+    """Write pyproject.toml and optionally install dependencies.
+
+    If ``install=True``, calls :func:`ensure_dependencies` after writing
+    so that benchmarks and tests can import everything they need.
+    """
     pkg_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', pkg_name).strip('_').lower()
     path = os.path.join(output_dir, "pyproject.toml")
     with open(path, "w") as f:
@@ -259,7 +265,168 @@ def write_pyproject(
             [tool.setuptools.packages.find]
             where = ["src"]
         """))
+    if install:
+        ensure_dependencies(dependencies, project_dir=output_dir)
     return path
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Shared dependency installation — used by ALL code-generating modules
+# ═══════════════════════════════════════════════════════════════════════
+
+def _is_installed(package: str) -> bool:
+    """Check whether *package* is already importable.
+
+    Handles common PyPI-name → import-name mismatches (e.g. scikit-learn →
+    sklearn, python-dateutil → dateutil).
+    """
+    _IMPORT_MAP: dict[str, str] = {
+        "scikit-learn": "sklearn",
+        "python-dateutil": "dateutil",
+        "pyyaml": "yaml",
+        "pillow": "PIL",
+        "opencv-python": "cv2",
+        "opencv-python-headless": "cv2",
+        "beautifulsoup4": "bs4",
+        "tables": "tables",
+    }
+    # Strip version specifiers: "numpy>=1.21" → "numpy"
+    bare = re.split(r'[><=!~;\[]', package)[0].strip()
+    import_name = _IMPORT_MAP.get(bare.lower(), bare.replace("-", "_"))
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", f"import {import_name}"],
+            capture_output=True, timeout=10,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def ensure_dependencies(
+    dependencies: list[str],
+    *,
+    project_dir: str | None = None,
+    quiet: bool = True,
+    timeout_per_dep: int = 120,
+    retry: int = 1,
+) -> dict[str, bool]:
+    """Install missing dependencies and return a status dict.
+
+    This is the **single shared entry-point** for dependency installation
+    across all code-generating modules (directed research, parallel
+    research, benchmarking, test generation).  It is idempotent — already-
+    installed packages are skipped.
+
+    Parameters
+    ----------
+    dependencies
+        Package specifiers (e.g. ``["numpy>=1.21", "yfinance", "scipy"]``).
+    project_dir
+        If given and contains a ``pyproject.toml``, the project is also
+        installed in editable mode (``pip install -e .``) after deps.
+    quiet
+        Suppress pip stdout.  Errors are always captured.
+    timeout_per_dep
+        Seconds before giving up on one package.
+    retry
+        Number of retries on failure (0 = no retries).
+
+    Returns
+    -------
+    dict mapping each dependency to ``True`` (installed/already present)
+    or ``False`` (failed after retries).
+    """
+    results: dict[str, bool] = {}
+    to_install: list[str] = []
+
+    # Phase 1: check what's already installed
+    for dep in dependencies:
+        if _is_installed(dep):
+            results[dep] = True
+        else:
+            to_install.append(dep)
+
+    # Phase 2: batch-install missing deps (faster than one-by-one)
+    if to_install:
+        cmd = [sys.executable, "-m", "pip", "install"] + to_install
+        if quiet:
+            cmd.append("-q")
+        for attempt in range(1 + retry):
+            try:
+                r = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_per_dep * len(to_install),
+                )
+                if r.returncode == 0:
+                    for dep in to_install:
+                        results[dep] = True
+                    to_install = []
+                    break
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
+
+    # Phase 3: any stragglers — install individually
+    still_missing = [d for d in to_install if d not in results]
+    for dep in still_missing:
+        ok = False
+        for attempt in range(1 + retry):
+            try:
+                cmd = [sys.executable, "-m", "pip", "install", dep]
+                if quiet:
+                    cmd.append("-q")
+                r = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=timeout_per_dep,
+                )
+                if r.returncode == 0:
+                    ok = True
+                    break
+            except Exception:
+                pass
+        results[dep] = ok
+
+    # Phase 4: editable install of the project itself
+    if project_dir:
+        pyproject = os.path.join(project_dir, "pyproject.toml")
+        if os.path.exists(pyproject):
+            try:
+                cmd = [sys.executable, "-m", "pip", "install", "-e", project_dir]
+                if quiet:
+                    cmd.append("-q")
+                subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=timeout_per_dep,
+                )
+            except Exception:
+                pass
+
+    return results
+
+
+def read_dependencies_from_pyproject(project_dir: str) -> list[str]:
+    """Read the dependency list from a pyproject.toml file.
+
+    Returns an empty list if the file doesn't exist or can't be parsed.
+    """
+    path = os.path.join(project_dir, "pyproject.toml")
+    if not os.path.exists(path):
+        return []
+    try:
+        # Simple TOML parsing — avoid adding a tomli dependency
+        text = open(path).read()
+        m = re.search(r'dependencies\s*=\s*\[(.*?)\]', text, re.DOTALL)
+        if not m:
+            return []
+        inner = m.group(1)
+        return [s.strip().strip('"').strip("'")
+                for s in inner.split(",") if s.strip().strip('"').strip("'")]
+    except Exception:
+        return []
 
 
 def syntax_check_all(code_files: list[str]) -> dict[str, bool]:

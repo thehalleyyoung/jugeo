@@ -488,8 +488,9 @@
           <p>
             The top-level entry points for each proof mode. These modules wire together
             all lower layers to implement <span class="cmd">jugeo spec</span>,
-            <span class="cmd">jugeo equiv</span>, <span class="cmd">jugeo bug</span>, and
-            <span class="cmd">jugeo refine</span>. CLI parsing also lives here.
+            <span class="cmd">jugeo equiv</span>, <span class="cmd">jugeo bugs</span>,
+            <span class="cmd">jugeo repair</span>, and the broader synthesis/research commands.
+            CLI parsing also lives here.
           </p>
           <ul>
             <li>CLI argument parsing and validation</li>
@@ -506,12 +507,13 @@
 
       <h3>Strict DAG enforcement</h3>
       <p>
-        Import cycles are prevented by a CI check that runs on every commit. The check
-        uses <span class="cmd">jugeo.analysis.import_graph</span> to compute the full import graph
-        and verifies it is a DAG. Any PR that introduces a cycle is automatically rejected.
+        Import cycles are prevented by CI checks that inspect the repository's module
+        structure and reject bad dependency edges before they land. In practice the
+        day-to-day public tooling here is the <span class="cmd">jugeo load</span> /
+        <span class="cmd">jugeo info</span> CLI surface plus targeted internal tests.
       </p>
-      <pre><code class="language-bash"># Run the import graph check locally
-python -m jugeo.analysis.import_graph --check-acyclic jugeo/</code></pre>
+      <pre><code class="language-bash"># Inspect a file's semantic structure locally
+jugeo --format json load src/jugeo/cli/main.py</code></pre>
 
       <h3>No upward imports</h3>
       <p>
@@ -523,45 +525,53 @@ python -m jugeo.analysis.import_graph --check-acyclic jugeo/</code></pre>
 
       <h3>Trust propagation</h3>
       <p>
-        Every value in the system carries a trust level from the kernel's trust lattice.
+        Every value in the system carries a trust level from the public trust algebra.
         When values from different trust levels are combined, the result takes the minimum
         trust level of its inputs. This means a certificate is only as trustworthy as its
         weakest evidence source.
       </p>
-      <pre><code class="language-python">from jugeo.kernel.trust import TrustLevel, meet
+      <pre><code class="language-python">from jugeo.evidence.trust import TrustAlgebra, TrustLevel
 
-t1 = TrustLevel.MACHINE_VERIFIED
+T = TrustAlgebra()
+t1 = TrustLevel.MECHANICALLY_VERIFIED
 t2 = TrustLevel.COPILOT_SUGGESTED
 
-result_trust = meet(t1, t2)
+result_trust = T.meet(t1, t2)
 print(result_trust)  # TrustLevel.COPILOT_SUGGESTED  (lower)
 </code></pre>
 
       <div class="section-divider"></div>
 
-      <h2 id="import-graph">Import Graph Analysis</h2>
+      <h2 id="import-graph">Structure Introspection</h2>
       <p>
-        JuGeo ships with a built-in import graph analyzer in
-        <code>jugeo.analysis.import_graph</code>. You can use it to inspect the dependency
-        structure of your own code and check for cycles.
+        A lightweight way to inspect dependency structure today is to materialize a
+        semantic site and then query its coordinates, morphisms, and covering families.
       </p>
-      <pre><code class="language-python">from jugeo.analysis import import_graph
+      <pre><code class="language-python">from jugeo.geometry.site import (
+    Coordinate,
+    CoordinateKind,
+    Morphism,
+    MorphismKind,
+    SiteBuilder,
+)
 
-# Analyze a module
-graph = import_graph.analyze("mypackage/")
-print(graph.node_count)      # number of modules
-print(graph.edge_count)      # number of import edges
-print(graph.is_acyclic())    # True if no cycles
-print(graph.layer_count())   # number of topological layers
-print(graph.critical_path()) # longest dependency chain
+builder = SiteBuilder("mypackage")
+pkg = Coordinate("mypackage", kind=CoordinateKind.MODULE)
+util = Coordinate(("mypackage", "utils"), kind=CoordinateKind.MODULE)
+api = Coordinate(("mypackage", "api"), kind=CoordinateKind.MODULE)
 
-# Detect cycles
-cycles = graph.find_cycles()
-for cycle in cycles:
-    print(" -> ".join(cycle))
+site = (
+    builder.add_coordinate(pkg)
+    .add_coordinate(util)
+    .add_coordinate(api)
+    .add_morphism(Morphism(source=util, target=pkg, kind=MorphismKind.INCLUSION))
+    .add_morphism(Morphism(source=api, target=pkg, kind=MorphismKind.INCLUSION))
+    .build()
+)
 
-# Generate a dot file for visualization
-graph.to_dot("import_graph.dot")
+print(site.coordinate_count())
+print(site.morphism_count())
+print([coord.name for coord in site.objects()])
 </code></pre>
 
       <div class="callout callout-warning">

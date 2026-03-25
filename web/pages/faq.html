@@ -137,7 +137,7 @@
             <p>
               No. JuGeo's API is entirely Pythonic. You write annotations like
               <code>@jugeo.ensures("pure")</code>, run
-              <code>jugeo check mymod</code>, and read diagnostic output that tells
+              <code>jugeo prove mymod</code>, and read diagnostic output that tells
               you which functions fail which properties and why. The sheaf-theoretic
               machinery runs entirely under the hood.
             </p>
@@ -164,8 +164,8 @@
               <li><code>mypy &gt;= 1.8</code> (optional) &mdash; for the static analysis agent</li>
               <li><code>anthropic &gt;= 0.25</code> (optional) &mdash; for LLM copilot agents</li>
             </ul>
-            <p>Install the minimal set with <code>pip install jugeo</code> and optionally
-            <code>pip install "jugeo[copilot,lean]"</code> for the full suite.</p>
+            <p>Install the repo from its root with <code>pip install -e .</code> and add
+            optional solver or model dependencies separately as needed.</p>
           </div>
         </details>
 
@@ -173,19 +173,21 @@
           <summary>How do I run JuGeo on my first project?</summary>
           <div class="faq-body">
             <p>Three steps:</p>
-            <pre><code class="language-python"># 1. Install
-pip install jugeo
+            <pre><code class="language-bash"># 1. Install from the repo root
+pip install -e .
 
-# 2. Run the bootstrapper to get annotation recommendations
-jugeo bootstrap mymod --property pure --budget 2h
+# 2. Find the highest-signal problems first
+jugeo bugs mymod.py
 
-# 3. Apply the top recommendations and verify
-jugeo check mymod --property pure</code></pre>
+# 3. Repair or verify against an explicit spec
+jugeo repair mymod.py --spec spec.py
+jugeo prove mymod.py --spec spec.py</code></pre>
             <p>
-              The bootstrap command runs the discovery engine, identifies the
-              highest-leverage functions to annotate first, and generates a preview
-              of suggested annotations. After reviewing and applying them,
-              <code>jugeo check</code> verifies the whole module and reports any
+              A practical adoption loop is: run <code>jugeo bugs</code> to surface the
+              highest-signal problems, use <code>jugeo repair</code> to preview or apply
+              mechanical fixes, then run <code>jugeo prove</code> with a real spec file.
+              After reviewing and applying those changes,
+              <code>jugeo prove</code> verifies the whole module and reports any
               remaining obstructions. See the <a href="quickstart.html">Quickstart</a>
               for a full walkthrough.
             </p>
@@ -419,9 +421,9 @@ class MySolver(SolverAgent):
               adoption:
             </p>
             <ul>
-              <li>Run <code>jugeo bootstrap</code> to get annotation recommendations for your highest-leverage functions.</li>
-              <li>Incrementally add <code>@jugeo.ensures</code> annotations as you review the recommendations.</li>
-              <li>Add <code>jugeo check</code> to CI to catch regressions as coverage grows.</li>
+              <li>Run <code>jugeo bugs</code> on a real file to find the highest-signal failures first.</li>
+              <li>Use <code>jugeo repair</code> for mechanical fixes and <code>jugeo spec</code> / <code>jugeo prove</code> when you have an explicit contract.</li>
+              <li>Add <code>jugeo prove</code> or <code>jugeo bugs --format json</code> to CI as coverage grows.</li>
             </ul>
             <p>
               Partial annotation is fully supported. Functions without annotations carry
@@ -438,15 +440,14 @@ class MySolver(SolverAgent):
               JuGeo provides a language server (LSP) that exposes inline diagnostics
               in VS Code, Neovim, and any LSP-compatible editor:
             </p>
-            <pre><code class="language-python">pip install "jugeo[lsp]"
-jugeo lsp --stdio</code></pre>
             <p>
-              The language server shows trust-level badges next to annotated functions,
-              highlights unverified code with a dashed underline, and provides quickfix
-              actions to apply repair suggestions. There is also a VS Code extension in
-              the marketplace (search &ldquo;JuGeo&rdquo;) that wraps the LSP with
-              additional UI panels showing trust coverage, frontier size, and
-              obstruction summaries.
+              Earlier drafts of the website mentioned a standalone language-server
+              command, but the public interface exposed in this
+              repository today is the CLI itself plus structured JSON output.
+              For editor workflows right now, the reliable path is to run
+              <code>jugeo --format json bugs</code> or
+              <code>jugeo --format json prove</code> and surface those diagnostics in
+              your editor or CI tooling.
             </p>
           </div>
         </details>
@@ -455,21 +456,22 @@ jugeo lsp --stdio</code></pre>
           <summary>How does JuGeo integrate with CI/CD pipelines?</summary>
           <div class="faq-body">
             <p>
-              JuGeo outputs structured JSON or SARIF reports that integrate with
+              JuGeo outputs structured JSON that integrates cleanly with
               GitHub Actions, GitLab CI, and Jenkins. A typical GitHub Actions setup:
             </p>
-            <pre><code class="language-python">- name: JuGeo check
+            <pre><code class="language-yaml">- name: JuGeo prove
   run: |
-    pip install jugeo
-    jugeo check mymod --property pure --format sarif --output jugeo.sarif
-- name: Upload SARIF
-  uses: github/codeql-action/upload-sarif@v3
+    pip install -e .
+    jugeo --format json prove mymod.py --spec spec.py > jugeo-report.json
+- name: Upload report artifact
+  uses: actions/upload-artifact@v4
   with:
-    sarif_file: jugeo.sarif</code></pre>
+    name: jugeo-report
+    path: jugeo-report.json</code></pre>
             <p>
-              The <code>--fail-on</code> flag controls when the CI step fails:
-              <code>--fail-on h1+</code> fails only on H&#x00B9; or higher obstructions;
-              <code>--fail-on any</code> fails on any open judgment.
+              Because the CLI returns a non-zero exit status on command failure, the
+              simplest policy is to let your CI step fail naturally and keep the JSON
+              artifact for inspection.
             </p>
           </div>
         </details>
@@ -502,23 +504,22 @@ jugeo lsp --stdio</code></pre>
           <summary>Which LLM models does JuGeo support?</summary>
           <div class="faq-body">
             <p>
-              JuGeo's copilot layer is model-agnostic. Built-in implementations support
-              Anthropic's Claude models (recommended for structured output reliability)
-              and OpenAI GPT-4 family. Any model implementing the
-              <code>CopilotBackend</code> protocol is supported:
+              JuGeo's current public model surface is the CLI's
+              <code>--model</code> flag rather than a stable public copilot Python package:
             </p>
-            <pre><code class="language-python">from jugeo.copilot import CopilotAgent, CopilotRole
-from jugeo.copilot.backends import CopilotBackend
+            <pre><code class="language-python">import subprocess
 
-# Use Claude
-agent = CopilotAgent(role=CopilotRole.CONSTRUCTION,
-                     model="claude-3-5-sonnet")
-
-# Use a fully custom backend
-class MyBackend(CopilotBackend):
-    def complete(self, prompt: str, max_tokens: int) -> str: ...
-
-agent = CopilotAgent(role=CopilotRole.DEDUCTION, backend=MyBackend())</code></pre>
+subprocess.run(
+    [
+        "python3",
+        "-m",
+        "jugeo",
+        "--model", "claude-sonnet-4.6",
+        "research",
+        "Find likely verification gaps in this module",
+    ],
+    check=True,
+)</code></pre>
           </div>
         </details>
       </div>
@@ -540,8 +541,11 @@ agent = CopilotAgent(role=CopilotRole.DEDUCTION, backend=MyBackend())</code></pr
             <p>
               Certificates are stored in <code>.jugeo/certs/</code> as
               CBOR-serialised certificate chains. The
-              <code>jugeo verify-cert</code> command checks a certificate against a
-              module version hash. This enables supply-chain trust: a downstream package
+              website drafts previously mentioned a standalone
+              <code>jugeo verify-cert</code> command, but that command is not part of the
+              public CLI surface in this repository today. In practice you inspect the
+              generated artifact metadata and serialized verification outputs instead.
+              This still enables supply-chain trust: a downstream package
               can require that its dependencies provide SOLVER-trust certificates for
               their public APIs.
             </p>
@@ -593,8 +597,8 @@ agent = CopilotAgent(role=CopilotRole.DEDUCTION, backend=MyBackend())</code></pr
               <li><strong>Bug reports &amp; feature requests:</strong> file a GitHub issue.</li>
               <li><strong>Code contributions:</strong> fork the repo, make your changes with tests, open a PR.</li>
               <li><strong>New encoding sub-packages:</strong> implement <code>EncodingProtocol</code> and submit a PR with benchmarks.</li>
-              <li><strong>New copilot roles:</strong> implement <code>CopilotBackend</code> and add a paper-style evaluation in <code>papers/</code>.</li>
-              <li><strong>Theorem ecology contributions:</strong> use <code>jugeo ecology publish</code> to contribute verified theorems for standard library functions.</li>
+              <li><strong>New model-backed workflows:</strong> extend the documented CLI or <code>jugeo.easy</code> surface and add a paper-style evaluation in <code>papers/</code>.</li>
+              <li><strong>Theorem and research contributions:</strong> add examples, papers, or benchmark cases that strengthen the existing ideation and research flows.</li>
             </ul>
             <p>
               The project follows a research-integrated development model: major new
@@ -615,8 +619,10 @@ agent = CopilotAgent(role=CopilotRole.DEDUCTION, backend=MyBackend())</code></pr
               easier to close if this theorem were in the ecology.
             </p>
             <p>
-              Running <code>jugeo bootstrap</code> triggers this process and outputs
-              a prioritised annotation plan. In the Paper 15 evaluation, bootstrapping
+              Running <code>jugeo ideate</code> explores candidate theorem and design
+              spaces, while <code>jugeo bugs</code>, <code>jugeo spec</code>, and
+              <code>jugeo prove</code> remain the concrete verification entry points
+              surfaced by the current CLI. In the Paper 15 evaluation, bootstrapping
               with the discovery engine reduced the annotation effort required to reach
               70% judgment coverage by 58% compared to manual annotation.
             </p>

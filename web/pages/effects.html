@@ -228,7 +228,7 @@
           <tr>
             <td>Async / concurrency</td>
             <td>Not built-in; requires external libraries</td>
-            <td>Suspended morphisms; first-class in <code>jugeo.effects.async_effects</code></td>
+            <td>Suspended morphisms; modeled through the public geometry and descent layers</td>
           </tr>
           <tr>
             <td>Effect composition</td>
@@ -266,44 +266,22 @@
       <h2 id="annotations">Effect Annotations</h2>
 
       <p>
-        JuGeo provides decorators to declare effect sections explicitly. When an
-        annotation is present it takes precedence over the inferred section; the inferred
-        result is used only to verify that the declared annotation is sound (i.e., that
-        the code actually has no more effects than claimed).
+        JuGeo's stable public API for effect reasoning is currently geometry-first rather
+        than decorator-first. In practice you inspect coordinates, runtime effect summaries,
+        and descent compatibility, then use the CLI to prove, repair, or align the code
+        that those summaries refer to.
       </p>
 
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">import jugeo
-from jugeo.effects import raises, reads_state, writes_state, is_async_safe, is_pure
+        <pre><code class="language-python">from jugeo.geometry.site import Coordinate, CoordinateKind
 
-# Declare that this function raises only ValueError
-@raises(ValueError)
-def parse_int(s: str) -> int:
-    return int(s)  # may raise ValueError
+coord = Coordinate(("mymod", "payments", "process_payment"), kind=CoordinateKind.FUNCTION)
+report = coord.runtime_effects()
 
-# Declare read-only state access (reads a global but does not mutate it)
-@reads_state("config.timeout")
-def get_timeout() -> float:
-    return config.timeout
-
-# Declare async safety: no shared mutable state across await points
-@is_async_safe
-async def fetch_user(uid: int) -> dict:
-    async with db.session() as sess:
-        return await sess.get(uid)
-
-# Declare full purity: no effects at all
-@is_pure
-def add(x: float, y: float) -> float:
-    return x + y
-
-# Verify that a function's declared effects match inferred effects
-report = jugeo.check_effects("mymod.payments.process_payment")
-print(report.effect_section)       # inferred EffectSection
-print(report.annotation_matches)   # True if declared == inferred
-print(report.excess_effects)       # effects found in code but not declared
+print(report["coordinate"])
+print(report["effects"])
 </code></pre>
       </div>
 
@@ -317,27 +295,12 @@ print(report.excess_effects)       # effects found in code but not declared
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.effects import EffectAnalyzer, EffectFamily
-import jugeo
+        <pre><code class="language-python">from jugeo.geometry.site import Coordinate, CoordinateKind
 
-site = jugeo.build_site("mymod")
-analyzer = EffectAnalyzer(site=site)
+coord = Coordinate(("mymod", "payments", "process_payment"), kind=CoordinateKind.FUNCTION)
 
-report = analyzer.analyze_module("mymod")
-
-for coord, section in report.sections.items():
-    print(f"\n{coord.qualified_name}")
-    print(f"  families : {[f.name for f in section.families]}")
-    print(f"  raises   : {section.exception_types}")
-    print(f"  reads    : {section.state_reads}")
-    print(f"  writes   : {section.state_writes}")
-    print(f"  is_async : {EffectFamily.ASYNC in section.families}")
-
-# Find all functions that write shared state
-writers = [c for c, s in report.sections.items() if s.state_writes]
-print(f"\nState writers: {len(writers)}")
-for w in writers:
-    print(f"  {w.qualified_name}: {report.sections[w].state_writes}")
+print(coord.program_loader())
+print(coord.runtime_effects())
 </code></pre>
       </div>
 
@@ -346,24 +309,13 @@ for w in writers:
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.effects import EffectCompatibilityChecker
+        <pre><code class="language-python">from jugeo.geometry.site import Coordinate, CoordinateKind
 
-checker = EffectCompatibilityChecker(site=site)
+caller = Coordinate(("mymod", "api", "handle_request"), kind=CoordinateKind.FUNCTION)
+callee = Coordinate(("mymod", "db", "query"), kind=CoordinateKind.FUNCTION)
 
-caller = site.find("mymod.api.handle_request")
-callee = site.find("mymod.db.query")
-
-compat = checker.check_boundary(caller, callee)
-print(compat.compatible)          # bool
-print(compat.leaked_effects)      # effects callee introduces that caller doesn't declare
-print(compat.obstruction_degree)  # H0, H1, or None
-
-# Verify that an async context manager properly covers its resource
-ctx_coord = site.find("mymod.resources.ManagedConnection")
-coverage = checker.check_context_manager_coverage(ctx_coord)
-print(coverage.enter_section)   # EffectSection from __enter__
-print(coverage.exit_section)    # EffectSection from __exit__
-print(coverage.is_covering)     # True if enter/exit form a valid covering family
+print(caller.runtime_effects())
+print(callee.runtime_effects())
 </code></pre>
       </div>
 
@@ -372,23 +324,11 @@ print(coverage.is_covering)     # True if enter/exit form a valid covering famil
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.effects import GeneratorFiberAnalyzer
+        <pre><code class="language-python">from jugeo.geometry.site import Coordinate, CoordinateKind
 
-gfa = GeneratorFiberAnalyzer(site=site)
-gen_coord = site.find("mymod.pipeline.batch_records")
-fibers = gfa.compute_fibers(gen_coord)
-
-print(f"Yield points: {len(fibers)}")
-for i, fiber in enumerate(fibers):
-    print(f"  Yield {i}: section={fiber.section}, "
-          f"state_at_yield={fiber.state_snapshot}")
-
-# Check that each fiber restriction is compatible with the previous
-transitions = gfa.check_fiber_transitions(fibers)
-for t in transitions:
-    if not t.compatible:
-        print(f"  Incompatible transition {t.from_index} -> {t.to_index}")
-        print(f"    reason: {t.reason}")
+coord = Coordinate(("mymod", "pipeline", "batch_records"), kind=CoordinateKind.FUNCTION)
+print(coord.runtime_effects())
+print(coord.callable_surface())
 </code></pre>
       </div>
 

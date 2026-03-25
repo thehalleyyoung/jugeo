@@ -40,10 +40,24 @@ try:
         available_agents,
         LLMSection,
     )
+    from jugeo.directed_research._types import AgentBackend
     HAS_AGENT_CHANNEL = True
 except ImportError:
     HAS_AGENT_CHANNEL = False
     log.warning("Agent channel not available — agent generation disabled")
+
+
+def _preferred_backend() -> "AgentBackend | None":
+    """Select the best agent backend for webapp generation.
+
+    Priority: copilot → claude → codex → sdk.
+    Returns None to let agent_call use its default priority order,
+    which is exactly copilot → claude → codex → sdk.
+    """
+    if not HAS_AGENT_CHANNEL:
+        return None
+    # Return None so agent_call uses its built-in priority order
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -340,6 +354,7 @@ def _agent_generate_js(
     """Have an AI agent generate JavaScript for a concept."""
     prompt = f"""\
 Generate a COMPLETE, self-contained JavaScript module for a web application.
+Output the code directly as text — do NOT create or write any files.
 
 APPLICATION CONTEXT: {app_prompt}
 
@@ -347,7 +362,7 @@ CONCEPT: {concept}
 WHAT TO BUILD: {description}
 
 REQUIREMENTS:
-- Write {target_lines}+ lines of real, working JavaScript
+- Output {target_lines}+ lines of real, working JavaScript
 - Wrap everything in an IIFE: (function() {{ 'use strict'; ... }})();
 - Export classes/functions to window.CT namespace: window.CT = window.CT || {{}};
 - NO external dependencies — pure vanilla JS
@@ -356,14 +371,20 @@ REQUIREMENTS:
 - Include error handling (try/catch where appropriate)
 - Code must be immediately runnable in a browser
 
-Write ONLY the JavaScript code. No explanations, no markdown fences."""
+Output ONLY the JavaScript code. No explanations, no markdown fences, no file operations."""
 
     section = agent_call(
         prompt,
         surface=SurfaceKind.CODE,
         coordinate=f"webapp.js.{concept}",
+        backend=_preferred_backend(),
         working_dir=working_dir,
     )
+
+    # Debug: show what the agent returned
+    print(f"  │    → agent backend={section.agent_backend.value}, "
+          f"content_len={len(section.content)}, "
+          f"first_60={section.content[:60]!r}")
 
     js = _extract_code_block(section.content, "javascript")
     if not js or len(js) < 50:
@@ -400,6 +421,7 @@ def _agent_generate_css(
     """Have an AI agent generate CSS for a concept."""
     prompt = f"""\
 Generate a COMPLETE CSS design system/stylesheet for a web application.
+Output the code directly as text — do NOT create or write any files.
 
 APPLICATION CONTEXT: {app_prompt}
 
@@ -407,7 +429,7 @@ CONCEPT: {concept}
 WHAT TO BUILD: {description}
 
 REQUIREMENTS:
-- Write {target_lines}+ lines of real, working CSS
+- Output {target_lines}+ lines of real, working CSS
 - Use CSS custom properties (--var-name) for theming
 - Include a CSS reset/normalize section
 - Include responsive breakpoints (@media queries for 480px, 768px, 1024px, 1440px)
@@ -417,12 +439,13 @@ REQUIREMENTS:
 - Dark theme by default with a polished, professional look
 - Include @keyframes animations (at least 15 different animations)
 
-Write ONLY the CSS code. No explanations, no markdown fences."""
+Output ONLY the CSS code. No explanations, no markdown fences, no file operations."""
 
     section = agent_call(
         prompt,
         surface=SurfaceKind.CODE,
         coordinate=f"webapp.css.{concept}",
+        backend=_preferred_backend(),
         working_dir=working_dir,
     )
 
@@ -455,13 +478,14 @@ def agent_generate_html(
 
     prompt = f"""\
 Generate a COMPLETE HTML5 document for a single-page web application.
+Output the code directly as text — do NOT create or write any files.
 
 APPLICATION: {app_title}
 DESCRIPTION: {app_prompt}
 FEATURES/CONCEPTS: {concept_list}
 
 REQUIREMENTS:
-- Write {int(target)}+ lines of semantic HTML5
+- Output {int(target)}+ lines of semantic HTML5
 - Include: navigation bar, hero section, main canvas area (with 4 layered canvases),
   game HUD overlay, action bar, sidebar panels, gallery section, tutorial section,
   settings section (with toggles/sliders), scores/leaderboard section, about section,
@@ -473,12 +497,13 @@ REQUIREMENTS:
 - Include meta viewport, charset, and Open Graph tags
 - Link to app.css and app.js (external files)
 
-Write ONLY the HTML code. No explanations, no markdown fences."""
+Output ONLY the HTML code. No explanations, no markdown fences, no file operations."""
 
     section = agent_call(
         prompt,
         surface=SurfaceKind.CODE,
         coordinate="webapp.html.shell",
+        backend=_preferred_backend(),
         working_dir=working_dir,
     )
 
@@ -522,6 +547,7 @@ def agent_enrich_js(
 
     prompt = f"""\
 Generate ADDITIONAL JavaScript code to add to an existing web application.
+Output the code directly as text — do NOT create or write any files.
 
 APPLICATION: {app_prompt}
 {existing_summary}
@@ -546,12 +572,13 @@ REQUIREMENTS:
 - Full JSDoc comments
 - Error handling throughout
 
-Write ONLY JavaScript code. No explanations, no markdown."""
+Output ONLY JavaScript code. No explanations, no markdown, no file operations."""
 
     section = agent_call(
         prompt,
         surface=SurfaceKind.CODE,
         coordinate="webapp.js.enrichment",
+        backend=_preferred_backend(),
         working_dir=working_dir,
     )
 
@@ -579,6 +606,7 @@ def agent_enrich_css(
 
     prompt = f"""\
 Generate ADDITIONAL CSS to add to an existing web application stylesheet.
+Output the code directly as text — do NOT create or write any files.
 
 APPLICATION: {app_prompt}
 EXISTING CSS: {existing_css.count(chr(10))+1} lines already written.
@@ -600,12 +628,13 @@ REQUIREMENTS:
 - {gap_lines}+ lines of real CSS — no stubs
 - Detailed section comments
 
-Write ONLY CSS code. No explanations, no markdown."""
+Output ONLY CSS code. No explanations, no markdown, no file operations."""
 
     section = agent_call(
         prompt,
         surface=SurfaceKind.CODE,
         coordinate="webapp.css.enrichment",
+        backend=_preferred_backend(),
         working_dir=working_dir,
     )
 

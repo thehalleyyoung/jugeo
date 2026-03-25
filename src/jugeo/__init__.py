@@ -30,6 +30,11 @@ try:
 except ImportError:  # pragma: no cover
     prove = bugs = equiv = ideate = carry = spec = research = None
 
+try:
+    from jugeo.moves import MoveEngine, MoveKind, MoveStatus, SemanticMove  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover
+    MoveEngine = MoveKind = MoveStatus = SemanticMove = None
+
 __all__ = [
     "GeometricSite",
     "TrustAlgebra",
@@ -44,6 +49,10 @@ __all__ = [
     "ideate",
     "carry",
     "research",
+    "MoveEngine",
+    "MoveKind",
+    "MoveStatus",
+    "SemanticMove",
 ]
 
 

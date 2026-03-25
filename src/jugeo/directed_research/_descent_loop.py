@@ -99,6 +99,8 @@ from jugeo.directed_research._code_gen import (
     write_pyproject,
     syntax_check_all,
     import_check,
+    ensure_dependencies,
+    read_dependencies_from_pyproject,
 )
 from jugeo.directed_research._benchmarking import (
     MetricFrontier,
@@ -117,6 +119,7 @@ from jugeo.directed_research._readme_gen import generate_readme
 from jugeo.directed_research._pivot import pivot_theory
 from jugeo.directed_research._workspace import build_workspace
 from jugeo.directed_research._provenance import ResearchProvenance
+from jugeo.directed_research._git_tracking import OutputRepoTracker
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
@@ -170,6 +173,7 @@ class DirectedResearch:
         self.workspace: Optional[WorkspaceSite] = None
         self.trust_manager = TrustManager()
         self.provenance = ResearchProvenance(prompt=prompt)
+        self.git_tracker = OutputRepoTracker(str(self.output_dir))
 
         # Accumulated sections and moves
         self.sections: list[LLMSection] = []
@@ -213,22 +217,27 @@ class DirectedResearch:
 
         # ── Phase 1: IDEATION ─────────────────────────────────────────
         self._log("═══ PHASE 1: IDEATION ═══")
+        self.git_tracker.commit_phase_boundary("IDEATION", f"Prompt: {self.prompt[:80]}...")
         self._phase_ideation()
 
         # ── Phase 2: SEED ─────────────────────────────────────────────
         self._log("═══ PHASE 2: SEED ═══")
+        self.git_tracker.commit_phase_boundary("SEED", "Domain analysis + theory elaboration")
         self._phase_seed()
 
         # ── Phase 3: GENERATE ─────────────────────────────────────────
         self._log("═══ PHASE 3: GENERATE ═══")
+        self.git_tracker.commit_phase_boundary("GENERATE", "Architecture design + module generation")
         self._phase_generate()
 
         # ── Phase 4: HARDEN (the descent loop) ────────────────────────
         self._log("═══ PHASE 4: HARDEN ═══")
+        self.git_tracker.commit_phase_boundary("HARDEN", "Descent loop: benchmark, verify, refine/pivot")
         status = self._phase_harden()
 
         # ── Phase 5: TAIL ─────────────────────────────────────────────
         self._log("═══ PHASE 5: TAIL ═══")
+        self.git_tracker.commit_phase_boundary("TAIL", "Paper + README + final verification")
         readme_report, paper_report = self._phase_tail()
 
         # ── Build final result ────────────────────────────────────────
@@ -238,6 +247,15 @@ class DirectedResearch:
         elapsed = time.time() - start
         self._save_metadata(status, elapsed)
         self.provenance.save(str(self.output_dir))
+        self.git_tracker.save_commit_log()
+        self.git_tracker.commit_move(
+            surface="LIFECYCLE", coordinate="research.complete",
+            trust=1.0, summary=f"Research complete: {status.value} in {elapsed:.1f}s",
+            phase="DONE",
+            extra_metadata={"status": status.value, "elapsed": elapsed,
+                            "sections": len(self.sections), "code_files": len(self.code_files)},
+        )
+        self._log(self.git_tracker.log_summary())
 
         return DirectedResearchResult(
             status=status,
@@ -558,27 +576,24 @@ Use this as the foundation for the domain analysis.
     # ══════════════════════════════════════════════════════════════════
 
     def _install_deps(self):
-        """Install the project's dependencies so benchmarks can run."""
+        """Install the project's dependencies so benchmarks can run.
+
+        Delegates to :func:`ensure_dependencies` in ``_code_gen`` — the
+        shared dependency installer used by all code-generating modules.
+        """
         self._log("  Installing dependencies...")
-        import subprocess as _sp
-        pkg = self.architecture.get("package_name", "")
         deps = self.domain_analysis.get("standard_libraries", [])
-        # pip install deps (best-effort, ignore failures on optional ones)
-        for dep in deps:
-            try:
-                _sp.run([sys.executable, "-m", "pip", "install", dep, "-q"],
-                       capture_output=True, timeout=120)
-            except Exception:
-                pass
-        # pip install the project itself in editable mode
-        pyproject = self.output_dir / "pyproject.toml"
-        if pyproject.exists():
-            try:
-                _sp.run([sys.executable, "-m", "pip", "install", "-e",
-                        str(self.output_dir), "-q"],
-                       capture_output=True, timeout=120)
-            except Exception:
-                pass
+        # Also pick up anything written into pyproject.toml by the agent
+        pyproject_deps = read_dependencies_from_pyproject(str(self.output_dir))
+        all_deps = list(dict.fromkeys(deps + pyproject_deps))  # dedupe, preserve order
+        results = ensure_dependencies(
+            all_deps,
+            project_dir=str(self.output_dir),
+        )
+        installed = sum(1 for v in results.values() if v)
+        failed = [k for k, v in results.items() if not v]
+        self._log(f"  Deps: {installed}/{len(results)} OK"
+                  + (f", failed: {failed}" if failed else ""))
 
     def _phase_harden(self) -> ResearchStatus:
         """The descent-driven hardening loop.
@@ -978,10 +993,33 @@ Use this as the foundation for the domain analysis.
     # ══════════════════════════════════════════════════════════════════
 
     def _record_section(self, section: LLMSection):
-        """Record a section and update provenance."""
+        """Record a section, update provenance, and commit to git."""
         self.sections.append(section)
         self.trust_manager.register_section(section)
         self.provenance.record_section(section)
+
+        # Git-track every semantic move
+        surface_name = section.surface.value if hasattr(section.surface, 'value') else str(section.surface)
+        summary = section.content[:120].replace('\n', ' ') if section.content else "(empty)"
+        self.git_tracker.commit_move(
+            surface=surface_name.upper(),
+            coordinate=section.coordinate,
+            trust=section.trust,
+            summary=summary,
+            phase=self._current_phase,
+            extra_metadata={"provenance": section.provenance},
+        )
+
+    @property
+    def _current_phase(self) -> str:
+        """Infer the current phase from state."""
+        if not self.architecture:
+            if not self.theory_text:
+                return "IDEATION"
+            return "SEED"
+        if not self.benchmark_results:
+            return "GENERATE"
+        return "HARDEN"
 
     def _rebuild_workspace(self):
         """Reconstruct the workspace site from all accumulated sections."""

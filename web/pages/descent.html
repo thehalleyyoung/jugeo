@@ -154,23 +154,33 @@
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.descent import LocalSection, GluingData, DescentEngine
-from jugeo.site import SemanticSite, SiteBuilder
+        <pre><code class="language-python">from jugeo.geometry.site import Coordinate, CoordinateKind
+from jugeo.geometry.covers import Cover
+from jugeo.geometry.descent import GluingData, LocalSection
 
-site = SiteBuilder().build_from_module("mymod")
-mod  = site.find("mymod", kind="MODULE")
-cover = site.topology.covering_family(mod)
+module = Coordinate(("mymod",), CoordinateKind.MODULE)
+left = Coordinate(("mymod", "validate"), CoordinateKind.FUNCTION)
+right = Coordinate(("mymod", "transform"), CoordinateKind.FUNCTION)
 
-# Prove the property locally on each element of the cover
-local_sections = []
-for coord in cover:
-    j = jugeo.verify_coordinate(coord, property="no_exceptions")
-    local_sections.append(LocalSection(coord=coord, judgment=j))
+cover = Cover(
+    target=module,
+    patches=(left, right),
+    overlaps=((left.key, right.key),),
+    provenance=("docs",),
+)
 
-# Assemble gluing data (checks pairwise intersection compatibility)
-gluing = GluingData.from_local_sections(local_sections, cover, site)
-print(gluing.is_compatible)  # True if all pairwise conditions hold
-print(gluing.conflicts)      # list of IntersectionConflict if any</code></pre>
+gluing = GluingData.from_cover(
+    cover,
+    {
+        left.key: {"pure": True, "throws": False},
+        right.key: {"pure": True, "throws": False},
+    },
+)
+
+print(gluing.patch_count())                    # 2
+print(gluing.verify_all_overlaps()[0].status)  # OverlapStatus.SATISFIED
+local = LocalSection(coordinate=left.key, judgment_data={"pure": True}, trust_level=0.9)
+print(local.summary())</code></pre>
       </div>
 
       <div class="section-divider"></div>
@@ -259,25 +269,29 @@ print(gluing.conflicts)      # list of IntersectionConflict if any</code></pre>
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.descent import DescentEngine, DescentStrategy
-
-engine = DescentEngine(
-    site=site,
-    strategy=DescentStrategy.EAGER,
-    property="pure",
+        <pre><code class="language-python">from jugeo.geometry.descent import (
+    DescentConfiguration,
+    DescentEngine,
+    DescentStrategy,
 )
 
-# Run descent on a module coordinate
-result = engine.run(mod)
+engine = DescentEngine(
+    configuration=DescentConfiguration(
+        strategy=DescentStrategy.EAGER,
+        record_log=False,
+    )
+)
 
-if result.succeeded:
-    global_section = result.global_section
-    print(global_section.judgment.trust)   # TrustLevel.SOLVER
-    print(global_section.judgment.formula) # IsPure(mymod)
-else:
-    print("Descent failed")
-    for conflict in result.conflicts:
-        print(f"  {conflict.coord_i} x {conflict.coord_j}: {conflict.reason}")</code></pre>
+report = engine.run(
+    cover,
+    {
+        left.key: {"pure": True},
+        right.key: {"pure": True},
+    },
+)
+
+print(report.success)        # True
+print(report.glued_section)  # {'pure': True}</code></pre>
       </div>
 
       <p>Inspecting local sections produced during descent:</p>
@@ -285,24 +299,22 @@ else:
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python"># Access individual local sections
-for ls in result.local_sections:
-    status = "OK" if ls.succeeded else "FAIL"
-    print(f"  [{status}] {ls.coord.qualified_name:40s}  trust={ls.judgment.trust}")
+        <pre><code class="language-python">print(report.target)         # mymod
+print(report.local_sections) # raw local data by patch
+print(report.obstructions)   # empty tuple when gluing succeeds
 
-# Access gluing data for a specific pair
-pair = result.gluing_data.intersection(cover[0], cover[1])
-print(pair.left_restriction)   # formula restricted from section 0
-print(pair.right_restriction)  # formula restricted from section 1
-print(pair.compatible)         # bool
+rich_result = engine.attempt_descent(
+    cover,
+    {
+        left.key: {"pure": True},
+        right.key: {"pure": False},
+    },
+)
 
-# Re-run with OPTIMISTIC strategy to see rollback in action
-engine2 = DescentEngine(site=site, strategy=DescentStrategy.OPTIMISTIC,
-                        property="no_io")
-result2 = engine2.run(mod)
-if result2.rolled_back:
-    print("Optimistic assumption failed, rolled back at:",
-          result2.rollback_reason)</code></pre>
+if rich_result.is_failure:
+    obstruction = rich_result.unwrap_obstruction()
+    print(obstruction.violation_count)
+    print(obstruction.violated_pairs())</code></pre>
       </div>
 
       <div class="section-divider"></div>

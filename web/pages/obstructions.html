@@ -247,24 +247,36 @@
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.obstructions import ObstructionClass, ObstructionDegree, Cochain
-
-# Typically produced by the descent engine, but you can build one manually
-obs = ObstructionClass(
-    degree=ObstructionDegree.H1,
-    coordinate=site.find("mymod.payments"),
-    cover=[site.find("mymod.payments.validate"),
-           site.find("mymod.payments.charge")],
-    failing_indices=[(0, 1)],
-    cochain=Cochain(degree=1, data={(0, 1): mismatch_formula}),
-    is_cocycle=True,
-    repair_hints=[],
-    backpressure_score=0.0,
+        <pre><code class="language-python">from jugeo.geometry.descent import (
+    CohomologyClass,
+    DescentObstruction,
+    OverlapCondition,
+    OverlapStatus,
+    RepairFrontier,
 )
 
-print(obs.degree)               # ObstructionDegree.H1
-print(obs.is_cocycle)           # True - genuine H1 obstruction
-print(obs.failing_indices)      # [(0, 1)]
+obs = DescentObstruction(
+    coordinate="mymod.payments",
+    violated_overlaps=(
+        OverlapCondition(
+            left_coordinate="mymod.payments.validate",
+            right_coordinate="mymod.payments.charge",
+            overlap_coordinate="mymod.payments.validate∩mymod.payments.charge",
+            status=OverlapStatus.VIOLATED,
+        ),
+    ),
+    repair_frontier=RepairFrontier(
+        missing_evidence=("spec:payments-charge",),
+        weakened_claims=("align validate/charge currency assumptions",),
+    ),
+    cohomology_class=CohomologyClass(
+        cocycle_data={"validate∩charge": {"currency": {"left": "USD", "right": "EUR"}}}
+    ),
+)
+
+print(obs.violation_count)
+print(obs.violated_pairs())
+print(obs.cohomology_class.cocycle_data)
 </code></pre>
       </div>
 
@@ -293,7 +305,7 @@ print(obs.failing_indices)      # [(0, 1)]
       <ul>
         <li>The frontier is the set of functions or classes that lack the required local section.</li>
         <li>JuGeo suggests adding or strengthening a postcondition annotation, or fixing the implementation to satisfy the required property.</li>
-        <li>Minimum effort: add a <code>@jugeo.ensures</code> annotation backed by a solver proof.</li>
+        <li>Minimum effort: tighten the local claim, re-run <code>jugeo prove</code>, and inspect the new obstruction data.</li>
       </ul>
 
       <p>For <strong>H&#x00B9; obstructions</strong>:</p>
@@ -313,19 +325,18 @@ print(obs.failing_indices)      # [(0, 1)]
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.obstructions import FrontierComputer
+        <pre><code class="language-python">from jugeo.geometry.descent import RepairFrontier
 
-fc = FrontierComputer(site=site, judgment_dag=dag)
-frontier = fc.compute(obs)
+frontier = RepairFrontier(
+    missing_evidence=("runtime trace:payments.validate",),
+    weakened_claims=("weaken charge() postcondition on accepted currencies",),
+    suggested_refinements=("split payments cover into auth/charge",),
+    estimated_cost=2.5,
+)
 
-print(f"Frontier size: {len(frontier.locations)}")
-for loc in frontier.locations:
-    print(f"  {loc.coordinate.qualified_name}")
-    print(f"    effort_estimate: {loc.effort_estimate}")
-    print(f"    repair_kind: {loc.repair_kind}")   # ADD_ANNOTATION | REWRITE | ADAPTER
-    for hint in loc.hints:
-        print(f"    hint: {hint.description}")
-        print(f"      at {hint.source_file}:{hint.line}")
+print(frontier.total_items())
+for category, item in frontier.prioritized_items():
+    print(category, item)
 </code></pre>
       </div>
 
@@ -353,7 +364,7 @@ for loc in frontier.locations:
         Edge weights \(w(f)\) depend on the morphism kind: direct call edges carry
         weight 1.0, import/module edges 0.5, and containment edges 0.8. Scores are
         normalised to \([0, 1]\) across the full obstruction report and displayed in
-        the <code>jugeo check</code> CLI output.
+        the <code>jugeo prove</code> CLI output.
       </p>
 
       <p>JuGeo recognises five canonical <em>backpressure families</em>, each suggesting a different response:</p>
@@ -406,24 +417,30 @@ for loc in frontier.locations:
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.obstructions import ObstructionReport, ObstructionDegree
-import jugeo
+        <pre><code class="language-python">from jugeo.geometry.covers import Cover
+from jugeo.geometry.descent import DescentEngine
+from jugeo.geometry.site import Coordinate, CoordinateKind
 
-# Run a module-wide verification and collect obstructions
-report = jugeo.analyze_module("mymod", property="pure")
+cover = Cover(
+    target=Coordinate("payments", kind=CoordinateKind.MODULE),
+    patches=(
+        Coordinate(("payments", "validate"), kind=CoordinateKind.FUNCTION),
+        Coordinate(("payments", "charge"), kind=CoordinateKind.FUNCTION),
+    ),
+    overlaps=(("payments/validate", "payments/charge"),),
+)
 
-print(f"Total obstructions: {len(report.obstructions)}")
-for obs in report.obstructions:
-    print(f"  {obs.degree.name:5s} | bp={obs.backpressure_score:.2f} | {obs.coordinate}")
+sections = {
+    "payments/validate": {"currency": "USD", "status": "ok"},
+    "payments/charge": {"currency": "EUR", "status": "ok"},
+}
 
-# Filter to H1 obstructions only
-h1 = [o for o in report.obstructions if o.degree == ObstructionDegree.H1]
-for obs in h1:
-    print(f"\nH1 obstruction at {obs.coordinate}")
-    print(f"  Conflicting pair: {obs.failing_indices}")
-    for hint in obs.repair_hints:
-        print(f"  Repair: {hint.description}")
-        print(f"    at {hint.source_file}:{hint.line}")
+result = DescentEngine().run(cover, sections).to_descent_result()
+obstruction = result.unwrap_obstruction()
+
+print(obstruction.violation_count)
+print(obstruction.violated_pairs())
+print(obstruction.cohomology_class.cocycle_data)
 </code></pre>
       </div>
 
@@ -432,29 +449,16 @@ for obs in h1:
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.obstructions import ObstructionRepairer, RepairStrategy
+        <pre><code class="language-python">import subprocess
 
-repairer = ObstructionRepairer(
-    strategy=RepairStrategy.ANNOTATION_FIRST,  # prefer annotations over rewrites
-    dry_run=True,   # preview changes without applying
+        completed = subprocess.run(
+            ["python3", "-m", "jugeo", "--format", "json", "repair", "payments.py"],
+    check=True,
+    capture_output=True,
+    text=True,
 )
 
-# Attempt to repair all H0 obstructions automatically
-h0_obs = [o for o in report.obstructions if o.degree == ObstructionDegree.H0]
-repair_plan = repairer.plan(h0_obs)
-
-for action in repair_plan.actions:
-    print(f"  {action.kind}: {action.description}")
-    print(f"    {action.file}:{action.line}")
-    if action.diff:
-        print(action.diff)
-
-# Apply the plan when satisfied
-repair_plan.apply()
-
-# Re-verify to confirm obstructions are resolved
-report2 = jugeo.analyze_module("mymod", property="pure")
-print(f"Remaining obstructions: {len(report2.obstructions)}")
+print(completed.stdout)
 </code></pre>
       </div>
 
@@ -463,27 +467,12 @@ print(f"Remaining obstructions: {len(report2.obstructions)}")
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python"># Access the raw Cech cochain for a H1 obstruction
-obs = h1[0]
-cochain = obs.cochain
-print(f"n-cochain degree: {cochain.degree}")  # 1
+        <pre><code class="language-python">cohomology = obstruction.cohomology_class
 
-# The cochain maps each pair (i, j) -> mismatch formula
-for (i, j), mismatch in cochain.items():
-    print(f"  ({obs.cover[i].name}, {obs.cover[j].name})")
-    print(f"    left  restriction: {mismatch.left}")
-    print(f"    right restriction: {mismatch.right}")
-    print(f"    is_cocycle: {obs.is_cocycle}")
-
-# Check if the obstruction is in the image of d^0 (resolvable by reordering)
-from jugeo.obstructions import CechComplex
-cx = CechComplex(site=site, cover=obs.cover, sheaf="judgment")
-print(cx.is_coboundary(cochain))  # True => resolvable without code changes
-
-# Get the full backpressure report sorted by severity
-bp_report = report.backpressure_summary()
-for entry in bp_report.sorted_by_severity():
-    print(f"  [{entry.family}] {entry.obstruction.coordinate} bp={entry.score:.3f}")
+print(cohomology.dimension)
+print(cohomology.rank)
+print(cohomology.is_trivial())
+print(cohomology.cocycle_data)
 </code></pre>
       </div>
 

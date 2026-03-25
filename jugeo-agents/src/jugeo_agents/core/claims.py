@@ -59,7 +59,7 @@ try:
     from spacy.tokens import Doc, Span, Token  # type: ignore[import-untyped]
 
     _HAS_SPACY = True
-except ImportError:  # pragma: no cover
+except Exception:  # pragma: no cover
     _HAS_SPACY = False
     spacy = None  # type: ignore[assignment]
     Doc = Any  # type: ignore[assignment,misc]

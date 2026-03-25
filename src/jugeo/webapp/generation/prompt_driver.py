@@ -44,10 +44,10 @@ try:
         agent_generate_html,
         agent_enrich_js,
         agent_enrich_css,
-        HAS_AGENT_CHANNEL,
+        HAS_AGENT_CHANNEL as _HAS_AGENTS,
     )
 except ImportError:
-    HAS_AGENT_CHANNEL = False
+    _HAS_AGENTS = False
 from .copilot_driver import (
     CopilotGenerationDriver,
     FiberKind,
@@ -159,7 +159,7 @@ class PromptToApp:
         # obligation presheaf governs descent — if output falls short, the
         # enricher makes additional agent calls.
         scale = scale_for_obligations(self.obligations)
-        use_agents = HAS_AGENT_CHANNEL if 'HAS_AGENT_CHANNEL' in dir() else False
+        use_agents = _HAS_AGENTS
         mode = "agent-driven" if use_agents else "template"
         print(f"  ┌─ PromptToApp: {self.prompt[:60]}...")
         print(f"  ├─ Concepts: {', '.join(c.name for c in self.concepts.concepts)}")

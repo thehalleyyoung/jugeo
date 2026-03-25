@@ -255,7 +255,7 @@ def _call_claude(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
     """Dispatch to Claude Code CLI.
 
     Claude Code is invoked with -p (print mode) for non-interactive use.
-    It has deep reasoning capabilities and full tool access.
+    No timeout — large code generation can take several minutes.
     """
     text = ""
     files_touched: list[str] = []
@@ -263,7 +263,10 @@ def _call_claude(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
 
     for attempt in range(config.max_retries):
         try:
-            cmd = ["claude", "-p", config.prompt, "--output-format", "text"]
+            cmd = [
+                "claude", "-p", config.prompt,
+                "--output-format", "text",
+            ]
             if config.working_dir:
                 cmd.extend(["--cwd", config.working_dir])
             commands_run.append("claude -p ...")
@@ -352,6 +355,26 @@ _AGENT_DISPATCHERS = {
 }
 
 
+def _looks_like_code(text: str) -> bool:
+    """Check if text looks like actual source code rather than narration.
+
+    Returns True if the text contains code-like tokens: function definitions,
+    class declarations, variable declarations, imports, braces, etc.
+    This prevents agent narration/error messages from being accepted as code.
+    """
+    code_indicators = [
+        "function", "class ", "const ", "let ", "var ", "return ",
+        "import ", "from ", "def ", "if (", "for (", "while (",
+        "this.", "self.", "window.", "document.", "module.",
+        "{", "=>", "/**", "# ", "//", "/*",
+        "<!DOCTYPE", "<html", "<div", "<section",
+        ":root", "@media", "@keyframes", ".ct-",
+    ]
+    # Require at least 3 different code indicators
+    found = sum(1 for ind in code_indicators if ind in text)
+    return found >= 3
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  The unified agent call — THE interface between agents and geometry
 # ═══════════════════════════════════════════════════════════════════════
@@ -430,12 +453,17 @@ def agent_call(
             continue
 
         text, files_touched, commands_run = dispatcher(config)
-        if text and len(text) > 20:
+        # Require substantive output — not just narration or error text.
+        # A valid code response should be at least 100 chars and contain
+        # code-like tokens (function/class/var/const/def/import/return/{).
+        if text and len(text) > 100 and _looks_like_code(text):
             used_backend = be
             break
+        # If this backend returned something short/non-code, try next
+        text = ""
 
     # If nothing worked, produce a placeholder
-    if not text or len(text) <= 20:
+    if not text or len(text) <= 100:
         text = f"[Agent unavailable — {prompt[:80]}...]"
 
     elapsed = time.time() - t0

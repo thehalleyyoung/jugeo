@@ -16,6 +16,17 @@ if str(SRC) not in sys.path:
 import jugeo  # noqa: E402,F401
 import jugeo.ideation  # noqa: E402,F401
 import jugeo.ideation.semantic_futures  # noqa: E402,F401
+import jugeo.webapp  # noqa: E402,F401
+import jugeo.webapp.site  # noqa: E402,F401
+import jugeo.webapp.generation  # noqa: E402,F401
+import jugeo.webapp.dom  # noqa: E402,F401
+import jugeo.webapp.ideation  # noqa: E402,F401
+import jugeo.webapp.evidence  # noqa: E402,F401
+import jugeo.webapp.trust  # noqa: E402,F401
+import jugeo.webapp.fibered  # noqa: E402,F401
+import jugeo.webapp.verification  # noqa: E402,F401
+import jugeo.webapp.cohomology  # noqa: E402,F401
+import jugeo.orchestration.large_scale  # noqa: E402,F401
 
 
 def _patch_test_integration_helper(module: Any) -> None:

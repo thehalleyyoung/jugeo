@@ -255,80 +255,59 @@
       <h2 id="python-api">Python API</h2>
 
       <p>
-        The <code>jugeo.core.judgment</code> module provides the <code>Judgment</code>
-        dataclass and factory functions. Judgments are normally created via the
-        high-level <code>jugeo.verify()</code> entry point, but can also be constructed
-        directly for testing or introspection.
+        The most stable public entry point for judgment-level work is
+        <code>jugeo.easy</code>, which runs the real CLI and returns structured results.
+        For lower-level introspection, the public geometry and trust modules expose the
+        coordinate, morphism, and trust primitives that these judgments sit on top of.
       </p>
 
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.core.judgment import Judgment, Budget, TrustLevel
-from jugeo.core.coordinate import Coordinate, CoordinateKind
-from jugeo.core.formula import Formula
+        <pre><code class="language-python">from jugeo.easy import prove
 
-# Build a coordinate for a function
-coord = Coordinate(
-    kind=CoordinateKind.FUNCTION,
-    qualified_name="mymod.sum_positive",
-    source_span=(10, 25),
+result = prove(
+    """
+def sum_positive(xs: list[int]) -> int:
+    return sum(x for x in xs if x > 0)
+"""
 )
 
-# Construct a formula asserting purity
-formula = Formula.parse("IsPure(mymod.sum_positive)")
-
-# Create a judgment with a 2-second solver budget
-j = Judgment(
-    coordinate=coord,
-    formula=formula,
-    antecedents=frozenset(),
-    evidence=None,          # not yet evidenced
-    obligations={formula},  # still open
-    budget=Budget(solver_ms=2000, token_budget=0),
-    trust=TrustLevel.NONE,
-    provenance=None,        # auto-filled on save
-)
-
-print(j)
-# Judgment(coord=FUNCTION:mymod.sum_positive, trust=NONE, obligations=1)</code></pre>
+print(result.verdict)      # verified / obstructed
+print(result.trust)        # e.g. SOLVER_DISCHARGED
+print(result.H1)           # 0 means descent succeeded
+print(result.propositions) # (discharged, total)</code></pre>
       </div>
 
       <p>
-        The preferred way to obtain an evidenced judgment is via <code>jugeo.verify()</code>
-        which orchestrates evidence gathering and sets the trust level automatically:
+        The public API follows the same rule as the internal judgment algebra:
+        trust is conservative. When two sources of evidence are combined, the result
+        takes the meet of their trust levels.
       </p>
 
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">import jugeo
+        <pre><code class="language-python">from jugeo.evidence.trust import TrustAlgebra, TrustLevel
 
-def sum_positive(xs: list[int]) -> int:
-    return sum(x for x in xs if x > 0)
+algebra = TrustAlgebra()
 
-# Verify purity — JuGeo picks the best available channel
-result = jugeo.verify(sum_positive, property="pure")
-print(result.trust)        # TrustLevel.SOLVER  (if z3 is available)
-print(result.obligations)  # frozenset()         (fully discharged)
-print(result.evidence)     # EvidenceBundle with 1 SOLVER item
+solver_checked = TrustLevel.SOLVER_DISCHARGED
+copilot_hint = TrustLevel.COPILOT_SUGGESTED
 
-# Access individual components
-j = result.judgment
-print(j.coordinate.kind)          # CoordinateKind.FUNCTION
-print(j.formula)                  # IsPure(sum_positive)
-print(j.budget.solver_ms)         # 2000 (default)
-print(j.provenance.agent_id)      # 'jugeo-kernel-0.9.0'</code></pre>
+combined = algebra.meet(solver_checked, copilot_hint)
+print(combined)  # TrustLevel.COPILOT_SUGGESTED
+
+promoted = algebra.promote(TrustLevel.UNVERIFIED, "confirmed by an explicit review step")
+print(promoted)</code></pre>
       </div>
 
       <div class="callout callout-note">
         <div class="callout-icon">&#128270;</div>
         <div class="callout-body">
-          <p><strong>Immutability.</strong> <code>Judgment</code> instances are frozen
-          dataclasses. Operations like <code>compose()</code>, <code>restrict()</code>,
-          and <code>transport()</code> always return <em>new</em> judgment objects rather
-          than mutating existing ones. This makes it safe to store judgments in sets and
-          use them as dictionary keys.</p>
+          <p><strong>Immutability.</strong> The public geometry and trust types are immutable
+          dataclasses and enums. Operations like coordinate restriction, morphism reversal,
+          and trust composition return <em>new</em> values rather than mutating existing ones.</p>
         </div>
       </div>
 
@@ -357,16 +336,22 @@ print(j.provenance.agent_id)      # 'jugeo-kernel-0.9.0'</code></pre>
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.core.judgment import compose
+        <pre><code class="language-python">from jugeo.easy import prove
+from jugeo.evidence.trust import TrustAlgebra, TrustLevel
 
-j_pure   = jugeo.verify(sum_positive, property="pure")
-j_total  = jugeo.verify(sum_positive, property="total")
+proof = prove(
+    """
+def add(x: int, y: int) -> int:
+    return x + y
+"""
+)
 
-# Compose: the result is pure AND total, with trust = min(T1, T2)
-j_both = compose(j_pure, j_total)
-print(j_both.formula)   # IsPure(sum_positive) ∧ Terminates(sum_positive)
-print(j_both.trust)     # TrustLevel.SOLVER (assuming both were SOLVER)
-print(len(j_both.antecedents))  # 2</code></pre>
+algebra = TrustAlgebra()
+judgment_trust = TrustLevel.from_label(proof.trust)
+combined_trust = algebra.meet(judgment_trust, TrustLevel.HUMAN_ATTESTED)
+
+print(judgment_trust)
+print(combined_trust)</code></pre>
       </div>
 
       <div class="section-divider"></div>
@@ -406,23 +391,23 @@ print(len(j_both.antecedents))  # 2</code></pre>
       <div class="code-block">
         <span class="code-lang">python</span>
         <button class="copy-btn">Copy</button>
-        <pre><code class="language-python">from jugeo.core.judgment import restrict, transport
-from jugeo.site import get_morphism
+        <pre><code class="language-python">from jugeo.geometry.site import Coordinate, CoordinateKind, Morphism, MorphismKind
 
-# Restriction: take a module-level judgment and restrict to a function
-j_module = jugeo.verify_module("mymod", property="no_io")
+module = Coordinate(("mymod",), CoordinateKind.MODULE)
+fn = Coordinate(("mymod", "sum_positive"), CoordinateKind.FUNCTION)
+renamed = Coordinate(("mymod", "add_positives"), CoordinateKind.FUNCTION)
 
-fn_coord = Coordinate(kind=CoordinateKind.FUNCTION,
-                      qualified_name="mymod.sum_positive")
-j_fn = restrict(j_module, fn_coord)
-print(j_fn.coordinate)  # FUNCTION:mymod.sum_positive
-print(j_fn.trust)       # same as j_module.trust
+print(module.is_prefix_of(fn))  # True: function is a restriction of the module
 
-# Transport: after renaming sum_positive -> add_positives
-rename_morphism = get_morphism("mymod.sum_positive", "mymod.add_positives",
-                               kind="rename")
-j_renamed = transport(j_fn, rename_morphism)
-print(j_renamed.coordinate.qualified_name)  # mymod.add_positives</code></pre>
+rename = Morphism(
+    source=fn,
+    target=renamed,
+    kind=MorphismKind.TRANSPORT,
+    label="rename",
+)
+
+print(rename.is_invertible())        # True
+print(rename.reversed().source.name) # mymod.add_positives</code></pre>
       </div>
 
       <div class="section-divider"></div>
