@@ -410,6 +410,7 @@ def agent_call(
     timeout: Optional[int] = None,
     model: str = "claude-sonnet-4.6",
     context_files: Optional[list[str]] = None,
+    expect_json: bool = False,
 ) -> LLMSection:
     """Call a coding agent and return a typed, trust-annotated section.
 
@@ -474,18 +475,28 @@ def agent_call(
         log.info("agent: trying %s for %s", be.value, coordinate)
         text, files_touched, commands_run = dispatcher(config)
         # Require substantive output — not just narration or error text.
-        if text and len(text) > 100 and _looks_like_code(text):
+        # For JSON-expected calls, accept anything with a JSON object;
+        # for code calls, require code-like tokens.
+        if text and len(text) > 10:
+            if expect_json:
+                acceptable = "{" in text
+            else:
+                acceptable = len(text) > 100 and _looks_like_code(text)
+        else:
+            acceptable = False
+
+        if acceptable:
             used_backend = be
             log.info("agent: %s succeeded: %d chars, %d lines",
                       be.value, len(text), text.count("\n"))
             break
         # If this backend returned something short/non-code, try next
-        reason = "empty" if not text else f"too short ({len(text)})" if len(text) <= 100 else "not code"
+        reason = "empty" if not text else f"too short ({len(text)})" if len(text) <= 10 else ("no JSON" if expect_json else "not code")
         log.info("agent: %s failed: %s", be.value, reason)
         text = ""
 
     # If nothing worked, produce a placeholder
-    if not text or len(text) <= 100:
+    if not text or (not expect_json and len(text) <= 100):
         text = f"[Agent unavailable — {prompt[:80]}...]"
 
     elapsed = time.time() - t0
@@ -514,7 +525,7 @@ def agent_json(
     the result. Falls back to regex extraction if direct parsing fails.
     """
     full_prompt = prompt + "\n\nRespond with ONLY valid JSON, no markdown fences."
-    section = agent_call(full_prompt, **kwargs)
+    section = agent_call(full_prompt, expect_json=True, **kwargs)
     text = section.content.strip()
 
     # Strip markdown fences
