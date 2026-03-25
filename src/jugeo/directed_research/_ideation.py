@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
 from jugeo.research_orchestration import SurfaceKind
@@ -232,30 +233,51 @@ Respond as JSON:
     # Sort by pairing score
     scored.sort(key=lambda x: _compute_pairing_score(x[2]), reverse=True)
 
-    # Step 3: Validate top candidates via descent (try to falsify morphisms)
-    validated: list[tuple[str, ExcessNoveltyFraction]] = []
-    for name, desc, enf in scored[:n_candidates + 2]:  # try a couple extra
+    # Step 3: Validate top candidates via descent IN PARALLEL.
+    # Each validation is independent — discovering morphisms and attempting
+    # falsification for one pairing doesn't affect another.
+    to_validate = scored[:n_candidates + 2]  # try a couple extra
+
+    def _validate_one(
+        name: str, desc: str, enf: ExcessNoveltyFraction,
+    ) -> tuple[str, ExcessNoveltyFraction, bool, str]:
         if verbose:
             print(f"  Validating pairing: {primary_domain.name} × {name}...", flush=True)
         valid, morphisms, reason = _validate_pairing_via_descent(
             primary_domain, name, desc, problem, problem_locus)
-        if valid:
-            # Update strength based on actual discovered morphisms
-            if morphisms:
-                actual_strength = sum(m.strength for m in morphisms) / len(morphisms)
-                enf = ExcessNoveltyFraction(
-                    domain_1=enf.domain_1, domain_2=enf.domain_2,
-                    enf=enf.enf, avg_morphism_strength=actual_strength,
-                    semantic_distance=enf.semantic_distance, verdict="productive",
-                )
-            validated.append((name, enf))
-            if verbose:
-                print(f"    ✓ SURVIVED descent (strength={enf.avg_morphism_strength:.2f})", flush=True)
-            if len(validated) >= n_candidates:
-                break
-        else:
-            if verbose:
-                print(f"    ✗ FAILED descent: {reason}", flush=True)
+        if valid and morphisms:
+            actual_strength = sum(m.strength for m in morphisms) / len(morphisms)
+            enf = ExcessNoveltyFraction(
+                domain_1=enf.domain_1, domain_2=enf.domain_2,
+                enf=enf.enf, avg_morphism_strength=actual_strength,
+                semantic_distance=enf.semantic_distance, verdict="productive",
+            )
+        return name, enf, valid, reason
+
+    validated: list[tuple[str, ExcessNoveltyFraction]] = []
+    with ThreadPoolExecutor(max_workers=min(len(to_validate), 4)) as pool:
+        futures = [
+            pool.submit(_validate_one, name, desc, enf)
+            for name, desc, enf in to_validate
+        ]
+        for future in as_completed(futures):
+            try:
+                name, enf, valid, reason = future.result()
+                if valid:
+                    validated.append((name, enf))
+                    if verbose:
+                        print(f"    ✓ {name} SURVIVED descent "
+                              f"(strength={enf.avg_morphism_strength:.2f})", flush=True)
+                else:
+                    if verbose:
+                        print(f"    ✗ {name} FAILED descent: {reason}", flush=True)
+            except Exception as exc:
+                if verbose:
+                    print(f"    ✗ Validation error: {exc}", flush=True)
+
+    # Re-sort validated by pairing score (parallel completion order is arbitrary)
+    validated.sort(key=lambda x: _compute_pairing_score(x[1]), reverse=True)
+    validated = validated[:n_candidates]
 
     # If no candidates survived, fall back to the top-scored unvalidated one
     if not validated and scored:
@@ -753,49 +775,70 @@ Respond as JSON:
 
     # Step 5–6: For EACH surviving partner, discover morphisms and search H^1.
     # This is the tournament: we don't commit to one partner upfront.
-    # Instead we explore the top N partners' H^1 fibers and pick the
-    # globally best bridge proposition across all of them.
+    # Instead we explore the top N partners' H^1 fibers IN PARALLEL and pick
+    # the globally best bridge proposition across all of them.
+    #
+    # Geometric justification for parallelism: each partner's search space
+    # Φ_p(D_2) = H¹(Loc(p) × D_2, S) ∩ {σ_p ≠ 0} is independent — the
+    # fiber products don't interact until the tournament (Theorem 9.3).
     all_propositions: list[BridgeProposition] = []
     all_morphisms: list[MethodologicalTranslation] = []
     partner_morphism_map: dict[str, list[MethodologicalTranslation]] = {}
     n_explore = min(len(partner_candidates), 3)  # explore top 3
 
-    for i, (partner_name, partner_enf) in enumerate(partner_candidates[:n_explore]):
+    def _explore_partner(
+        idx: int,
+        partner_name: str,
+        partner_enf: ExcessNoveltyFraction,
+    ) -> tuple[str, list[MethodologicalTranslation], list[BridgeProposition]]:
+        """Explore one partner: morphisms → H¹ search. Thread-safe (subprocess agents)."""
         partner_desc = partner_enf.domain_2
-
         if verbose:
-            print(f"IDEATION: [{i+1}/{n_explore}] Exploring partner "
+            print(f"IDEATION: [{idx+1}/{n_explore}] Exploring partner "
                   f"'{partner_name}' (ENF={partner_enf.enf:.2f}, "
                   f"strength={partner_enf.avg_morphism_strength:.2f})...",
                   flush=True)
 
-        # Step 5a: Discover morphisms for this partner
         morphisms = discover_cross_domain_morphisms(
             primary, partner_name, partner_desc, locus)
-        partner_morphism_map[partner_name] = morphisms
-        all_morphisms.extend(morphisms)
 
         if not morphisms:
             if verbose:
                 print(f"  ✗ No morphisms found for {partner_name}", flush=True)
-            continue
+            return partner_name, [], []
 
         if verbose:
-            print(f"  Found {len(morphisms)} morphisms "
+            print(f"  [{partner_name}] {len(morphisms)} morphisms "
                   f"(avg strength={sum(m.strength for m in morphisms)/len(morphisms):.2f})",
                   flush=True)
 
-        # Step 6a: Search H^1 for this partner
         propositions = search_h1_fiber(
             primary, partner_name, partner_desc,
             morphisms, problem, locus, n_propositions=n_propositions)
-        all_propositions.extend(propositions)
 
         if verbose:
             for bp in propositions[:2]:
-                print(f"  Bridge: {bp.title} "
+                print(f"  [{partner_name}] Bridge: {bp.title} "
                       f"(UNS={bp.useful_novelty_score:.2f}, "
                       f"covdim={bp.covering_dimension})", flush=True)
+
+        return partner_name, morphisms, propositions
+
+    with ThreadPoolExecutor(max_workers=n_explore) as pool:
+        futures = {
+            pool.submit(_explore_partner, i, name, enf): name
+            for i, (name, enf) in enumerate(partner_candidates[:n_explore])
+        }
+        for future in as_completed(futures):
+            partner_name = futures[future]
+            try:
+                name, morphisms, propositions = future.result()
+                partner_morphism_map[name] = morphisms
+                all_morphisms.extend(morphisms)
+                all_propositions.extend(propositions)
+            except Exception as exc:
+                if verbose:
+                    print(f"  ✗ Partner '{partner_name}' failed: {exc}", flush=True)
 
     # Step 7: Tournament — select the best approach across ALL partners.
     # Scoring: UNS * min(covdim, 15) (Theorem 10.4: useful, novel, AND substantial).
