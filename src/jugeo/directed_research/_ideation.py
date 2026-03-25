@@ -236,11 +236,13 @@ Respond as JSON:
     # Step 3: Validate top candidates via descent IN PARALLEL.
     # Each validation is independent — discovering morphisms and attempting
     # falsification for one pairing doesn't affect another.
-    to_validate = scored[:n_candidates + 2]  # try a couple extra
+    # We CACHE the morphisms found during validation to avoid re-discovering
+    # them in the exploration phase (saves 1 agent call per surviving partner).
+    to_validate = scored[:n_candidates]  # validate exactly top N
 
     def _validate_one(
         name: str, desc: str, enf: ExcessNoveltyFraction,
-    ) -> tuple[str, ExcessNoveltyFraction, bool, str]:
+    ) -> tuple[str, ExcessNoveltyFraction, bool, str, list[MethodologicalTranslation]]:
         if verbose:
             print(f"  Validating pairing: {primary_domain.name} × {name}...", flush=True)
         valid, morphisms, reason = _validate_pairing_via_descent(
@@ -252,9 +254,10 @@ Respond as JSON:
                 enf=enf.enf, avg_morphism_strength=actual_strength,
                 semantic_distance=enf.semantic_distance, verdict="productive",
             )
-        return name, enf, valid, reason
+        return name, enf, valid, reason, morphisms
 
     validated: list[tuple[str, ExcessNoveltyFraction]] = []
+    cached_morphisms: dict[str, list[MethodologicalTranslation]] = {}
     with ThreadPoolExecutor(max_workers=min(len(to_validate), 4)) as pool:
         futures = [
             pool.submit(_validate_one, name, desc, enf)
@@ -262,9 +265,10 @@ Respond as JSON:
         ]
         for future in as_completed(futures):
             try:
-                name, enf, valid, reason = future.result()
+                name, enf, valid, reason, morphisms = future.result()
                 if valid:
                     validated.append((name, enf))
+                    cached_morphisms[name] = morphisms
                     if verbose:
                         print(f"    ✓ {name} SURVIVED descent "
                               f"(strength={enf.avg_morphism_strength:.2f})", flush=True)
@@ -284,7 +288,7 @@ Respond as JSON:
         name, desc, enf = scored[0]
         validated.append((name, enf))
 
-    return validated
+    return validated, cached_morphisms
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -884,7 +888,7 @@ Respond as JSON:
 def run_ideation(
     prompt: str,
     *,
-    n_partner_candidates: int = 5,
+    n_partner_candidates: int = 3,
     n_propositions: int = 5,
     n_idea_sources: int = 3,
     verbose: bool = False,
@@ -943,7 +947,7 @@ Respond as JSON:
     # Step 4: Select partner domains (descent-validated)
     if verbose:
         print("IDEATION: Selecting partner domains...", flush=True)
-    partner_candidates = select_partner_domains(
+    partner_candidates, cached_morphisms = select_partner_domains(
         primary, problem, locus, n_candidates=n_partner_candidates, verbose=verbose)
 
     if not partner_candidates:
@@ -951,11 +955,11 @@ Respond as JSON:
             domain_1=primary.name, domain_2="optimization",
             enf=0.5, avg_morphism_strength=0.5,
             semantic_distance=3.0, verdict="fallback"))]
+        cached_morphisms = {}
 
-    # Step 5–6: For EACH surviving partner, discover morphisms and search H^1.
-    # This is the tournament: we don't commit to one partner upfront.
-    # Instead we explore the top N partners' H^1 fibers IN PARALLEL and pick
-    # the globally best bridge proposition across all of them.
+    # Step 5–6: For EACH surviving partner, search H^1 (reusing cached morphisms).
+    # Morphisms were already discovered during validation — no need to re-discover.
+    # Only the H¹ search is new. This halves the per-partner agent call count.
     #
     # Geometric justification for parallelism: each partner's search space
     # Φ_p(D_2) = H¹(Loc(p) × D_2, S) ∩ {σ_p ≠ 0} is independent — the
@@ -970,7 +974,7 @@ Respond as JSON:
         partner_name: str,
         partner_enf: ExcessNoveltyFraction,
     ) -> tuple[str, list[MethodologicalTranslation], list[BridgeProposition]]:
-        """Explore one partner: morphisms → H¹ search. Thread-safe (subprocess agents)."""
+        """Explore one partner: reuse cached morphisms → H¹ search."""
         partner_desc = partner_enf.domain_2
         if verbose:
             print(f"IDEATION: [{idx+1}/{n_explore}] Exploring partner "
@@ -978,8 +982,11 @@ Respond as JSON:
                   f"strength={partner_enf.avg_morphism_strength:.2f})...",
                   flush=True)
 
-        morphisms = discover_cross_domain_morphisms(
-            primary, partner_name, partner_desc, locus)
+        # Reuse morphisms from validation; only re-discover if cache miss
+        morphisms = cached_morphisms.get(partner_name)
+        if morphisms is None:
+            morphisms = discover_cross_domain_morphisms(
+                primary, partner_name, partner_desc, locus)
 
         if not morphisms:
             if verbose:

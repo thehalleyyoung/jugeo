@@ -171,6 +171,25 @@ class AgentCallConfig:
     context_files: list[str] = field(default_factory=list)
 
 
+def _prompt_to_file_if_long(prompt: str, label: str = "prompt") -> tuple[str, str | None]:
+    """If prompt > 2000 chars, write to a temp .md and return a short reference.
+
+    Returns (effective_prompt, temp_file_path_or_None).
+    """
+    if len(prompt) <= 2000:
+        return prompt, None
+    import tempfile
+    h = hashlib.sha256(prompt.encode()).hexdigest()[:10]
+    path = os.path.join(tempfile.gettempdir(), f"jugeo_{label}_{h}.md")
+    with open(path, "w") as f:
+        f.write(prompt)
+    short = (
+        f"Read the full prompt at {path} and follow its instructions exactly. "
+        f"Respond with ONLY the requested output, no commentary."
+    )
+    return short, path
+
+
 def _call_copilot(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
     """Dispatch to GitHub Copilot CLI.
 
@@ -178,7 +197,8 @@ def _call_copilot(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
     --allow-all-tools to avoid slow codebase scanning. For file-write
     tasks, full tool access is enabled.
 
-    Returns (text, files_touched, commands_run).
+    Long prompts (>2000 chars) are written to a temp file and referenced
+    by path to avoid shell argument limits and improve speed.
     """
     prompt_hash = hashlib.sha256(config.prompt.encode()).hexdigest()[:12]
     text = ""
@@ -195,14 +215,16 @@ def _call_copilot(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
                     f"Write the following content to {out_path} — write ONLY the "
                     f"requested content, no explanations:\n\n{config.prompt}"
                 )
+                effective, _ = _prompt_to_file_if_long(file_prompt, "copilot")
                 cmd = [
-                    "copilot", "-p", file_prompt,
+                    "copilot", "-p", effective,
                     "--model", config.model,
                     "--allow-all-tools", "--allow-all-paths",
                 ]
             else:
+                effective, _ = _prompt_to_file_if_long(config.prompt, "copilot")
                 cmd = [
-                    "copilot", "-p", config.prompt,
+                    "copilot", "-p", effective,
                     "--model", config.model,
                 ]
 
@@ -214,12 +236,10 @@ def _call_copilot(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
 
             commands_run.append("copilot -p ...")
 
-            timeout = 300
             r = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
                 cwd=config.working_dir,
-                timeout=timeout,
             )
 
             # Check output file if one was specified
@@ -238,14 +258,6 @@ def _call_copilot(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
                 if len(cleaned) > 20:
                     text = cleaned
                     break
-        except subprocess.TimeoutExpired as te:
-            # Capture partial output from timed-out process
-            partial = (te.stdout or "") if isinstance(te.stdout, str) else ""
-            if partial:
-                cleaned = _clean_agent_output(partial)
-                if len(cleaned) > 100 and _looks_like_code(cleaned):
-                    text = cleaned
-                    break
         except Exception:
             pass
         if attempt < config.max_retries - 1:
@@ -258,7 +270,7 @@ def _call_claude(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
     """Dispatch to Claude Code CLI.
 
     Claude Code is invoked with -p (print mode) for non-interactive use.
-    No timeout — large code generation can take several minutes.
+    Long prompts written to temp files.
     """
     text = ""
     files_touched: list[str] = []
@@ -266,8 +278,9 @@ def _call_claude(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
 
     for attempt in range(config.max_retries):
         try:
+            effective, _ = _prompt_to_file_if_long(config.prompt, "claude")
             cmd = [
-                "claude", "-p", config.prompt,
+                "claude", "-p", effective,
                 "--output-format", "text",
             ]
             if config.working_dir:
@@ -278,7 +291,6 @@ def _call_claude(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
                 cmd,
                 capture_output=True, text=True,
                 cwd=config.working_dir,
-                timeout=300,
             )
 
             if r.returncode == 0 and r.stdout.strip():
@@ -287,13 +299,6 @@ def _call_claude(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
                     text = cleaned
                     break
 
-        except subprocess.TimeoutExpired as te:
-            partial = (te.stdout or "") if isinstance(te.stdout, str) else ""
-            if partial:
-                cleaned = _clean_agent_output(partial)
-                if len(cleaned) > 100 and _looks_like_code(cleaned):
-                    text = cleaned
-                    break
         except Exception:
             pass
         if attempt < config.max_retries - 1:
@@ -306,6 +311,7 @@ def _call_codex(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
     """Dispatch to OpenAI Codex CLI.
 
     Codex is invoked with --full-auto for autonomous operation.
+    Long prompts written to temp files.
     """
     text = ""
     files_touched: list[str] = []
@@ -313,26 +319,19 @@ def _call_codex(config: AgentCallConfig) -> tuple[str, list[str], list[str]]:
 
     for attempt in range(config.max_retries):
         try:
-            cmd = ["codex", "--full-auto", config.prompt]
+            effective, _ = _prompt_to_file_if_long(config.prompt, "codex")
+            cmd = ["codex", "--full-auto", effective]
             commands_run.append("codex --full-auto ...")
 
             r = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
                 cwd=config.working_dir,
-                timeout=300,
             )
 
             if r.returncode == 0 and r.stdout.strip():
                 cleaned = _clean_agent_output(r.stdout)
                 if len(cleaned) > 20:
-                    text = cleaned
-                    break
-        except subprocess.TimeoutExpired as te:
-            partial = (te.stdout or "") if isinstance(te.stdout, str) else ""
-            if partial:
-                cleaned = _clean_agent_output(partial)
-                if len(cleaned) > 100 and _looks_like_code(cleaned):
                     text = cleaned
                     break
         except Exception:

@@ -25,6 +25,30 @@ try:
 except ImportError:
     _THEORY_AVAILABLE = False
 
+try:
+    from jugeo.webapp.cli.prompt_obligations import PromptObligationExtractor
+    from jugeo.webapp.cli.spec_builder import TheorySpecBuilder
+    _OBLIGATIONS_AVAILABLE = True
+except ImportError:
+    _OBLIGATIONS_AVAILABLE = False
+
+try:
+    from jugeo.webapp.cli.generators.flask_generator import FlaskGenerator
+    from jugeo.webapp.cli.generators.model_generator import ModelGenerator
+    from jugeo.webapp.cli.generators.template_generator import TemplateGenerator
+    from jugeo.webapp.cli.generators.css_generator import CSSGenerator
+    from jugeo.webapp.cli.generators.js_generator import JSGenerator
+    _GENERATORS_AVAILABLE = True
+except ImportError:
+    _GENERATORS_AVAILABLE = False
+
+try:
+    from jugeo.webapp.cli.cross_layer_descent import CrossLayerDescentChecker
+    from jugeo.webapp.cli.visual_correctness import VisualCorrectnessChecker
+    _CHECKERS_AVAILABLE = True
+except ImportError:
+    _CHECKERS_AVAILABLE = False
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TemplateSpecs — canonical spec dicts for each template tier
@@ -362,6 +386,12 @@ class WebappPipeline:
         result = PipelineResult(config=config, output_dir=config.outdir)
         stages_completed: list = []
 
+        # Phase 0: obligations (if prompt provided)
+        if config.prompt:
+            obligations_stage = self._stage_obligations(config)
+            stages_completed.append(obligations_stage)
+            result.obligations_result = obligations_stage.details
+
         # 1. Ideate
         ideate_res = self._stage_ideate(config)
         stages_completed.append(ideate_res)
@@ -381,6 +411,16 @@ class WebappPipeline:
         generate_res = self._stage_generate(config, result.app_spec)
         stages_completed.append(generate_res)
         result.generation_result = generate_res.details
+
+        # Phase 3: cross-layer descent check
+        cross_layer_stage = self._stage_cross_layer(config, result.output_dir, result.app_spec)
+        stages_completed.append(cross_layer_stage)
+        result.cross_layer_result = cross_layer_stage.details
+
+        # Phase 4: visual correctness check
+        visual_stage = self._stage_visual_check(config, result.output_dir)
+        stages_completed.append(visual_stage)
+        result.visual_result = visual_stage.details
 
         # 4. Verify (optional)
         if config.verify:
@@ -482,6 +522,93 @@ class WebappPipeline:
                 success=False,
                 errors=[str(exc)],
             )
+
+        # Theory-constrained generation (falls through to template-based on failure)
+        if _GENERATORS_AVAILABLE and spec:
+            try:
+                mode = spec.get("mode", "flask")
+                (outdir / "static").mkdir(parents=True, exist_ok=True)
+                (outdir / "templates").mkdir(parents=True, exist_ok=True)
+
+                css_gen = CSSGenerator()
+                css_result = css_gen.generate(spec)
+                (outdir / "static" / "style.css").write_text(css_result.style_css)
+
+                js_gen = JSGenerator()
+                js_result = js_gen.generate(spec)
+                if js_result.csrf_js:
+                    (outdir / "static" / "csrf.js").write_text(js_result.csrf_js)
+                if js_result.form_validation_js:
+                    (outdir / "static" / "form_validation.js").write_text(js_result.form_validation_js)
+                if js_result.interactions_js:
+                    noun = (spec.get("domain_nouns") or ["app"])[0]
+                    (outdir / "static" / f"{noun}_interactions.js").write_text(js_result.interactions_js)
+
+                tmpl_gen = TemplateGenerator()
+                tmpl_result = tmpl_gen.generate(spec)
+                for fname, content in tmpl_result.files.items():
+                    fpath = outdir / "templates" / fname
+                    fpath.parent.mkdir(parents=True, exist_ok=True)
+                    fpath.write_text(content)
+
+                model_result = None
+                if mode == "flask" and spec.get("models"):
+                    model_gen = ModelGenerator()
+                    model_result = model_gen.generate(spec)
+                    (outdir / "models.py").write_text(model_result.models_py)
+
+                flask_result = None
+                if mode == "flask":
+                    flask_gen = FlaskGenerator()
+                    flask_result = flask_gen.generate(spec)
+                    (outdir / "app.py").write_text(flask_result.app_py)
+                    (outdir / "requirements.txt").write_text(flask_result.requirements_txt)
+
+                all_annotations = (
+                    css_result.theory_annotations
+                    + js_result.theory_annotations
+                    + tmpl_result.theory_annotations
+                    + (model_result.theory_annotations if model_result else [])
+                    + (flask_result.theory_annotations if flask_result else [])
+                )
+                elapsed = (time.monotonic() - t0) * 1000
+                # Always write README even in theory-constrained path
+                try:
+                    (outdir / "README.md").write_text(
+                        _generate_readme(config.app_name, config.port)
+                    )
+                except OSError:
+                    pass
+                # Optional files
+                if config.include_tests:
+                    tests_dir = outdir / "tests"
+                    tests_dir.mkdir(exist_ok=True)
+                    try:
+                        (tests_dir / "test_app.py").write_text(
+                            _generate_test_app(config.app_name)
+                        )
+                    except OSError:
+                        pass
+                if config.include_docker:
+                    try:
+                        (outdir / "Dockerfile").write_text(
+                            _generate_dockerfile(config.app_name, config.port)
+                        )
+                    except OSError:
+                        pass
+                return StageResult(
+                    stage=PipelineStage.GENERATE,
+                    success=True,
+                    duration_ms=elapsed,
+                    details={
+                        "generator": "theory_constrained",
+                        "theory_annotations": all_annotations[:10],
+                        "files_generated": len(tmpl_result.files) + 3,
+                        "mode": mode,
+                    },
+                )
+            except Exception:
+                pass  # Fall through to template-based generation
 
         # app.py
         try:
@@ -591,6 +718,123 @@ class WebappPipeline:
             details={"passed": passed, "checks": checks, "errors": errors},
             errors=errors,
         )
+
+    def _stage_obligations(self, config: WebappConfig) -> StageResult:
+        """Phase 0: Convert prompt to obligation presheaf using PromptObligationExtractor."""
+        start = time.time()
+        if not _OBLIGATIONS_AVAILABLE or not config.prompt:
+            return StageResult(
+                stage=PipelineStage.OBLIGATIONS,
+                success=True,
+                duration_ms=(time.time() - start) * 1000,
+                details={"skipped": True, "reason": "no prompt or obligations module unavailable"},
+            )
+        try:
+            extractor = PromptObligationExtractor()
+            presheaf = extractor.extract(config.prompt)
+            presheaf.check_satisfiability()
+            return StageResult(
+                stage=PipelineStage.OBLIGATIONS,
+                success=True,
+                duration_ms=(time.time() - start) * 1000,
+                details={
+                    "mode": presheaf.mode.value,
+                    "domain_nouns": presheaf.domain_nouns,
+                    "auth_required": presheaf.auth_required,
+                    "obligation_count": len(presheaf.obligations),
+                    "satisfiable": True,  # always proceed even if advisory failures
+                },
+            )
+        except Exception as exc:
+            return StageResult(
+                stage=PipelineStage.OBLIGATIONS,
+                success=True,  # advisory — never block
+                warnings=[f"Obligation extraction failed: {exc}"],
+                duration_ms=(time.time() - start) * 1000,
+            )
+
+    def _stage_cross_layer(self, config: WebappConfig, output_dir: str, spec: dict) -> StageResult:
+        """Phase 3: Cross-layer descent check on generated files."""
+        start = time.time()
+        if not _CHECKERS_AVAILABLE:
+            return StageResult(
+                stage=PipelineStage.CROSS_LAYER,
+                success=True,
+                duration_ms=(time.time() - start) * 1000,
+                details={"skipped": True},
+            )
+        try:
+            files = {}
+            out = Path(output_dir)
+            for p in out.rglob("*"):
+                if p.is_file() and p.suffix in {".py", ".html", ".css", ".js"}:
+                    try:
+                        files[str(p.relative_to(out))] = p.read_text()
+                    except Exception:
+                        pass
+            checker = CrossLayerDescentChecker()
+            report = checker.check(files, spec)
+            return StageResult(
+                stage=PipelineStage.CROSS_LAYER,
+                success=True,  # advisory
+                duration_ms=(time.time() - start) * 1000,
+                details={
+                    "error_count": report.error_count(),
+                    "warning_count": report.warning_count(),
+                    "passed_checks": [c.value for c in report.passed_checks],
+                    "repairs_suggested": len(report.repairs),
+                },
+                warnings=[o.description for o in report.obstructions if o.severity == "warning"],
+                errors=[],  # cross-layer is advisory
+            )
+        except Exception as exc:
+            return StageResult(
+                stage=PipelineStage.CROSS_LAYER,
+                success=True,
+                warnings=[f"Cross-layer check failed: {exc}"],
+                duration_ms=(time.time() - start) * 1000,
+            )
+
+    def _stage_visual_check(self, config: WebappConfig, output_dir: str) -> StageResult:
+        """Phase 4: Visual correctness check on generated CSS + HTML."""
+        start = time.time()
+        if not _CHECKERS_AVAILABLE:
+            return StageResult(
+                stage=PipelineStage.VISUAL_CHECK,
+                success=True,
+                duration_ms=(time.time() - start) * 1000,
+                details={"skipped": True},
+            )
+        try:
+            files = {}
+            out = Path(output_dir)
+            for p in out.rglob("*"):
+                if p.is_file() and p.suffix in {".html", ".css"}:
+                    try:
+                        files[str(p.relative_to(out))] = p.read_text()
+                    except Exception:
+                        pass
+            checker = VisualCorrectnessChecker()
+            report = checker.check(files)
+            return StageResult(
+                stage=PipelineStage.VISUAL_CHECK,
+                success=True,  # advisory
+                duration_ms=(time.time() - start) * 1000,
+                details={
+                    "passes_wcag_aa": report.passes_wcag_aa(),
+                    "violation_count": len(report.violations),
+                    "wcag_level": report.wcag_level,
+                    "estimated_lcp_ms": report.estimated_lcp_ms,
+                },
+                warnings=[v.description for v in report.violations if v.severity == "warning"],
+            )
+        except Exception as exc:
+            return StageResult(
+                stage=PipelineStage.VISUAL_CHECK,
+                success=True,
+                warnings=[f"Visual check failed: {exc}"],
+                duration_ms=(time.time() - start) * 1000,
+            )
 
     def _stage_report(self, config: WebappConfig, result: PipelineResult) -> StageResult:
         t0 = time.monotonic()

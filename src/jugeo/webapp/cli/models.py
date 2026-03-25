@@ -33,6 +33,13 @@ class TemplateChoice(str, Enum):
     CUSTOM = "custom"
 
 
+class AppMode(str, Enum):
+    """Whether this is a Flask/server app or a static HTML app."""
+
+    FLASK = "flask"
+    STATIC = "static"
+
+
 class PipelineStage(str, Enum):
     """Named stages in the webapp generation pipeline."""
 
@@ -42,6 +49,11 @@ class PipelineStage(str, Enum):
     GENERATE = "generate"
     VERIFY = "verify"
     REPORT = "report"
+    OBLIGATIONS = "obligations"    # Phase 0: prompt → obligation presheaf
+    SPEC_BUILD   = "spec_build"    # Phase 1: obligations → validated spec
+    CROSS_LAYER  = "cross_layer"   # Phase 3: cross-layer descent check
+    VISUAL_CHECK = "visual_check"  # Phase 4: visual correctness
+    REPAIR       = "repair"        # Phase 5: iterative repair
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +78,8 @@ class WebappConfig:
     include_security_scan: bool = False
     models_json: list = field(default_factory=list)
     routes_json: list = field(default_factory=list)
+    app_mode: AppMode = AppMode.FLASK
+    prompt: str = ""  # raw natural language prompt if provided
 
     # -- serialisation -------------------------------------------------------
 
@@ -86,6 +100,8 @@ class WebappConfig:
             "include_security_scan": self.include_security_scan,
             "models_json": list(self.models_json),
             "routes_json": list(self.routes_json),
+            "app_mode": self.app_mode.value if isinstance(self.app_mode, AppMode) else self.app_mode,
+            "prompt": self.prompt,
         }
 
     @classmethod
@@ -96,6 +112,8 @@ class WebappConfig:
             d["app_type"] = AppType(d["app_type"])
         if "template" in d:
             d["template"] = TemplateChoice(d["template"])
+        if "app_mode" in d:
+            d["app_mode"] = AppMode(d["app_mode"])
         return cls(**d)
 
 
@@ -151,6 +169,10 @@ class PipelineResult:
     descent_result: dict = field(default_factory=dict)
     output_dir: str = ""
     elapsed_ms: float = 0.0
+    obligations_result: dict = field(default_factory=dict)
+    cross_layer_result: dict = field(default_factory=dict)
+    visual_result: dict = field(default_factory=dict)
+    repair_iterations: int = 0
 
     # -- derived properties --------------------------------------------------
 
@@ -189,6 +211,10 @@ class PipelineResult:
             "descent_result": dict(self.descent_result),
             "output_dir": self.output_dir,
             "elapsed_ms": self.elapsed_ms,
+            "obligations_result": dict(self.obligations_result),
+            "cross_layer_result": dict(self.cross_layer_result),
+            "visual_result": dict(self.visual_result),
+            "repair_iterations": self.repair_iterations,
         }
 
     @classmethod
@@ -203,4 +229,8 @@ class PipelineResult:
                 stages.append(s)
         d["stages_completed"] = stages
         d.setdefault("descent_result", {})
+        d.setdefault("obligations_result", {})
+        d.setdefault("cross_layer_result", {})
+        d.setdefault("visual_result", {})
+        d.setdefault("repair_iterations", 0)
         return cls(**d)

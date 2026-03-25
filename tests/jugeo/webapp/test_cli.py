@@ -98,7 +98,7 @@ class TestPipelineStage:
         assert PipelineStage.REPORT == "report"
 
     def test_count(self):
-        assert len(PipelineStage) == 6
+        assert len(PipelineStage) == 11
 
 
 # ═══════════════════════════════════════════════════════════════════════════
