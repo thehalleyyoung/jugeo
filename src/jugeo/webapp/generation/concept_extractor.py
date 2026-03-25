@@ -224,10 +224,18 @@ def extract_concepts(prompt: str) -> ConceptMap:
             seen[name] = Concept(name=name, domain=domain, relevance=0.5)
 
     slug = _slugify(prompt)
+    title = _titleize(slug)
+    # Derive a short, user-facing description — never use the raw prompt
+    domains = {c.domain.value for c in seen.values()}
+    if domains:
+        domain_str = ", ".join(sorted(domains))
+        description = f"An interactive {title.lower()} application featuring {domain_str}."
+    else:
+        description = f"An interactive {title.lower()} application."
     return ConceptMap(
         prompt=prompt,
         concepts=sorted(seen.values(), key=lambda c: -c.relevance),
         app_name=slug,
-        app_title=_titleize(slug),
-        app_description=prompt,
+        app_title=title,
+        app_description=description,
     )

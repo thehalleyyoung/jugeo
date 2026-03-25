@@ -352,11 +352,14 @@ def _agent_generate_js(
     working_dir: str | None,
 ) -> str:
     """Have an AI agent generate JavaScript for a concept."""
+    # Derive a short context line — never pass the raw prompt to avoid echo
+    app_context = app_prompt[:80].split(".")[0] if app_prompt else "interactive web application"
+
     prompt = f"""\
 Generate a COMPLETE, self-contained JavaScript module for a web application.
 Output the code directly as text — do NOT create or write any files.
 
-APPLICATION CONTEXT: {app_prompt}
+APPLICATION CONTEXT: {app_context}
 
 CONCEPT: {concept}
 WHAT TO BUILD: {description}
@@ -370,6 +373,10 @@ REQUIREMENTS:
 - Include detailed JSDoc comments on all classes and public methods
 - Include error handling (try/catch where appropriate)
 - Code must be immediately runnable in a browser
+- All DOM interaction must create elements programmatically — do NOT use
+  getElementById/querySelector for elements you haven't created yourself.
+  Use the CT namespace for inter-module communication, not DOM queries.
+- If you need a canvas, create it: const canvas = document.createElement('canvas');
 
 Output ONLY the JavaScript code. No explanations, no markdown fences, no file operations."""
 
@@ -455,6 +462,28 @@ Output ONLY the CSS code. No explanations, no markdown fences, no file operation
 #  HTML generation via agent
 # ═══════════════════════════════════════════════════════════════════════
 
+def _strip_to_body_content(html: str) -> str:
+    """Extract only the inner body content from a full HTML document.
+
+    If the HTML contains ``<body>...</body>`` tags, returns only the content
+    between them.  Also strips any ``<!DOCTYPE>``, ``<html>``, ``<head>``
+    wrappers so the result is a pure fragment safe for embedding inside
+    the template shell produced by ``HTMLOnlyGenerator._generate_page()``.
+    """
+    # Try to extract <body> inner content
+    m = re.search(r'<body[^>]*>(.*)</body>', html, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # If no <body> tags but has <!DOCTYPE or <html>, strip those wrappers
+    stripped = html
+    stripped = re.sub(r'<!DOCTYPE[^>]*>', '', stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r'</?html[^>]*>', '', stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r'<head>.*?</head>', '', stripped, flags=re.DOTALL | re.IGNORECASE)
+    stripped = stripped.strip()
+    return stripped if stripped else html
+
+
 def agent_generate_html(
     app_title: str,
     app_prompt: str,
@@ -462,35 +491,52 @@ def agent_generate_html(
     scale: int = 3,
     working_dir: str | None = None,
 ) -> str:
-    """Have an AI agent generate the full HTML document shell."""
+    """Have an AI agent generate the HTML body content for a SPA.
+
+    Returns a body-content fragment (no ``<!DOCTYPE>``, ``<html>``, or
+    ``<head>`` wrappers) so it can be embedded inside the template shell
+    produced by ``HTMLOnlyGenerator._generate_page()``.
+    """
     if not HAS_AGENT_CHANNEL:
         return ""
 
     target = 300 * _SCALE_MULTIPLIERS.get(scale, 2.0)
     concept_list = ", ".join(concepts)
 
+    # Derive a short tagline from the title — never echo the raw prompt
+    tagline = f"An interactive {app_title.lower()} experience"
+
     prompt = f"""\
-Generate a COMPLETE HTML5 document for a single-page web application.
+Generate the BODY CONTENT (inner HTML only — no DOCTYPE, no <html>, no <head>, no <body> tags) \
+for a single-page web application.
 Output the code directly as text — do NOT create or write any files.
 
 APPLICATION: {app_title}
-DESCRIPTION: {app_prompt}
+TAGLINE: {tagline}
 FEATURES/CONCEPTS: {concept_list}
 
 REQUIREMENTS:
-- Output {int(target)}+ lines of semantic HTML5
-- Include: navigation bar, hero section, main canvas area (with 4 layered canvases),
-  game HUD overlay, action bar, sidebar panels, gallery section, tutorial section,
-  settings section (with toggles/sliders), scores/leaderboard section, about section,
-  footer, modal dialogs, toast container, loading screen
+- Output {int(target)}+ lines of semantic HTML5 body content
+- Do NOT include <!DOCTYPE>, <html>, <head>, or <body> tags — output body inner content ONLY
+- The external files css/style.css and js/app.js are already linked by the page shell
+- Include: navigation bar (nav.navbar), hero section (section.hero), main canvas area,
+  game HUD overlay, action bar, sidebar panels, gallery view (section[data-view="gallery"]),
+  tutorial view (section[data-view="tutorial"]), settings view (section[data-view="settings"]),
+  scores/leaderboard view (section[data-view="scores"]), about view (section[data-view="about"]),
+  footer, modal dialogs, toast container (div#toasts), loading screen (div#loading-screen)
+- Each major view section MUST have data-view="viewname" attribute for SPA routing
+- Only the home/play view should be visible initially; other views get style="display:none"
 - Use ARIA attributes for accessibility
-- Include data-* attributes for JS hooks
-- Structure with meaningful class names matching the CSS design system
-- NO inline styles, NO inline scripts — those come from separate files
-- Include meta viewport, charset, and Open Graph tags
-- Link to app.css and app.js (external files)
+- Include data-hook="..." attributes for JS hooks
+- Use class names: navbar, nav-container, nav-brand, nav-links, nav-link, hero, hero-inner,
+  hero-title, hero-subtitle, btn, btn-primary, card, sidebar, hud, modal, toast-container
+- Loading screen should have id="loading-screen" with a progress bar (data-hook="loading-progress")
+  and step indicators (data-hook="loading-steps")
+- All buttons must have data-action="..." attributes describing their function
+- NO inline styles (except display:none for hidden views), NO inline scripts
+- Do NOT include the application description/prompt text as visible content
 
-Output ONLY the HTML code. No explanations, no markdown fences, no file operations."""
+Output ONLY the HTML body content. No explanations, no markdown fences."""
 
     section = agent_call(
         prompt,
@@ -503,8 +549,11 @@ Output ONLY the HTML code. No explanations, no markdown fences, no file operatio
     if not html or len(html) < 50:
         html = section.content.strip()
 
+    # Safety: always strip to body content in case the agent included wrappers
+    html = _strip_to_body_content(html)
+
     lines = html.count("\n") + 1
-    log.info("Agent generated %d HTML lines for shell (target: %d)", lines, int(target))
+    log.info("Agent generated %d HTML body-content lines for shell (target: %d)", lines, int(target))
     return html
 
 
