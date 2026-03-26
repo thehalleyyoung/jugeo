@@ -149,3 +149,85 @@ def test_to_descent_result_success():
     # If jugeo is available the result should indicate success; otherwise None is fine.
     if result is not None:
         assert result.is_success, f"Expected successful DescentResult but got: {result}"
+
+
+# ---------------------------------------------------------------------------
+# JS→JS module import/export tests
+# ---------------------------------------------------------------------------
+
+JS_MODULE_GOOD_FILES = {
+    **GOOD_FILES,
+    "static/csrf.js": (
+        "const CSRF = (() => { return {}; })();\n"
+        "const csrfFetch = (url) => fetch(url);\n"
+        "export { CSRF, csrfFetch };\n"
+    ),
+    "static/app.js": (
+        "import { csrfFetch } from './csrf.js';\n"
+        "const r = await csrfFetch('/recipes');\n"
+    ),
+}
+
+JS_MODULE_BAD_FILES = {
+    **GOOD_FILES,
+    "static/csrf.js": (
+        "const CSRF = (() => { return {}; })();\n"
+        # No export statement
+    ),
+    "static/app.js": (
+        "import { csrfFetch } from './csrf.js';\n"
+        "const r = await csrfFetch('/recipes');\n"
+    ),
+}
+
+JS_MODULE_MISSING_FILE = {
+    **GOOD_FILES,
+    "static/app.js": (
+        "import { csrfFetch } from './nonexistent.js';\n"
+        "const r = await csrfFetch('/recipes');\n"
+    ),
+}
+
+
+def test_js_module_good_imports_pass():
+    checker = CrossLayerDescentChecker()
+    report = checker.check(JS_MODULE_GOOD_FILES, SPEC)
+    js_obs = [o for o in report.obstructions if o.check == CrossLayerCheck.JS_JS_MODULE]
+    assert not js_obs, (
+        f"Expected no JS_JS_MODULE obstructions but got: "
+        f"{[o.description for o in js_obs]}"
+    )
+
+
+def test_js_module_missing_export_detected():
+    checker = CrossLayerDescentChecker()
+    report = checker.check(JS_MODULE_BAD_FILES, SPEC)
+    js_obs = [
+        o for o in report.obstructions
+        if o.check == CrossLayerCheck.JS_JS_MODULE and o.missing_name == "csrfFetch"
+    ]
+    assert js_obs, (
+        "Expected JS_JS_MODULE obstruction for 'csrfFetch' but none found. "
+        f"Obstructions: {[o.description for o in report.obstructions]}"
+    )
+
+
+def test_js_module_missing_file_detected():
+    checker = CrossLayerDescentChecker()
+    report = checker.check(JS_MODULE_MISSING_FILE, SPEC)
+    js_obs = [
+        o for o in report.obstructions
+        if o.check == CrossLayerCheck.JS_JS_MODULE and "nonexistent.js" in o.missing_name
+    ]
+    assert js_obs, (
+        "Expected JS_JS_MODULE obstruction for missing module 'nonexistent.js' but none found. "
+        f"Obstructions: {[o.description for o in report.obstructions]}"
+    )
+
+
+def test_js_module_repair_generated():
+    checker = CrossLayerDescentChecker()
+    report = checker.check(JS_MODULE_BAD_FILES, SPEC)
+    js_repairs = [r for r in report.repairs if r.repair_type == "add_js_export"]
+    assert js_repairs, "Expected at least one add_js_export repair."
+    assert js_repairs[0].repair_data["export_name"] == "csrfFetch"

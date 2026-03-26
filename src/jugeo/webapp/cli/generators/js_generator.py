@@ -112,6 +112,14 @@ const CSRF = (() => {
 
   return { token, headers, post, del };
 })();
+
+// ES module exports for import { csrfFetch, getCsrfFetch } from './csrf.js'
+const csrfFetch = (url, options = {}) => {
+  const h = CSRF.headers();
+  return fetch(url, { ...options, headers: { ...h, ...(options.headers || {}) } });
+};
+const getCsrfFetch = () => csrfFetch;
+export { CSRF, csrfFetch, getCsrfFetch };
 """
 
     def _generate_form_validation_js(self, spec: dict) -> str:

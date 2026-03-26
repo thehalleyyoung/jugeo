@@ -36,11 +36,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 class CrossLayerCheck(str, Enum):
-    """The eight cross-layer morphism checks."""
+    """The nine cross-layer morphism checks."""
     HTML_CSS = "HTML_CSS"
     HTML_FLASK = "HTML_FLASK"
     HTML_JS = "HTML_JS"
     JS_FLASK = "JS_FLASK"
+    JS_JS_MODULE = "JS_JS_MODULE"
     FORM_FLASK = "FORM_FLASK"
     TEMPLATE_MODEL = "TEMPLATE_MODEL"
     CSS_HTML = "CSS_HTML"
@@ -160,11 +161,20 @@ _DEAD_SELECTOR_SKIP = _DYNAMIC_CLASSES | _UTILITY_CLASSES | frozenset({
 
 
 def _extract_html_classes(html: str) -> set[str]:
-    """Return all individual CSS class tokens that appear in class="…" attributes."""
+    """Return all individual CSS class tokens that appear in class="…" attributes.
+
+    Jinja/template expressions (``{{ … }}``, ``{% … %}``) are stripped from
+    class attribute values before tokenising so that dynamic fragments such as
+    ``alert-{{ category }}`` do not produce false-positive cross-layer errors.
+    """
+    _jinja_re = re.compile(r'\{[{%].*?[%}]\}', re.DOTALL)
     classes: set[str] = set()
     for raw in re.findall(r'class=["\']([^"\']+)["\']', html):
-        for tok in raw.split():
-            classes.add(tok.strip())
+        static = _jinja_re.sub(' ', raw)
+        for tok in static.split():
+            tok = tok.strip().rstrip('-').lstrip('-')
+            if tok and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]*', tok):
+                classes.add(tok)
     return classes
 
 
@@ -278,6 +288,7 @@ class CrossLayerDescentChecker:
             run(CrossLayerCheck.HTML_CSS, self._check_html_css, html_files, css_content)
             run(CrossLayerCheck.HTML_FLASK, self._check_html_flask, html_files, app_py)
             run(CrossLayerCheck.JS_FLASK, self._check_js_flask, js_files, app_py)
+            run(CrossLayerCheck.JS_JS_MODULE, self._check_js_modules, js_files)
             run(CrossLayerCheck.FORM_FLASK, self._check_form_flask, html_files, app_py)
             run(CrossLayerCheck.TEMPLATE_MODEL, self._check_template_model, html_files, spec)
             run(CrossLayerCheck.CSS_HTML, self._check_css_html, css_content, html_files)
@@ -288,6 +299,7 @@ class CrossLayerDescentChecker:
             run(CrossLayerCheck.CSS_HTML, self._check_css_html, css_content, html_files)
             # Static asset / link checks reuse the JS_FLASK slot for JS→HTML querySelector
             run(CrossLayerCheck.JS_FLASK, self._check_js_flask, js_files, app_py)
+            run(CrossLayerCheck.JS_JS_MODULE, self._check_js_modules, js_files)
 
         repairs = self._generate_repairs(obstructions)
         return CrossLayerReport(
@@ -369,6 +381,123 @@ class CrossLayerDescentChecker:
                         missing_name=url_path,
                         severity="error",
                     ))
+        return obstructions
+
+    def _check_js_modules(
+        self,
+        js_files: dict[str, str],
+    ) -> list[CrossLayerObstruction]:
+        """JS→JS: every ``import { X } from './Y.js'`` must resolve to an export in Y.js."""
+        # Build export map: filename → set of exported names
+        export_map: dict[str, set[str]] = {}
+        for js_name, js_content in js_files.items():
+            exports: set[str] = set()
+            # Named exports: export { a, b }  or  export { a as b }
+            for m in re.finditer(r'export\s*\{([^}]+)\}', js_content):
+                for token in m.group(1).split(','):
+                    token = token.strip()
+                    # handle "localName as exportedName"
+                    if ' as ' in token:
+                        token = token.split(' as ')[-1].strip()
+                    if token:
+                        exports.add(token)
+            # Inline exports: export function X / export const X / export class X
+            for m in re.finditer(
+                r'export\s+(?:default\s+)?(?:function|const|let|var|class)\s+(\w+)', js_content
+            ):
+                exports.add(m.group(1))
+            # export default X
+            for m in re.finditer(r'export\s+default\s+(\w+)', js_content):
+                exports.add(m.group(1))
+                exports.add('default')
+            # IIFE global pattern: window.X = ... or globalThis.X = ...
+            for m in re.finditer(r'(?:window|globalThis)\.(\w+)\s*=', js_content):
+                exports.add(m.group(1))
+            export_map[js_name] = exports
+
+        obstructions: list[CrossLayerObstruction] = []
+        for js_name, js_content in js_files.items():
+            # Match: import { a, b } from './module.js'
+            for m in re.finditer(
+                r"""import\s*\{([^}]+)\}\s*from\s*['"]\.\/([^'"]+)['"]""",
+                js_content,
+            ):
+                imported_names = [n.strip().split(' as ')[0].strip() for n in m.group(1).split(',')]
+                module_ref = m.group(2)
+                # Resolve the module reference to a known JS file
+                target_file = None
+                for candidate in js_files:
+                    base = candidate.rsplit('/', 1)[-1]
+                    if base == module_ref or candidate == module_ref:
+                        target_file = candidate
+                        break
+                if target_file is None:
+                    obstructions.append(CrossLayerObstruction(
+                        check=CrossLayerCheck.JS_JS_MODULE,
+                        description=(
+                            f"import from './{module_ref}' in {js_name} "
+                            f"refers to a module that does not exist"
+                        ),
+                        source_file=js_name,
+                        target_file=module_ref,
+                        missing_name=module_ref,
+                        severity="error",
+                    ))
+                    continue
+                target_exports = export_map.get(target_file, set())
+                for name in imported_names:
+                    if name and name not in target_exports:
+                        obstructions.append(CrossLayerObstruction(
+                            check=CrossLayerCheck.JS_JS_MODULE,
+                            description=(
+                                f"import {{ {name} }} from './{module_ref}' in {js_name} "
+                                f"but '{module_ref}' does not export '{name}'"
+                            ),
+                            source_file=js_name,
+                            target_file=target_file,
+                            missing_name=name,
+                            severity="error",
+                        ))
+            # Also match: import X from './module.js' (default import)
+            for m in re.finditer(
+                r"""import\s+(\w+)\s+from\s*['"]\.\/([^'"]+)['"]""",
+                js_content,
+            ):
+                name = m.group(1)
+                module_ref = m.group(2)
+                target_file = None
+                for candidate in js_files:
+                    base = candidate.rsplit('/', 1)[-1]
+                    if base == module_ref or candidate == module_ref:
+                        target_file = candidate
+                        break
+                if target_file is None:
+                    obstructions.append(CrossLayerObstruction(
+                        check=CrossLayerCheck.JS_JS_MODULE,
+                        description=(
+                            f"import from './{module_ref}' in {js_name} "
+                            f"refers to a module that does not exist"
+                        ),
+                        source_file=js_name,
+                        target_file=module_ref,
+                        missing_name=module_ref,
+                        severity="error",
+                    ))
+                    continue
+                target_exports = export_map.get(target_file, set())
+                if 'default' not in target_exports and name not in target_exports:
+                    obstructions.append(CrossLayerObstruction(
+                        check=CrossLayerCheck.JS_JS_MODULE,
+                        description=(
+                            f"import {name} from './{module_ref}' in {js_name} "
+                            f"but '{module_ref}' has no default export"
+                        ),
+                        source_file=js_name,
+                        target_file=target_file,
+                        missing_name=name,
+                        severity="error",
+                    ))
+
         return obstructions
 
     def _check_form_flask(
@@ -557,6 +686,19 @@ class CrossLayerDescentChecker:
                         "source_file": obs.source_file,
                     },
                     description=f"Add id='{obs.missing_name}' to the appropriate HTML element",
+                ))
+            elif obs.check == CrossLayerCheck.JS_JS_MODULE:
+                repairs.append(RepairAction(
+                    obstruction=obs,
+                    repair_type="add_js_export",
+                    repair_data={
+                        "export_name": obs.missing_name,
+                        "target_file": obs.target_file,
+                    },
+                    description=(
+                        f"Add 'export {{ {obs.missing_name} }}' to {obs.target_file} "
+                        f"or fix the import in {obs.source_file}"
+                    ),
                 ))
             # CSS_HTML and AUTH_CONSISTENCY obstructions are warnings; no repair needed
         return repairs
