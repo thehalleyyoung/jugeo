@@ -11,6 +11,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 # Under pytest's importlib mode, package directories under tests/ can shadow the
 # real source package unless the corresponding source packages are imported first.
 import jugeo  # noqa: E402,F401
@@ -27,6 +30,15 @@ import jugeo.webapp.fibered  # noqa: E402,F401
 import jugeo.webapp.verification  # noqa: E402,F401
 import jugeo.webapp.cohomology  # noqa: E402,F401
 import jugeo.orchestration.large_scale  # noqa: E402,F401
+
+# Prevent tests/gofai_chat/ from shadowing the real gofai_chat package.
+try:
+    import gofai_chat  # noqa: E402,F401
+    import gofai_chat.chat  # noqa: E402,F401
+    import gofai_chat.chat.task_registry  # noqa: E402,F401
+    import gofai_chat.chat.task_handlers  # noqa: E402,F401
+except Exception:
+    pass
 
 
 def _patch_test_integration_helper(module: Any) -> None:

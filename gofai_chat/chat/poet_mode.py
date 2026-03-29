@@ -1286,6 +1286,17 @@ class PoetMode:
             except Exception as e:
                 return f"[Domain switch error: {e}]"
 
+        # ── Auto-detect non-poetry domain and route ───────────────────────────
+        try:
+            from gofai_chat.chat.domain import DomainRegistry
+            _registry = DomainRegistry.default()
+            _domain, _request = _registry.route(raw)
+            if _domain.name != "poetry":
+                _output = _domain.generate(_request)
+                return _output.display()
+        except Exception:
+            pass
+
         # ── Exact single-token commands ────────────────────────────────────
         if tokens == ["show"]:
             if self.current_poem.is_empty():
@@ -1331,6 +1342,70 @@ class PoetMode:
                 return self.explain_choice(line)
             except (ValueError, IndexError):
                 return "Usage: explain <line_number>"
+
+        # ── PRIMARY PATH: NL → HLF → output ──────────────────────────────────
+        # Task registry dispatch — runs before HLFRealizer for rich task routing
+        try:
+            from gofai_chat.chat.task_registry import PoeticTaskRecognizer, TaskKind
+            from gofai_chat.chat.task_handlers import handle_task
+            _task = PoeticTaskRecognizer().recognize(raw)
+            if _task.confidence >= 0.75 and _task.kind != TaskKind.GENERATE:
+                _task_result = handle_task(_task, self)
+                if _task_result:
+                    return _task_result
+        except Exception:
+            pass  # always fall through to existing dispatch
+
+        try:
+            from gofai_chat.generation.nl_to_hlf import NLToHLF
+            from gofai_chat.generation.hlf_realizer import HLFRealizer, OutputMode
+
+            parsed = NLToHLF().parse(raw)
+
+            if parsed.topic:
+                self._discourse_focus = parsed.topic
+
+            try:
+                from gofai_chat.strata.info.qud_engine import QUDStack, QUDEntry, QUDType
+                qt = next(
+                    (v for v in QUDType if 'WH' in str(v) or 'OPEN' in str(v)),
+                    list(QUDType)[0],
+                )
+                if self._qud_stack is not None:
+                    self._qud_stack.push(QUDEntry(question_text=raw, qud_type=qt))
+            except Exception:
+                pass
+
+            realizer = HLFRealizer()
+            form_arg = (
+                getattr(self, '_current_form', None)
+                or (self.current_poem.form if not self.current_poem.is_empty() else None)
+                or 'free_verse'
+            )
+            result = realizer.realize(parsed, form=form_arg)
+
+            if parsed.output_mode != OutputMode.POEM:
+                if getattr(self, '_wiki_reasoner', None) and parsed.topic:
+                    try:
+                        wiki_answer = self._wiki_reasoner.answer_question(raw, parsed.topic)
+                        if wiki_answer:
+                            result = wiki_answer + '\n\n' + result
+                    except Exception:
+                        pass
+
+            # Prepend entity summary when Wikipedia was successfully consulted
+            enr = getattr(parsed, 'enrichment', None)
+            if enr and enr.found and enr.summary:
+                wiki_note = f"[Wikipedia: {enr.summary}]\n\n"
+                result = wiki_note + result
+
+            if parsed.output_mode == OutputMode.POEM:
+                self._current_poem = result.split('\n\n[')[0]
+
+            return result
+
+        except Exception:
+            pass  # fall through to existing dispatch
 
         # ── Prose → LF → Poem pipeline ────────────────────────────────────
         # Intercept "turn this into a poem: …" and similar requests before
