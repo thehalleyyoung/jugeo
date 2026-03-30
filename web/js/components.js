@@ -17,7 +17,7 @@ function renderNav(activePage) {
         <li><a href="pages/concepts.html" class="${activePage === 'concepts' ? 'active' : ''}">Concepts</a></li>
         <li><a href="pages/api.html" class="${activePage === 'api' ? 'active' : ''}">API</a></li>
         <li><a href="pages/tutorial.html" class="${activePage === 'tutorial' ? 'active' : ''}">Tutorial</a></li>
-        <li><a href="pages/papers.html" class="${activePage === 'papers' ? 'active' : ''}">Papers</a></li>
+
         <li><a href="pages/proofs.html" class="${activePage === 'proofs' ? 'active' : ''}">Proofs</a></li>
         <li><a href="pages/comparison.html" class="${activePage === 'comparison' ? 'active' : ''}">Comparison</a></li>
       </ul>
@@ -58,7 +58,7 @@ function renderFooter() {
         </div>
         <div class="footer-section">
           <h4>Theory</h4>
-          <a href="pages/papers.html">Paper Series</a>
+
           <a href="pages/proofs.html">Lean Proofs</a>
           <a href="pages/math.html">Math Background</a>
           <a href="pages/comparison.html">vs. Lean/Coq/F*</a>
@@ -135,7 +135,7 @@ function renderDocsSidebar(activePage) {
       title: 'Theory & Research',
       links: [
         { href: 'math.html', label: 'Math Background', id: 'math' },
-        { href: 'papers.html', label: 'Paper Series', id: 'papers' },
+
         { href: 'proofs.html', label: 'Lean Proofs', id: 'proofs' },
         { href: 'comparison.html', label: 'vs. Lean/Coq/F*', id: 'comparison' },
       ]
