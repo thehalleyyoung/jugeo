@@ -1,0 +1,1820 @@
+% Part VI: Applications and Future Directions
+% This file is \include'd from main.tex
+
+\chapter{LLM-Assisted Software Synthesis}
+\label{ch:llm-synthesis}
+
+Large Language Models (LLMs) generate plausible code with remarkable
+fluency, yet their outputs carry no structural guarantees: type errors
+slip through, modules fail to compose, and subtle semantic bugs hide
+behind syntactically correct surfaces.  This chapter shows how
+Judgment Geometry supplies the missing \emph{verification and repair
+layer} for LLM-generated code.
+
+%% ─── 27.1 ──────────────────────────────────────────────────────
+\section{The structural deficit of LLM code}
+\label{sec:llm-deficit}
+
+An LLM treats code generation as next-token prediction: given a prompt
+$p$, it samples a continuation $c$ from a learned distribution
+$P(c \mid p)$.  Nothing in this process enforces that:
+\begin{enumerate}[label=(\roman*)]
+  \item $c$ type-checks against the project's type system,
+  \item $c$ is consistent with specifications in \emph{other} modules,
+  \item $c$ satisfies non-local invariants (security policies,
+        performance contracts, API versioning).
+\end{enumerate}
+Testing catches some of these failures, but testing is inherently
+\emph{local}: a test suite checks individual behaviors ($H^0$, in our
+language) without examining whether local sections \emph{glue} into a
+global one ($H^1$).  Formal verification, at the other extreme, is
+too rigid---it demands binary pass/fail and cannot exploit partial
+correctness.
+
+Judgment Geometry occupies the middle ground: it is \emph{graded}
+(partial correctness is meaningful), \emph{cohomological} (it detects
+non-local inconsistencies), and \emph{iterative} (the descent algorithm
+produces a convergent repair sequence).
+
+%% ─── 27.2 ──────────────────────────────────────────────────────
+\section{JuGeo as LLM supervisor}
+\label{sec:llm-supervisor}
+
+We instantiate the four objects for LLM-assisted development.
+
+\begin{definition}[LLM Development Site]
+\label{def:llm-site}
+Let $\mathcal{P}$ be a software project with modules
+$M_1,\dots,M_n$.  Define the \emph{LLM development site}
+$\STop_{\mathrm{LLM}}$ as follows:
+\begin{itemize}
+  \item \textbf{Objects}: modules, files, functions, and test suites
+        of~$\mathcal{P}$, ordered by containment.
+  \item \textbf{Morphisms}: inclusion and dependency maps
+        (imports, function calls, type references).
+  \item \textbf{Topology}: the coverage $J$ in which a family
+        $\{U_i \to U\}$ covers~$U$ when every public symbol of~$U$
+        is exercised by at least one~$U_i$.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[LLM Proof Structure]
+\label{def:llm-pstr}
+The presheaf $\PStr_{\mathrm{LLM}}$ assigns to each object $U$:
+\begin{itemize}
+  \item A \emph{specification} $A_U$ (type signature, docstring
+        contract, or formal pre/post-condition).
+  \item An \emph{evidence bundle} $E_U$: the LLM-generated code
+        together with any passing tests.
+\end{itemize}
+A section $s \in \PStr_{\mathrm{LLM}}(U)$ is a pair $(A_U, E_U)$
+asserting ``evidence $E_U$ satisfies specification~$A_U$\!.''
+\end{definition}
+
+The \emph{Cohomological Spectrum} $\CSpec_{\mathrm{LLM}}$ is the
+\v{C}ech complex of $\PStr_{\mathrm{LLM}}$.  Concretely:
+\[
+  \Cech^0 = \prod_i \PStr(U_i), \qquad
+  \Cech^1 = \prod_{i<j} \PStr(U_i \cap U_j),
+\]
+where $U_i \cap U_j$ is the shared interface between modules $M_i$
+and~$M_j$ (exported types, shared state, API contracts).  A class
+$[\alpha] \in \check{H}^1(\STop_{\mathrm{LLM}}, \PStr_{\mathrm{LLM}})$
+with $[\alpha]\neq 0$ witnesses an \emph{integration bug}: the
+LLM-generated code for $M_i$ and $M_j$ individually type-checks but
+disagrees on the overlap.
+
+\begin{example}
+Module $M_1$ exports a function \texttt{get\_user} returning a
+dictionary with key \texttt{"name"}.  The LLM generates $M_2$
+expecting a key \texttt{"username"}.  Both modules pass their local
+tests (the LLM generates a mock with the expected key), but the
+overlap section records the mismatch.  This is a non-trivial class in
+$\check{H}^1$.
+\end{example}
+
+The \emph{Graded Evaluation} $\GEval_{\mathrm{LLM}}$ grades each
+section along multiple axes:
+\begin{equation}
+\label{eq:llm-grade}
+  g(s) \;=\; g_{\mathrm{type}} \;\otG\;
+             g_{\mathrm{test}} \;\otG\;
+             g_{\mathrm{style}} \;\otG\;
+             g_{\mathrm{perf}},
+\end{equation}
+where each component lies in $\Grade = (-\infty, 0]$ and
+$\otG = +$ aggregates them (recall $\gone = 0$ is perfect).
+
+%% ─── 27.3 ──────────────────────────────────────────────────────
+\section{The descent loop for LLM code}
+\label{sec:llm-descent}
+
+The central observation is that \emph{iterative LLM repair is exactly
+descent}.
+
+\begin{construction}[LLM Descent Algorithm]
+\label{con:llm-descent}
+Given an LLM $\mathcal{L}$, a project site $\STop$, and a
+specification presheaf $\PStr$:
+\begin{enumerate}
+  \item \textbf{Generate.}\; For each $U_i$, prompt $\mathcal{L}$
+        to produce a candidate section
+        $s_i^{(0)} \in \PStr(U_i)$.
+  \item \textbf{Compute coboundary.}\; Form
+        $\delta^0 s^{(0)} \in \Cech^1$; identify all non-zero
+        components $\alpha_{ij}$.
+  \item \textbf{Repair.}\; For each obstruction $\alpha_{ij}$,
+        construct a \emph{repair prompt}
+        $p_{ij} = \texttt{``Fix: module } M_i \texttt{ expects \dots\ but }
+        M_j \texttt{ provides \dots''}$.
+        Feed $p_{ij}$ to~$\mathcal{L}$; obtain $s_i^{(1)}$
+        or~$s_j^{(1)}$.
+  \item \textbf{Re-evaluate.}\; Compute $\delta^0 s^{(1)}$.
+        If $\check{H}^1 = 0$ and
+        $\GEval(s^{(1)}) \geq g_{\min}$, accept.
+        Otherwise return to step~3.
+  \item \textbf{Budget.}\; If the iteration count exceeds a bound
+        $N$ or the grade fails to improve for $k$ consecutive
+        iterations, halt and report the residual obstructions.
+\end{enumerate}
+\end{construction}
+
+\begin{proposition}
+\label{prop:llm-descent-mono}
+If each repair step strictly improves the grade of at least one
+obstruction component (i.e., $g(\alpha_{ij}^{(t+1)}) >
+g(\alpha_{ij}^{(t)})$ for some~$(i,j)$), and the grade is bounded
+above by~$\gone$, then the descent loop terminates in at most
+$n(n-1)/2 \cdot \lceil (\gone - g_{\min})/\epsilon \rceil$ steps,
+where $\epsilon$ is the minimum per-step improvement.
+\end{proposition}
+
+\begin{proof}
+There are at most $\binom{n}{2}$ overlap pairs.  Each
+can improve at most $(\gone - g_{\min})/\epsilon$ times before
+reaching~$\gone$.  Once every overlap grade reaches~$\gone$, the
+coboundary vanishes and $\check{H}^1 = 0$.
+\end{proof}
+
+\begin{remark}
+In practice one does not require $\check{H}^1 = 0$ exactly; a graded
+threshold $g_{\min}$ suffices.  This is a key advantage of graded
+cohomology over binary verification: the system can declare
+``good enough'' and defer minor mismatches.
+\end{remark}
+
+%% ─── 27.4 ──────────────────────────────────────────────────────
+\section{Prompt engineering as site construction}
+\label{sec:prompt-site}
+
+We now observe that the art of prompt engineering admits a precise
+geometric interpretation.
+
+\begin{proposition}[Prompts as Covers]
+\label{prop:prompt-cover}
+Let $\mathcal{T}$ be the target specification (the ``task'' given
+to the LLM).  A \emph{prompt decomposition}
+$p = \{p_1, \dots, p_k\}$ induces a covering family
+$\{U_1, \dots, U_k\}$ of~$\mathcal{T}$ in $\STop$, where each
+$U_i$ is the sub-task addressed by prompt~$p_i$.  The LLM's response
+to $p_i$ is a local section $s_i \in \PStr(U_i)$.  The full
+response glues iff $\check{H}^1(\{U_i\}, \PStr) = 0$.
+\end{proposition}
+
+Under this interpretation:
+\begin{itemize}
+  \item \textbf{Few-shot examples} are \emph{covering sieves}:
+        they demonstrate the desired behavior on specific
+        sub-regions of the task, guiding the LLM toward sections
+        that agree on overlaps.
+  \item \textbf{The context window} is the \emph{open cover}
+        $\mathcal{U}$: the finite amount of information the LLM can
+        attend to at once.
+  \item \textbf{Prompt decomposition} is \emph{refinement of the
+        cover}: splitting a complex prompt into sub-prompts
+        corresponds to refining $\mathcal{U}$ into a finer cover,
+        which can only \emph{improve} the cohomological condition
+        (by Leray's theorem, refinement does not increase~$H^1$).
+  \item \textbf{Chain-of-thought prompting} is \emph{choosing a good
+        nerve}: it makes the simplicial structure of the cover
+        explicit, so the LLM can track overlaps.
+\end{itemize}
+
+%% ─── 27.5 ──────────────────────────────────────────────────────
+\section{Multi-agent orchestration via the fibration}
+\label{sec:multi-agent}
+
+Modern LLM systems deploy multiple agents, each responsible for one
+module or aspect of the codebase.  JuGeo provides the orchestration
+framework.
+
+\begin{construction}[Multi-Agent Fibration]
+\label{con:multi-agent}
+Let $\{A_1, \dots, A_n\}$ be LLM agents, with agent $A_i$
+responsible for module~$M_i$.  The \emph{judgment fibration}
+$\pi\colon \mathcal{E} \to \STop$ has fiber $\pi^{-1}(U_i)$
+consisting of all code artifacts agent~$A_i$ can produce for~$U_i$.
+The orchestrator's job is to select a \emph{global section}
+$s \in \Gamma(\STop, \mathcal{E})$---i.e., a choice of artifact per
+module that glues across all overlaps.  This is precisely the
+descent problem.
+\end{construction}
+
+The orchestrator proceeds as follows:
+\begin{enumerate}
+  \item Each agent $A_i$ proposes a local section $s_i$.
+  \item The orchestrator computes $\delta^0 s$ and identifies
+        obstructions $\alpha_{ij}$.
+  \item For each obstruction, the orchestrator sends a
+        \emph{compatibility constraint} to agents $A_i$ and~$A_j$.
+  \item The agents regenerate; the process iterates.
+\end{enumerate}
+
+This is the exact pattern used by systems such as ChatDev and
+MetaGPT, but JuGeo gives it a \emph{mathematical foundation}:
+convergence, termination, and quality guarantees follow from the
+general descent theory of Part~II.
+
+%% ─── 27.6 ──────────────────────────────────────────────────────
+\section{Application: full-stack web generation}
+\label{sec:webapp-gen}
+
+We illustrate the framework on a concrete application:
+generating a complete web application (HTML, CSS, JavaScript,
+backend~API).
+
+\begin{example}[Web Application as Stratified Site]
+\label{ex:webapp-site}
+A web application defines a natural three-stratum site, analogous to
+the linguistic strata of Part~III:
+\begin{center}
+\begin{tabular}{lll}
+\textbf{Stratum} & \textbf{Web layer} & \textbf{Linguistic analogue} \\
+\hline
+$\sigma_1$ & HTML (structure) & $\synt$ (syntax) \\
+$\sigma_2$ & CSS (presentation) & $\phon$ (phonology / surface form) \\
+$\sigma_3$ & JS (behavior) & $\sem$ (semantics) \\
+$\sigma_4$ & API (data) & $\prag$ (pragmatics / context)
+\end{tabular}
+\end{center}
+Cross-stratum descent asks: does the JavaScript match the HTML
+structure?  Do the CSS selectors reference elements that actually
+exist?  Does the API return data in the format the frontend expects?
+\end{example}
+
+The generation loop for a web app is:
+\begin{enumerate}
+  \item \textbf{Specification.}\;  The user provides a natural-language
+        description $\mathcal{T}$.
+  \item \textbf{Site construction.}\;  Parse $\mathcal{T}$ into a
+        module decomposition $\{U_i\}$ (pages, components, API
+        endpoints).
+  \item \textbf{LLM generation.}\;  For each $(U_i, \sigma_j)$
+        (module $\times$ stratum), the LLM generates a local section.
+  \item \textbf{Cross-stratum descent.}\;  Compute
+        $\check{H}^1$ across strata: verify that CSS classes match
+        HTML elements, that JS event handlers reference existing DOM
+        nodes, that API calls match endpoint signatures.
+  \item \textbf{Repair.}\;  Feed obstructions back to the LLM as
+        repair prompts.
+  \item \textbf{Compilation and testing.}\;  Run the project's build
+        system and test suite; feed results into $\GEval$.
+  \item \textbf{Iterate.}\;  Repeat until $\GEval \geq g_{\min}$.
+\end{enumerate}
+
+\begin{remark}
+The \texttt{jugeo-webapp} module in the JuGeo codebase implements
+a prototype of this loop, using the descent engine from
+\texttt{src/jugeo/} to orchestrate HTML/CSS/JS generation and
+cross-layer verification.
+\end{remark}
+
+%% ─── 27.7 ──────────────────────────────────────────────────────
+\section{Comparison with existing approaches}
+\label{sec:llm-comparison}
+
+We compare JuGeo-supervised LLM code generation with three
+alternatives.
+
+\medskip\noindent
+\textbf{Plain LLM generation.}\;
+Without JuGeo, an LLM has no mechanism to detect non-local
+inconsistencies.  It can only ``hope'' that independently generated
+modules cohere.  JuGeo adds the cohomological check ($\CSpec$)
+and the descent repair loop, converting hope into a convergent
+algorithm.
+
+\medskip\noindent
+\textbf{Formal verification.}\;
+Systems like Dafny and Lean provide strong guarantees but require
+full formal specifications and produce binary verdicts.
+JuGeo is \emph{graded}: a section with
+$g(s) = -0.3$ is meaningful (``almost correct''),
+enabling iterative improvement.  Moreover, JuGeo can incorporate
+formal verification as one component of $\GEval$ (set
+$g_{\mathrm{formal}} = \gone$ if the prover succeeds,
+$g_{\mathrm{formal}} = \gzero$ otherwise), subsuming
+formal methods as a special case.
+
+\medskip\noindent
+\textbf{Testing alone.}\;
+A test suite checks $H^0$: does each module individually behave
+correctly?  JuGeo also checks $H^1$: do modules compose correctly?
+This is precisely the gap that integration bugs exploit.
+By computing the full \v{C}ech complex, JuGeo detects classes
+of bugs that no finite test suite can reliably catch---those
+arising from the \emph{interaction} of correct components.
+
+\begin{proposition}[Subsumption]
+\label{prop:subsumption}
+Let $\mathcal{V}$ be any verification methodology that assigns a
+binary verdict $v_U \in \{0,1\}$ to each module~$U$.  Then
+$\mathcal{V}$ embeds into $\GEval$ via $g_U = v_U \cdot \gone$,
+and the $\check{H}^1$ computation of $\CSpec$ subsumes any pairwise
+compatibility check that $\mathcal{V}$ performs.
+\end{proposition}
+
+\chapter{GOFAI Natural and Creative Language}
+\label{ch:gofai-nl}
+
+A central claim of Judgment Geometry is that structured mathematical
+theory can \emph{replace} learned statistical models for certain
+language tasks.  This chapter develops the claim in full: we show how
+the Compositional Theory of Theories (CTT), instantiated with $\sim\!450$
+theory slots across ten linguistic strata, drives a chatbot and a
+poetry engine that use \emph{no neural model whatsoever}---zero
+parameters, zero training data, zero GPU.
+
+%% ─── 28.1 ──────────────────────────────────────────────────────
+\section{The GOFAI thesis}
+\label{sec:gofai-thesis}
+
+\begin{quote}
+\emph{If you have enough theory, you don't need an LLM.}
+\end{quote}
+
+The CTT of Part~III provides:
+\begin{enumerate}[label=(\arabic*)]
+  \item \textbf{450 theory slots} spanning phonology through aesthetics,
+        each contributing constraints and generation rules.
+  \item \textbf{The $\Grade$ semiring} for combining theory verdicts:
+        $\otG$ conjoins independent requirements; $\opG$ selects
+        among competing alternatives.
+  \item \textbf{The $\FMLM$ decoder}, which fills masked positions
+        by iterative fixpoint computation over the full theory
+        ensemble.
+  \item \textbf{The descent algorithm}, which repairs
+        disharmonious output until the global grade crosses a
+        threshold.
+\end{enumerate}
+
+The result is a system whose every output is \emph{explainable}
+(each quality grade traces to a named theory), \emph{controllable}
+(change one theory slot, change one aspect of output), and
+\emph{compositional} (theories compose via the semiring without
+interference).
+
+%% ─── 28.2 ──────────────────────────────────────────────────────
+\section{The GOFAI chatbot architecture}
+\label{sec:gofai-chatbot}
+
+The chatbot implements a classic pipeline, but every stage is
+graded by a JuGeo theory slot.
+
+\subsection{Natural language understanding}
+\label{ssec:nlu}
+
+Input processing follows a five-stage NLU pipeline:
+\begin{enumerate}
+  \item \textbf{Tokenization and POS tagging}\; ($\morph$ stratum).
+        Rule-based tokenizer with lexicon lookup; POS tags assigned by
+        suffix rules and disambiguation via the highest-grade parse.
+  \item \textbf{Syntactic parsing}\; ($\synt$ stratum).
+        A slot-based parser identifies clause boundaries, verb frames,
+        and modifier attachment.  Each parse receives a grade
+        $g_{\synt}$ from theories such as \textsf{ClauseCompleteness}
+        and \textsf{InversionLicensing}.
+  \item \textbf{Semantic analysis}\; ($\sem$ stratum).
+        Frame-semantic analysis using FrameNet frames: the input is
+        mapped to a frame with filled roles.  Theories
+        \textsf{FrameCoherence} and \textsf{EntityBinding} grade the
+        result.
+  \item \textbf{Pragmatic interpretation}\; ($\prag$ stratum).
+        Speech-act classification (request, assertion, question) and
+        Gricean maxim checking.  The theory \textsf{SpeechActFelicity}
+        grades the pragmatic parse.
+  \item \textbf{Discourse integration}\; ($\disc$ stratum).
+        Topic tracking and anaphora resolution update the discourse
+        state.  Theories \textsf{TopicCoherence} and
+        \textsf{AnaphoraResolution} grade the integration.
+\end{enumerate}
+
+The overall NLU grade is the $\otG$-product across strata:
+\begin{equation}
+\label{eq:nlu-grade}
+  g_{\mathrm{NLU}} = g_{\morph} \otG g_{\synt} \otG g_{\sem}
+    \otG g_{\prag} \otG g_{\disc}.
+\end{equation}
+
+\subsection{Intent classification}
+\label{ssec:intent}
+
+The dialogue manager classifies user intent via a pattern-based
+system graded by the $\Grade$ semiring.  Each candidate intent
+$I \in \{\textsc{PoemRequest}, \textsc{StyleRequest},
+\textsc{Feedback}, \textsc{Revision}, \textsc{Question},
+\textsc{Greeting}, \textsc{Help}, \textsc{Thanks}\}$ has a set of
+indicator patterns; firing patterns contribute grade via~$\opG$
+(log-sum-exp), and the highest-grade intent wins:
+\begin{equation}
+\label{eq:intent-grade}
+  I^* = \arg\max_I \; g(I \mid \text{input}).
+\end{equation}
+No neural classifier is involved: the grade semiring \emph{is} the
+classifier.
+
+\subsection{Response generation}
+\label{ssec:response-gen}
+
+Given the classified intent $I^*$ and discourse state, the response
+pipeline proceeds:
+\begin{enumerate}
+  \item \textbf{Topic model $\to$ frame selection.}\;
+        The current topic (maintained by the $\disc$ stratum) selects
+        a FrameNet frame; frame elements become template slots.
+  \item \textbf{Template instantiation.}\;
+        A response template is chosen from a bank indexed by intent
+        and frame; slots are filled from the discourse context and
+        knowledge base.
+  \item \textbf{Surface realization.}\;
+        The filled template is linearized, applying morphological
+        rules ($\morph$ stratum) and phonological smoothing ($\phon$
+        stratum).
+  \item \textbf{$\FMLM$ refinement.}\;
+        Any remaining masked positions are filled by the fixpoint
+        decoder, which scores candidates against the full theory
+        ensemble.
+\end{enumerate}
+
+\subsection{Conversation management}
+\label{ssec:conversation}
+
+Long-range coherence is maintained by the \emph{discourse monad}
+$\mathrm{DMon}$, which tracks:
+\begin{itemize}
+  \item \textbf{Topic stack}\; ($\disc$ stratum): active topics,
+        topic shifts, and topic resumption.
+  \item \textbf{Reference resolution}\; ($\sem$ stratum): entity
+        mentions and their antecedents.
+  \item \textbf{Turn history}\; ($\prag$ stratum): user preferences,
+        feedback history, and affective state.
+  \item \textbf{User model}: accumulated preferences for poetic form,
+        mood, and style, updated after each interaction.
+\end{itemize}
+
+The monadic structure ensures that state updates compose cleanly
+across turns: each turn is a Kleisli arrow
+$\mathrm{Turn} \to \mathrm{DMon}(\mathrm{Response})$.
+
+%% ─── 28.3 ──────────────────────────────────────────────────────
+\section{The GOFAI poetry engine}
+\label{sec:gofai-poetry}
+
+The poetry engine is the showcase application of the GOFAI approach.
+It generates metrically, rhymically, and semantically controlled
+verse using no neural model.
+
+\subsection{Form selection}
+\label{ssec:form-select}
+
+Each poetic form is a type $F$ in $\PStr$ with specific structural
+constraints:
+\begin{center}
+\begin{tabular}{lll}
+\textbf{Form} & \textbf{Constraint type} & \textbf{Theory} \\
+\hline
+Sonnet & 14 lines, volta at 8 or 12, iambic pentameter
+       & \textsf{FormCompliance} \\
+Villanelle & 19 lines, two refrains, $\mathrm{ABA}$ tercets
+           & \textsf{FormCompliance} \\
+Haiku & 5-7-5 syllables, seasonal word (\emph{kigo})
+      & \textsf{SyllableCount} \\
+Ghazal & couplets with \emph{radif} and \emph{qafia}
+       & \textsf{RhymeScheme} \\
+Terza rima & $\mathrm{ABA\;BCB\;CDC\;\dots}$ interlocking tercets
+           & \textsf{RhymeScheme} \\
+Free verse & no fixed meter; scored on rhythm variety
+           & \textsf{MeterCompliance}
+\end{tabular}
+\end{center}
+The user may also specify a \emph{poet style} (Keats, Dickinson,
+Whitman, Shakespeare, Neruda), which modulates diction, syntax, and
+thematic profiles via a style presheaf over the stratal tower.
+
+\subsection{Content generation}
+\label{ssec:content-gen}
+
+Content is generated by pure knowledge-base lookup:
+\begin{enumerate}
+  \item \textbf{Topic $\to$ FrameNet frames.}\;
+        The topic word activates one or more FrameNet frames
+        (e.g., \emph{love} activates \textsc{Personal\_relationship},
+        \textsc{Emotion\_directed}, \textsc{Desiring}).
+  \item \textbf{Frame $\to$ lexical units.}\;
+        Each frame provides lexical units; these are expanded via
+        WordNet synonymy, hypernymy, and semantic similarity.
+  \item \textbf{Candidate word pool.}\;
+        The union of lexical units and WordNet expansions forms
+        the candidate pool, from which the $\FMLM$ decoder draws.
+  \item \textbf{Proof strategies.}\;
+        Eight proof strategies---\textsf{BaseFact}, \textsf{Causal},
+        \textsf{Metaphor}, \textsf{Temporal}, \textsf{Negation},
+        \textsf{Relational}, \textsf{Hypernym},
+        \textsf{Presupposition}---each produce an $\HPLF$ term and
+        a template with bindings.  These provide the propositional
+        skeleton of each line.
+\end{enumerate}
+
+No neural model is consulted at any point: content derives from
+FrameNet, WordNet, CMUDict, and the theory ensemble.
+
+\subsection{Quality control}
+\label{ssec:quality}
+
+Each candidate poem is scored by the $\Grade$ semiring along four
+primary axes, each backed by specific theory slots:
+
+\medskip\noindent\textbf{Meter.}\;
+CMUDict provides stress patterns (sequences of 0, 1, 2 for
+unstressed, primary, secondary stress).  The theory
+\textsf{MeterCompliance} computes the edit distance between the
+observed stress pattern and the target pattern (e.g., iambic
+pentameter = $01\,01\,01\,01\,01$), normalized to $[-\infty, 0]$:
+\[
+  g_{\mathrm{meter}} = -\frac{d_{\mathrm{edit}}(\sigma_{\mathrm{obs}},
+    \sigma_{\mathrm{target}})}{\lvert \sigma_{\mathrm{target}} \rvert}.
+\]
+
+\medskip\noindent\textbf{Rhyme.}\;
+CMUDict phoneme sequences enable perfect rhyme (identical final
+stressed vowel and coda), near rhyme (identical vowel, different
+coda), and slant rhyme (similar vowel).  The theory
+\textsf{RhymeScheme} checks each line-ending pair against the
+target scheme:
+\[
+  g_{\mathrm{rhyme}} = \frac{1}{|\text{pairs}|}\sum_{\text{pairs}}
+    g_{\mathrm{match}}(w_i, w_j).
+\]
+
+\medskip\noindent\textbf{Imagery.}\;
+WordNet Wu--Palmer similarity between successive content words
+measures semantic diversity; excessively high similarity (clich\'e)
+or excessively low similarity (incoherence) is penalized:
+\[
+  g_{\mathrm{imagery}} = -\bigl\lvert
+    \mathrm{sim}(w_i, w_j) - \tau_{\mathrm{target}} \bigr\rvert,
+\]
+where $\tau_{\mathrm{target}} \approx 0.4$ balances novelty and
+coherence.
+
+\medskip\noindent\textbf{Emotion.}\;
+Affect lexicons (valence, arousal, dominance) map each word to an
+emotional vector.  The theory \textsf{RasaConsistency} checks that
+the poem's emotional trajectory matches the target
+mood (\emph{rasa}):
+\[
+  g_{\mathrm{emotion}} = -\left\lVert
+    \vec{e}_{\mathrm{poem}} - \vec{e}_{\mathrm{target}}
+  \right\rVert.
+\]
+
+The total poem grade is:
+\begin{equation}
+\label{eq:poem-grade}
+  g_{\mathrm{poem}} = g_{\mathrm{meter}} \otG g_{\mathrm{rhyme}}
+    \otG g_{\mathrm{imagery}} \otG g_{\mathrm{emotion}}
+    \otG g_{\mathrm{style}} \otG g_{\mathrm{form}}.
+\end{equation}
+
+\subsection{Beam search as proof search}
+\label{ssec:beam-search}
+
+The generation engine maintains a beam of $k$ candidate poems,
+scored by their total grade~\eqref{eq:poem-grade}.  At each
+step (line or stanza), the $\FMLM$ decoder produces $m$ candidate
+continuations for each beam element; the top-$k$ by grade survive.
+This is formally identical to \emph{proof search} in the type
+theory of Part~III: each candidate poem is a partial proof term,
+each continuation extends the proof, and the grade is the
+proof's quality.
+
+\begin{proposition}
+\label{prop:beam-convergence}
+If the per-step grade is bounded below by $g_{\min} > \gzero$ and
+the form imposes a finite length~$L$, then beam search terminates
+in at most $L$ steps with at least one candidate of grade
+$\geq g_{\min}^L$ (where exponentiation is in the $\otG$-monoid,
+i.e., $L$-fold $\otG$-product).
+\end{proposition}
+
+%% ─── 28.4 ──────────────────────────────────────────────────────
+\section{Advantages of GOFAI + JuGeo}
+\label{sec:gofai-advantages}
+
+We summarize the structural advantages of the theory-driven approach
+over LLM-based generation.
+
+\begin{description}
+  \item[Interpretability.]
+    Every component of $g_{\mathrm{poem}}$ traces to a named theory
+    slot.  A user can ask ``why is the meter grade low?'' and receive
+    a specific answer (``line~7 has a trochaic inversion at
+    position~3'').  An LLM cannot provide this.
+  \item[Controllability.]
+    Changing one theory slot changes exactly one aspect of the
+    output.  To make the poem more emotionally intense, raise the
+    weight of \textsf{RasaConsistency}; to allow more metrical
+    freedom, lower the weight of \textsf{MeterCompliance}.
+    In an LLM, such fine-grained control is unavailable.
+  \item[Compositionality.]
+    Theories compose via the $\Grade$ semiring: adding a new
+    theory (e.g., \textsf{Alliteration}) does not interfere with
+    existing ones.  This is the \emph{open world property} of CTT.
+  \item[No training data.]
+    The system runs on pure theory: lexicons (WordNet, CMUDict,
+    FrameNet), affect dictionaries, and hand-authored constraints.
+    No corpus of poems is needed.
+  \item[No hallucination.]
+    Every factual claim in the poem traces to a knowledge-base
+    entry (WordNet gloss, FrameNet frame, or Wikipedia fact).
+    The system cannot invent false facts because it has no
+    generative model to hallucinate from.
+\end{description}
+
+%% ─── 28.5 ──────────────────────────────────────────────────────
+\section{Disadvantages and mitigations}
+\label{sec:gofai-disadvantages}
+
+\begin{description}
+  \item[Fluency.]
+    GOFAI-generated text can sound stilted.  Mitigation: large word
+    banks ($> 150{,}000$ words from CMUDict), frame-based templates
+    from FrameNet, and the $\FMLM$ decoder's multi-axis scoring
+    (phonological, semantic, register, diversity) smooth the surface.
+  \item[Novelty.]
+    Knowledge-base lookup risks producing predictable combinations.
+    Mitigation: the \emph{conceptual blending} type constructor
+    $\mathrm{Blend}(F_1, F_2)$ of Part~III merges two FrameNet frames
+    to produce novel juxtapositions (e.g., blending
+    \textsc{Commerce\_sell} with \textsc{Death} for a war poem).
+  \item[Scale.]
+    Full beam search over 450 theories is expensive.
+    Mitigation: theories are lazily evaluated (only active
+    theories fire), and the $\FMLM$ decoder caches lexical lookups
+    across lines.  In practice, generation of a 14-line sonnet
+    takes $<$\,2 seconds on commodity hardware.
+\end{description}
+
+%% ─── 28.6 ──────────────────────────────────────────────────────
+\section{The hybrid approach}
+\label{sec:hybrid}
+
+The GOFAI and LLM approaches are not mutually exclusive; JuGeo
+provides the framework for combining them.
+
+\begin{construction}[Hybrid Generation Pipeline]
+\label{con:hybrid}
+\begin{enumerate}
+  \item \textbf{GOFAI generates the structural skeleton.}\;
+        The theory ensemble produces a metrically and rhymically
+        correct draft with filled semantic roles, graded by
+        $\GEval$.  This draft is a \emph{section} in $\PStr$ with
+        $\check{H}^1 = 0$ (it glues) but potentially low surface
+        fluency.
+  \item \textbf{LLM polishes the surface.}\;
+        The draft is passed to an LLM with the instruction ``improve
+        fluency while preserving meter, rhyme, and meaning.''
+        The LLM's output is a new candidate section.
+  \item \textbf{JuGeo verifies the result.}\;
+        The full theory ensemble re-grades the polished version.
+        If $\GEval$ improves and $\check{H}^1$ remains zero, the
+        polished version is accepted; otherwise the GOFAI draft is
+        preferred.
+\end{enumerate}
+\end{construction}
+
+This hybrid pipeline gives the best of both worlds: the structural
+guarantees of GOFAI and the surface fluency of an LLM, with JuGeo
+serving as the arbiter.  The graded evaluation ensures that the
+LLM cannot silently break structural invariants---any fluency
+improvement that damages meter, rhyme, or semantic coherence will
+be caught by the theory ensemble and rejected.
+
+\chapter{Software Generation at Scale}
+\label{ch:software-scale}
+
+We now turn from individual-project verification to
+\emph{industrial-scale} applications of Judgment Geometry:
+continuous integration, multi-repository coherence, specification
+mining, refactoring, security analysis, and performance optimization.
+
+%% ─── 29.1 ──────────────────────────────────────────────────────
+\section{Continuous verification}
+\label{sec:continuous-verif}
+
+Modern software development is organized around
+continuous-integration (CI) pipelines.  JuGeo integrates naturally
+into this workflow.
+
+\begin{construction}[JuGeo CI Layer]
+\label{con:ci-layer}
+Augment a standard CI/CD pipeline with a JuGeo verification stage:
+\begin{enumerate}
+  \item \textbf{Every commit $c$ induces a judgment.}\;
+        The diff of $c$ modifies sections on one or more open sets
+        $U_i$ in the project site $\STop$.  JuGeo recomputes the
+        affected entries of the \v{C}ech complex.
+  \item \textbf{Every pull request triggers descent.}\;
+        The PR's changeset defines a candidate section~$s'$;
+        JuGeo computes $\delta^0 s'$ and reports any new
+        obstructions introduced by the change.
+  \item \textbf{$\CSpec$ catches integration bugs.}\;
+        Standard CI runs unit tests ($H^0$ check).  JuGeo adds the
+        $H^1$ check: do the changed modules still glue with their
+        neighbors?
+  \item \textbf{$\GEval$ tracks quality over time.}\;
+        The grade $g(s)$ is computed for every merge to the main
+        branch, producing a \emph{quality time series}
+        $\{g(s^{(t)})\}_{t \geq 0}$.  Regressions are flagged when
+        $g(s^{(t+1)}) < g(s^{(t)}) - \epsilon$ for a configurable
+        tolerance~$\epsilon$.
+\end{enumerate}
+\end{construction}
+
+\begin{remark}
+The JuGeo CI layer is \emph{incremental}: only the affected
+part of the \v{C}ech complex is recomputed.  If a commit touches
+modules $M_i$ and~$M_j$, only the overlap cochains involving $M_i$
+and~$M_j$ are re-evaluated.  This makes the computation
+proportional to the size of the diff, not the size of the project.
+\end{remark}
+
+%% ─── 29.2 ──────────────────────────────────────────────────────
+\section{Multi-repository coherence}
+\label{sec:multi-repo}
+
+Large organizations operate across monorepos or constellations of
+microservice repositories.  JuGeo scales naturally to this setting.
+
+\begin{definition}[Multi-Repository Site]
+\label{def:multi-repo-site}
+Let $R_1, \dots, R_n$ be repositories.  Define the
+\emph{multi-repository site} $\STop_{\mathrm{multi}}$:
+\begin{itemize}
+  \item Objects: the modules of each $R_i$, plus inter-repository
+        API surfaces.
+  \item Morphisms: intra-repo dependency + inter-repo API calls.
+  \item Topology: a family covers an API surface~$A$ if it
+        includes both the provider and all consumers of~$A$.
+\end{itemize}
+\end{definition}
+
+Under this site:
+\begin{itemize}
+  \item \textbf{API contracts are $\Cech^1$ conditions.}\;
+        The overlap $U_i \cap U_j$ between a service and its
+        client is the API contract (request/response schema,
+        error codes, latency bounds).  A class
+        $[\alpha] \in \check{H}^1$ with $[\alpha]\neq 0$ signals a
+        \emph{contract violation}.
+  \item \textbf{Breaking changes are $H^1 \neq 0$.}\;
+        A breaking API change is precisely a modification that
+        introduces a non-trivial class in $\check{H}^1$: the
+        provider and consumer disagree on the overlap.
+  \item \textbf{Versioning is cover refinement.}\;
+        Introducing a new API version $v2$ alongside $v1$ refines
+        the cover: consumers of $v1$ and $v2$ live in different
+        open sets, and the overlap conditions split accordingly.
+        This is sheaf-theoretically natural---it corresponds to
+        passing to a finer topology.
+\end{itemize}
+
+\begin{proposition}
+\label{prop:semver}
+Under the multi-repository site, semantic versioning
+(major/minor/patch) admits the following cohomological
+interpretation:
+\begin{enumerate}[label=(\roman*)]
+  \item A \emph{patch} change preserves all sections
+        ($\check{H}^1$ unchanged).
+  \item A \emph{minor} change adds new sections but
+        preserves existing ones
+        ($\check{H}^1$ can only shrink).
+  \item A \emph{major} change may introduce new classes in
+        $\check{H}^1$ (existing sections may fail to glue).
+\end{enumerate}
+\end{proposition}
+
+%% ─── 29.3 ──────────────────────────────────────────────────────
+\section{Specification mining}
+\label{sec:spec-mining}
+
+A key practical obstacle to verification is that most code lacks
+formal specifications.  JuGeo can \emph{infer} specifications from
+existing code and tests.
+
+\begin{construction}[Specification Mining via $\PStr$]
+\label{con:spec-mining}
+Given a module~$U$ with code~$E_U$ and test suite~$T_U$:
+\begin{enumerate}
+  \item \textbf{Mine candidate types.}\;
+        Analyze $E_U$ to extract function signatures, invariants,
+        and pre/post-conditions.  Each candidate is a potential
+        type $A_U$ in~$\PStr$.
+  \item \textbf{Tests as evidence.}\;
+        Each passing test $t \in T_U$ is an evidence term
+        $e_t : A_U$ in the mined type.  The grade
+        $g(e_t : A_U)$ measures how well the test exercises the
+        specification.
+  \item \textbf{Cross-module consistency.}\;
+        Compute $\check{H}^1$ for the mined specifications:
+        if module $M_i$'s mined spec says ``\texttt{get\_user}
+        returns a string'' but $M_j$'s tests treat the return
+        value as a dictionary, $\check{H}^1 \neq 0$ flags the
+        inconsistency.
+  \item \textbf{Refinement.}\;
+        Use the obstructions to refine the mined specifications
+        until $\check{H}^1 = 0$.  The result is a consistent,
+        machine-inferred specification for the entire project.
+\end{enumerate}
+\end{construction}
+
+\begin{remark}
+Specification mining is dual to code generation: generation starts
+from $A$ and produces~$E$; mining starts from $E$ and infers~$A$.
+In both cases, $\CSpec$ enforces global consistency.
+\end{remark}
+
+%% ─── 29.4 ──────────────────────────────────────────────────────
+\section{Refactoring as descent}
+\label{sec:refactoring}
+
+Large-scale refactoring---renaming, module extraction, API
+migration---is one of the most error-prone activities in software
+engineering.  Under JuGeo, refactoring is \emph{exactly} descent.
+
+\begin{proposition}[Refactoring = Descent]
+\label{prop:refactoring}
+Let $s^{(0)}$ be the current codebase (a section of $\PStr$) and
+let $A'$ be the target specification (post-refactoring types and
+interfaces).  Refactoring from $s^{(0)}$ to a section $s^{(*)}$
+satisfying $A'$ is the descent problem for the presheaf
+$\PStr_{A'}$ with initial candidate~$s^{(0)}$.  Specifically:
+\begin{enumerate}
+  \item The current code $s^{(0)}$ does not satisfy $A'$ on overlaps:
+        $\check{H}^1(\STop, \PStr_{A'}) \neq 0$ with $s^{(0)}$ as
+        candidate.
+  \item Each refactoring step modifies $s^{(t)}$ on some $U_i$,
+        producing $s^{(t+1)}$.
+  \item Descent converges when $\check{H}^1 = 0$ relative to~$A'$.
+\end{enumerate}
+\end{proposition}
+
+The $\GEval$ component tracks refactoring progress:
+$g(s^{(t)})$ increases monotonically if each step resolves at least
+one obstruction.  This provides a \emph{progress metric} for
+refactoring projects that is more informative than ``percentage of
+files changed.''
+
+%% ─── 29.5 ──────────────────────────────────────────────────────
+\section{Security analysis via cohomology}
+\label{sec:security}
+
+Security vulnerabilities often arise from \emph{non-local}
+interactions: data flows from a trusted source through an untrusted
+transformation to a sensitive sink.  This is a cohomological
+phenomenon.
+
+\begin{construction}[Security Presheaf]
+\label{con:security-presheaf}
+Define a presheaf $\mathcal{S}$ on the call-graph site of a program:
+\begin{itemize}
+  \item To each function $f$, assign the set of
+        \emph{security labels} (e.g., public, confidential, secret)
+        of its inputs and outputs.
+  \item To each call edge $f \to g$, assign the restriction map
+        that propagates labels through the call.
+\end{itemize}
+The sheaf condition requires that labels are consistent along every
+path from source to sink.  Failure of the sheaf condition---a
+non-trivial class in $\check{H}^1(\mathcal{G}, \mathcal{S})$---is
+an \emph{information leak}: data classified ``secret'' reaches a
+function labeled ``public'' via an intermediate path that fails to
+enforce the label.
+\end{construction}
+
+\begin{example}
+A web application has a function \texttt{get\_password} labeled
+\texttt{secret} and a logging function \texttt{log} labeled
+\texttt{public}.  An intermediate function \texttt{format\_user}
+calls both.  The overlap cochain records that \texttt{format\_user}
+must simultaneously handle \texttt{secret} input and produce
+\texttt{public} output---a non-trivial $H^1$ class, flagging a
+potential leak path.
+\end{example}
+
+Patching the vulnerability is descent: modify the code (repair the
+section) until the security labels glue consistently and
+$\check{H}^1 = 0$.
+
+%% ─── 29.6 ──────────────────────────────────────────────────────
+\section{Performance optimization}
+\label{sec:perf-opt}
+
+Performance can be treated as an additional stratum in the JuGeo
+framework.
+
+\begin{construction}[Performance Stratum]
+\label{con:perf-stratum}
+Augment the project site with a \emph{performance stratum}
+$\sigma_{\mathrm{perf}}$:
+\begin{itemize}
+  \item To each function~$f$, assign a performance profile
+        (time complexity, memory usage, cache behavior).
+  \item The grade $g_{\mathrm{perf}}(f)$ measures how well $f$'s
+        observed performance matches its target.
+  \item \emph{Hotspots} are obstructions: functions where
+        $g_{\mathrm{perf}} \ll \gone$.
+  \item \emph{Optimization} is descent: iteratively improve the
+        lowest-grade functions until
+        $g_{\mathrm{perf}} \geq g_{\min}$.
+\end{itemize}
+\end{construction}
+
+Cross-stratum descent is particularly powerful here: a performance
+optimization that changes a function's interface (e.g., switching
+from synchronous to asynchronous I/O) creates an obstruction in
+the functional stratum.  JuGeo's cross-stratum descent detects this
+and ensures that all callers are updated accordingly.
+
+\begin{remark}
+The performance stratum illustrates the \emph{extensibility} of
+JuGeo: adding a new stratum requires only defining the appropriate
+theory slots and grade functions.  The descent algorithm, the
+cohomological machinery, and the $\Grade$ semiring are reused
+unchanged.  This is the open-world property of CTT applied to
+software engineering.
+\end{remark}
+
+\chapter{Future Directions}
+\label{ch:future}
+
+We close the monograph with a survey of open problems, speculative
+applications, and directions for future research.  Some of these are
+natural extensions of the existing framework; others require
+fundamentally new mathematics.
+
+%% ─── 30.1 ──────────────────────────────────────────────────────
+\section{Higher-categorical Judgment Geometry}
+\label{sec:higher-cat}
+
+Throughout this monograph, $\STop$ has been a 1-topos: a category
+of sheaves on a Grothendieck site.  The natural generalization
+replaces 1-categories with $(\infty,1)$-categories.
+
+\begin{itemize}
+  \item \textbf{$\STop$ becomes an $\infty$-topos} in the sense of
+        Lurie~\cite{lurie2009}.  The judgment presheaf $\PStr$
+        becomes an $\infty$-presheaf valued in $\infty$-groupoids
+        rather than sets; this captures not just whether two
+        local sections agree on an overlap, but all \emph{higher
+        coherences} (homotopies between homotopies, \emph{ad
+        infinitum}).
+  \item \textbf{$\PStr$ becomes homotopy type theory.}\;
+        Types are no longer mere propositions or sets but
+        \emph{spaces}; the identity type $\GId_g(a,b)$ of Part~III
+        generalizes to a graded path space, and higher identity
+        types capture graded homotopies.
+  \item \textbf{$\CSpec$ becomes derived $\infty$-cohomology.}\;
+        The \v{C}ech complex is replaced by the full derived
+        functor of global sections in the $\infty$-topos.  The
+        obstruction theory gains access to the full spectrum of
+        cohomological invariants, including $H^n$ for all $n \geq 0$.
+  \item \textbf{$\GEval$ becomes an $\infty$-graded structure.}\;
+        The $\Grade$ semiring is replaced by a
+        \emph{graded $\infty$-ring spectrum}, in which grades
+        themselves form a homotopy-coherent algebraic structure.
+\end{itemize}
+
+\begin{remark}
+The motivation for higher-categorical JuGeo is not merely
+generality.  In software verification, higher coherences arise
+naturally: a refactoring $r_1$ and a refactoring $r_2$ may each
+preserve correctness, but their composition $r_2 \circ r_1$ may
+not---and tracking \emph{why} requires a homotopy between the
+two paths.  In linguistics, higher coherences appear in poetic
+ambiguity: a word may have two readings, each reading two
+sub-readings, and so forth.  The $\infty$-categorical framework
+captures this tower of ambiguity natively.
+\end{remark}
+
+The key open problem is:
+
+\begin{quote}
+\emph{Does the descent algorithm of Part~II generalize to the
+$\infty$-categorical setting with convergence guarantees?}
+\end{quote}
+
+We conjecture that it does, provided the $\infty$-graded structure
+satisfies an appropriate finiteness condition (e.g., that the
+homotopy groups of the grade spectrum stabilize).
+
+%% ─── 30.2 ──────────────────────────────────────────────────────
+\section{Quantum Judgment Geometry}
+\label{sec:quantum}
+
+Quantum computing introduces programs whose correctness cannot be
+verified by classical testing (measuring a quantum state collapses
+it).  JuGeo offers an alternative.
+
+\begin{itemize}
+  \item \textbf{The site} is the category of quantum circuits,
+        with morphisms given by circuit composition and ancilla
+        management.
+  \item \textbf{Types} are quantum specifications: unitary
+        conditions ($U^\dagger U = I$), entanglement invariants,
+        and decoherence bounds.
+  \item \textbf{Cohomology} captures topological invariants of
+        quantum states---analogous to topological quantum
+        computation, where the robustness of a quantum gate is
+        measured by a topological invariant.
+  \item \textbf{Grades} are fidelity measures: the grade
+        $g(\rho, \sigma) = \log F(\rho, \sigma)$ where $F$ is the
+        quantum fidelity between the ideal state $\sigma$ and the
+        actual state~$\rho$.
+\end{itemize}
+
+\begin{remark}
+The connection between JuGeo and topological quantum computing
+is tantalizing: both frameworks use cohomological invariants to
+measure the ``robustness'' of a structure.  Whether this analogy
+can be made precise---whether quantum error correction codes
+arise as descent data in a JuGeo site over quantum circuits---is
+an open question.
+\end{remark}
+
+%% ─── 30.3 ──────────────────────────────────────────────────────
+\section{Biological Judgment Geometry}
+\label{sec:biological}
+
+Biological macromolecules can be viewed as ``programs'' whose
+``execution'' is physical.  JuGeo provides a verification framework.
+
+\begin{itemize}
+  \item \textbf{Codons as morphemes.}\;
+        The genetic code maps nucleotide triplets to amino acids,
+        exactly as morphological rules map morphemes to meanings.
+        The $\morph$ stratum of CTT applies directly.
+  \item \textbf{Protein folding as descent.}\;
+        A protein's amino acid sequence is a ``local'' description;
+        the folded 3D structure is the ``global section'' that the
+        sequence must descend to.  Misfolding is $H^1 \neq 0$: the
+        local energetic preferences of individual residues fail to
+        glue into a globally consistent structure.
+  \item \textbf{Mutations as obstructions.}\;
+        A point mutation modifies the section on one open set
+        (one residue's local environment).  Whether the mutant
+        protein still folds correctly is whether the modified
+        section still glues---a cohomological question.
+  \item \textbf{Fitness as grade.}\;
+        Darwinian fitness provides a natural $\GEval$: the grade
+        of an organism is its reproductive success, and evolution
+        is descent toward higher grades.
+\end{itemize}
+
+%% ─── 30.4 ──────────────────────────────────────────────────────
+\section{Musical Judgment Geometry: DAW Projects as Programs}
+\label{sec:musical}
+
+A digital audio workstation (DAW) project file---a Renoise
+\texttt{.xrns}, an Ableton Live \texttt{.als}, an FL~Studio
+\texttt{.flp}---is a \emph{complete program}.  It contains tracks
+(modules), patterns (functions), notes and effect commands
+(instructions), signal-flow routing (data flow), automation curves
+(continuous parameter functions), a mixer dependency graph (sends,
+returns, sidechains), references to external plugins (libraries),
+and a master bus (entry point).  The analogy is not metaphorical:
+these project files admit exactly the same 4-tuple structure
+$\JJ = (\STop, \PStr, \CSpec, \GEval)$ that governs software
+verification.  In this section we develop that structure in detail,
+using tracker-style DAWs (especially Renoise) as the running
+example while noting how each concept maps to timeline-based
+environments such as Ableton Live and FL~Studio.
+
+% ────────────────────────────────────────────────────────────────
+\subsection{The site \texorpdfstring{$\STop$}{S} for a DAW project}
+\label{ssec:musical-site}
+
+The site is the temporal-structural hierarchy of the project.
+
+\begin{definition}[Musical site]
+\label{def:musical-site}
+Let $\mathcal{C}_{\mathrm{DAW}}$ be the category whose objects are
+the structural units of the project at every scale:
+\begin{enumerate}
+  \item \textbf{Sample level.}\;
+        Individual audio samples at the sample rate
+        (e.g.\ 44\,100\,Hz or 48\,000\,Hz).
+  \item \textbf{Tick level.}\;
+        Tracker ticks or MIDI ticks---the finest rhythmic
+        resolution.  In Renoise the default is 12~ticks per line;
+        at 8~lines per beat this gives 96~ticks per beat.
+  \item \textbf{Line / beat level.}\;
+        Individual rows in a Renoise pattern (``lines''),
+        corresponding to sixteenth-note or other subdivisions,
+        or beats in a timeline DAW.
+  \item \textbf{Pattern level.}\;
+        Renoise's fundamental compositional unit: a rectangular
+        grid of note columns and effect columns, of configurable
+        length.  In Ableton this corresponds to a clip; in
+        FL~Studio, a pattern clip.
+  \item \textbf{Track level.}\;
+        Instrument tracks, group tracks, send tracks, and the
+        master track.
+  \item \textbf{Song level.}\;
+        The pattern sequence (Renoise's ``order list''), or the
+        arrangement view timeline.
+  \item \textbf{Project level.}\;
+        The complete \texttt{.xrns}/\texttt{.als}/\texttt{.flp}
+        file, including all referenced samples, instruments,
+        plugin states, and configuration.
+\end{enumerate}
+Morphisms are \emph{restriction} maps: a pattern restricts to a
+line, a line restricts to a tick, a track restricts to its content
+within a single pattern, etc.  Composition of restrictions is
+associative; identity restrictions exist at every level.
+\end{definition}
+
+The Grothendieck topology on $\mathcal{C}_{\mathrm{DAW}}$ is
+defined by covering sieves:
+
+\begin{itemize}
+  \item A \emph{cover of the song} is its pattern sequence---the
+        ordered collection of pattern instances that tile the
+        timeline.
+  \item A \emph{cover of a pattern} is its track decomposition---
+        the collection of per-track columns within that pattern.
+  \item The \emph{overlap} between adjacent patterns in the
+        sequence captures crossfade regions, automation
+        continuity at pattern boundaries, and sustained notes
+        that cross a pattern break.
+\end{itemize}
+
+In Renoise, the \textbf{pattern matrix}---the grid of pattern
+slots vs.\ tracks---\emph{is} the covering sieve, made visible as
+a GUI element.  Each cell $(p, t)$ in the matrix is an open set
+$U_{p,t}$, and the pattern matrix is the nerve of the cover.
+
+\begin{definition}[Musical presheaf]
+\label{def:musical-presheaf}
+The \emph{structure presheaf} $\mathcal{F}$ on
+$\mathcal{C}_{\mathrm{DAW}}$ assigns to each open set $U$ the
+musical data active on $U$:
+\begin{itemize}
+  \item At a line: note values, velocities, instrument indices,
+        panning, volume, and effect-column commands
+        (e.g.\ \texttt{0Exx} retrigger, \texttt{0Bxx} pattern
+        break, \texttt{0900} sample offset).
+  \item At a track: the DSP effect chain, send amounts, group
+        routing.
+  \item At an instrument: sample mappings, modulation sets
+        (envelopes, LFOs), macro assignments, plugin state.
+  \item At a pattern: automation envelopes for any device
+        parameter.
+\end{itemize}
+Restriction maps are the natural projections:
+$\mathcal{F}(U) \to \mathcal{F}(V)$ for $V \hookrightarrow U$
+restricts the data to the sub-region.
+\end{definition}
+
+\begin{remark}[Renoise effect commands as morphisms]
+Pattern effect commands such as \texttt{0Bxx} (pattern break) and
+\texttt{0Fxx} (set speed/LPB) are morphisms \emph{between} pattern
+objects: they alter the flow of control in the pattern sequence,
+just as jump instructions alter control flow in a program.
+Instrument macros---Renoise's 8 assignable knobs that each control
+an arbitrary set of device parameters---are natural transformations
+between sub-presheaves, coordinating multiple restriction maps
+through a single control surface.
+\end{remark}
+
+% ────────────────────────────────────────────────────────────────
+\subsection{The proof structure \texorpdfstring{$\PStr$}{P} for
+  music}
+\label{ssec:musical-proof}
+
+The \emph{type} of a DAW project is its musical specification---the
+constraints that the finished piece must satisfy.
+
+\begin{definition}[Musical type]
+\label{def:musical-type}
+A \emph{musical type} $\tau$ is a tuple of constraints drawn from:
+\begin{itemize}
+  \item \textbf{Global parameters.}\;
+        BPM range, time signature, key, scale/mode.
+  \item \textbf{Arrangement structure.}\;
+        An ordered list of section labels---e.g.\
+        $[\mathsf{intro}, \mathsf{verse}, \mathsf{chorus},
+         \mathsf{bridge}, \mathsf{chorus}, \mathsf{outro}]$---with
+        target durations.
+  \item \textbf{Harmonic rules.}\;
+        Chord progression grammars (e.g.\ $\mathrm{ii}$--$\mathrm{V}$--$\mathrm{I}$,
+        circle-of-fifths motion), modulation constraints,
+        voice-leading rules.
+  \item \textbf{Rhythmic constraints.}\;
+        Groove template, swing percentage, quantization grid.
+  \item \textbf{Timbral constraints.}\;
+        Frequency band allocation per track group, stereo-field
+        assignments (e.g.\ bass and kick centered, hats and
+        percussion panned), dynamic range targets.
+  \item \textbf{Reference targets.}\;
+        A reference track with measured LUFS loudness,
+        spectral profile, and stereo width---the ``type'' the
+        final master should inhabit.
+\end{itemize}
+\end{definition}
+
+The \emph{evidence} inhabiting this type is the actual musical
+content: the patterns, notes, automation curves, DSP chains, and
+mixer settings that constitute the project.  The \emph{typing
+derivation} is the compositional structure that connects each piece
+of evidence to its constraint:
+
+\begin{itemize}
+  \item Each pattern's content derives from the arrangement type
+        for that section.
+  \item Each note in a pattern derives from the harmonic type
+        active at that moment.
+  \item Each DSP device in a chain derives from the timbral type
+        for that track's frequency/stereo allocation.
+  \item Each automation curve derives from the dynamic contour
+        specified by the arrangement arc.
+\end{itemize}
+
+\begin{definition}[Renoise-specific types]
+\label{def:renoise-types}
+We define the following type constructors for Renoise projects:
+\begin{align*}
+  &\mathsf{PatternType}(\ell, n_t, \mathit{lpb})
+    &&\text{--- pattern of length $\ell$ lines, $n_t$ tracks,
+           $\mathit{lpb}$ lines per beat,} \\
+  &\mathsf{InstrumentType}(S, M, K)
+    &&\text{--- instrument with sample set $S$, modulation sets $M$,
+           macro map $K$,} \\
+  &\mathsf{EffectChainType}(D_1, \ldots, D_k)
+    &&\text{--- chain of DSP devices $D_i$ in signal-flow order,} \\
+  &\mathsf{AutomationType}(p, e)
+    &&\text{--- automation envelope $e$ for device parameter $p$.}
+\end{align*}
+\end{definition}
+
+A well-typed project is one where every piece of musical content
+has a derivation from the specification.  An untyped passage---a
+note outside the scale, a pattern with no arrangement role, an
+unrouted send---is a type error.
+
+% ────────────────────────────────────────────────────────────────
+\subsection{The cohomological spectrum \texorpdfstring{$\CSpec$}{H}
+  for music}
+\label{ssec:musical-cohomology}
+
+Cohomology detects precisely the obstructions that separate a
+collection of locally acceptable musical fragments from a
+\emph{finished production}.
+
+\paragraph{$H^0$: Global consistency.}
+$H^0(\mathcal{C}_{\mathrm{DAW}}, \mathcal{F})$ is the space of
+global sections---the data that is consistent across every open set.
+Non-trivial $H^0$ elements include:
+\begin{itemize}
+  \item The master bus output is valid audio (finite amplitude,
+        non-silent, within 0\,dBFS).
+  \item All sample references in all instruments resolve to
+        existing files.
+  \item All plugin identifiers (\texttt{VST2}, \texttt{VST3},
+        \texttt{AU}) resolve to installed binaries.
+  \item BPM and time signature are consistent across the entire
+        song (or the tempo automation is continuous).
+\end{itemize}
+
+\paragraph{$H^1$: Obstructions to gluing.}
+$H^1 \neq 0$ is where the real problems live---where locally
+acceptable sections fail to compose into a coherent whole.  Each
+class of $H^1$ corresponds to a specific production problem:
+
+\begin{enumerate}
+  \item \textbf{Phase cancellation.}\;
+        Two tracks---e.g.\ a layered snare top and snare
+        bottom---that sound full in solo but partially cancel when
+        summed to the mix bus.  This is a textbook $H^1$ class:
+        $\mathcal{F}|_{U_{\mathrm{top}}}$ and
+        $\mathcal{F}|_{U_{\mathrm{bot}}}$ are each satisfactory,
+        but $\mathcal{F}|_{U_{\mathrm{top}} \cap
+        U_{\mathrm{bot}}} = \mathcal{F}|_{\mathrm{sum}}$ has a
+        non-trivial obstruction.
+  \item \textbf{Frequency masking.}\;
+        A kick drum and a bass synth both occupy the
+        60--120\,Hz band.  Each sounds powerful in solo; together
+        they produce mud.  The overlap
+        $U_{\mathrm{kick}} \cap U_{\mathrm{bass}}$ in the
+        spectral domain is the source of the obstruction.
+  \item \textbf{Key clashes at pattern boundaries.}\;
+        Pattern~$A$ is in C~major; pattern~$B$ modulates to
+        F$\sharp$~major.  Each pattern is harmonically
+        well-formed, but the transition---the overlap in the
+        covering sieve---carries an $H^1$ class measuring the
+        smoothness of the modulation.
+  \item \textbf{Automation discontinuities.}\;
+        A filter cutoff automation in pattern~$A$ ends at
+        value~$x$; the same parameter in pattern~$B$ begins at
+        value~$y \neq x$.  At the pattern boundary, the
+        presheaf has a discontinuity---an $H^1$ obstruction in
+        the automation sub-presheaf.
+  \item \textbf{Sustained-note truncation.}\;
+        A note sustains across a pattern break via Renoise's
+        \texttt{OFF}/\texttt{---} convention, but the next
+        pattern's first line contains a conflicting note-on in
+        the same column.  The gluing fails.
+  \item \textbf{Sidechain conflicts.}\;
+        Two instruments sidechained to the same source
+        (e.g.\ kick) with conflicting ducking envelopes: one
+        demands fast release, the other demands slow release.
+        The shared dependency creates an obstruction in the
+        signal-flow presheaf.
+  \item \textbf{Tempo automation breaks.}\;
+        Pattern at 120~BPM jumps to 140~BPM without a
+        ritardando or accelerando transition.  The tempo
+        presheaf is discontinuous.
+\end{enumerate}
+
+\paragraph{$H^2$ and higher: Structural obstructions.}
+Higher cohomology captures arrangement-level issues visible only in
+full-song context:
+\begin{itemize}
+  \item The verse--chorus--verse--chorus form lacks a satisfying
+        energy arc (no build, no release).
+  \item Mix balance is locally fine section-by-section but the
+        overall spectral center of gravity shifts
+        unpredictably across the arrangement.
+  \item Motivic development stalls---themes introduced in the
+        intro never return or transform.
+\end{itemize}
+
+\begin{proposition}[Mayer--Vietoris for mixing]
+\label{prop:mv-mixing}
+Let $A$ and $B$ be two track groups (e.g.\ drums and bass).  Their
+spectral/stereo overlap is $A \cap B$.  The Mayer--Vietoris
+sequence
+\[
+  \cdots \to H^0(A \cup B) \to H^0(A) \oplus H^0(B)
+  \to H^0(A \cap B) \xrightarrow{\;\partial\;}
+  H^1(A \cup B) \to \cdots
+\]
+gives the connecting homomorphism $\partial$ that sends ``local
+spectral compatibility'' to ``global mixing obstruction.''
+Concretely: $A$ and $B$ each pass their solo mix checks
+($H^0(A), H^0(B)$ trivial), but their shared frequency content
+$H^0(A \cap B)$ maps via $\partial$ to a non-trivial $H^1(A \cup
+B)$ class---frequency masking.  The standard mixing repair is to
+apply complementary EQ curves to $A$ and $B$, carving space in
+$A \cap B$ until $\partial = 0$.
+\end{proposition}
+
+% ────────────────────────────────────────────────────────────────
+\subsection{The graded evaluation \texorpdfstring{$\GEval$}{Q} for
+  music}
+\label{ssec:musical-grading}
+
+The graded evaluation for a DAW project is multi-stratal, with
+each stratum measuring an independent axis of production quality.
+
+\begin{definition}[Musical grade algebra]
+\label{def:musical-grade}
+Define the grade monoid
+$G_{\mathrm{DAW}} = (G, \otG, \gone, \opG, \gzero)$ with strata:
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lll@{}}
+\textbf{Stratum} & \textbf{What it measures} &
+  \textbf{Computation} \\
+\hline
+$\mathsf{mix}$         & Mix quality
+  & LUFS loudness, dynamic range, frequency balance, stereo width \\
+$\mathsf{master}$      & Mastering quality
+  & Peak level, RMS, crest factor, spectral tilt \\
+$\mathsf{arrangement}$ & Structural quality
+  & Section lengths, contrast ratios, tension/release arc \\
+$\mathsf{harmony}$     & Harmonic quality
+  & Voice leading, progression logic, modulation smoothness \\
+$\mathsf{rhythm}$      & Rhythmic quality
+  & Groove consistency, syncopation interest, quantize accuracy \\
+$\mathsf{timbre}$      & Timbral quality
+  & Spectral diversity, band allocation, stereo separation \\
+$\mathsf{melody}$      & Melodic quality
+  & Contour balance, interval distribution, motivic development \\
+$\mathsf{production}$  & Production polish
+  & Noise floor, artifact absence, latency compensation \\
+\end{tabular}
+\end{center}
+The overall grade is the $\otG$-product across all strata:
+\[
+  g_{\mathrm{total}} = g_{\mathsf{mix}} \otG\, g_{\mathsf{master}}
+    \otG\, g_{\mathsf{arrangement}} \otG\, g_{\mathsf{harmony}}
+    \otG\, g_{\mathsf{rhythm}} \otG\, g_{\mathsf{timbre}}
+    \otG\, g_{\mathsf{melody}} \otG\, g_{\mathsf{production}}.
+\]
+\end{definition}
+
+The $\otG$-product enforces the \textbf{bottleneck principle}: a
+track with brilliant melodies ($g_{\mathsf{melody}} \approx
+\gone$) but a clipping, distorted mix ($g_{\mathsf{mix}} \approx
+\gzero$) receives a low total grade, because $\gone \otG \gzero
+= \gzero$.  This is the formal expression of the producer's maxim
+that a great song with a bad mix never gets played.
+
+\begin{example}[Loudness war as grade collapse]
+The ``loudness war'' is the phenomenon of over-compressing masters
+to maximize perceived loudness at the cost of dynamic range.  In
+our grading, aggressive brick-wall limiting pushes
+$g_{\mathsf{master}}$ toward $\gone$ (the LUFS target is met) but
+simultaneously drives $g_{\mathsf{mix}} \to \gzero$ (dynamic range
+collapses, transients are destroyed).  The $\otG$-product correctly
+identifies this as a degradation: the master stratum cannot
+compensate for a destroyed mix stratum.
+\end{example}
+
+% ────────────────────────────────────────────────────────────────
+\subsection{Descent as the production workflow}
+\label{ssec:musical-descent}
+
+The actual DAW production workflow is \emph{descent}: a sequence of
+refinements that reduce $H^1$ obstructions and increase $\GEval$
+grades.
+
+\begin{enumerate}
+  \item \textbf{Sketch (initial candidate).}\;
+        Rough patterns with placeholder sounds---a bare melodic
+        idea in a default sine wave, a four-on-the-floor kick from
+        the factory library.  This candidate has many $H^1$
+        obstructions: no frequency separation, no arrangement
+        logic, placeholder timbres.
+  \item \textbf{Arrangement (first descent step).}\;
+        Organize patterns into a song structure---intro, build,
+        drop, break, drop, outro.  Assign section types from the
+        musical type $\tau$.  This resolves structural $H^1$
+        classes (the piece now has a coherent macro-form) and
+        increases $g_{\mathsf{arrangement}}$.
+  \item \textbf{Sound design (second step).}\;
+        Replace placeholder instruments with designed sounds:
+        layer samples in Renoise's instrument editor, sculpt
+        wavetables, program modulation sets and macros.  This
+        resolves timbral $H^1$ (the sounds now occupy distinct
+        spectral regions) and increases $g_{\mathsf{timbre}}$.
+  \item \textbf{Mixing (third step).}\;
+        Apply EQ, compression, saturation, and spatial
+        processing.  Configure send tracks for reverb and delay.
+        Set up sidechain routing.  Automate levels across
+        sections.  This resolves frequency-masking, phase, and
+        stereo $H^1$ classes, and increases $g_{\mathsf{mix}}$.
+  \item \textbf{Mastering (final step).}\;
+        Master bus processing: multi-band compression, stereo
+        imaging, limiting to target LUFS.  Resolves loudness and
+        dynamic-range $H^1$, and pushes $g_{\mathsf{master}}$
+        toward $\gone$.
+\end{enumerate}
+
+Each step is one iteration of the descent loop from
+Definition~\ref{def:musical-site}: produce a candidate section,
+compute $\CSpec$ (detect obstructions), compute $\GEval$ (grade
+quality), repair the lowest-grade stratum, and repeat.
+
+\begin{remark}[Renoise-specific descent moves]
+Renoise's pattern effect commands are \emph{local repair
+operations}:
+\begin{itemize}
+  \item \texttt{0Exx} (retrigger) repairs rhythmic sparseness by
+        subdividing a single note event.
+  \item \texttt{0Cxx} (set volume) repairs dynamic-range
+        obstructions within a pattern.
+  \item \texttt{0Gxx} (glide-to-note) repairs melodic
+        discontinuities by interpolating between pitches.
+  \item DSP chain reordering---EQ before vs.\ after
+        compression---changes the $H^1$ structure: pre-EQ
+        tightens the compressor's response (repairs spectral
+        obstructions first), while post-EQ allows broader
+        dynamics but may reintroduce masking.
+  \item Instrument macro mappings automate multi-parameter descent:
+        a single macro knob can simultaneously adjust filter
+        cutoff, resonance, and envelope decay, maintaining
+        timbral consistency as one control sweeps a family of
+        coherent states.
+\end{itemize}
+\end{remark}
+
+% ────────────────────────────────────────────────────────────────
+\subsection{Music generation via \texorpdfstring{$\FMLM$}{FMLM}}
+\label{ssec:musical-fmlm}
+
+JuGeo can \emph{generate} music, not just verify it.  The
+$\FMLM$ loop (Fill--Measure--Locate--Mend) applies directly.
+
+\begin{example}[Techno track generation]
+\label{ex:techno-gen}
+Start with a type:
+\[
+  \tau = \mathsf{Song}\!\left(
+    \begin{aligned}
+      &\mathit{genre} = \mathsf{techno},\;
+       \mathit{bpm} = 128,\;
+       \mathit{key} = \mathrm{A}\,\text{minor}, \\
+      &\mathit{structure} = [\mathsf{intro}, \mathsf{build},
+        \mathsf{drop}, \mathsf{break}, \mathsf{drop},
+        \mathsf{outro}]
+    \end{aligned}
+  \right).
+\]
+The $\FMLM$ loop proceeds:
+\begin{enumerate}
+  \item \textbf{Fill (iteration~1): drums.}\;
+        For each section, fill the drum track patterns---kick,
+        hats, clap, ride---respecting the rhythmic constraints
+        of $\tau$.  After this step, the project has rhythmic
+        content but massive $H^1$ (no harmonic content, no
+        spectral balance).
+  \item \textbf{Measure:}\;
+        compute
+        $g_{\mathsf{rhythm}} \approx 0.7$,
+        $g_{\mathsf{harmony}} = \gzero$,
+        $g_{\mathsf{timbre}} \approx 0.2$.
+  \item \textbf{Fill (iteration~2): bass line.}\;
+        Add a bass track constrained by the key
+        ($\mathrm{A}\,\text{minor}$) and the groove (locked to
+        kick pattern).  Frequency band: 30--200\,Hz.
+  \item \textbf{Measure:}\;
+        $g_{\mathsf{harmony}} \approx 0.4$ (bass provides root
+        motion), $H^1_{\mathrm{mask}}$ appears between kick and
+        bass in the 50--80\,Hz band.
+  \item \textbf{Locate + Mend:}\;
+        apply sidechain compression from kick to bass
+        (resolve masking $H^1$), high-pass the bass at 35\,Hz.
+  \item \textbf{Fill (iteration~3): lead/pad.}\;
+        Add a pad track (200\,Hz--2\,kHz) and a lead
+        (1--8\,kHz), constrained by the harmonic type and the
+        remaining spectral space.
+  \item \textbf{Fill (iteration~4): FX and transitions.}\;
+        Add risers, sweeps, impacts at section boundaries.
+        Automate filter cutoffs for builds.  Resolve
+        arrangement-level $H^1$ (section transitions are now
+        smooth).
+  \item \textbf{Final Measure:}\;
+        all strata near $\gone$; $H^1 \approx 0$; the project
+        is a well-typed, cohomologically trivial,
+        high-grade \texttt{.xrns} file.
+\end{enumerate}
+This is \emph{exactly} how an experienced tracker musician
+works---JuGeo formalizes the workflow.
+\end{example}
+
+% ────────────────────────────────────────────────────────────────
+\subsection{The isomorphism: music \texorpdfstring{$\cong$}{≅}
+  software}
+\label{ssec:musical-iso}
+
+The structural parallel between a DAW project and a software
+project is not a loose analogy but a genuine categorical
+equivalence mediated by the 4-tuple.
+
+\begin{proposition}[DAW--software equivalence]
+\label{prop:daw-software}
+There exists a structure-preserving functor
+$\Phi \colon \mathcal{C}_{\mathrm{DAW}} \to
+\mathcal{C}_{\mathrm{SW}}$ that maps:
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}ll@{}}
+\textbf{Music (DAW project)} & \textbf{Software project} \\
+\hline
+Track              & Module / thread \\
+Pattern            & Function / procedure \\
+Note / effect cmd  & Instruction / statement \\
+Signal flow        & Data flow \\
+Mixer routing      & Dependency graph \\
+Plugin (VST/AU)    & Library (npm, pip, crate) \\
+Frequency masking  & Resource contention \\
+Phase cancellation & Race condition \\
+Clipping (0\,dBFS) & Buffer overflow \\
+Sidechain routing  & Semaphore / lock \\
+Mastering          & Deployment / release \\
+Mix balance        & Load balancing \\
+Automation curve   & Configuration schedule \\
+Pattern matrix     & Module dependency matrix \\
+\end{tabular}
+\end{center}
+Under $\Phi$, the 4-tuples are compatible:
+$\Phi_*(\STop_{\mathrm{DAW}}) = \STop_{\mathrm{SW}}$,
+$\Phi_*(\PStr_{\mathrm{DAW}}) = \PStr_{\mathrm{SW}}$, and
+similarly for $\CSpec$ and $\GEval$ (with appropriate stratum
+relabeling).
+\end{proposition}
+
+\begin{remark}
+The equivalence is productive in both directions.  Software
+engineering concepts suggest musical techniques: \emph{unit
+testing} corresponds to \emph{solo monitoring} (check each track
+in isolation), \emph{integration testing} to \emph{group bus
+monitoring} (check track groups together), and \emph{end-to-end
+testing} to \emph{full-mix playback}.  Conversely, musical
+concepts suggest software techniques: \emph{sidechain
+compression}---dynamically ducking one signal in response to
+another---is a pattern for adaptive resource throttling, and
+\emph{send/return routing}---sharing a single reverb instance
+across many tracks---is a service mesh pattern.
+\end{remark}
+
+\begin{remark}
+Algorithmic composition has a long history, from Hiller and
+Isaacson's \emph{Illiac Suite}~(1957) to modern neural audio
+synthesis.  What JuGeo adds is the cohomological dimension: not
+merely ``does each pattern sound acceptable in isolation?''
+($H^0$) but ``do the patterns compose into a coherent
+production?'' ($H^1$).  This is precisely the difference between
+a collection of loops and a \emph{finished track}---and it is the
+same difference that separates a collection of working functions
+from a \emph{shipped program}.
+\end{remark}
+
+%% ─── 30.5 ──────────────────────────────────────────────────────
+\section{Ethical Judgment Geometry}
+\label{sec:ethical}
+
+Ethical reasoning involves multiple, potentially conflicting moral
+frameworks---a natural setting for graded, multi-theory judgment.
+
+\begin{itemize}
+  \item \textbf{Moral frameworks as theory slots.}\;
+        Utilitarianism, deontology, virtue ethics, care ethics,
+        and other frameworks each become a theory slot in the CTT.
+        Each provides a grade for a given action or policy.
+  \item \textbf{Ethical dilemmas as $H^1 \neq 0$.}\;
+        An ethical dilemma is precisely a situation where different
+        moral frameworks assign contradictory verdicts: the local
+        sections (framework-specific judgments) fail to glue.
+        The resulting $H^1$ class identifies the \emph{source} of
+        the disagreement.
+  \item \textbf{Resolution via graded evaluation.}\;
+        Rather than forcing a binary choice, $\GEval$ assigns a
+        grade that reflects the degree of moral consensus or
+        conflict.  A policy with $g \approx \gone$ enjoys broad
+        agreement; a policy with $g \ll \gone$ is deeply contested.
+  \item \textbf{Pluralism via the open world property.}\;
+        New ethical frameworks can be added to the theory ensemble
+        without modifying existing ones.  This is genuine moral
+        pluralism: no framework is privileged, and the graded
+        evaluation tracks how well any action satisfies the full
+        ensemble.
+\end{itemize}
+
+%% ─── 30.6 ──────────────────────────────────────────────────────
+\section{JuGeo for education}
+\label{sec:education}
+
+Educational assessment is a domain where graded judgment is
+the norm, not the exception.
+
+\begin{itemize}
+  \item \textbf{Student work as evidence.}\;
+        A student's submission $E$ is evidence for a rubric
+        specification~$A$.  The judgment
+        $\vdash_g E : A$ says ``$E$ satisfies $A$ to grade~$g$\!.''
+  \item \textbf{Partial credit.}\;
+        The $\Grade$ semiring provides a principled theory of partial
+        credit.  Each rubric criterion is a theory slot with its own
+        grade; the total grade is $\otG$-aggregated (all criteria
+        matter) or $\opG$-aggregated (best-of, for alternative
+        approaches).
+  \item \textbf{Feedback as obstruction identification.}\;
+        When $g < \gone$, the obstructions identify which
+        rubric criteria were not fully met.  This is structured
+        feedback: not just ``your grade is 7/10'' but ``the
+        logical structure criterion is at $-0.2$ because of a gap
+        in the proof of Lemma~3.''
+  \item \textbf{Automated grading via descent.}\;
+        The grading process itself can be automated:
+        parse the submission, compute theory-slot grades, aggregate,
+        and report obstructions.  This is structurally identical to
+        program verification---the student's work is a ``program''
+        and the rubric is its ``specification.''
+\end{itemize}
+
+%% ─── 30.7 ──────────────────────────────────────────────────────
+\section{Self-improving JuGeo}
+\label{sec:self-improving}
+
+In the spirit of G\"odelian self-reference, JuGeo can be applied
+to its own development.
+
+\begin{construction}[JuGeo Bootstrap]
+\label{con:bootstrap}
+Let $\STop_{\mathrm{JG}}$ be the site of JuGeo's own codebase
+(the modules in \texttt{src/jugeo/}).  Define:
+\begin{itemize}
+  \item $\PStr_{\mathrm{JG}}$: JuGeo's specification (the
+        mathematical definitions of this monograph) together with
+        the implementation as evidence.
+  \item $\CSpec_{\mathrm{JG}}$: the \v{C}ech cohomology of the
+        implementation relative to the specification.
+        $H^1 \neq 0$ identifies modules whose implementation
+        deviates from the formal theory.
+  \item $\GEval_{\mathrm{JG}}$: the graded evaluation of JuGeo
+        by JuGeo---using the very descent algorithm being verified
+        to check that the descent algorithm is correctly
+        implemented.
+\end{itemize}
+\end{construction}
+
+This bootstrap is not circular: JuGeo version $n$ verifies JuGeo
+version $n+1$, and each version's correctness is established
+relative to the previous one.  The process is analogous to
+compiler bootstrapping, where compiler version $n$ compiles
+version~$n+1$.
+
+%% ─── 30.8 ──────────────────────────────────────────────────────
+\section{Open mathematical problems}
+\label{sec:open-problems}
+
+We close with a list of open problems that the framework raises.
+
+\begin{enumerate}
+  \item \textbf{Decidability.}\;
+        Is the full 4-tuple verification problem ($\check{H}^1 = 0$
+        and $\GEval \geq g_{\min}$) decidable for any interesting
+        fragment of the site category?  For finite sites with
+        computable grade functions the answer is trivially yes; for
+        sites arising from Turing-complete programming languages
+        it is trivially no.  The interesting question is: what is
+        the largest class of sites for which the problem remains
+        decidable, and does this class cover practically relevant
+        programs?
+
+  \item \textbf{Homotopy type of the judgment fibration.}\;
+        The judgment fibration $\pi\colon \mathcal{E} \to \STop$
+        is a Grothendieck fibration with rich structure.  What are
+        its homotopy invariants?  In particular, is the classifying
+        space $B\!\operatorname{Aut}(\mathcal{E})$ related to known
+        classifying spaces in algebraic topology?
+
+  \item \textbf{Spectral sequences for NLP.}\;
+        The \v{C}ech-to-derived spectral sequence converging to
+        $H^*(\STop, \PStr)$ provides a computational tool that, to
+        our knowledge, has never been applied to NLP\@.  Can the
+        differentials $d_r\colon E_r^{p,q} \to E_r^{p+r,q-r+1}$
+        be given linguistic interpretations?  Could this yield new
+        parsing or generation algorithms that operate stratum-by-stratum?
+
+  \item \textbf{Continuous JuGeo.}\;
+        Replace the discrete site with a smooth manifold (or a
+        diffeological space).  Sections become smooth functions,
+        the \v{C}ech complex becomes the de Rham complex, and
+        obstructions become differential forms.  Does this
+        ``continuous JuGeo'' yield a useful framework for
+        cyber-physical systems, control theory, or signal processing?
+
+  \item \textbf{Categorification of the grade.}\;
+        The $\Grade$ semiring is a 0-categorical structure.  Can it
+        be categorified---replacing grades by grading categories,
+        and the semiring operations by functors---to capture
+        ``grades of grades''?  This would give a natural notion of
+        \emph{confidence in the grade itself}, addressing the
+        meta-question ``how reliable is our quality assessment?''
+
+  \item \textbf{Effective descent bounds.}\;
+        Proposition~\ref{prop:llm-descent-mono} gives a worst-case
+        bound on descent iterations.  What is the \emph{expected}
+        number of iterations under realistic distributions of LLM
+        errors?  Is there a phase-transition phenomenon: a critical
+        error rate above which descent fails to converge?
+
+  \item \textbf{JuGeo and dependent type theory.}\;
+        Part~III introduced graded dependent types.  To what extent
+        can JuGeo be \emph{internalized} in a dependent type theory
+        (e.g., Agda or Lean~4)?  A full internalization would yield
+        machine-checked proofs of JuGeo's own metatheory.
+\end{enumerate}
+
+\bigskip
+
+These problems span category theory, homotopy theory, computability,
+and applied mathematics.  We hope that the framework developed in
+this monograph---simple enough to be stated in a single 4-tuple,
+rich enough to organize program verification, natural language
+generation, and beyond---will inspire progress on all of them.

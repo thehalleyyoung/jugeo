@@ -1,0 +1,1474 @@
+% Part V: Worked Examples
+% This file is \include'd from main.tex
+
+\chapter{Program Verification}
+\label{ch:ex-verification}
+
+We begin Part~V with the domain closest to JuGeo's origins:
+program verification.  We walk through the full 4-tuple
+$(\STop,\PStr,\CSpec,\GEval)$ for two concrete programs---a
+lock-free queue (where obstructions arise) and a sorting function
+(where they vanish).
+
+%% ─────────────────────────────────────────────────────────────
+\section{Example 1: A Lock-Free Queue}
+\label{sec:lfq}
+
+Consider a Michael--Scott lock-free queue with two operations
+\texttt{enqueue} and \texttt{dequeue}, each using a
+compare-and-swap (CAS) loop.  The correctness goal is
+\emph{linearizability}: every concurrent execution is equivalent to
+some sequential one.
+
+%% ── 22.1.1  STop ─────────────────────────────────────────────
+\subsection{The Semantic Topos $\STop$}
+
+\begin{construction}[Control-flow site]
+\label{con:cfg-site}
+Let $\mathcal{C}_Q$ be the category whose
+\begin{itemize}[nosep]
+  \item \textbf{objects} are program points
+        $p_0,p_1,\ldots,p_n$ in the control-flow graph (CFG),
+  \item \textbf{morphisms} $p_i\to p_j$ are feasible execution paths
+        (sequences of basic-block transitions).
+\end{itemize}
+The Grothendieck topology~$J$ declares a covering family
+of a function node $f$ to be the set of its basic blocks:
+\[
+  \{B_1\hookrightarrow f,\;B_2\hookrightarrow f,\;\ldots\}
+  \;\in\; J(f).
+\]
+\end{construction}
+
+\begin{definition}[Type presheaf]
+\label{def:type-presheaf}
+The presheaf $\mathcal{F}_{\mathrm{ty}}:\mathcal{C}_Q^{\op}\to\Set$
+assigns to each program point~$p$ the set of variable-type bindings
+in scope:
+\[
+  \mathcal{F}_{\mathrm{ty}}(p)
+  \;=\;
+  \bigl\{(x:\texttt{Node*}),\;(tail:\texttt{AtomicPtr<Node>}),\;\ldots\bigr\}.
+\]
+Restriction along a morphism $p\to q$ is the usual scope narrowing.
+\end{definition}
+
+The \textbf{subobject classifier} $\Omega$ in the topos
+$\Sh(\mathcal{C}_Q,J)$ sends each program point~$p$ to the set of
+sieves on~$p$.  Concretely, a sieve on~$p$ is a downward-closed set
+of paths arriving at~$p$.  The interpretation: a sieve encodes the
+set of \emph{reachable} histories at that point.  An assertion
+$\varphi$ at~$p$ is therefore a map
+$\llbracket\varphi\rrbracket:1\to\Omega$ selecting the sieve of
+paths on which $\varphi$ holds.
+
+\begin{example}[Assertions as sieves]
+At program point $p_{\mathrm{cas}}$ (the CAS instruction in
+\texttt{enqueue}), the assertion ``\texttt{tail} still points to the
+last node'' selects the sieve
+$S = \{$paths that have not been preempted by another
+\texttt{enqueue}$\}$.  This sieve is a \emph{proper} sub-sieve of
+the maximal sieve, reflecting the fact that the assertion can be
+invalidated by concurrent interference.
+\end{example}
+
+%% ── 22.1.2  PStr ─────────────────────────────────────────────
+\subsection{The Proof Structure $\PStr$}
+
+\begin{construction}[Specification type]
+\label{con:spec-type}
+The specification is the type
+\[
+  \mathrm{Lin}(Q)
+  \;:\equiv\;
+  \Pi\,(\sigma:\mathrm{ConcExec}(Q)).\;
+  \Sigma\,(\tau:\mathrm{SeqExec}(Q)).\;
+  \GId_{\gone}\!\bigl(\mathrm{Obs},\;
+    \mathrm{obs}(\sigma),\;\mathrm{obs}(\tau)\bigr),
+\]
+reading: ``for every concurrent execution~$\sigma$, there exists a
+sequential execution~$\tau$ with identical observable behaviour.''
+\end{construction}
+
+The \textbf{evidence} inhabiting this type is a \emph{simulation
+relation} $R\subseteq\mathrm{State}\times\mathrm{AbsState}$ together
+with proofs that $R$ is preserved by every atomic step.
+
+\begin{construction}[Hoare-logic proof tree]
+\label{con:hoare-tree}
+The derivation tree has the shape of a Hoare-logic proof.
+For \texttt{enqueue(x)}:
+\[
+  \dfrac{
+    \dfrac{
+      \{\texttt{tail}=t\}
+      \;\texttt{new\_node := alloc(x)}\;
+      \{\texttt{new\_node}\neq\texttt{null}\}
+    }{\text{(Alloc)}}
+    \quad
+    \dfrac{
+      \{\texttt{tail}=t \wedge \texttt{next}=\texttt{null}\}
+      \;\texttt{CAS(tail.next, null, new\_node)}\;
+      \{R(t,t')\}
+    }{\text{(CAS-success)}}
+  }{
+    \{\mathrm{pre}\}\;\texttt{enqueue(x)}\;\{\mathrm{post}\}
+  }
+\]
+Each horizontal line is a typing rule application
+$\Gamma\vdash_{\gone} e:A$; the full tree is the term witnessing
+$\mathrm{Lin}(Q)$.
+\end{construction}
+
+\textbf{$\beta$-reduction.}\quad
+In $\PStr$, $\beta$-reduction corresponds to
+\emph{proof simplification}.  For instance, composing the CAS-success
+lemma with the swing-tail lemma yields a single invariant-preservation
+step:
+\[
+  (\lambda h.\;\mathrm{swing}(h))\;(\mathrm{cas\text{-}ok}(\sigma))
+  \;\;\longrightarrow_\beta\;\;
+  \mathrm{swing}(\mathrm{cas\text{-}ok}(\sigma)),
+\]
+reducing two proof steps to one.
+
+%% ── 22.1.3  CSpec ────────────────────────────────────────────
+\subsection{The Cohomological Spectrum $\CSpec$}
+
+\begin{construction}[Thread decomposition as a cover]
+\label{con:thread-cover}
+Partition the CFG into thread-local sub-graphs
+$U_{\mathrm{enq}},U_{\mathrm{deq}}$ (one per operation).  This is a
+cover in~$J$.  The \v{C}ech complex is:
+\[
+  C^0 \;=\;
+  \mathrm{Proof}(U_{\mathrm{enq}})
+  \;\times\;
+  \mathrm{Proof}(U_{\mathrm{deq}}),
+  \qquad
+  C^1 \;=\;
+  \mathrm{Proof}(U_{\mathrm{enq}}\cap U_{\mathrm{deq}}).
+\]
+Here $C^0$ contains each thread's \emph{local} correctness proof,
+and $C^1$ contains proofs about shared state accessed by both threads.
+\end{construction}
+
+The coboundary $\delta^0:C^0\to C^1$ computes:
+\[
+  \delta^0(s_{\mathrm{enq}},s_{\mathrm{deq}})
+  \;=\;
+  s_{\mathrm{enq}}\big|_{U_{\mathrm{enq}}\cap U_{\mathrm{deq}}}
+  \;-\;
+  s_{\mathrm{deq}}\big|_{U_{\mathrm{enq}}\cap U_{\mathrm{deq}}}.
+\]
+
+\begin{proposition}[Obstruction = data race]
+\label{prop:race-obstruction}
+$H^1(\mathcal{C}_Q,\mathcal{F}_{\mathrm{inv}})\neq 0$ if and only
+if the local invariants of \texttt{enqueue} and \texttt{dequeue}
+are inconsistent on shared state---i.e., there exists a data race
+or an atomicity violation.
+\end{proposition}
+
+\begin{example}[A concrete race]
+Suppose a buggy implementation omits the ``swing tail'' step after
+a successful CAS.  Then \texttt{enqueue} believes
+$\texttt{tail}=\texttt{new\_node}$ on exit, while a concurrent
+\texttt{dequeue} still sees the old tail.  The difference
+\[
+  \delta^0(\texttt{tail}=\texttt{new\_node},\;
+           \texttt{tail}=\texttt{old\_tail})
+  \;\neq\;0
+\]
+is a non-trivial 1-cocycle: the obstruction.
+Mayer--Vietoris gives the exact sequence
+\[
+  \cdots\to
+  H^0(U_{\mathrm{enq}})\oplus H^0(U_{\mathrm{deq}})
+  \xrightarrow{\;\delta^0\;}
+  H^0(U_{\mathrm{enq}}\cap U_{\mathrm{deq}})
+  \to
+  H^1(\mathcal{C}_Q,\mathcal{F}_{\mathrm{inv}})
+  \to\cdots
+\]
+The non-vanishing $H^1$ localises the bug to the shared-state
+interface.
+\end{example}
+
+\textbf{Repair.}\quad
+Adding the swing-tail step makes $\delta^0=0$, whence
+$H^1=0$ and the proofs glue into a global linearizability argument.
+
+%% ── 22.1.4  GEval ────────────────────────────────────────────
+\subsection{The Graded Evaluation $\GEval$}
+
+\begin{construction}[Verification grade]
+\label{con:verif-grade}
+The overall grade is a product in the grade semiring:
+\[
+  G
+  \;=\;
+  g_{\mathrm{test}} \;\otG\; g_{\mathrm{type}} \;\otG\; g_{\mathrm{perf}},
+\]
+where each component lies in $\Grade=(-\infty,0]\cup\{-\infty\}$
+(with $\gone=0$ perfect, $\gzero=-\infty$ vacuous).
+\end{construction}
+
+\begin{itemize}[nosep]
+  \item \textbf{Test-coverage grade} $g_{\mathrm{test}}$.
+    The trail is: unit tests ($g=-2.1$, covering basic enqueue/dequeue)
+    $\to$ integration tests ($g=-1.3$, two-thread interleaving)
+    $\to$ stress tests ($g=-0.4$, 64 threads, 10\textsuperscript{6}
+    operations).  Convergence of random fuzzing pushes $g_{\mathrm{test}}$
+    toward~$\gone$.
+
+  \item \textbf{Type-safety grade} $g_{\mathrm{type}}$.
+    With a verified simulation relation checked by a proof assistant,
+    $g_{\mathrm{type}}=\gone$ (the proof is machine-checked).
+
+  \item \textbf{Performance grade} $g_{\mathrm{perf}}$.
+    Benchmarks show lock-free throughput exceeds a mutex-based queue
+    by $3\times$ at 32~threads.  We assign $g_{\mathrm{perf}}=-0.2$
+    (minor contention penalty at very high thread counts).
+\end{itemize}
+
+The overall grade is
+$G = (-0.4)\otG 0 \otG (-0.2) = -0.4$
+(bottleneck: test coverage not yet exhaustive).
+
+\medskip
+
+%% ─────────────────────────────────────────────────────────────
+\section{Example 2: Insertion Sort}
+\label{sec:isort}
+
+To contrast, consider a sequential insertion sort on integer arrays.
+
+\subsection{The 4-Tuple in Brief}
+
+\textbf{$\STop$.}\quad
+The site $\mathcal{C}_S$ has program points
+$\{p_0,\ldots,p_5\}$ with linear control flow (one loop).  The
+topology is trivial: the single function is its own cover.
+The type presheaf assigns $\texttt{int[]}$ at every point.
+
+\textbf{$\PStr$.}\quad
+The specification type is
+$\mathrm{Sorted}(a') \;\wedge\; \mathrm{Perm}(a,a')$.
+The proof is a standard loop-invariant argument:
+\[
+  \dfrac{
+    \Gamma\vdash_{\gone}
+      \mathrm{inv}(i):\mathrm{Sorted}(a[0..i])
+    \quad
+    \Gamma\vdash_{\gone}
+      \mathrm{step}(i):\mathrm{inv}(i)\Rightarrow\mathrm{inv}(i+1)
+  }{
+    \Gamma\vdash_{\gone}
+      \mathrm{loop}:\mathrm{Sorted}(a[0..n])
+  }
+\]
+$\beta$-reduction unfolds the loop to $n$ applications of
+$\mathrm{step}$.
+
+\textbf{$\CSpec$.}\quad
+Since the program is sequential, the cover has a single element
+(the whole function).  The \v{C}ech complex degenerates:
+$C^0=\mathrm{Proof}(U)$, $C^1=0$.  Therefore $H^1=0$---no
+obstructions.  The proof glues trivially.
+
+\textbf{$\GEval$.}\quad
+$g_{\mathrm{test}}=-0.3$ (exhaustive tests up to $n=10\,000$),
+$g_{\mathrm{type}}=\gone$ (mechanised proof of the loop invariant),
+$g_{\mathrm{perf}}=-1.5$ ($O(n^2)$ is slow for large~$n$).
+Overall $G=-1.5$ (bottleneck: performance).
+
+\begin{remark}[Comparing the two examples]
+The lock-free queue has non-trivial $H^1$ that must be resolved;
+insertion sort has $H^1=0$ by triviality of the cover.  Both
+achieve high type-safety grades, but differ in their test-coverage
+and performance profiles.  The 4-tuple captures these differences
+precisely: the geometric (cohomological) and evaluative aspects
+are orthogonal dimensions of program quality.
+\end{remark}
+
+\chapter{Natural Language Semantics}
+\label{ch:ex-nl}
+
+We now turn to natural language, the domain where the CTT extension
+of JuGeo (Part~III) is most directly exercised.  Three examples
+illustrate the 4-tuple at progressively greater interpretive depth:
+a classic donkey sentence, a garden-path sentence, and a metaphor.
+
+%% ─────────────────────────────────────────────────────────────
+\section{Example 1: Donkey Anaphora}
+\label{sec:donkey}
+
+\begin{quote}
+\emph{``Every farmer who owns a donkey beats it.''}
+\end{quote}
+
+This sentence is the touchstone of formal semantics: the pronoun
+\emph{it} must be bound by the indefinite \emph{a donkey}, yet
+the two sit in different clauses.  We show how each of the four
+objects handles this.
+
+%% ── STop ─────────────────────────────────────────────────────
+\subsection{The Semantic Topos $\STop$}
+
+\begin{construction}[NL site]
+\label{con:nl-site}
+The category $\mathcal{C}_{\mathrm{NL}}$ has:
+\begin{itemize}[nosep]
+  \item \textbf{Objects}: discourse segments at every granularity---morphemes,
+    words, phrases, clauses, sentences, and multi-sentence discourses.
+  \item \textbf{Morphisms}: inclusion of a sub-segment into a
+    larger segment (e.g.\ the relative clause ``who owns a donkey''
+    into the full sentence).
+\end{itemize}
+The topology~$J$ declares a covering family of a sentence to
+be its immediate-constituent phrases:
+\[
+  \bigl\{\text{NP}_{\text{subj}}\hookrightarrow S,\;
+         \text{VP}\hookrightarrow S\bigr\}
+  \;\in\;J(S).
+\]
+\end{construction}
+
+\begin{definition}[Semantic-type presheaf]
+The presheaf $\mathcal{F}_{\sem}:\mathcal{C}_{\mathrm{NL}}^{\op}\to\Set$
+assigns to each node its semantic type in the stratal universe tower:
+\[
+  \mathcal{F}_{\sem}(\text{``farmer''}) = U_{\sem},\quad
+  \mathcal{F}_{\sem}(\text{``beats''}) = U_{\sem}\to U_{\sem}\to U_{\sem},\quad
+  \mathcal{F}_{\sem}(\text{``it''}) = U_{\disc}.
+\]
+The pronoun lives at the \emph{discourse} stratum $U_{\disc}$
+because its referent is determined by cross-clausal context.
+\end{definition}
+
+The internal logic of $\Sh(\mathcal{C}_{\mathrm{NL}},J)$ is
+intuitionistic: truth of a proposition at a discourse segment~$d$
+means truth in \emph{every extension} of~$d$.  This captures the
+open-world nature of discourse: adding more sentences can never
+revoke what is established.
+
+%% ── PStr ─────────────────────────────────────────────────────
+\subsection{The Proof Structure $\PStr$}
+
+We build the semantic representation step by step.
+
+\begin{construction}[Lexicon entries as types]
+\label{con:lexicon}
+\begin{align*}
+  \text{every}   &:\; \Pi(P:U_{\sem}\to\Type).\,
+                       \Pi(Q:U_{\sem}\to\Type).\,
+                       \bigl(\Pi(x:U_{\sem}).\,P(x)\Rightarrow Q(x)\bigr), \\
+  \text{farmer}  &:\; U_{\sem}\to\Prop, \\
+  \text{owns}    &:\; U_{\sem}\to U_{\sem}\to\Prop, \\
+  \text{a}       &:\; \Pi(P:U_{\sem}\to\Type).\,\Sigma(x:U_{\sem}).\,P(x), \\
+  \text{donkey}  &:\; U_{\sem}\to\Prop, \\
+  \text{beats}   &:\; U_{\sem}\to U_{\sem}\to\Prop, \\
+  \text{it}      &:\; \text{(unresolved discourse referent)}.
+\end{align*}
+\end{construction}
+
+\textbf{The anaphora problem.}\quad
+Under na\"ive composition, ``a donkey'' introduces an existential
+$\Sigma(y:U_{\sem}).\,\mathrm{donkey}(y)$ inside the relative clause,
+but the pronoun ``it'' sits in the matrix clause and must refer
+to~$y$.  The variable~$y$ is not in scope.
+
+\begin{construction}[Resolution via the discourse monad]
+\label{con:dmon}
+Define the discourse monad
+$\mathrm{DMon}(A) = \mathrm{DCtx}\to(A\times\mathrm{DCtx})$
+where $\mathrm{DCtx}$ is a list of discourse referents.
+The indefinite ``a donkey'' performs a monadic action that
+\emph{pushes} a referent~$y$ onto $\mathrm{DCtx}$:
+\[
+  \llbracket\text{a donkey}\rrbracket
+  \;=\;
+  \lambda\,\gamma.\;
+  \mathrm{let}\;y=\mathrm{fresh}(\gamma)\;\mathrm{in}\;
+  (y,\;\gamma\!::\!y).
+\]
+The pronoun ``it'' is a \emph{lookup}:
+$\llbracket\text{it}\rrbracket = \lambda\gamma.\,
+  (\mathrm{top}(\gamma),\;\gamma)$.
+\end{construction}
+
+Composing inside $\mathrm{DMon}$, the full derivation is:
+\[
+  \dfrac{
+    \dfrac{
+      \Gamma\vdash_{\gone} \text{farmer}:U_{\sem}\to\Prop
+      \qquad
+      \Gamma\vdash_{\gone}
+        [\text{who owns a donkey}] :
+        \Pi(x).\,\mathrm{DMon}(\mathrm{donkey}(y)\wedge\mathrm{owns}(x,y))
+    }{
+      \Gamma\vdash_{\gone}
+        [\text{farmer who owns a donkey}] :
+        \Pi(x).\,\mathrm{DMon}(\mathrm{farmer}(x)\wedge
+                                \mathrm{donkey}(y)\wedge
+                                \mathrm{owns}(x,y))
+    }
+  }{
+    \Gamma\vdash_{\gone}
+      S : \Pi(x).\,
+          \bigl(\mathrm{farmer}(x)\wedge\mathrm{donkey}(y)
+                \wedge\mathrm{owns}(x,y)\bigr)
+          \Rightarrow\mathrm{beats}(x,y)
+  }
+\]
+The monadic plumbing threads $y$ from the relative clause to the
+matrix clause, binding ``it'' to the donkey.
+
+%% ── CSpec ────────────────────────────────────────────────────
+\subsection{The Cohomological Spectrum $\CSpec$}
+
+\begin{construction}[Clause cover]
+\label{con:clause-cover}
+Take the cover $\{U_{\mathrm{rel}},U_{\mathrm{mat}}\}$ where
+$U_{\mathrm{rel}}$ = the relative clause and
+$U_{\mathrm{mat}}$ = the matrix clause.
+\end{construction}
+
+\textbf{Before resolution.}\quad
+The presheaf of discourse referents restricted to $U_{\mathrm{rel}}$
+contains~$y$, but restricted to $U_{\mathrm{mat}}$ does not.
+The coboundary is:
+\[
+  \delta^0(s_{\mathrm{rel}},s_{\mathrm{mat}})
+  \;=\;
+  s_{\mathrm{rel}}\big|_{U_{\mathrm{rel}}\cap U_{\mathrm{mat}}}
+  - s_{\mathrm{mat}}\big|_{U_{\mathrm{rel}}\cap U_{\mathrm{mat}}}
+  \;\neq\; 0,
+\]
+since $y\in s_{\mathrm{rel}}$ but $y\notin s_{\mathrm{mat}}$.
+Therefore $H^1\neq 0$: the anaphora is an obstruction to local
+gluing.
+
+\textbf{After resolution.}\quad
+Switching to the discourse-monad presheaf (which threads $y$
+through $\mathrm{DCtx}$) makes $y$ available at
+$U_{\mathrm{mat}}$.  Now $\delta^0=0$ and $H^1=0$: the
+interpretation glues globally.
+
+\begin{remark}
+This is the cohomological content of Dynamic Predicate Logic
+and DRT: the discourse monad is exactly the change-of-coefficients
+that kills $H^1$.
+\end{remark}
+
+%% ── GEval ────────────────────────────────────────────────────
+\subsection{The Graded Evaluation $\GEval$}
+
+The sentence receives independent grades at each linguistic stratum:
+\begin{align*}
+  g_{\phon}  &= -0.05  &&\text{(phonologically well-formed, minor coda cluster)},\\
+  g_{\synt}  &= \gone   &&\text{(grammatical)},\\
+  g_{\sem}   &= -0.1   &&\text{(coherent once anaphora is resolved)},\\
+  g_{\prag}  &= -0.3   &&\text{(pragmatically odd: ``beats'' is harsh)}.
+\end{align*}
+The overall grade is
+$T = g_{\phon}\otG g_{\synt}\otG g_{\sem}\otG g_{\prag}
+   = -0.3$
+(bottleneck: pragmatic felicity).
+In the normalised scale where $\gone=0$ is perfect, a grade of
+$-0.3$ corresponds to ``well-formed but stylistically marked.''
+
+\medskip
+
+%% ─────────────────────────────────────────────────────────────
+\section{Example 2: Garden-Path Sentence}
+\label{sec:garden-path}
+
+\begin{quote}
+\emph{``The horse raced past the barn fell.''}
+\end{quote}
+
+This sentence is grammatical (a reduced relative clause:
+``The horse [that was] raced past the barn fell''),
+but readers initially parse ``raced'' as the main verb and
+reach ``fell'' with no syntactic slot for it.
+
+\textbf{$\STop$.}\quad
+The site is the same NL category $\mathcal{C}_{\mathrm{NL}}$.
+The initial parse assigns the cover
+$\{$NP:``the horse'', VP:``raced past the barn''$\}$
+to the substring before ``fell.''
+
+\textbf{$\PStr$ (first attempt).}\quad
+The first derivation tree types ``raced'' as a main verb:
+$\Gamma\vdash_{\gone}\text{raced}:U_{\sem}\to U_{\sem}$.
+When ``fell'' arrives, the context $\Gamma$ has no open
+argument position.  The typing derivation fails:
+$\Gamma\nvdash\text{fell}:A$ for any~$A$.
+
+\textbf{$\CSpec$ (first attempt).}\quad
+The cover $\{U_{\text{pre-fell}}, U_{\text{fell}}\}$ has
+$H^1\neq 0$: the local parse of ``raced past the barn'' does not
+extend to include ``fell.''  The obstruction is localised at the
+word boundary before ``fell.''
+
+\textbf{Reanalysis.}\quad
+The parser \emph{recovers} the cover: ``raced past the barn'' is
+re-typed as a reduced relative clause (participial modifier), freeing
+a VP slot for ``fell.''
+Under the new cover,
+$\Gamma\vdash_{\gone}[\text{the horse raced past the barn}]:
+  \mathrm{NP}$
+and
+$\Gamma\vdash_{\gone}\text{fell}:\mathrm{NP}\to S$,
+giving $H^1=0$.
+
+\textbf{$\GEval$.}\quad
+After reanalysis:
+$g_{\synt}=-0.6$ (syntactically legal but highly marked),
+$g_{\sem}=\gone$ (semantically clear),
+$g_{\prag}=-0.8$ (pragmatically confusing).
+Overall $T=-0.8$: a difficult sentence.
+
+\medskip
+
+%% ─────────────────────────────────────────────────────────────
+\section{Example 3: Metaphor}
+\label{sec:metaphor}
+
+\begin{quote}
+\emph{``Juliet is the sun.''}  --- Shakespeare, \emph{Romeo and Juliet}
+\end{quote}
+
+\textbf{$\STop$.}\quad
+The site is $\mathcal{C}_{\mathrm{NL}}$; the relevant presheaf
+is $\mathcal{F}_{\sem}$ assigning semantic types.  At the literal
+level, $\mathcal{F}_{\sem}(\text{Juliet})=\texttt{Person}$ and
+$\mathcal{F}_{\sem}(\text{sun})=\texttt{Star}$.
+
+\textbf{$\PStr$.}\quad
+A literal identity $\GId_{\gone}(\texttt{Entity},\text{Juliet},\text{sun})$
+is uninhabited: a person is not a star.  But a \emph{graded} identity
+\[
+  \GId_g(\texttt{Entity},\text{Juliet},\text{sun})
+  \quad\text{with}\quad g\approx -0.35
+\]
+is inhabited when we restrict to the sub-type of entities possessing
+\emph{radiance, warmth, centrality}.  The grade $g$ measures the
+proportion of shared structure.
+
+The typing derivation is:
+\[
+  \dfrac{
+    \Gamma\vdash_{\gone}\text{Juliet}:\texttt{Person}
+    \qquad
+    \Gamma\vdash_{\gone}\text{sun}:\texttt{Star}
+    \qquad
+    \Gamma\vdash_{-0.35}
+      \mathrm{radiance}:\texttt{Person}\cap\texttt{Star}
+  }{
+    \Gamma\vdash_{-0.35}
+      \text{``Juliet is the sun''}
+      :\GId_{-0.35}(\texttt{Entity},\text{Juliet},\text{sun})
+  }
+\]
+
+\textbf{$\CSpec$.}\quad
+$H^1=0$ at the metaphorical grade: the identification glues
+across the source and target domains because we have restricted
+to shared features.  At the literal grade ($g=\gone$), $H^1\neq 0$:
+the literal identification fails.
+
+\textbf{$\GEval$.}\quad
+$g_{\phon}=\gone$ (simple monosyllables),
+$g_{\synt}=\gone$ (subject--copula--predicate),
+$g_{\sem}=-0.35$ (metaphorical, not literal),
+$g_{\poet}=-0.05$ (vivid imagery, canonical).
+The \emph{poetic} grade is near-perfect; the semantic grade reflects
+the deliberate non-literalness.  Overall
+$T=-0.35$ in the semantic dimension, but the evaluative judgment
+is that this is \emph{excellent} poetry: the aesthetic grade overrides
+the semantic gap.
+
+\begin{remark}[Graded identity as the algebra of figurative language]
+The metaphor example illustrates the central thesis of CTT:
+figurative language is not a ``deviation'' from literal meaning
+but a principled use of the graded identity type $\GId_g$ at a
+grade $\gzero < g < \gone$.  Simile, metonymy, synecdoche, and
+irony each correspond to different structural restrictions on
+the shared sub-type that witnesses the graded identification.
+\end{remark}
+
+\chapter{Poetry Generation and Analysis}
+\label{ch:ex-poetry}
+
+Poetry is the domain where all four objects are most densely
+populated.  We present three examples: generating a Shakespearean
+sonnet, analysing a Keats sonnet, and diagnosing a flawed poem.
+
+%% ─────────────────────────────────────────────────────────────
+\section{Example 1: Generating a Shakespearean Sonnet}
+\label{sec:sonnet-gen}
+
+\textbf{Prompt.}\; Generate a Shakespearean sonnet on
+\emph{the passage of time}.
+
+%% ── STop ─────────────────────────────────────────────────────
+\subsection{The Semantic Topos $\STop$}
+
+\begin{construction}[Poetic site]
+\label{con:poet-site}
+The category $\mathcal{C}_{\mathrm{poet}}$ refines
+$\mathcal{C}_{\mathrm{NL}}$ with poetic structure:
+\begin{itemize}[nosep]
+  \item \textbf{Objects}: syllables, metrical feet, lines,
+    quatrains (Q1--Q3), couplet (C), and the full sonnet~$S$.
+  \item \textbf{Morphisms}: inclusions
+    $\text{syll}\hookrightarrow\text{foot}\hookrightarrow
+     \text{line}\hookrightarrow\text{quatrain}\hookrightarrow S$.
+\end{itemize}
+The topology declares the 14-line decomposition as a cover of~$S$:
+\[
+  \{l_1,l_2,\ldots,l_{14}\hookrightarrow S\}\in J(S),
+\]
+and at a coarser level,
+$\{Q_1,Q_2,Q_3,C\hookrightarrow S\}\in J(S)$.
+\end{construction}
+
+The presheaf $\mathcal{F}_{\mathrm{ling}}$ assigns to each level
+the available linguistic material: at the syllable level, phonemes
+from the CMU dictionary; at the line level, syntactic frames and
+semantic content; at the quatrain level, rhetorical functions
+(exposition, complication, turn, resolution).
+
+%% ── PStr ─────────────────────────────────────────────────────
+\subsection{The Proof Structure $\PStr$}
+
+\begin{construction}[Sonnet type]
+\label{con:sonnet-type}
+The specification type is:
+\[
+  \mathrm{Sonnet}(\theta, \rho, \mu)
+  \;:\equiv\;
+  \Sigma(l_{1..14}:\mathrm{Line}^{14}).\;
+  \mathrm{Theme}(l_{1..14},\theta)
+  \;\wedge\;
+  \mathrm{Rhyme}(l_{1..14},\rho)
+  \;\wedge\;
+  \mathrm{Meter}(l_{1..14},\mu),
+\]
+where $\theta=\text{time}$,
+$\rho=\text{ABAB\,CDCD\,EFEF\,GG}$,
+$\mu=\text{iambic pentameter}$.
+\end{construction}
+
+\textbf{Step 1: Choose a conceit.}\quad
+The $\FMLM$ proposes three conceits---time as \emph{river},
+\emph{season}, \emph{hourglass}---and scores each against the
+theme type.  ``River'' wins ($g=-0.05$) for richness of imagery.
+
+\textbf{Step 2: Generate line by line.}\quad
+Each line~$l_i$ is typed in context:
+\[
+  \Gamma,\;l_1,\ldots,l_{i-1}
+  \;\vdash_{g_i}\;
+  l_i : \mathrm{Line}(\theta_i,\rho_i,\mu),
+\]
+where $\theta_i$ is the local sub-theme and $\rho_i$ constrains the
+end-rhyme.  The $\FMLM$ fills each line via masked-slot iteration:
+\begin{enumerate}[nosep]
+  \item Start with a template:
+    \texttt{[\_\_\_] of time [\_\_\_] like a [\_\_\_]}.
+  \item Generate candidates for each slot from WordNet/FrameNet.
+  \item Score: $g_{ij}=\mathrm{grade}(\Gamma\vdash l_i[w_j/M_k]:T_k(w_j))$.
+  \item Select $\arg\max_j\,g_{ij}$.
+  \item Iterate until grades stabilise.
+\end{enumerate}
+
+\textbf{Step 3: Meter check.}\quad
+Each line must satisfy $\mathrm{Meter}(l_i,\mu)$: exactly 10
+syllables with stress pattern $\cup/\cup/\cup/\cup/\cup/$ (iambic
+pentameter).  The $\HPLF$ voice bundle at the $\phon$ stratum
+verifies this:
+\[
+  G_i^{\phon}(l_i)
+  \;=\;
+  \gone \;\text{if stress pattern matches},
+  \qquad
+  g < \gone\;\text{otherwise (substitutions allowed at a cost)}.
+\]
+A feminine ending (11th unstressed syllable) costs $g=-0.1$.
+
+\textbf{Step 4: Rhyme check.}\quad
+End-words of paired lines must satisfy
+$\GId_{g_r}(U_{\phon},\mathrm{coda}(w_i),\mathrm{coda}(w_j))$
+with $g_r$ close to $\gone$.  Perfect rhyme: $g_r=\gone$.
+Near-rhyme (e.g.\ ``love''/``prove''): $g_r\approx -0.15$.
+
+\medskip
+Suppose the $\FMLM$ produces the opening quatrain:
+\begin{verse}
+  The river of our years flows ever on,\\
+  Through meadows green where youthful pleasures play,\\
+  Until the golden afternoon is gone\\
+  And twilight steals the colours from the day.
+\end{verse}
+Each line has been typed at grade $g_i\in[-0.15,\,0]$; the quatrain
+as a whole satisfies $\mathrm{Rhyme}(Q_1,\text{ABAB})$ and
+$\mathrm{Meter}(Q_1,\mu)$.
+
+%% ── CSpec ────────────────────────────────────────────────────
+\subsection{The Cohomological Spectrum $\CSpec$}
+
+With the quatrain cover $\{Q_1,Q_2,Q_3,C\}$:
+
+\begin{example}[Obstruction at the Q2--Q3 boundary]
+Suppose line~5 (start of Q2) rhymes correctly with line~7 but
+introduces the word ``frozen,'' breaking the river metaphor
+(rivers don't freeze in this conceit).  The \v{C}ech coboundary
+between Q1 and Q2 is:
+\[
+  \delta^0(s_{Q_1},s_{Q_2})
+  \;=\;
+  \text{``river (flowing)''}\big|_{Q_1\cap Q_2}
+  \;-\;
+  \text{``frozen (static)''}\big|_{Q_1\cap Q_2}
+  \;\neq\;0.
+\]
+$H^1\neq 0$: the metaphor does not glue across quatrains.
+
+\textbf{Repair}: replace ``frozen'' with ``narrowing'' (the
+river narrows as time shrinks).  Now $\delta^0=0$ and
+$H^1=0$.
+\end{example}
+
+\begin{example}[Volta obstruction]
+The volta at line~9 must shift the argument (from ``time
+passes'' to ``but something endures'').  If Q3 merely
+continues the lament without a turn, the structural
+constraint $\mathrm{Volta}(l_9)$ is unsatisfied---an
+obstruction at the $Q_2$--$Q_3$ boundary in the rhetorical
+presheaf.  Repair: rewrite line~9 as a ``But'' or ``Yet''
+clause.
+\end{example}
+
+%% ── GEval ────────────────────────────────────────────────────
+\subsection{The Graded Evaluation $\GEval$}
+
+After repair, the final grades (in the $\HPLF$ framework) are:
+\begin{align*}
+  g_{\mathrm{meter}}   &= -0.08  &&\text{(one feminine ending in line 12)},\\
+  g_{\mathrm{rhyme}}   &= -0.05  &&\text{(one near-rhyme: ``on''/``gone'')},\\
+  g_{\mathrm{imagery}} &= -0.12  &&\text{(one clich\'e: ``golden afternoon'')},\\
+  g_{\mathrm{arc}}     &= -0.10  &&\text{(volta could be sharper)}.
+\end{align*}
+The overall harmony:
+\[
+  \mathrm{Harm}^{\HPLF}
+  \;=\;
+  g_{\mathrm{meter}} \otG g_{\mathrm{rhyme}} \otG
+  g_{\mathrm{imagery}} \otG g_{\mathrm{arc}}
+  \;=\; -0.12
+\]
+(bottleneck: imagery).  The sonnet is competent but not
+outstanding; the clich\'e drags the grade down.
+
+\medskip
+
+%% ─────────────────────────────────────────────────────────────
+\section{Example 2: Analysing a Keats Sonnet}
+\label{sec:keats}
+
+\begin{quote}
+\emph{``When I have fears that I may cease to be \\
+Before my pen has glean'd my teeming brain\ldots''}\\
+\hfill --- Keats, \emph{Sonnet VII}
+\end{quote}
+
+\textbf{$\STop$.}\quad
+The poetic site is the same $\mathcal{C}_{\mathrm{poet}}$ as above,
+with the 14-line cover.  The presheaf assigns Keats's actual
+linguistic material at each node.
+
+\textbf{$\PStr$.}\quad
+The type $\mathrm{Sonnet}(\text{mortality},\text{ABAB}\ldots,\mu)$
+is inhabited by the actual poem.  Key typing observations:
+\begin{itemize}[nosep]
+  \item ``Glean'd my teeming brain'' uses $\GId_{-0.2}$
+    (metaphor: mind = field to be harvested).
+  \item ``High-pil\`ed books'' carries
+    $\mathrm{Ico}(\text{books},\text{grain})$: an iconicity between
+    physical stacking and intellectual accumulation.
+  \item The volta at line~9 (``And when I feel\ldots'') introduces
+    the beloved, shifting from self to other.
+\end{itemize}
+
+\textbf{$\CSpec$.}\quad
+$H^1=0$ throughout: every metaphor, every rhyme, every metrical
+choice glues perfectly.  The \v{C}ech complex is exact---the
+hallmark of a masterwork.
+
+\textbf{$\GEval$.}\quad
+$g_{\mathrm{meter}}=\gone$ (flawless iambic pentameter),
+$g_{\mathrm{rhyme}}=\gone$ (all perfect rhymes),
+$g_{\mathrm{imagery}}=-0.02$ (near-perfect; every image is
+fresh),
+$g_{\mathrm{arc}}=-0.03$ (the volta is slightly abrupt).
+$\mathrm{Harm}^{\HPLF}=-0.03$.  This is essentially a
+grade-$\gone$ poem.
+
+\medskip
+
+%% ─────────────────────────────────────────────────────────────
+\section{Example 3: A Flawed Poem}
+\label{sec:bad-poem}
+
+Consider the following attempt:
+\begin{verse}
+  The clock goes tick and also tock,\\
+  It tells the time just like a clock,\\
+  The hours pass both fast and slow,\\
+  And that is all I need to know.
+\end{verse}
+
+\textbf{$\STop$.}\quad
+The site has 4 lines; the cover is $\{l_1,l_2,l_3,l_4\}$.
+
+\textbf{$\PStr$.}\quad
+The type is $\mathrm{Quatrain}(\text{time},\text{AABB},\mu')$
+for some meter~$\mu'$.  The poem inhabits this type at a low
+grade:
+\begin{itemize}[nosep]
+  \item Line~2 is a tautology (``like a clock'') --- the semantic
+    content is $\GId_{\gone}(\text{clock},\text{clock})$, which
+    is trivial and adds no information.
+  \item Line~4 is a clich\'e (``all I need to know'').
+\end{itemize}
+
+\textbf{$\CSpec$.}\quad
+$H^1\neq 0$ at the $l_1$--$l_2$ boundary: line~2 repeats
+the content of line~1 without advancing the argument.  The
+coboundary
+$\delta^0(s_1,s_2) = \text{clock}-\text{clock}$ would be zero
+\emph{semantically}, but in the poetic presheaf (which values
+\emph{novelty}), the redundancy registers as a non-trivial
+cocycle.  Similarly, $H^1\neq 0$ at $l_3$--$l_4$ (clich\'e is
+an obstruction to freshness).
+
+\textbf{$\GEval$.}\quad
+$g_{\mathrm{meter}}=-0.3$ (irregular stress),
+$g_{\mathrm{rhyme}}=-0.5$ (``clock''/``clock'' is an identical
+rhyme, penalised),
+$g_{\mathrm{imagery}}=-2.0$ (no fresh imagery),
+$g_{\mathrm{arc}}=-1.5$ (no development).
+$\mathrm{Harm}^{\HPLF}=-2.0$ (bottleneck: imagery).
+The poem is essentially at the $\gzero$ end of the scale.
+
+\begin{remark}[Diagnosis vs.\ generation]
+The 4-tuple does not merely \emph{judge} the bad poem; it
+\emph{localises} the failures.  $\CSpec$ points to the
+$l_1$--$l_2$ boundary and the $l_3$--$l_4$ boundary;
+$\GEval$ identifies imagery as the worst dimension.  A
+generation system could use this diagnosis to \emph{repair}
+the poem: replace line~2 with a non-tautological elaboration,
+replace line~4's clich\'e, and re-check $H^1$.
+\end{remark}
+
+\chapter{Mathematical Ideation and Proof}
+\label{ch:ex-math}
+
+Mathematics is the domain where $\PStr$ is richest and $\GEval$
+most contested.  We work through the irrationality of $\sqrt{2}$
+in full 4-tuple detail, then sketch mathematical ideation as
+proof search.
+
+%% ─────────────────────────────────────────────────────────────
+\section{Example 1: $\sqrt{2}$ Is Irrational}
+\label{sec:sqrt2}
+
+\subsection{The Semantic Topos $\STop$}
+
+\begin{construction}[Mathematical site]
+\label{con:math-site}
+The category $\mathcal{C}_{\mathrm{math}}$ has:
+\begin{itemize}[nosep]
+  \item \textbf{Objects}: mathematical statements---definitions
+    ($\mathrm{gcd}$, ``rational'', ``irrational''), lemmas
+    (``if $p^2$ is even then $p$ is even''), and theorems
+    ($\sqrt{2}\notin\mathbb{Q}$).
+  \item \textbf{Morphisms}: logical dependency.  A morphism
+    $L\to T$ exists when lemma~$L$ is used in the proof of
+    theorem~$T$.
+\end{itemize}
+The topology declares a cover of a theorem to be a
+\emph{complete} set of dependencies:
+\[
+  \bigl\{\text{Def}(\gcd),\;
+         \text{Lem}(\text{even-square}),\;
+         \text{Ax}(\mathbb{Z}\text{-domain})
+  \bigr\}
+  \;\in\;J\bigl(\sqrt{2}\notin\mathbb{Q}\bigr).
+\]
+\end{construction}
+
+The presheaf $\mathcal{F}_{\mathrm{obj}}$ assigns to each node the
+set of mathematical objects in scope: at $\text{Def}(\gcd)$, the
+objects $\{p,q,\gcd(p,q)\}$; at the theorem node, the full
+collection $\{p,q,k,\gcd,\sqrt{2}\}$.
+
+\subsection{The Proof Structure $\PStr$}
+
+\begin{construction}[Irrationality type]
+The specification is:
+\[
+  \mathrm{Irrational}(\sqrt{2})
+  \;:\equiv\;
+  \neg\,\Sigma(p:\mathbb{Z}).\,\Sigma(q:\mathbb{Z}_{>0}).\,
+  \GId_{\gone}\!\bigl(\mathbb{R},\;\sqrt{2},\;p/q\bigr).
+\]
+\end{construction}
+
+The proof term inhabiting this type is a \emph{proof by
+contradiction}.  We present the full derivation tree.
+
+\begin{construction}[Proof tree]
+\label{con:sqrt2-proof}
+\[
+\dfrac{
+  \dfrac{
+    \dfrac{
+      [h:\sqrt{2}=p/q,\;\gcd(p,q)=1]
+    }{
+      2q^2=p^2
+    }\text{\scriptsize(algebra)}
+    \qquad
+    \dfrac{
+      2q^2=p^2
+    }{
+      2\mid p^2
+    }\text{\scriptsize(div)}
+    \qquad
+    \dfrac{
+      2\mid p^2
+    }{
+      2\mid p
+    }\text{\scriptsize(prime)}
+  }{
+    \Gamma,h\vdash_{\gone} e_1:2\mid p
+  }
+  \quad
+  \dfrac{
+    \dfrac{
+      p=2k
+    }{
+      2q^2=4k^2
+    }\text{\scriptsize(subst)}
+    \quad
+    \dfrac{
+      q^2=2k^2
+    }{
+      2\mid q
+    }\text{\scriptsize(same)}
+  }{
+    \Gamma,h\vdash_{\gone} e_2:2\mid q
+  }
+}{
+  \dfrac{
+    \Gamma,h\vdash_{\gone} (e_1,e_2):2\mid p\;\wedge\;2\mid q
+    \qquad
+    \Gamma\vdash_{\gone} c:\gcd(p,q)=1
+  }{
+    \Gamma\vdash_{\gone}\;\bot
+  }\text{\scriptsize(contra)}
+}
+\]
+The overall term is
+$\lambda h.\;\mathrm{absurd}(\mathrm{gcd\text{-}contra}(e_1,e_2,c))
+ :\mathrm{Irrational}(\sqrt{2})$.
+\end{construction}
+
+\textbf{$\beta$-reduction.}\quad
+Inlining $k=p/2$ into the second branch and simplifying
+$2q^2=4(p/2)^2\longrightarrow q^2=2(p/2)^2$ is a $\beta$-step
+that shortens the derivation.
+
+\subsection{The Cohomological Spectrum $\CSpec$}
+
+\textbf{Correct proof: $H^1=0$.}\quad
+Take the cover
+$\{U_1:\text{``$p$ is even''},\;U_2:\text{``$q$ is even''}\}$.
+The local proofs (even-square lemma applied to $p^2=2q^2$ and
+$q^2=2k^2$) glue at the overlap
+$U_1\cap U_2=\{\gcd(p,q)=1\}$, since having both $2\mid p$ and
+$2\mid q$ contradicts $\gcd(p,q)=1$.  The \v{C}ech coboundary
+vanishes: $\delta^0=0$, so $H^1=0$.
+
+\textbf{Proof with a gap: $H^1\neq 0$.}\quad
+Suppose we omit the hypothesis $\gcd(p,q)=1$.  Then the local
+proofs ``$2\mid p$'' and ``$2\mid q$'' are both valid, but the
+contradiction step has no fuel---$\gcd(p,q)$ is unconstrained.
+
+\begin{proposition}[Gap = non-trivial $H^1$]
+The proofs over $U_1$ and $U_2$ define local sections of the
+proof presheaf, but $\delta^0(s_1,s_2)\neq 0$ at the overlap
+$U_1\cap U_2$: the two local proofs do not compose into a
+global contradiction because the necessary compatibility datum
+($\gcd=1$) is missing.
+\end{proposition}
+
+Repair: adding ``without loss of generality, assume
+$\gcd(p,q)=1$'' restores the missing section, making
+$\delta^0=0$ and $H^1=0$.
+
+\subsection{The Graded Evaluation $\GEval$}
+
+\begin{align*}
+  g_{\mathrm{rigor}}       &= \gone   &&\text{(every step is valid)},\\
+  g_{\mathrm{elegance}}    &= -0.3  &&\text{(standard; not the most elegant proof)},\\
+  g_{\mathrm{novelty}}     &= -3.0  &&\text{(2500 years old)},\\
+  g_{\mathrm{significance}}&= -0.1  &&\text{(foundational result)}.
+\end{align*}
+Overall $G = \gone\otG(-0.3)\otG(-3.0)\otG(-0.1)=-3.0$
+(bottleneck: novelty).  This is correct but unsurprising---exactly
+the evaluation a journal referee would give.
+
+\medskip
+
+%% ─────────────────────────────────────────────────────────────
+\section{Example 2: Mathematical Ideation}
+\label{sec:ideation}
+
+Consider a mathematician who notices:
+$1+3=4=2^2$,\;
+$1+3+5=9=3^2$,\;
+$1+3+5+7=16=4^2$.
+
+\textbf{$\STop$.}\quad
+The site $\mathcal{C}_{\mathrm{conj}}$ has objects = observed
+equalities and a conjectured theorem node
+$T:``\sum_{i=1}^n(2i{-}1)=n^2$''.  The cover of $T$ includes
+the examples plus the inductive step (which is not yet proved).
+
+\textbf{$\PStr$.}\quad
+The type is $\Pi(n:\mathbb{N}).\,\GId_{\gone}(\mathbb{N},
+  \sum_{i=1}^n(2i{-}1),\,n^2)$.
+A full term requires induction:
+\[
+  \dfrac{
+    \Gamma\vdash_{\gone}\mathrm{base}:\sum_{i=1}^1(2i{-}1)=1^2
+    \qquad
+    \Gamma\vdash_{\gone}\mathrm{step}:
+      \bigl(\textstyle\sum_{i=1}^n(2i{-}1)=n^2\bigr)
+      \Rightarrow
+      \bigl(\textstyle\sum_{i=1}^{n+1}(2i{-}1)=(n{+}1)^2\bigr)
+  }{
+    \Gamma\vdash_{\gone}\mathrm{ind}(\mathrm{base},\mathrm{step}):
+      \Pi(n).\,\textstyle\sum_{i=1}^n(2i{-}1)=n^2
+  }
+\]
+Before the inductive step is found, the mathematician has only
+the examples.  These are \emph{partial evidence} at grades
+$g<\gone$: three witnesses do not constitute a proof.
+
+\textbf{$\CSpec$.}\quad
+Before the inductive proof, $H^1\neq 0$: the examples cover
+$n=2,3,4$ but do not glue into a proof for all~$n$.  After
+finding the inductive step, $H^1=0$: the proof glues globally.
+This is a precise formalisation of the difference between
+\emph{conjecture} and \emph{theorem}.
+
+\textbf{$\GEval$.}\quad
+Before proof: $g_{\mathrm{rigor}}=-2.0$ (empirical only).
+After proof: $g_{\mathrm{rigor}}=\gone$,
+$g_{\mathrm{elegance}}=-0.1$ (clean one-line induction),
+$g_{\mathrm{novelty}}=-2.5$ (well-known),
+$g_{\mathrm{significance}}=-0.5$ (useful but not deep).
+
+\begin{remark}[Ideation as proof search]
+Mathematical ideation---the process of noticing a pattern and
+conjecturing a theorem---is precisely the $\FMLM$ applied to
+$\PStr$: generate candidate proof terms (``try induction,''
+``try contradiction,'' ``try a clever substitution''), score
+each against the type, and iterate.  The grade $g$ rises from
+$\gzero$ (no evidence) through intermediate values (empirical
+support) to $\gone$ (complete proof).  $\CSpec$ tracks which
+parts of the proof are missing at each stage.
+\end{remark}
+
+\chapter{Cross-Domain Isomorphisms}
+\label{ch:isomorphisms}
+
+The preceding four chapters instantiated the 4-tuple
+$(\STop,\PStr,\CSpec,\GEval)$ in four domains: programming,
+natural language, poetry, and mathematics.  This chapter
+demonstrates that the instantiations are not merely analogous
+but \emph{functorially related}: structure-preserving maps
+connect every pair.
+
+%% ─────────────────────────────────────────────────────────────
+\section{The Category of Domains}
+\label{sec:dom-cat}
+
+\begin{definition}[Domain 4-tuple]
+A \emph{domain instantiation} is a quadruple
+$\mathcal{D}=(\STop_{\mathcal{D}},\PStr_{\mathcal{D}},
+ \CSpec_{\mathcal{D}},\GEval_{\mathcal{D}})$
+where each component is the restriction of the universal
+4-tuple to the domain's site, types, cohomology, and grade
+components.
+\end{definition}
+
+\begin{definition}[Domain morphism]
+A \emph{domain morphism} $\Phi:\mathcal{D}_1\to\mathcal{D}_2$
+is a quadruple of functors/natural transformations:
+\[
+  \Phi = (\Phi_{\STop},\;\Phi_{\PStr},\;\Phi_{\CSpec},\;\Phi_{\GEval})
+\]
+such that (i)~$\Phi_{\STop}$ is a morphism of sites,
+(ii)~$\Phi_{\PStr}$ preserves typing derivations,
+(iii)~$\Phi_{\CSpec}$ maps cocycles to cocycles and
+coboundaries to coboundaries (hence induces a map on $H^1$),
+and (iv)~$\Phi_{\GEval}$ is a semiring homomorphism on grades.
+\end{definition}
+
+We write $\mathbf{Dom}$ for the category of domain instantiations
+and domain morphisms.  The four domains studied form a cycle:
+\[
+\begin{tikzcd}
+  \mathcal{D}_{\mathrm{prog}}
+    \arrow[r,"\Phi_{\mathrm{prog}\to\mathrm{NL}}"]
+  & \mathcal{D}_{\mathrm{NL}}
+    \arrow[d,"\Phi_{\mathrm{NL}\to\mathrm{poet}}"]
+  \\
+  \mathcal{D}_{\mathrm{math}}
+    \arrow[u,"\Phi_{\mathrm{math}\to\mathrm{prog}}"]
+  & \mathcal{D}_{\mathrm{poet}}
+    \arrow[l,"\Phi_{\mathrm{poet}\to\mathrm{math}}"]
+\end{tikzcd}
+\]
+
+%% ─────────────────────────────────────────────────────────────
+\section{Programs $\leftrightarrow$ Sentences}
+\label{sec:prog-nl}
+
+\begin{construction}[The functor $\Phi_{\mathrm{prog}\to\mathrm{NL}}$]
+\label{con:prog-nl}
+\begin{itemize}[nosep]
+  \item $\Phi_{\STop}$: program points $\mapsto$ discourse segments;
+    basic blocks $\mapsto$ phrases; the CFG cover $\mapsto$ constituent
+    cover.
+  \item $\Phi_{\PStr}$: specifications $\mapsto$ propositions
+    (a spec ``output is sorted'' becomes the proposition ``the
+    array is sorted''); programs $\mapsto$ utterances (the code
+    \emph{is} a statement about what it does).
+  \item $\Phi_{\CSpec}$: bugs $\mapsto$ ungrammaticality.
+    A data race ($H^1\neq 0$ in the thread cover) maps to a
+    binding failure ($H^1\neq 0$ in the clause cover).
+  \item $\Phi_{\GEval}$: test quality $\mapsto$ linguistic quality;
+    type safety $\mapsto$ grammaticality;
+    performance $\mapsto$ pragmatic efficiency.
+\end{itemize}
+\end{construction}
+
+\begin{theorem}[Faithfulness]
+\label{thm:prog-nl-faithful}
+$\Phi_{\mathrm{prog}\to\mathrm{NL}}$ is a faithful functor:
+distinct programs map to distinct ``sentences'' (no two
+structurally different programs have identical NL images).
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Faithfulness follows from the injectivity of $\Phi_{\PStr}$ on
+derivation trees: different proof trees (Hoare-logic derivations)
+yield different typing derivations in $\PStr_{\mathrm{NL}}$
+because each atomic Hoare rule maps to a distinct NL typing
+rule.
+\end{proof}
+
+\begin{remark}[Not full]
+The functor is not full: natural-language sentences expressing
+emotions, social conventions, or fictional narratives have no
+corresponding program.  The image of $\Phi_{\mathrm{prog}\to\mathrm{NL}}$
+is the sublanguage of \emph{declarative descriptions of
+computational processes}.
+\end{remark}
+
+%% ─────────────────────────────────────────────────────────────
+\section{Sentences $\leftrightarrow$ Poems}
+\label{sec:nl-poet}
+
+\begin{construction}[The functor $\Phi_{\mathrm{NL}\to\mathrm{poet}}$]
+\label{con:nl-poet}
+\begin{itemize}[nosep]
+  \item $\Phi_{\STop}$: $\mathcal{C}_{\mathrm{NL}}\hookrightarrow
+    \mathcal{C}_{\mathrm{poet}}$ by adding metrical, rhyme, and
+    stanzaic objects.  Every NL site embeds into the poetic site as
+    the ``prose sub-site.''
+  \item $\Phi_{\PStr}$: a sentence type $A$ maps to
+    $A\wedge\mathrm{Meter}(\mu)\wedge\mathrm{Rhyme}(\rho)\wedge
+    \mathrm{Form}(f)$---the sentence plus additional constraints.
+    Every grammatical sentence is a trivial ``poem'' (free verse
+    with no metre or rhyme constraints).
+  \item $\Phi_{\CSpec}$: NL obstructions embed as poetic
+    obstructions; poetry has \emph{additional} obstructions
+    (broken metre, failed rhyme, weak volta).
+  \item $\Phi_{\GEval}$: the NL grade components
+    $g_{\phon},g_{\synt},g_{\sem},g_{\prag}$ embed into the
+    larger poetic grade vector, which adds
+    $g_{\mathrm{meter}},g_{\mathrm{rhyme}},g_{\mathrm{imagery}},
+    g_{\mathrm{arc}}$.
+\end{itemize}
+\end{construction}
+
+\begin{theorem}[Faithful embedding]
+\label{thm:nl-poet-embed}
+$\Phi_{\mathrm{NL}\to\mathrm{poet}}$ is faithful: every
+grammatical sentence embeds as a (trivially constrained) poem.
+The embedding is not full: poems carry structure that arbitrary
+prose does not.
+\end{theorem}
+
+The key insight: poetry is \emph{NL plus extra strata in $\PStr$
+and extra components in $\GEval$}.  The CTT stratal tower
+$U_{\phon}:U_{\morph}:\cdots:U_{\poet}:U_{\aesth}$ makes this
+precise---poetry activates the upper strata that prose leaves
+dormant.
+
+%% ─────────────────────────────────────────────────────────────
+\section{Proofs $\leftrightarrow$ Programs (Curry--Howard)}
+\label{sec:math-prog}
+
+\begin{construction}[The functor $\Phi_{\mathrm{math}\to\mathrm{prog}}$]
+\label{con:math-prog}
+This is the classical Curry--Howard correspondence, enriched with
+$\CSpec$ and $\GEval$:
+\begin{itemize}[nosep]
+  \item $\Phi_{\STop}$: the dependency graph of lemmas $\mapsto$
+    the call graph of functions.  A cover (complete set of
+    dependencies) $\mapsto$ a cover (complete set of callee
+    implementations).
+  \item $\Phi_{\PStr}$: propositions $\mapsto$ types;
+    proofs $\mapsto$ programs; the derivation tree of a proof
+    $\mapsto$ the typing derivation of a program.
+  \item $\Phi_{\CSpec}$: a proof gap (missing lemma, $H^1\neq 0$)
+    $\mapsto$ a bug (missing case, $H^1\neq 0$).
+    Exact correspondence: non-vanishing $H^1$ in the mathematical
+    site maps to non-vanishing $H^1$ in the program site.
+  \item $\Phi_{\GEval}$: rigor $\mapsto$ type safety;
+    elegance $\mapsto$ code cleanliness;
+    novelty $\mapsto$ algorithmic innovation;
+    significance $\mapsto$ practical impact.
+\end{itemize}
+\end{construction}
+
+\begin{theorem}[Equivalence on $\CSpec$]
+\label{thm:ch-cspec}
+Under Curry--Howard,
+$H^1(\mathcal{C}_{\mathrm{math}},\mathcal{F}_{\mathrm{proof}})
+\cong
+H^1(\mathcal{C}_{\mathrm{prog}},\mathcal{F}_{\mathrm{inv}})$.
+Proof gaps and program bugs are cohomologically identical.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+$\Phi_{\CSpec}$ maps the \v{C}ech complex of the lemma cover to
+the \v{C}ech complex of the callee cover.  Since Curry--Howard
+is an isomorphism on derivation trees, it induces an isomorphism
+on cochain groups, hence on cohomology.
+\end{proof}
+
+%% ─────────────────────────────────────────────────────────────
+\section{Poems $\leftrightarrow$ Proofs}
+\label{sec:poet-math}
+
+This is the most surprising correspondence.
+
+\begin{construction}[The functor $\Phi_{\mathrm{poet}\to\mathrm{math}}$]
+\label{con:poet-math}
+\begin{itemize}[nosep]
+  \item \textbf{Form $\mapsto$ proof structure.}\quad
+    The stanzaic form of a sonnet (three quatrains + couplet)
+    $\mapsto$ the logical structure of a proof (three lemmas +
+    final theorem).
+  \item \textbf{Meter $\mapsto$ proof rhythm.}\quad
+    The alternation of stressed and unstressed syllables
+    $\mapsto$ the alternation of lemma statements and their
+    applications in a proof.
+  \item \textbf{Rhyme $\mapsto$ structural echo.}\quad
+    Rhyming end-words ($\GId_{g_r}$ at the $\phon$ stratum)
+    $\mapsto$ reuse of the same lemma at different points in a
+    proof (structural parallelism).
+  \item \textbf{Volta $\mapsto$ key insight.}\quad
+    The turn at line~9 of a sonnet $\mapsto$ the ``aha moment''
+    where a proof introduces the decisive idea.
+  \item \textbf{Elegance $\mapsto$ elegance.}\quad
+    Both domains have an ``elegance'' component in $\GEval$ that
+    resists formal definition but is recognised by experts.
+\end{itemize}
+\end{construction}
+
+\begin{remark}[Why this works]
+The correspondence is not metaphorical---it is structural.
+Both poems and proofs are terms inhabiting a type in $\PStr$,
+both must satisfy global gluing conditions ($H^1=0$ in
+$\CSpec$), and both are evaluated by multi-component grades
+in $\GEval$.  The functor $\Phi_{\mathrm{poet}\to\mathrm{math}}$
+identifies the \emph{formal skeleton} shared by both, while
+acknowledging that the \emph{content} differs (linguistic vs.\
+logical).
+\end{remark}
+
+%% ─────────────────────────────────────────────────────────────
+\section{The Cycle and Its Fixed Points}
+\label{sec:cycle}
+
+\begin{proposition}[The cycle is idempotent]
+\label{prop:cycle-idempotent}
+Let $\Psi = \Phi_{\mathrm{math}\to\mathrm{prog}}
+            \circ\Phi_{\mathrm{poet}\to\mathrm{math}}
+            \circ\Phi_{\mathrm{NL}\to\mathrm{poet}}
+            \circ\Phi_{\mathrm{prog}\to\mathrm{NL}}$.
+Then $\Psi$ is not the identity on $\mathcal{D}_{\mathrm{prog}}$
+(the round trip through four domains loses domain-specific
+detail), but $\Psi^2=\Psi$: the image of $\Psi$ is a
+\emph{retract}, and applying $\Psi$ again does not lose further
+information.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Each functor in the cycle is faithful, hence injective on
+morphisms.  The composition $\Psi$ projects onto the
+\emph{shared structural skeleton}---the sub-4-tuple consisting
+of features present in all four domains.  This sub-4-tuple is
+already in the image of $\Psi$, so $\Psi^2$ acts as the
+identity on it.
+\end{proof}
+
+\begin{definition}[Universal artifact]
+An artifact $a$ is \emph{universal} if $\Psi(a)\cong a$---it
+is a fixed point of the cycle.  Such an artifact has coherent
+realisations in all four domains simultaneously.
+\end{definition}
+
+%% ─────────────────────────────────────────────────────────────
+\section{Worked Example: Recursion Across Four Domains}
+\label{sec:recursion}
+
+We take the concept of \emph{recursion} and exhibit its
+4-tuple in each domain, then verify the functorial
+correspondences.
+
+\subsection{As a Program: Factorial}
+
+\textbf{$\STop$.}\quad
+The CFG contains a self-loop at the recursive call site.
+
+\textbf{$\PStr$.}\quad
+Type: $\mathrm{Factorial}:\mathbb{N}\to\mathbb{N}$,
+with specification $\mathrm{fact}(n)=n!$.  The term
+is $\lambda n.\;\mathrm{if}\;n=0\;\mathrm{then}\;1\;
+\mathrm{else}\;n\cdot\mathrm{fact}(n-1)$.
+Termination proof: the argument $n$ strictly decreases.
+
+\textbf{$\CSpec$.}\quad
+$H^1=0$: the base case and inductive case glue at $n=0$.
+
+\textbf{$\GEval$.}\quad
+$g_{\mathrm{rigor}}=\gone$, $g_{\mathrm{perf}}=-0.5$
+(stack overflow for large $n$).
+
+\subsection{As a Sentence: Centre-Embedding}
+
+\begin{quote}
+\emph{``The cat that the dog that the rat bit chased ran.''}
+\end{quote}
+
+\textbf{$\STop$.}\quad
+Three nested relative clauses form a recursive phrase structure.
+
+\textbf{$\PStr$.}\quad
+The typing derivation nests three NP--VP pairs, each containing
+the next.  This is linguistic recursion: the grammar rule
+$\text{NP}\to\text{NP}\;\text{RelClause}$ applies to its own
+output.
+
+\textbf{$\CSpec$.}\quad
+$H^1\neq 0$ for most human parsers: the triple centre-embedding
+exceeds working memory, causing a processing breakdown.  The
+obstruction is at the innermost clause boundary.
+
+\textbf{$\GEval$.}\quad
+$g_{\synt}=\gone$ (grammatical), $g_{\prag}=-2.0$
+(incomprehensible to most listeners).
+
+\textbf{Functor check.}\quad
+$\Phi_{\mathrm{prog}\to\mathrm{NL}}$ maps the self-loop in
+the CFG to the nested clause structure.  The recursive call
+corresponds to the recursive application of the NP rule.
+
+\subsection{As a Poem: A Villanelle}
+
+The villanelle repeats two refrain lines (A1 and A2)
+throughout, returning to them in a fixed pattern.  The
+repetition \emph{is} recursion: the poem calls back to
+its own earlier material.
+
+\textbf{$\PStr$.}\quad
+Type: $\mathrm{Villanelle}(\theta,\text{ABA}\ldots,\mu)$.
+The refrain lines are shared sub-terms, reused at specified
+positions---exactly like a recursive call reusing the
+function body.
+
+\textbf{$\CSpec$.}\quad
+$H^1=0$ when the refrains integrate seamlessly into each
+stanza.  $H^1\neq 0$ if a refrain clashes with its local
+context (e.g.\ the repeated line contradicts new material).
+
+\textbf{Functor check.}\quad
+$\Phi_{\mathrm{NL}\to\mathrm{poet}}$ maps the recursive NP
+structure to the refrain structure: both are self-referential
+uses of material.
+
+\subsection{As a Proof: Induction}
+
+\textbf{$\PStr$.}\quad
+Type: $\Pi(n:\mathbb{N}).\,P(n)$.  The proof term is
+$\mathrm{ind}(\mathrm{base},\lambda n.\lambda h.\,
+\mathrm{step}(n,h))$ where the step function receives
+the inductive hypothesis~$h:P(n)$ and produces $P(n+1)$.
+This \emph{is} recursion: the proof of $P(n+1)$ calls
+the proof of $P(n)$.
+
+\textbf{$\CSpec$.}\quad
+$H^1=0$ when the base case and step glue at $n=0$.
+
+\textbf{Functor check.}\quad
+$\Phi_{\mathrm{math}\to\mathrm{prog}}$ (Curry--Howard)
+maps the induction term to a recursive program.
+$\Phi_{\mathrm{poet}\to\mathrm{math}}$ maps the
+villanelle's refrain pattern to the reuse of the inductive
+hypothesis.
+
+\medskip
+
+\begin{theorem}[Recursion as a universal artifact]
+\label{thm:recursion-universal}
+Recursion is a fixed point of the cycle $\Psi$: its 4-tuple
+is invariant (up to isomorphism) under the round-trip
+$\mathrm{prog}\to\mathrm{NL}\to\mathrm{poet}\to\mathrm{math}
+\to\mathrm{prog}$.  The structural skeleton---a self-referential
+term with a base case and an inductive/recursive step---is
+preserved by every functor in the cycle.
+\end{theorem}
+
+\begin{remark}[Other universal artifacts]
+Recursion is not the only fixed point.  Other candidates include
+\emph{composition} (function composition / sentence conjunction /
+stanza sequencing / lemma chaining),
+\emph{abstraction} ($\lambda$-abstraction / pronoun binding /
+metonymy / universal quantification), and
+\emph{symmetry} (invariance under permutation / palindrome /
+chiasmus / group-theoretic symmetry).  Each deserves a full
+treatment parallel to the recursion example above.
+\end{remark}
